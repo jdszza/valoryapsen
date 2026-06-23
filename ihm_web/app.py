@@ -291,12 +291,27 @@ def layout_principal(pathname, auth, role, nome):
 app.layout = html.Div([
     dcc.Location(id="url"),
     dcc.Store(id="auth-store", storage_type="session"),
+    dcc.Store(id="_ready", data=False),
+    dcc.Interval(id="_hydrated", interval=100, max_intervals=1),
     html.Div(id="app-root"),
 ])
 
+@callback(Output("_ready", "data"),
+          Input("_hydrated", "n_intervals"),
+          prevent_initial_call=True)
+def _mark_ready(_):
+    """Dispara uma vez (~100 ms) após o page load, depois que o browser
+    já hidratou o dcc.Store a partir do sessionStorage."""
+    return True
+
 @callback(Output("app-root", "children"),
-          Input("url", "pathname"), Input("auth-store", "data"))
-def router(pathname, auth):
+          Input("url", "pathname"),
+          Input("auth-store", "data"),
+          Input("_ready", "data"))
+def router(pathname, auth, ready):
+    # Enquanto o sessionStorage ainda não foi lido, não decide nada.
+    if not ready:
+        return html.Div()
     if not auth or not auth.get("token"):
         return pagina_login()
     role = auth.get("role", "")
@@ -320,6 +335,10 @@ def router(pathname, auth):
           State("offcanvas-menu", "is_open"),
           prevent_initial_call=True)
 def toggle_sidebar(n, is_open):
+    # Guarda: btn-menu aparece dinamicamente com n_clicks=0;
+    # sem essa checagem o Dash abre o offcanvas automaticamente.
+    if not n:
+        return dash.no_update
     return not is_open
 
 @callback(Output("auth-store", "data"), Output("login-erro", "children"),
@@ -327,6 +346,10 @@ def toggle_sidebar(n, is_open):
           State("login-user", "value"), State("login-senha", "value"),
           prevent_initial_call=True)
 def fazer_login(n, username, senha):
+    # Guarda: btn-login aparece dinamicamente com n_clicks=0;
+    # sem essa checagem o Dash mostra "Preencha..." em toda re-renderização.
+    if not n:
+        return dash.no_update, dash.no_update
     if not username or not senha:
         return dash.no_update, "Preencha usuario e senha."
     resp = api("post", "/auth/login", json={"username": username, "senha": senha})
@@ -338,6 +361,13 @@ def fazer_login(n, username, senha):
           Input("btn-logout", "n_clicks"), Input("btn-logout-mobile", "n_clicks"),
           prevent_initial_call=True)
 def logout(n1, n2):
+    # GUARDA CRÍTICA: btn-logout e btn-logout-mobile são renderizados
+    # dinamicamente pelo router. Quando aparecem no DOM, o Dash dispara
+    # este callback com n_clicks=0, o que limparia o auth-store e
+    # deslogaria o usuário automaticamente. Sem este guard, a IHM ficava
+    # pedindo login em loop a cada re-renderização do router.
+    if not (n1 or n2):
+        return dash.no_update, dash.no_update
     return None, "/"
 
 @callback(Output("op-feedback", "children"),
@@ -424,6 +454,9 @@ def refresh_ordens(_, auth):
           State("auth-store", "data"), prevent_initial_call=True)
 def modal_os(n_open, n_cancel, n_confirm, is_open, produto, lote, meta, resp, auth):
     t = ctx.triggered_id
+    # Guarda: n_clicks=0 quando o botão aparece dinamicamente.
+    if t == "btn-nova-os"    and not n_open:   return is_open, ""
+    if t == "btn-nos-cancel" and not n_cancel: return is_open, ""
     if t == "btn-nova-os":    return True, ""
     if t == "btn-nos-cancel": return False, ""
     if t == "btn-nos-confirm":
@@ -436,22 +469,28 @@ def modal_os(n_open, n_cancel, n_confirm, is_open, produto, lote, meta, resp, au
     return is_open, ""
 
 @callback(Output("modal-novo-user", "is_open"), Output("user-fb", "children"),
-          Input("btn-novo-user", "n_clicks"), Input("btn-nu-cancel", "n_clicks"),
-          Input("btn-nu-confirm", "n_clicks"),
+          Input("btn-novo-user", "n_clicks"), Input("btn-nu-confirm", "n_clicks"),
+          Input("btn-nu-cancel", "n_clicks"),
           State("modal-novo-user", "is_open"),
           State("nu-username", "value"), State("nu-nome", "value"),
           State("nu-senha", "value"), State("nu-role", "value"),
-          State("auth-store", "data"), prevent_initial_call=True)
-def modal_user(n_open, n_cancel, n_confirm, is_open, username, nome, senha, role, auth):
+          State("auth-store", "data"),
+          prevent_initial_call=True)
+def toggle_user(open_click, confirm_click, cancel_click, is_open,
+                username, nome, senha, role, auth):
     t = ctx.triggered_id
-    if t == "btn-novo-user":   return True, ""
-    if t == "btn-nu-cancel":   return False, ""
+    # Guarda: n_clicks=0 quando o botao aparece dinamicamente.
+    if t == "btn-novo-user" and not open_click: return is_open, ""
+    if t == "btn-novo-user":
+        return True, ""
     if t == "btn-nu-confirm":
         token = (auth or {}).get("token")
-        if all([username, nome, senha, role, token]):
-            api("post", "/usuarios", token=token,
-                json={"username": username, "nome_completo": nome, "senha": senha, "role": role})
-            return False, f"✔ Usuario '{username}' criado."
+        if username and nome and senha and role:
+            r = api("post", "/usuarios", token=token,
+                    json={"username": username, "nome_completo": nome,
+                          "senha": senha, "role": role})
+            if r:
+                return False, f"✔ Usuario {username} criado com sucesso."
         return False, "Preencha todos os campos."
     return is_open, ""
 
