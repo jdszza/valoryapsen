@@ -164,3 +164,18 @@ APSEN - VALORY/
 ├── docker-compose.yml
 └── SISTEMA.md           # Este arquivo
 ```
+
+---
+
+## Credenciais de Acesso
+
+**Dashboard** → `http://localhost:8050`  
+**IHM Web** → `http://localhost:8051`
+
+| Usuário    | Senha      | Role        | Acesso                                      |
+|------------|------------|-------------|---------------------------------------------|
+| `admin`    | `admin123` | Admin       | Dashboard + IHM completo                    |
+| `operador1`| `op123`    | Operador    | Dashboard + IHM (operação e OS)             |
+| `manut1`   | `mnt123`   | Manutenção  | Dashboard + IHM (operação, OS e manutenção) |
+
+> **Atenção:** troque as senhas antes de colocar em produção. Acesse a página de Usuários na IHM (login como `admin`) ou use o endpoint `PUT /usuarios/{username}` no backend.
