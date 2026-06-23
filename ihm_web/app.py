@@ -23,13 +23,6 @@ VERDE, AMAR, VERM, AZUL, CINZA = "#00ff88", "#ffc107", "#ff4444", "#0d6efd", "#6
 STATUS_COR = {"aberto": AZUL, "em_andamento": VERDE, "concluido": CINZA,
               "cancelado": VERM, "idle": CINZA, "running": VERDE, "paused": AMAR, "alarm": VERM}
 
-_CSS = """
-@media (min-width: 768px) { .ihm-content { margin-left: 210px; } }
-.ihm-content { min-height: 100vh; padding: 20px 16px; }
-.ihm-topbar { background: #111; border-bottom: 1px solid #222; padding: 10px 16px;
-              position: sticky; top: 0; z-index: 998; }
-"""
-
 def badge(texto, cor):
     return html.Span(texto.upper(), style={"background": cor,
         "color": "#000" if cor == AMAR else "#fff", "borderRadius": "4px",
@@ -296,7 +289,6 @@ def layout_principal(pathname, auth, role, nome):
 
 # ── Layout ──────────────────────────────────────────────────────────────────────
 app.layout = html.Div([
-    html.Style(_CSS),
     dcc.Location(id="url"),
     dcc.Store(id="auth-store", storage_type="session"),
     html.Div(id="app-root"),

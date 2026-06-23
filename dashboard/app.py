@@ -52,13 +52,6 @@ VERDE, VERM, AMAR, CINZA = "#28a745", "#dc3545", "#ffc107", "#6c757d"
 STATUS_COR   = {"idle": CINZA, "running": VERDE, "paused": AMAR, "alarm": VERM}
 STATUS_LABEL = {"idle": "AGUARDANDO", "running": "EM PRODUCAO", "paused": "PAUSADO", "alarm": "ALARME"}
 
-_CSS = """
-.dash-content { padding: 16px 12px; }
-@media (min-width: 768px) { .dash-content { padding: 28px 32px; } }
-@media (max-width: 480px)  { .dash-header-sub { display: none !important; } }
-@media (max-width: 575px)  { .dash-graph { height: 220px !important; } }
-"""
-
 # ── Login ──────────────────────────────────────────────────────────────────────
 def pagina_login(erro=""):
     return html.Div(style={
@@ -108,7 +101,6 @@ def pagina_dash(auth):
     role  = auth.get("role", "")
     return html.Div(style={"background": "#f0f4f8", "minHeight": "100vh",
                             "fontFamily": "'Inter', sans-serif"}, children=[
-        html.Style(_CSS),
         # Header
         html.Div(style={
             "background": f"linear-gradient(90deg, {AZUL} 0%, {AZUL2} 100%)",
