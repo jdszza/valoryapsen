@@ -179,3 +179,23 @@ APSEN - VALORY/
 | `manut1`   | `mnt123`   | Manutenção  | Dashboard + IHM (operação, OS e manutenção) |
 
 > **Atenção:** troque as senhas antes de colocar em produção. Acesse a página de Usuários na IHM (login como `admin`) ou use o endpoint `PUT /usuarios/{username}` no backend.
+
+---
+
+## Próximos Passos
+
+### Prioridade alta
+- **Corrigir perda de sessão na IHM Web** — a página está pedindo login repetidamente após refresh. O token JWT é salvo no `dcc.Store(storage_type="session")`, mas o callback do router pode estar re-renderizando o login antes do store carregar do browser. Investigar race condition entre `url.pathname` e `auth-store.data` no callback `router`.
+
+### Funcionalidades
+- **Gerador automático de OS** — inspirado em `sap_integration.py`: ao iniciar um novo lote (via MQTT `apsen/lote` ou comando manual), o sistema gera automaticamente uma OS com os dados do lote, produto e meta. Opcionalmente envia um payload JSON para um ERP externo (SAP ou sistema da APSEN) via `POST /api/sap/registro`, com campos: `lote`, `produto`, `meta`, `centro`, `timestamp`. Implementar como módulo `erp_integration.py` no backend, chamado dentro do handler do tópico `apsen/lote`.
+- **Edição e encerramento de OS** — a rota `PUT /ordens/{os_id}` já existe no backend, mas a IHM não tem botão para mudar status (aberto → em andamento → concluído). Adicionar ações na tabela de OS.
+- **Edição/desativação de usuários** — a página de Usuários só cria. Adicionar botões de editar role e desativar conta.
+
+### Hardware e integração
+- **Integrar sensor de contagem no ESP32** — o bloco `INTEGRE SEU SENSOR AQUI` no firmware está vazio. Implementar leitura real (sensor IR, encoder incremental ou câmera com IA) e publicar em `apsen/contagem`.
+- **Integração com firmware CNC** — quando pronto, criar tópicos `apsen/cnc/*`, assinar no backend e exibir painel dedicado no dashboard.
+
+### Infraestrutura
+- **Teste completo com Docker** — subir `docker compose up --build` e validar fluxo ponta a ponta: ESP32 → MQTT → backend → dashboard e IHM.
+- **Segurança para produção** — gerar `SECRET_KEY` forte no `docker-compose.yml`, habilitar HTTPS/WSS, validar comportamento do ESP32 em WiFi industrial (reconexão automática, interferências).
