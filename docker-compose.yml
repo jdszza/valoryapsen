@@ -1,0 +1,69 @@
+version: "3.9"
+
+services:
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: apsen-mqtt
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mqtt_data:/mosquitto/data
+    networks:
+      - apsen-net
+
+  backend:
+    build: ./backend
+    container_name: apsen-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      MQTT_HOST:  mosquitto
+      MQTT_PORT:  1883
+      DB_PATH:    /data/apsen.db
+      SECRET_KEY: apsen-mude-esta-chave-em-producao-2024
+    volumes:
+      - db_data:/data
+    depends_on:
+      - mosquitto
+    networks:
+      - apsen-net
+
+  dashboard:
+    build: ./dashboard
+    container_name: apsen-dash
+    restart: unless-stopped
+    ports:
+      - "8050:8050"
+    environment:
+      BACKEND_URL: http://backend:8000
+      BACKEND_WS:  ws://backend:8000/ws
+    depends_on:
+      - backend
+    networks:
+      - apsen-net
+
+  ihm_web:
+    build: ./ihm_web
+    container_name: apsen-ihm-web
+    restart: unless-stopped
+    ports:
+      - "8051:8051"
+    environment:
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - apsen-net
+
+volumes:
+  mqtt_data:
+  db_data:
+
+networks:
+  apsen-net:
+    driver: bridge
