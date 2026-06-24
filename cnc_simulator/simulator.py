@@ -126,6 +126,8 @@ class CNCSimulator:
         # Evento: dispenser atual concluiu a dispensa
         self._disp_concluiu = threading.Event()
         self._disp_atual_id: int | None = None
+        # Flag: erro de CV detectado — abortar espera
+        self._cv_erro       = False
 
         self.client = mqtt.Client(client_id="apsen-cnc-simulator-v21", clean_session=True)
         self.client.on_connect    = self._on_connect
@@ -136,9 +138,10 @@ class CNCSimulator:
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
-            client.subscribe("apsen/os/nova",          qos=1)
-            client.subscribe("apsen/ia/atribuicao",    qos=0)
-            client.subscribe("apsen/dispenser/status", qos=0)
+            client.subscribe("apsen/os/nova",              qos=1)
+            client.subscribe("apsen/ia/atribuicao",        qos=0)
+            client.subscribe("apsen/dispenser/status",     qos=0)
+            client.subscribe("apsen/dispenser/carregamento", qos=0)
             logger.info("CNC conectada ao broker. Aguardando OS...")
             self._pub_status()
 
@@ -160,25 +163,46 @@ class CNCSimulator:
             elif topic == "apsen/dispenser/status":
                 self._handle_dispenser_status(payload)
 
+            elif topic == "apsen/dispenser/carregamento":
+                self._handle_dispenser_carregamento(payload)
+
         except Exception as exc:
             logger.error(f"[CNC] Erro em mensagem: {exc}", exc_info=True)
 
     # ─────────────────────────────────────────────────── Handlers ──────────────
+
+    def _handle_dispenser_carregamento(self, payload: dict):
+        """Se CV reportar erro no carregamento → aborta espera imediatamente."""
+        status = payload.get("status")
+        os_id  = payload.get("os_id")
+        disp_id = payload.get("dispenser_id")
+        motivo  = payload.get("motivo_falha", "erro CV")
+
+        with self._lock:
+            if status == "erro" and os_id == self.os_id:
+                logger.error(
+                    f"[CNC] Dispenser {disp_id} — ERRO CV na OS {os_id}: {motivo}. "
+                    f"Abortando espera."
+                )
+                self._cv_erro = True
+                # Desbloqueia _aguardar_todos_prontos sem marcar como pronto
+                self._todos_prontos.set()
 
     def _handle_os_nova(self, payload: dict):
         with self._lock:
             if self.state != "idle":
                 logger.warning(f"[CNC] OS recebida mas máquina em '{self.state}' — ignorando.")
                 return
-            self.os_id         = payload.get("os_id")
-            self.os_itens      = payload.get("medicamentos", [])
-            self.atribuicoes   = {}
-            self._disp_prontos = set()
+            self.os_id           = payload.get("os_id")
+            self.os_itens        = payload.get("medicamentos", [])
+            self.atribuicoes     = {}
+            self._disp_prontos   = set()
             self._disp_esperados = set()
+            self._cv_erro        = False
             self._todos_prontos.clear()
-            self.ciclo_atual   = 0
-            self.total_ciclos  = len(self.os_itens)
-            self.state         = "aguardando_atribuicao"
+            self.ciclo_atual     = 0
+            self.total_ciclos    = len(self.os_itens)
+            self.state           = "aguardando_atribuicao"
 
         logger.info(
             f"\n{'='*60}\n"
@@ -259,8 +283,24 @@ class CNCSimulator:
         """Aguarda todos os dispensers reportarem 'pronto'. Então inicia a mesa."""
         logger.info(f"[CNC] Aguardando {len(self._disp_esperados)} dispenser(s) carregar...")
         ok = self._todos_prontos.wait(timeout=TIMEOUT_PRONTO)
-        if not ok:
-            logger.error("[CNC] Timeout aguardando dispensers carregarem!")
+
+        with self._lock:
+            cv_erro = self._cv_erro
+            prontos = set(self._disp_prontos)
+            esperados = set(self._disp_esperados)
+
+        if cv_erro:
+            logger.error("[CNC] Erro de CV detectado nos dispensers — abortando OS.")
+            self._pub_status(status="erro", extra={"mensagem": "Erro de CV no carregamento"})
+            with self._lock:
+                self.state = "idle"
+                self.os_id = None
+                self._cv_erro = False
+            return
+
+        if not ok or prontos < esperados:
+            faltam = esperados - prontos
+            logger.error(f"[CNC] Timeout! Dispensers ainda não prontos: {sorted(faltam)}")
             self._pub_status(status="erro", extra={"mensagem": "Timeout aguardando abastecimento"})
             with self._lock:
                 self.state = "idle"

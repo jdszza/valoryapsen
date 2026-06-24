@@ -165,8 +165,9 @@ services:
       MQTT_PORT:       1883
       T_CARGA_UNID:    0.3     # s por unidade durante carregamento
       T_DISPENSA_UNID: 0.5     # s por unidade durante dispensa
-      PROB_FALHA_IA:   0.05    # 5% falha na validação IA (aumentar para testes)
-      PROB_ERRO_CV:    0.03    # 3% erro na visão computacional (carregamento)
+      PROB_FALHA_IA:   0.05    # 5% falha na validação IA
+      PROB_ERRO_CV:    0.01    # 1% erro de CV por unidade (~10% por dispenser)
+      TIMEOUT_CNC_POS: 240     # s aguardando CNC posicionar antes de abortar
     depends_on:
       - mosquitto
     networks:
