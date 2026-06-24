@@ -240,6 +240,20 @@ def pg_dashboard(_auth):
                         width=12, lg=4,
                     ),
                 ],
+                className="g-3 mb-3",
+            ),
+            # ── Log de Comunicação CNC ────────────────────────────────────────
+            dbc.Row(
+                [
+                    dbc.Col(
+                        section_card(
+                            "📡 Comunicação Backend ↔ CNC",
+                            html.Div(id="dash-cnc-log"),
+                            cor="#6f42c1",
+                        ),
+                        width=12,
+                    ),
+                ],
                 className="g-3",
             ),
             dcc.Interval(id="iv-dash", interval=3000, n_intervals=0),
@@ -693,12 +707,29 @@ def toggle_sidebar(n, is_open):
 # DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 
+_CNC_STATUS_COR = {
+    "enviada":   "#0057b8",
+    "recebido":  "#17a2b8",
+    "iniciando": "#28a745",
+    "concluido": "#6c757d",
+    "erro":      "#dc3545",
+}
+_CNC_STATUS_ICON = {
+    "enviada":   "→",
+    "recebido":  "✓",
+    "iniciando": "▶",
+    "concluido": "✅",
+    "erro":      "✗",
+}
+
+
 @callback(
     Output("dash-kpis",      "children"),
     Output("dash-alarme",    "children"),
     Output("dash-graph",     "figure"),
     Output("dash-gauge",     "figure"),
     Output("dash-painel-os", "children"),
+    Output("dash-cnc-log",   "children"),
     Input("iv-dash", "n_intervals"),
     State("auth-store", "data"),
     prevent_initial_call=True,
@@ -794,7 +825,14 @@ def atualizar_dashboard(_, auth):
         height=180,
     )
 
-    ordens   = api("get", "/ordens?status_os=em_andamento", token=token) or []
+    # ── Painel OS ativas (aberto + em_andamento) ──────────────────────────────
+    todas_ordens = api("get", "/ordens", token=token) or []
+    ordens_ativas = [
+        o for o in todas_ordens
+        if o.get("status") in ("aberto", "em_andamento")
+    ][:5]
+
+    _cor_os = {"aberto": AZUL, "em_andamento": VERDE}
     os_items = [
         html.Div(
             [
@@ -804,31 +842,94 @@ def atualizar_dashboard(_, auth):
                         html.Span(
                             o["status"].replace("_", " ").upper(),
                             style={
-                                "fontSize": "10px", "background": VERDE, "color": "#fff",
-                                "borderRadius": "4px", "padding": "1px 7px", "marginLeft": "8px",
+                                "fontSize": "10px",
+                                "background": _cor_os.get(o["status"], CINZA),
+                                "color": "#fff",
+                                "borderRadius": "4px",
+                                "padding": "1px 7px",
+                                "marginLeft": "8px",
                             },
                         ),
                     ]
                 ),
                 html.Div(o["produto"], style={"fontSize": "12px", "color": "#666"}),
-                html.Div(f"Meta: {o['meta']:,} un | Resp: {o.get('responsavel', '—')}",
-                         style={"fontSize": "11px", "color": "#aaa"}),
+                html.Div(
+                    f"Meta: {o['meta']:,} un | Resp: {o.get('responsavel', '—')}",
+                    style={"fontSize": "11px", "color": "#aaa"},
+                ),
             ],
-            style={"borderBottom": "1px solid #f0f0f0", "paddingBottom": "10px", "marginBottom": "10px"},
+            style={
+                "borderBottom": "1px solid #f0f0f0",
+                "paddingBottom": "10px",
+                "marginBottom": "10px",
+            },
         )
-        for o in ordens[:5]
+        for o in ordens_ativas
     ]
 
     painel = html.Div(
         [
-            html.Div("Ordens em Andamento", className="kpi-label mb-2"),
+            html.Div("Ordens Ativas", className="kpi-label mb-2"),
             *(
                 os_items
-                or [html.P("Nenhuma OS em andamento.", style={"color": "#aaa", "fontSize": "13px"})]
+                or [html.P("Nenhuma OS ativa.", style={"color": "#aaa", "fontSize": "13px"})]
             ),
         ]
     )
-    return kpis, banner, fig, gauge, painel
+
+    # ── Log CNC ───────────────────────────────────────────────────────────────
+    cnc_entries = api("get", "/cnc/log?limite=10", token=token) or []
+    if not cnc_entries:
+        cnc_view = html.P(
+            "Nenhuma comunicação CNC registrada ainda. Inicie um lote para ver o fluxo.",
+            style={"color": "#aaa", "fontSize": "13px", "marginTop": "8px"},
+        )
+    else:
+        cnc_items = []
+        for e in cnc_entries:
+            sts   = e.get("status", "enviada")
+            cor   = _CNC_STATUS_COR.get(sts, "#6c757d")
+            icon  = _CNC_STATUS_ICON.get(sts, "•")
+            ts    = (e.get("ts") or "")[:19].replace("T", " ")
+            direcao = "Backend → CNC" if e.get("tipo") == "os_enviada" else "CNC → Backend"
+            cnc_items.append(
+                html.Div(
+                    [
+                        html.Span(
+                            icon,
+                            style={
+                                "width": "22px", "display": "inline-block",
+                                "color": cor, "fontWeight": "700",
+                            },
+                        ),
+                        html.Span(
+                            f"[{ts}] ",
+                            style={"color": "#aaa", "fontSize": "11px", "marginRight": "6px"},
+                        ),
+                        html.Span(
+                            direcao + " ",
+                            style={"color": cor, "fontSize": "11px", "fontWeight": "600"},
+                        ),
+                        html.Span(
+                            f"{e.get('os_id', '')}",
+                            style={"color": AZUL, "fontSize": "11px", "fontWeight": "700",
+                                   "marginRight": "6px"},
+                        ),
+                        html.Span(
+                            e.get("mensagem", ""),
+                            style={"color": "#555", "fontSize": "12px"},
+                        ),
+                    ],
+                    style={
+                        "padding": "5px 0",
+                        "borderBottom": "1px solid #f5f5f5",
+                        "lineHeight": "1.5",
+                    },
+                )
+            )
+        cnc_view = html.Div(cnc_items)
+
+    return kpis, banner, fig, gauge, painel, cnc_view
 
 
 # ══════════════════════════════════════════════════════════════════════════════

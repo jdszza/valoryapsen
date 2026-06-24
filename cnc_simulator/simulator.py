@@ -1,27 +1,34 @@
 """
-APSEN - Simulador CNC de Contagem de Medicamentos
-=================================================
-Simula o firmware da máquina CNC, publicando contagem em tempo real via MQTT.
+APSEN - Simulador CNC v2.1
+===========================
+Simula o firmware da mesa CNC que movimenta a caixa sob cada dispenser.
 
-Estado da máquina:
-  idle    → aguardando comando
-  running → contando remédios
-  paused  → pausado (aguarda resume)
-  alarm   → alarme ativo (aguarda reset)
+Fluxo completo:
+  1. Recebe OS via apsen/os/nova
+  2. Recebe atribuição da IA (apsen/ia/atribuicao) — sabe qual dispenser tem qual remédio
+  3. IA da CNC calcula a melhor ordem de visita (cartonização — nearest-neighbor)
+  4. Aguarda TODOS os dispensers da OS publicarem status "pronto"
+  5. Mesa inicia: para cada dispenser na ordem otimizada:
+       a. Publica "movendo" + log de cada passo (posição interpolada)
+       b. Publica "posicionado" ao chegar
+       c. Aguarda dispenser concluir a dispensa
+       d. Avança para o próximo
+  6. Ao finalizar todos: publica "concluido" e retorna para HOME
 
-Comandos recebidos (apsen/cmd/#):
-  apsen/cmd/lote   → {lote_id, meta, produto}  — novo lote, auto-start em 2s
-  apsen/cmd/status → {cmd: "start"|"pause"|"stop"}
-  apsen/cmd/reset  → {} — reseta contagem e sai do alarme
+Tópicos publicados:
+  apsen/cnc/status      → log de cada movimento + estado geral
+  apsen/manut/temperatura
+  apsen/manut/uso
 
-Publicações:
-  apsen/contagem  → {valor, velocidade}            — a cada INTERVALO_PUB segundos
-  apsen/status    → {status, alarme, evento?}       — em mudanças de estado
-  apsen/lote      → {lote_id, meta, produto}        — ao receber cmd/lote (confirma)
+Tópicos assinados:
+  apsen/os/nova           — OS recebida da SAP
+  apsen/ia/atribuicao     — atribuição IA: qual dispenser tem qual remédio
+  apsen/dispenser/status  — aguarda "pronto" e "concluido" dos dispensers
 """
 
 import json
 import logging
+import math
 import os
 import random
 import threading
@@ -32,249 +39,485 @@ import paho.mqtt.client as mqtt
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [CNC] %(levelname)s %(message)s",
+    format="%(asctime)s [CNC-SIM] %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ── Configuração ───────────────────────────────────────────────────────────────
-MQTT_HOST        = os.getenv("MQTT_HOST",        "mosquitto")
-MQTT_PORT        = int(os.getenv("MQTT_PORT",    "1883"))
-VELOCIDADE_BASE  = float(os.getenv("VEL_BASE",   "120"))   # unidades/min em regime estável
-INTERVALO_PUB    = float(os.getenv("INTERVALO",  "1.0"))   # segundos entre publicações
-WARMUP_SEG       = float(os.getenv("WARMUP",     "2.0"))   # segundos de aquecimento antes de contar
-RECONNECT_DELAY  = 5   # segundos antes de tentar reconectar
+MQTT_HOST       = os.getenv("MQTT_HOST",    "mosquitto")
+MQTT_PORT       = int(os.getenv("MQTT_PORT", "1883"))
+VELOCIDADE_MM_S = float(os.getenv("VEL_MM_S",   "80"))    # mm/s de movimento
+INTERVALO_PUB   = float(os.getenv("INTERVALO",  "0.5"))   # s entre publicações de posição
+TIMEOUT_PRONTO  = float(os.getenv("TIMEOUT_PRONTO", "180"))  # s aguardando todos prontos
+TIMEOUT_DISP    = float(os.getenv("TIMEOUT_DISP",   "120"))  # s aguardando dispenser dispensar
+RECONNECT_DELAY = 5
+
+# Posições XY (mm) de cada dispenser na mesa
+POSICOES: dict[int, tuple[float, float]] = {
+    1: (0.0,   0.0),
+    2: (120.0, 0.0),
+    3: (240.0, 0.0),
+    4: (360.0, 0.0),
+    5: (480.0, 0.0),
+    6: (600.0, 0.0),
+}
+HOME: tuple[float, float] = (0.0, -50.0)  # posição de repouso
+
+# Componentes para telemetria de manutenção
+COMPONENTES_TEMP = [
+    ("motor_eixo_x", 35, 55),
+    ("motor_eixo_y", 33, 50),
+    ("driver_x",     40, 70),
+    ("driver_y",     38, 68),
+    ("placa_cnc",    45, 65),
+]
+COMPONENTES_USO = [
+    ("correia_eixo_x",    "desgaste"),
+    ("fuso_eixo_y",       "desgaste"),
+    ("rolamento_motor_x", "desgaste"),
+    ("rolamento_motor_y", "desgaste"),
+]
+
+
+def _nearest_neighbor(dispensers: list[int], start: tuple[float, float]) -> list[int]:
+    """
+    Calcula a ordem ótima de visita aos dispensers usando nearest-neighbor.
+    Simula a IA de cartonização: minimiza a distância total percorrida.
+    """
+    restantes = list(dispensers)
+    ordem     = []
+    pos_atual  = start
+
+    while restantes:
+        # Escolhe o dispenser mais próximo da posição atual
+        mais_proximo = min(
+            restantes,
+            key=lambda d: math.hypot(
+                POSICOES[d][0] - pos_atual[0],
+                POSICOES[d][1] - pos_atual[1],
+            ),
+        )
+        ordem.append(mais_proximo)
+        restantes.remove(mais_proximo)
+        pos_atual = POSICOES[mais_proximo]
+
+    return ordem
 
 
 class CNCSimulator:
-    """Máquina de estados da CNC + cliente MQTT."""
-
     def __init__(self):
-        self.state      = "idle"
-        self.lote_id    = "LOTE-INICIAL"
-        self.produto    = "Produto APSEN"
-        self.meta       = 1000
-        self.contagem   = 0
-        self.velocidade = 0.0
-        self.alarme     = None
-        self._lock      = threading.Lock()
+        self.state          = "idle"
+        self.os_id          = None
+        self.os_itens       = []       # medicamentos da OS atual (raw)
+        self.atribuicoes    = {}       # {dispenser_id: {...}} da IA
+        self.ciclo_atual    = 0
+        self.total_ciclos   = 0
+        self.pos_x          = HOME[0]
+        self.pos_y          = HOME[1]
+        self.horas_uso      = random.uniform(120, 800)
+        self.ciclos_total   = random.randint(5000, 50000)
 
-        self.client = mqtt.Client(client_id="apsen-cnc-simulator", clean_session=True)
+        self._lock          = threading.Lock()
+        # Dispensers que já enviaram "pronto" para a OS atual
+        self._disp_prontos: set[int] = set()
+        # Dispensers aguardados (IDs inteiros)
+        self._disp_esperados: set[int] = set()
+        # Evento: todos os dispensers prontos
+        self._todos_prontos = threading.Event()
+        # Evento: dispenser atual concluiu a dispensa
+        self._disp_concluiu = threading.Event()
+        self._disp_atual_id: int | None = None
+
+        self.client = mqtt.Client(client_id="apsen-cnc-simulator-v21", clean_session=True)
         self.client.on_connect    = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message    = self._on_message
 
-    # ── MQTT callbacks ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────── MQTT ──────────────────
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
-            client.subscribe("apsen/cmd/#", qos=1)
-            logger.info("Conectado ao broker MQTT. Subscrito em apsen/cmd/#")
-            self._publish_status()
-        else:
-            logger.error(f"Falha na conexão MQTT: rc={rc}")
+            client.subscribe("apsen/os/nova",          qos=1)
+            client.subscribe("apsen/ia/atribuicao",    qos=0)
+            client.subscribe("apsen/dispenser/status", qos=0)
+            logger.info("CNC conectada ao broker. Aguardando OS...")
+            self._pub_status()
 
     def _on_disconnect(self, client, userdata, rc):
         if rc != 0:
-            logger.warning(f"Desconectado do broker (rc={rc}). Reconectando em {RECONNECT_DELAY}s...")
+            logger.warning(f"CNC desconectada (rc={rc}). Reconectando em {RECONNECT_DELAY}s...")
 
     def _on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode())
             topic   = msg.topic
-            logger.info(f"← {topic}: {payload}")
 
-            with self._lock:
-                if topic == "apsen/cmd/lote":
-                    self._handle_lote(payload)
+            if topic == "apsen/os/nova":
+                self._handle_os_nova(payload)
 
-                elif topic == "apsen/cmd/status":
-                    self._handle_status_cmd(payload.get("cmd", ""))
+            elif topic == "apsen/ia/atribuicao":
+                self._handle_ia_atribuicao(payload)
 
-                elif topic == "apsen/cmd/reset":
-                    self._handle_reset()
+            elif topic == "apsen/dispenser/status":
+                self._handle_dispenser_status(payload)
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"Payload inválido em {msg.topic}: {e}")
-        except Exception as e:
-            logger.error(f"Erro ao processar mensagem: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error(f"[CNC] Erro em mensagem: {exc}", exc_info=True)
 
-    # ── Handlers de comando ────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────── Handlers ──────────────
 
-    def _handle_lote(self, payload: dict):
-        """Novo lote recebido — armazena info, confirma via apsen/lote e
-        agenda auto-start após WARMUP_SEG segundos (simula aquecimento)."""
-        self.lote_id  = payload.get("lote_id", self.lote_id)
-        self.meta     = int(payload.get("meta",    self.meta))
-        self.produto  = payload.get("produto", self.produto)
-        self.contagem = 0
-        self.velocidade = 0.0
-        self.alarme   = None
-        self.state    = "idle"
-
-        logger.info(f"Novo lote recebido: {self.lote_id} | meta={self.meta} | produto={self.produto}")
-
-        # Publica apsen/lote para o backend atualizar o estado interno
-        self.client.publish(
-            "apsen/lote",
-            json.dumps({
-                "lote_id": self.lote_id,
-                "meta":    self.meta,
-                "produto": self.produto,
-            }),
-            qos=1,
-        )
-        self._publish_status()
-
-        # Auto-start após aquecimento (chama fora do lock via timer)
-        threading.Timer(WARMUP_SEG, self._auto_start).start()
-
-    def _auto_start(self):
-        """Inicia contagem automaticamente após aquecimento."""
+    def _handle_os_nova(self, payload: dict):
         with self._lock:
-            if self.state == "idle":   # só inicia se ainda parado (não foi stopado manualmente)
-                self.state = "running"
-                logger.info(f"Máquina AQUECIDA — iniciando contagem do lote {self.lote_id}")
-        self._publish_status()
+            if self.state != "idle":
+                logger.warning(f"[CNC] OS recebida mas máquina em '{self.state}' — ignorando.")
+                return
+            self.os_id         = payload.get("os_id")
+            self.os_itens      = payload.get("medicamentos", [])
+            self.atribuicoes   = {}
+            self._disp_prontos = set()
+            self._disp_esperados = set()
+            self._todos_prontos.clear()
+            self.ciclo_atual   = 0
+            self.total_ciclos  = len(self.os_itens)
+            self.state         = "aguardando_atribuicao"
 
-    def _handle_status_cmd(self, cmd: str):
-        prev = self.state
-        if cmd == "start":
-            if self.state in ("idle", "paused"):
-                self.state = "running"
-        elif cmd == "pause":
-            if self.state == "running":
-                self.state = "paused"
-                self.velocidade = 0.0
-        elif cmd == "stop":
-            self.state = "idle"
-            self.velocidade = 0.0
-        else:
-            logger.warning(f"Comando desconhecido: {cmd}")
-            return
-
-        if self.state != prev:
-            logger.info(f"Estado: {prev} → {self.state} (cmd={cmd})")
-            # Publica fora do lock via thread para não deadlock
-            threading.Thread(target=self._publish_status, daemon=True).start()
-
-    def _handle_reset(self):
-        prev_state = self.state
-        self.contagem   = 0
-        self.velocidade = 0.0
-        if self.state == "alarm":
-            self.state  = "idle"
-            self.alarme = None
-        logger.info(f"Reset: contagem zerada. Estado: {prev_state} → {self.state}")
-        threading.Thread(target=self._publish_status, daemon=True).start()
-
-    # ── Publicações MQTT ───────────────────────────────────────────────────────
-
-    def _publish_status(self, extra: dict = None):
-        with self._lock:
-            payload = {"status": self.state, "alarme": self.alarme}
-        if extra:
-            payload.update(extra)
-        self.client.publish("apsen/status", json.dumps(payload), qos=0, retain=True)
-        logger.debug(f"→ apsen/status: {payload}")
-
-    def _publish_contagem(self):
-        with self._lock:
-            payload = {
-                "valor":      self.contagem,
-                "velocidade": round(self.velocidade, 1),
-            }
-        self.client.publish("apsen/contagem", json.dumps(payload), qos=0)
-
-    # ── Loop de contagem ───────────────────────────────────────────────────────
-
-    def _counting_loop(self):
-        """Roda em daemon thread. A cada INTERVALO_PUB segundos,
-        incrementa a contagem se estiver no estado 'running'."""
-        ramp_ciclos = 0  # ciclos desde que entrou em 'running' (para ramp-up)
-
-        while True:
-            time.sleep(INTERVALO_PUB)
-
-            with self._lock:
-                state = self.state
-
-            if state == "running":
-                ramp_ciclos += 1
-                # Ramp-up: velocidade cresce nos primeiros 5 ciclos
-                fator_ramp = min(1.0, ramp_ciclos / 5.0)
-                # Variação aleatória ±15%
-                variacao = random.uniform(0.85, 1.15)
-                vel = VELOCIDADE_BASE * fator_ramp * variacao
-
-                # Incremento por intervalo: vel(un/min) / 60 * INTERVALO_PUB(s)
-                incremento = max(1, round(vel / 60.0 * INTERVALO_PUB * 60))
-
-                with self._lock:
-                    restante = self.meta - self.contagem
-                    if restante <= 0:
-                        # Já chegou na meta (pode ter chegado entre ciclos)
-                        self._concluir_lote()
-                        ramp_ciclos = 0
-                        continue
-
-                    if incremento >= restante:
-                        # Última parcela — bate exatamente na meta
-                        self.contagem   = self.meta
-                        self.velocidade = vel
-                        concluido = True
-                    else:
-                        self.contagem   += incremento
-                        self.velocidade  = vel
-                        concluido = False
-
-                self._publish_contagem()
-
-                if concluido:
-                    with self._lock:
-                        self._concluir_lote()
-                    ramp_ciclos = 0
-
-            elif state == "paused":
-                ramp_ciclos = 0
-                self._publish_contagem()  # mantém dashboard atualizado mesmo pausado
-
-            else:
-                # idle ou alarm — não conta
-                ramp_ciclos = 0
-
-    def _concluir_lote(self):
-        """Chamado dentro do _lock quando contagem == meta."""
-        self.state      = "idle"
-        self.velocidade = 0.0
         logger.info(
-            f"✓ Lote {self.lote_id} CONCLUÍDO: {self.contagem}/{self.meta} unidades produzidas."
+            f"\n{'='*60}\n"
+            f"  [CNC] OS RECEBIDA: {self.os_id}\n"
+            f"  Medicamentos: {[(i['dispenser_id'], i['medicamento']) for i in self.os_itens]}\n"
+            f"  Aguardando atribuição da IA...\n"
+            f"{'='*60}"
         )
-        # Publica fora do lock
-        detalhe = f"Lote {self.lote_id} concluído: {self.meta} unidades produzidas."
+        self._pub_status(status="aguardando_atribuicao")
+
+    def _handle_ia_atribuicao(self, payload: dict):
+        os_id = payload.get("os_id")
+        with self._lock:
+            if os_id != self.os_id:
+                return  # atribuição para outra OS
+            atribuicoes = payload.get("atribuicoes", [])
+            for a in atribuicoes:
+                disp_id = int(a["dispenser_id"])
+                self.atribuicoes[disp_id] = a
+                self._disp_esperados.add(disp_id)
+            self.state = "aguardando_abastecimento"
+
+        # Calcula a ordem ótima de visita (cartonização)
+        with self._lock:
+            dispenser_ids = list(self._disp_esperados)
+        ordem_otima = _nearest_neighbor(dispenser_ids, (self.pos_x, self.pos_y))
+
+        logger.info(
+            f"[CNC] IA: atribuição recebida para {len(dispenser_ids)} dispenser(s).\n"
+            f"       Ordem ótima calculada (cartonização): {ordem_otima}"
+        )
+        with self._lock:
+            self._ordem_visita = ordem_otima
+            self.total_ciclos  = len(ordem_otima)
+
+        self._pub_status(
+            status="aguardando_abastecimento",
+            extra={"ordem_visita": ordem_otima},
+        )
+
+        # Aguarda todos prontos em thread separada
         threading.Thread(
-            target=self._publish_status,
-            kwargs={"extra": {"evento": "lote_concluido", "detalhe": detalhe}},
+            target=self._aguardar_todos_prontos,
             daemon=True,
+            name="aguardar-prontos",
         ).start()
 
-    # ── Entrada ───────────────────────────────────────────────────────────────
+    def _handle_dispenser_status(self, payload: dict):
+        disp_id = payload.get("dispenser_id")
+        status  = payload.get("status", "")
+        os_id   = payload.get("os_id")
+
+        with self._lock:
+            # Dispenser sinalizou que está pronto para dispensar
+            if (status == "pronto"
+                    and isinstance(disp_id, int)
+                    and disp_id in self._disp_esperados
+                    and os_id == self.os_id):
+                self._disp_prontos.add(disp_id)
+                faltam = self._disp_esperados - self._disp_prontos
+                logger.info(
+                    f"[CNC] Dispenser {disp_id} PRONTO. "
+                    f"Prontos: {len(self._disp_prontos)}/{len(self._disp_esperados)}. "
+                    f"Faltam: {sorted(faltam) or 'nenhum'}"
+                )
+                if self._disp_prontos >= self._disp_esperados:
+                    self._todos_prontos.set()
+
+            # Dispenser concluiu a dispensa (CNC pode avançar)
+            elif (status == "concluido"
+                      and isinstance(disp_id, int)
+                      and disp_id == self._disp_atual_id):
+                self._disp_concluiu.set()
+
+    # ─────────────────────────────────────── Processamento da OS ───────────────
+
+    def _aguardar_todos_prontos(self):
+        """Aguarda todos os dispensers reportarem 'pronto'. Então inicia a mesa."""
+        logger.info(f"[CNC] Aguardando {len(self._disp_esperados)} dispenser(s) carregar...")
+        ok = self._todos_prontos.wait(timeout=TIMEOUT_PRONTO)
+        if not ok:
+            logger.error("[CNC] Timeout aguardando dispensers carregarem!")
+            self._pub_status(status="erro", extra={"mensagem": "Timeout aguardando abastecimento"})
+            with self._lock:
+                self.state = "idle"
+            return
+
+        logger.info("\n[CNC] TODOS OS DISPENSERS PRONTOS. Mesa iniciando!\n")
+        self._processar_os()
+
+    def _processar_os(self):
+        """Visita cada dispenser na ordem otimizada e loga cada movimento."""
+        with self._lock:
+            ordem    = list(self._ordem_visita)
+            os_id    = self.os_id
+            total    = self.total_ciclos
+            self.state = "em_operacao"
+
+        self._pub_status(status="iniciando")
+        time.sleep(0.5)
+
+        for seq, disp_id in enumerate(ordem, start=1):
+            with self._lock:
+                self.ciclo_atual = seq
+                med = self.atribuicoes.get(disp_id, {}).get("medicamento", "?")
+
+            logger.info(
+                f"\n[CNC] ──── Ciclo {seq}/{total} ────\n"
+                f"       Destino: Dispenser {disp_id} ({med})\n"
+                f"       Posição alvo: {POSICOES[disp_id]} mm"
+            )
+
+            # Mover para o dispenser (publica cada passo de posição)
+            self._mover_para(disp_id, seq, total, os_id)
+
+            # Posicionado — notifica dispenser que pode dispensar
+            self._pub_status(status="posicionado", dispenser_alvo=disp_id)
+            logger.info(f"[CNC] POSICIONADA no Dispenser {disp_id}. Aguardando dispensa...")
+
+            # Aguarda dispenser concluir (timeout de segurança)
+            with self._lock:
+                self._disp_atual_id = disp_id
+                self._disp_concluiu.clear()
+
+            concluiu = self._disp_concluiu.wait(timeout=TIMEOUT_DISP)
+            if not concluiu:
+                logger.error(f"[CNC] Timeout aguardando Dispenser {disp_id} concluir!")
+                self._pub_status(
+                    status="erro",
+                    dispenser_alvo=disp_id,
+                    extra={"mensagem": f"Timeout dispenser {disp_id}"},
+                )
+                with self._lock:
+                    self.state = "idle"
+                return
+
+            logger.info(f"[CNC] Dispenser {disp_id} concluído. Avançando.")
+
+        # Todos visitados — retorna para HOME
+        self._mover_para_home(os_id)
+        self._pub_status(status="concluido")
+
+        with self._lock:
+            self.ciclos_total += total
+            self.horas_uso    += total * 0.01  # ~36s por ciclo em média
+            self.state         = "idle"
+            self.os_id         = None
+            self._ordem_visita = []
+
+        logger.info(
+            f"\n{'='*60}\n"
+            f"  [CNC] OS CONCLUIDA. {total} dispenser(s) visitados.\n"
+            f"  Retornando para HOME.\n"
+            f"{'='*60}"
+        )
+        time.sleep(1.0)
+        self._pub_status(status="idle")
+
+    # ─────────────────────────────────────────── Movimento ─────────────────────
+
+    def _mover_para(self, dispenser_id: int, ciclo: int, total: int, os_id: str):
+        """Interpola posição até o dispenser, publicando cada passo."""
+        alvo_x, alvo_y = POSICOES[dispenser_id]
+        with self._lock:
+            orig_x, orig_y = self.pos_x, self.pos_y
+
+        distancia = math.hypot(alvo_x - orig_x, alvo_y - orig_y)
+        if distancia < 0.1:
+            return  # já está no lugar
+
+        duracao = max(1.0, distancia / VELOCIDADE_MM_S)
+        passos  = max(3, int(duracao / INTERVALO_PUB))
+
+        logger.info(
+            f"[CNC] Movendo de ({orig_x:.1f}, {orig_y:.1f}) → "
+            f"({alvo_x:.1f}, {alvo_y:.1f}) | {distancia:.0f}mm | "
+            f"~{duracao:.1f}s | {passos} passos"
+        )
+
+        for i in range(1, passos + 1):
+            t     = i / passos
+            cur_x = orig_x + (alvo_x - orig_x) * t
+            cur_y = orig_y + (alvo_y - orig_y) * t
+
+            with self._lock:
+                self.pos_x = cur_x
+                self.pos_y = cur_y
+
+            self.client.publish(
+                "apsen/cnc/status",
+                json.dumps({
+                    "status":         "movendo",
+                    "os_id":          os_id,
+                    "dispenser_alvo": dispenser_id,
+                    "posicao_x":      round(cur_x, 2),
+                    "posicao_y":      round(cur_y, 2),
+                    "ciclo_atual":    ciclo,
+                    "total_ciclos":   total,
+                    "passo":          i,
+                    "total_passos":   passos,
+                    "progresso_pct":  round(t * 100, 1),
+                    "timestamp":      datetime.now(timezone.utc).isoformat(),
+                }),
+                qos=0,
+            )
+            time.sleep(INTERVALO_PUB)
+
+    def _mover_para_home(self, os_id: str):
+        """Move de volta para a posição HOME."""
+        with self._lock:
+            orig_x, orig_y = self.pos_x, self.pos_y
+
+        distancia = math.hypot(HOME[0] - orig_x, HOME[1] - orig_y)
+        duracao   = max(1.0, distancia / VELOCIDADE_MM_S)
+        passos    = max(3, int(duracao / INTERVALO_PUB))
+
+        for i in range(1, passos + 1):
+            t     = i / passos
+            cur_x = orig_x + (HOME[0] - orig_x) * t
+            cur_y = orig_y + (HOME[1] - orig_y) * t
+            with self._lock:
+                self.pos_x = cur_x
+                self.pos_y = cur_y
+            self.client.publish(
+                "apsen/cnc/status",
+                json.dumps({
+                    "status":     "retornando",
+                    "os_id":      os_id,
+                    "posicao_x":  round(cur_x, 2),
+                    "posicao_y":  round(cur_y, 2),
+                    "timestamp":  datetime.now(timezone.utc).isoformat(),
+                }),
+                qos=0,
+            )
+            time.sleep(INTERVALO_PUB)
+
+    # ─────────────────────────────────────── Publicação geral ──────────────────
+
+    def _pub_status(self, status: str = None, dispenser_alvo: int = None,
+                    extra: dict = None):
+        with self._lock:
+            sts   = status or self.state
+            os_id = self.os_id
+            px    = self.pos_x
+            py    = self.pos_y
+            ciclo = self.ciclo_atual
+            total = self.total_ciclos
+
+        payload = {
+            "status":         sts,
+            "os_id":          os_id,
+            "dispenser_alvo": dispenser_alvo,
+            "posicao_x":      round(px, 2),
+            "posicao_y":      round(py, 2),
+            "ciclo_atual":    ciclo,
+            "total_ciclos":   total,
+            "timestamp":      datetime.now(timezone.utc).isoformat(),
+        }
+        if extra:
+            payload.update(extra)
+
+        self.client.publish("apsen/cnc/status", json.dumps(payload), qos=0, retain=True)
+
+    # ─────────────────────────────────── Telemetria de manutenção ──────────────
+
+    def _telemetria_loop(self):
+        """Publica leituras de sensores a cada 30 segundos."""
+        while True:
+            time.sleep(30)
+            with self._lock:
+                em_uso = self.state not in ("idle",)
+                horas  = self.horas_uso
+                ciclos = self.ciclos_total
+
+            ts = datetime.now(timezone.utc).isoformat()
+
+            for comp, t_min, t_max in COMPONENTES_TEMP:
+                base  = t_min + (t_max - t_min) * (0.75 if em_uso else 0.2)
+                valor = round(base + random.uniform(-1.5, 1.5), 1)
+                self.client.publish(
+                    "apsen/manut/temperatura",
+                    json.dumps({"componente": comp, "valor_c": valor, "timestamp": ts}),
+                    qos=0,
+                )
+
+            for comp, tipo in COMPONENTES_USO:
+                self.client.publish(
+                    "apsen/manut/uso",
+                    json.dumps({
+                        "componente": comp,
+                        "tipo":       tipo,
+                        "valor":      round(min(100.0, horas / 10.0), 1),
+                        "unidade":    "%",
+                        "timestamp":  ts,
+                    }),
+                    qos=0,
+                )
+
+            self.client.publish(
+                "apsen/manut/uso",
+                json.dumps({
+                    "componente": "cnc_geral",
+                    "tipo":       "horas_uso",
+                    "valor":      round(horas, 1),
+                    "unidade":    "h",
+                    "timestamp":  ts,
+                }),
+                qos=0,
+            )
+            self.client.publish(
+                "apsen/manut/uso",
+                json.dumps({
+                    "componente": "cnc_geral",
+                    "tipo":       "ciclos",
+                    "valor":      ciclos,
+                    "unidade":    "ciclos",
+                    "timestamp":  ts,
+                }),
+                qos=0,
+            )
+
+    # ──────────────────────────────────────────────────── Main ─────────────────
 
     def run(self):
         logger.info(
-            f"Iniciando CNC Simulator | broker={MQTT_HOST}:{MQTT_PORT} "
-            f"| vel_base={VELOCIDADE_BASE} un/min | intervalo={INTERVALO_PUB}s"
+            f"CNC Simulator v2.1 | broker={MQTT_HOST}:{MQTT_PORT} "
+            f"| vel={VELOCIDADE_MM_S}mm/s | timeout_pronto={TIMEOUT_PRONTO}s"
         )
+        self._ordem_visita = []
+        threading.Thread(
+            target=self._telemetria_loop, daemon=True, name="telemetria"
+        ).start()
 
-        # Thread de contagem (daemon — termina quando o processo principal terminar)
-        threading.Thread(target=self._counting_loop, daemon=True, name="cnc-counter").start()
-
-        # Conecta e mantém loop MQTT (reconexão automática)
         while True:
             try:
                 self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
                 self.client.loop_forever(retry_first_connection=True)
             except Exception as exc:
-                logger.error(f"Erro no loop MQTT: {exc}. Reconectando em {RECONNECT_DELAY}s...")
+                logger.error(f"Erro MQTT: {exc}. Reconectando em {RECONNECT_DELAY}s...")
                 time.sleep(RECONNECT_DELAY)
 
 

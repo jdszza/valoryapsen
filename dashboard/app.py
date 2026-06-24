@@ -1,299 +1,403 @@
 """
-APSEN - Dashboard Executivo (porta 8050) - Responsivo
+APSEN - Dashboard de Monitoramento v2.0
+========================================
+Aplicação Plotly Dash de leitura EXCLUSIVA — sem autenticação, sem controle.
+
+Exibe em tempo real:
+  • OS ativa: medicamentos, progresso por dispenser
+  • CNC: posição XY, status, ciclo atual
+  • Dispensers: fase (carregamento / dispensa), progresso, validação IA
+  • Atribuição da IA para a OS atual
+  • Alarmes ativos
+  • Log de eventos recentes
+  • Histórico de OS concluídas
+
+Atualização: polling a cada 2 segundos via dcc.Interval.
+Backend: GET http://backend:8000/estado + endpoints REST individuais.
 """
-import json, os, threading, time
+
+import os
+
 import dash
+import requests
+from dash import Input, Output, callback, dcc, html
 import dash_bootstrap_components as dbc
-import plotly.graph_objects as go
-import requests, websocket
-from dash import Input, Output, State, callback, dcc, html
 
-BACKEND_HTTP = os.getenv("BACKEND_URL", "http://backend:8000")
-BACKEND_WS   = os.getenv("BACKEND_WS",  "ws://backend:8000/ws")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
+POLL_MS     = int(os.getenv("POLL_MS", "2000"))
 
-_lock   = threading.Lock()
-_estado = {"contagem": 0, "meta": 1000, "lote_id": "—",
-           "status": "idle", "velocidade": 0, "alarme": None}
-_token_holder = {"token": ""}
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.DARKLY],
+    title="APSEN — Monitoramento",
+    update_title=None,
+)
 
-def _ws_thread(token_holder):
-    def on_message(ws, msg):
-        with _lock:
-            _estado.update(json.loads(msg))
-    def on_close(ws, *a):
-        time.sleep(5)
-        if token_holder.get("token"):
-            _ws_thread(token_holder)
-    ws = websocket.WebSocketApp(
-        f"{BACKEND_WS}?token={token_holder.get('token','')}",
-        on_message=on_message, on_close=on_close,
-        on_error=lambda ws, e: None,
-    )
-    ws.run_forever()
 
-def _start_ws(token):
-    _token_holder["token"] = token
-    threading.Thread(target=_ws_thread, args=(_token_holder,), daemon=True).start()
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def api(method, path, token=None, **kwargs):
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+def _get(endpoint: str) -> dict | list:
     try:
-        r = getattr(requests, method)(f"{BACKEND_HTTP}{path}", headers=headers, timeout=5, **kwargs)
-        return r.json() if r.ok else None
+        r = requests.get(f"{BACKEND_URL}{endpoint}", timeout=3)
+        return r.json()
     except Exception:
-        return None
+        return {}
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
-                suppress_callback_exceptions=True, title="APSEN – Dashboard", update_title=None)
-server = app.server
 
-AZUL, AZUL2 = "#003087", "#0057b8"
-VERDE, VERM, AMAR, CINZA = "#28a745", "#dc3545", "#ffc107", "#6c757d"
-STATUS_COR   = {"idle": CINZA, "running": VERDE, "paused": AMAR, "alarm": VERM}
-STATUS_LABEL = {"idle": "AGUARDANDO", "running": "EM PRODUCAO", "paused": "PAUSADO", "alarm": "ALARME"}
+def _badge(label: str, color: str = "secondary") -> dbc.Badge:
+    return dbc.Badge(label, color=color, className="ms-1")
 
-# ── Login ──────────────────────────────────────────────────────────────────────
-def pagina_login(erro=""):
-    return html.Div(style={
-        "minHeight": "100vh",
-        "background": f"linear-gradient(135deg, {AZUL} 0%, #001a4d 100%)",
-        "display": "flex", "alignItems": "center", "justifyContent": "center", "padding": "16px",
-    }, children=[
-        html.Div(style={
-            "background": "#fff", "borderRadius": "16px",
-            "padding": "clamp(24px,5vw,48px) clamp(20px,5vw,40px)",
-            "width": "100%", "maxWidth": "400px",
-            "boxShadow": "0 20px 60px rgba(0,0,0,.3)",
-        }, children=[
-            html.Div([
-                html.H1("APSEN", style={"color": AZUL, "fontWeight": "900",
-                                         "letterSpacing": "4px",
-                                         "fontSize": "clamp(28px,6vw,36px)", "margin": "0"}),
-                html.P("Dashboard Executivo", style={"color": CINZA, "fontSize": "14px", "margin": "4px 0 32px"}),
-            ], className="text-center"),
-            html.Label("Usuario", style={"fontWeight": "600", "fontSize": "13px", "color": "#555"}),
-            dbc.Input(id="login-user", type="text", size="lg", className="mb-3"),
-            html.Label("Senha", style={"fontWeight": "600", "fontSize": "13px", "color": "#555"}),
-            dbc.Input(id="login-senha", type="password", size="lg", className="mb-4"),
-            dbc.Button("ENTRAR", id="btn-login", size="lg", className="w-100",
-                       style={"background": AZUL, "border": "none", "fontWeight": "700", "letterSpacing": "2px"}),
-            html.Div(erro, style={"color": VERM, "textAlign": "center", "marginTop": "12px", "fontSize": "13px"}),
+
+STATUS_COR = {
+    "idle":                     "secondary",
+    "aguardando_atribuicao":    "info",
+    "aguardando_abastecimento": "warning",
+    "iniciando":                "primary",
+    "movendo":                  "primary",
+    "posicionado":              "success",
+    "retornando":               "info",
+    "concluido":                "success",
+    "erro":                     "danger",
+    "carregando":               "warning",
+    "carregando_iniciado":      "warning",
+    "carregando_ok":            "success",
+    "carregando_erro":          "danger",
+    "pronto":                   "success",
+    "dispensando":              "primary",
+    "aguardando":               "secondary",
+    "em_andamento":             "primary",
+    "em_operacao":              "primary",
+    "atribuicao_recebida":      "info",
+}
+
+
+def _cor(status: str) -> str:
+    return STATUS_COR.get(str(status).lower(), "secondary")
+
+
+# ── Layout ─────────────────────────────────────────────────────────────────────
+
+app.layout = dbc.Container(
+    fluid=True,
+    children=[
+        dcc.Interval(id="poll", interval=POLL_MS, n_intervals=0),
+        dcc.Store(id="store-estado"),
+        dcc.Store(id="store-eventos"),
+        dcc.Store(id="store-os"),
+
+        # ── Header ────────────────────────────────────────────────────────────
+        dbc.Row(
+            dbc.Col(
+                html.Div([
+                    html.H1("APSEN", className="d-inline me-3 fw-bold text-primary"),
+                    html.Span(
+                        "Sistema de Contagem de Medicamentos",
+                        className="text-muted fs-5",
+                    ),
+                    html.Span(id="badge-alarmes", className="float-end mt-1"),
+                ]),
+                className="py-3 border-bottom",
+            )
+        ),
+
+        # ── Row 1: OS ativa + CNC ─────────────────────────────────────────────
+        dbc.Row([
+            dbc.Col(dbc.Card([
+                dbc.CardHeader([
+                    html.Span("📋 Ordem de Saída Ativa"),
+                    html.Span(id="badge-os-status", className="float-end"),
+                ]),
+                dbc.CardBody(id="card-os"),
+            ]), md=6, className="mb-3"),
+
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("🤖 Mesa CNC"),
+                dbc.CardBody(id="card-cnc"),
+            ]), md=6, className="mb-3"),
+        ], className="mt-3"),
+
+        # ── Row 2: Dispensers ─────────────────────────────────────────────────
+        dbc.Row(
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("💊 Dispensers (6 unidades)"),
+                dbc.CardBody(id="card-dispensers"),
+            ]), className="mb-3")
+        ),
+
+        # ── Row 3: Alarmes + Log eventos ──────────────────────────────────────
+        dbc.Row([
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("🚨 Alarmes Ativos"),
+                dbc.CardBody(
+                    id="card-alarmes",
+                    style={"maxHeight": "220px", "overflowY": "auto"},
+                ),
+            ]), md=5, className="mb-3"),
+
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("📡 Log de Eventos"),
+                dbc.CardBody(
+                    id="card-log",
+                    style={"maxHeight": "220px", "overflowY": "auto"},
+                ),
+            ]), md=7, className="mb-3"),
         ]),
-    ])
 
-def kpi(titulo, valor, sub="", cor=AZUL):
-    return html.Div(style={
-        "background": "#fff", "borderRadius": "12px",
-        "padding": "clamp(12px,2vw,24px) clamp(12px,2vw,28px)",
-        "height": "100%", "boxShadow": "0 2px 12px rgba(0,0,0,.06)",
-        "borderLeft": f"4px solid {cor}",
-    }, children=[
-        html.Div(titulo, style={"fontSize": "11px", "color": "#999",
-                                 "textTransform": "uppercase", "letterSpacing": "1px", "fontWeight": "600"}),
-        html.Div(valor, style={"fontSize": "clamp(20px,4vw,38px)", "fontWeight": "900",
-                                "color": "#1a1a2e", "lineHeight": "1.1", "margin": "4px 0"}),
-        html.Div(sub, style={"fontSize": "11px", "color": "#aaa"}),
-    ])
+        # ── Row 4: Histórico OS ───────────────────────────────────────────────
+        dbc.Row(
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("📂 Histórico de Ordens"),
+                dbc.CardBody(
+                    id="card-historico",
+                    style={"maxHeight": "250px", "overflowY": "auto"},
+                ),
+            ]), className="mb-3")
+        ),
+    ],
+)
 
-def pagina_dash(auth):
-    token = auth.get("token")
-    nome  = auth.get("nome", "")
-    role  = auth.get("role", "")
-    return html.Div(style={"background": "#f0f4f8", "minHeight": "100vh",
-                            "fontFamily": "'Inter', sans-serif"}, children=[
-        # Header
-        html.Div(style={
-            "background": f"linear-gradient(90deg, {AZUL} 0%, {AZUL2} 100%)",
-            "color": "#fff", "padding": "0 16px", "height": "56px",
-            "display": "flex", "alignItems": "center", "justifyContent": "space-between",
-            "boxShadow": "0 2px 8px rgba(0,0,0,.2)",
-        }, children=[
-            html.Div([
-                html.Span("APSEN", style={"fontSize": "clamp(16px,4vw,22px)",
-                                           "fontWeight": "900", "letterSpacing": "3px"}),
-                html.Span(" Dashboard Executivo", className="dash-header-sub",
-                          style={"fontSize": "13px", "opacity": ".7", "marginLeft": "8px"}),
-            ]),
-            html.Div([
-                html.Span(f"{nome} - {role.upper()}", className="d-none d-sm-inline",
-                          style={"fontSize": "13px", "opacity": ".8", "marginRight": "12px"}),
-                dbc.Button("Sair", id="btn-logout", size="sm",
-                           style={"background": "rgba(255,255,255,.15)",
-                                  "border": "1px solid rgba(255,255,255,.3)", "color": "#fff"}),
-            ], style={"display": "flex", "alignItems": "center"}),
-        ]),
-        # Conteudo
-        html.Div(className="dash-content", children=[
-            dbc.Row(id="kpis", className="g-3 mb-4"),
-            html.Div(id="alarme-banner"),
+
+# ── Callbacks: busca dados ─────────────────────────────────────────────────────
+
+@callback(
+    Output("store-estado",  "data"),
+    Output("store-eventos", "data"),
+    Output("store-os",      "data"),
+    Input("poll", "n_intervals"),
+)
+def _fetch(_):
+    estado  = _get("/estado")
+    eventos = _get("/log/eventos?limite=30")
+    os_hist = _get("/os/historico?limite=10")
+    return estado, eventos, os_hist
+
+
+# ── Callbacks: render ──────────────────────────────────────────────────────────
+
+@callback(
+    Output("badge-alarmes",   "children"),
+    Output("badge-os-status", "children"),
+    Output("card-os",         "children"),
+    Output("card-cnc",        "children"),
+    Output("card-dispensers", "children"),
+    Output("card-alarmes",    "children"),
+    Output("card-log",        "children"),
+    Output("card-historico",  "children"),
+    Input("store-estado",  "data"),
+    Input("store-eventos", "data"),
+    Input("store-os",      "data"),
+)
+def _render(estado: dict, eventos: list, os_hist: list):
+    if not estado:
+        vazio = html.P("Aguardando backend...", className="text-muted")
+        return (vazio,) * 8
+
+    estado    = estado or {}
+    eventos   = eventos or []
+    os_hist   = os_hist or []
+    cnc       = estado.get("cnc", {})
+    os_ativa  = estado.get("os_ativa")
+    disp_map  = estado.get("dispensers", {})
+    n_alarmes = estado.get("alarmes_ativos", 0)
+
+    # ── Badge alarmes ─────────────────────────────────────────────────────────
+    badge_alarmes = dbc.Badge(
+        f"⚠ {n_alarmes} alarme(s)" if n_alarmes else "✓ Sem alarmes",
+        color="danger" if n_alarmes else "success",
+        className="fs-6 px-3 py-2",
+    )
+
+    # ── OS ativa ──────────────────────────────────────────────────────────────
+    if os_ativa:
+        os_status = os_ativa.get("status", "?")
+        badge_os  = _badge(os_status.upper(), _cor(os_status))
+        os_itens  = os_ativa.get("itens", [])
+        itens_rows = [
             dbc.Row([
-                dbc.Col(html.Div(style={
-                    "background": "#fff", "borderRadius": "12px", "padding": "20px",
-                    "boxShadow": "0 2px 8px rgba(0,0,0,.06)", "height": "100%",
-                }, children=[
-                    html.H3("Producao ao Longo do Tempo",
-                            style={"margin": "0 0 12px", "fontSize": "15px", "color": AZUL, "fontWeight": "700"}),
-                    dcc.Graph(id="graph-prod", style={"height": "320px"},
-                              className="dash-graph", config={"displayModeBar": False}),
-                ]), width=12, lg=9, className="mb-4"),
-                dbc.Col(html.Div([
-                    html.Div(style={
-                        "background": "#fff", "borderRadius": "12px", "padding": "16px",
-                        "boxShadow": "0 2px 8px rgba(0,0,0,.06)", "marginBottom": "16px",
-                    }, children=[
-                        html.H3("Progresso do Lote",
-                                style={"margin": "0 0 8px", "fontSize": "15px", "color": AZUL, "fontWeight": "700"}),
-                        dcc.Graph(id="gauge-prog", style={"height": "200px"}, config={"displayModeBar": False}),
-                    ]),
-                    html.Div(id="painel-os", style={
-                        "background": "#fff", "borderRadius": "12px", "padding": "16px",
-                        "boxShadow": "0 2px 8px rgba(0,0,0,.06)",
-                    }),
-                ]), width=12, lg=3, className="mb-4"),
-            ], className="g-3"),
-        ]),
-        dcc.Interval(id="iv-dash", interval=3000),
+                dbc.Col(
+                    html.Small(f"Dispenser {item.get('dispenser_id')}:",
+                               className="text-muted"), width=4),
+                dbc.Col(
+                    html.Small(item.get("medicamento", "?"),
+                               className="fw-bold"), width=5),
+                dbc.Col(
+                    html.Small(f"× {item.get('quantidade', 0)}",
+                               className="text-warning"), width=3),
+            ], className="mb-1")
+            for item in os_itens
+        ]
+        card_os = html.Div([
+            html.H5(os_ativa.get("os_id", ""), className="text-primary mb-1"),
+            html.P(os_ativa.get("descricao", ""),
+                   className="text-muted small mb-2"),
+            *itens_rows,
+        ])
+    else:
+        badge_os = _badge("SEM OS", "secondary")
+        card_os  = html.P("Nenhuma OS em andamento.", className="text-muted")
+
+    # ── CNC ───────────────────────────────────────────────────────────────────
+    cnc_status   = cnc.get("status", "idle")
+    cnc_disp_alv = cnc.get("dispenser_alvo")
+    ciclo_atual  = cnc.get("ciclo_atual", 0)
+    total_ciclos = cnc.get("total_ciclos", 0)
+    pct_cnc      = (ciclo_atual / max(total_ciclos, 1)) * 100 if total_ciclos else 0
+
+    card_cnc = html.Div([
+        dbc.Row([
+            dbc.Col([
+                html.Div([
+                    html.Span("Status: "),
+                    _badge(cnc_status.upper(), _cor(cnc_status)),
+                ], className="mb-2"),
+                html.Div(f"X: {cnc.get('posicao_x', 0):.1f} mm", className="small"),
+                html.Div(f"Y: {cnc.get('posicao_y', 0):.1f} mm", className="small"),
+            ], md=6),
+            dbc.Col([
+                html.Div(
+                    f"Dispenser Alvo: {cnc_disp_alv or '—'}",
+                    className="small",
+                ),
+                html.Div(
+                    f"Ciclo: {ciclo_atual} / {total_ciclos}",
+                    className="small mb-2",
+                ),
+                dbc.Progress(
+                    value=pct_cnc,
+                    color=_cor(cnc_status),
+                    style={"height": "10px"},
+                    label=f"{pct_cnc:.0f}%",
+                ) if total_ciclos > 0 else html.Div(),
+            ], md=6),
+        ])
     ])
 
-# ── Layout ──────────────────────────────────────────────────────────────────────
-# Mesmo guard de hidratação da IHM: evita flash de login antes do sessionStorage
-# carregar e previne o loop causado pelo logout callback disparar com n_clicks=0.
-app.layout = html.Div([
-    dcc.Location(id="url"),
-    dcc.Store(id="auth-store", storage_type="session"),
-    dcc.Store(id="_ready", data=False),
-    dcc.Interval(id="_hydrated", interval=100, max_intervals=1),
-    html.Div(id="app-root"),
-])
+    # ── Dispensers ────────────────────────────────────────────────────────────
+    disp_cards = []
+    for disp_id in range(1, 7):
+        info  = disp_map.get(str(disp_id), {})
+        d_sts = info.get("status", "idle")
+        med   = info.get("medicamento") or f"Dispenser {disp_id}"
+        qtd_d = info.get("quantidade_dispensada", 0)
+        qtd_a = info.get("quantidade_alvo", 0)
+        pct   = (qtd_d / qtd_a * 100) if qtd_a > 0 else 0
 
-@callback(Output("_ready", "data"),
-          Input("_hydrated", "n_intervals"),
-          prevent_initial_call=True)
-def _mark_ready(_):
-    return True
+        disp_cards.append(
+            dbc.Col(
+                dbc.Card([
+                    dbc.CardHeader(
+                        html.Small([
+                            html.Strong(f"D{disp_id} "),
+                            _badge(d_sts, _cor(d_sts)),
+                        ]),
+                        className="py-1 px-2",
+                    ),
+                    dbc.CardBody([
+                        html.P(
+                            med,
+                            className="mb-1 fw-semibold",
+                            style={"fontSize": "0.68rem"},
+                        ),
+                        html.Div(
+                            f"{qtd_d} / {qtd_a}" if qtd_a else "—",
+                            className="text-center fw-bold mb-1 small",
+                        ),
+                        dbc.Progress(
+                            value=pct,
+                            color=_cor(d_sts),
+                            style={"height": "6px"},
+                        ) if qtd_a > 0 else html.Div(),
+                    ], className="py-1 px-2"),
+                ], className="h-100"),
+                md=2, sm=4, xs=6, className="mb-2",
+            )
+        )
 
-@callback(Output("app-root", "children"),
-          Input("auth-store", "data"),
-          Input("url", "pathname"),
-          Input("_ready", "data"))
-def root(auth, _, ready):
-    if not ready:
-        return html.Div()
-    if not auth or not auth.get("token"):
-        return pagina_login()
-    return pagina_dash(auth)
+    card_dispensers = dbc.Row(disp_cards)
 
-@callback(Output("auth-store", "data"),
-          Output("app-root", "children", allow_duplicate=True),
-          Input("btn-login", "n_clicks"),
-          State("login-user", "value"), State("login-senha", "value"),
-          prevent_initial_call=True)
-def fazer_login(n, username, senha):
-    # Guard: btn-login aparece dinamicamente com n_clicks=0
-    if not n:
-        return dash.no_update, dash.no_update
-    if not username or not senha:
-        return dash.no_update, pagina_login("Preencha usuario e senha.")
-    resp = api("post", "/auth/login", json={"username": username, "senha": senha})
-    if resp and "token" in resp:
-        _start_ws(resp["token"])
-        return resp, dash.no_update
-    return dash.no_update, pagina_login("Usuario ou senha incorretos.")
+    # ── Alarmes ───────────────────────────────────────────────────────────────
+    alarmes_data = _get("/alarmes?resolvido=false&limite=20")
+    if alarmes_data and isinstance(alarmes_data, list):
+        card_alarmes_content = html.Div([
+            dbc.Alert([
+                html.Strong(f"[{a.get('tipo', '?').upper()}] "),
+                html.Span(a.get("descricao", "")),
+                html.Small(
+                    f" — {str(a.get('criado_em', ''))[:16]}",
+                    className="text-muted ms-2",
+                ),
+            ], color="danger", className="py-1 px-2 mb-1 small")
+            for a in alarmes_data
+        ])
+    else:
+        card_alarmes_content = html.P("Nenhum alarme ativo.", className="text-muted small")
 
-@callback(Output("auth-store", "data", allow_duplicate=True),
-          Input("btn-logout", "n_clicks"), prevent_initial_call=True)
-def logout(n):
-    # Guard: btn-logout aparece dinamicamente com n_clicks=0 — sem isso
-    # o auth é limpo automaticamente ao renderizar pagina_dash(), causando
-    # o KeyError no atualizar e o loop de login.
-    if not n:
-        return dash.no_update
-    return None
-
-@callback(Output("kpis", "children"), Output("alarme-banner", "children"),
-          Output("graph-prod", "figure"), Output("gauge-prog", "figure"),
-          Output("painel-os", "children"),
-          Input("iv-dash", "n_intervals"), State("auth-store", "data"),
-          prevent_initial_call=True)
-def atualizar(_, auth):
-    token = (auth or {}).get("token")
-    with _lock:
-        est = dict(_estado)
-
-    contagem = est.get("contagem", 0)
-    meta     = est.get("meta", 1)
-    status   = est.get("status", "idle")
-    vel      = est.get("velocidade", 0)
-    lote_id  = est.get("lote_id", "—")
-    alarme   = est.get("alarme")
-    prog     = min(100, round(contagem / max(meta, 1) * 100, 1))
-
-    kpis = [
-        dbc.Col(kpi("Contagem Atual", f"{contagem:,}", f"Lote: {lote_id}", AZUL),  width=6, md=4, xl=2),
-        dbc.Col(kpi("Meta",           f"{meta:,}",     "unidades",          CINZA), width=6, md=4, xl=2),
-        dbc.Col(kpi("Progresso",      f"{prog}%",       f"{contagem:,} / {meta:,}",
-                    VERDE if prog >= 80 else AMAR),                                 width=6, md=4, xl=2),
-        dbc.Col(kpi("Velocidade",     f"{vel}",         "un/min",            AZUL2),width=6, md=4, xl=3),
-        dbc.Col(kpi("Status",         STATUS_LABEL.get(status, status.upper()), "",
-                    STATUS_COR.get(status, CINZA)),                                 width=12,md=4, xl=3),
+    # ── Log eventos ───────────────────────────────────────────────────────────
+    ICONE = {
+        "os_nova":          "📋",
+        "ia_atribuicao":    "🧠",
+        "carregamento":     "📦",
+        "dispenser_pronto": "✅",
+        "dispensa":         "💊",
+        "falha_ia":         "⚠️",
+        "alarme":           "🚨",
+        "cnc_concluido":    "🏁",
+    }
+    log_items = [
+        html.Div(
+            html.Small(
+                f"{ICONE.get(e.get('tipo', ''), '•')} "
+                f"[{str(e.get('ts', ''))[:19].replace('T', ' ')}] "
+                f"{e.get('msg', '')}",
+                className="d-block text-muted",
+            ),
+            className="mb-1",
+        )
+        for e in (eventos or [])
     ]
+    card_log_content = (
+        html.Div(log_items)
+        if log_items
+        else html.P("Sem eventos.", className="text-muted small")
+    )
 
-    banner = html.Div([html.Strong("⚠ ALARME: "), alarme],
-        style={"background": "#fff3cd", "border": f"1px solid {AMAR}", "borderRadius": "10px",
-               "padding": "14px 20px", "fontWeight": "600", "color": "#856404",
-               "marginBottom": "20px"}) if alarme else html.Div()
+    # ── Histórico OS ──────────────────────────────────────────────────────────
+    if os_hist and isinstance(os_hist, list):
+        hist_rows = [
+            dbc.Row([
+                dbc.Col(
+                    html.Small(h.get("os_id", "?"),
+                               className="fw-bold text-primary"), md=4),
+                dbc.Col(
+                    html.Small(h.get("descricao", ""),
+                               className="text-muted"), md=5),
+                dbc.Col(
+                    _badge(h.get("status", "?"), _cor(h.get("status", ""))),
+                    md=3,
+                ),
+            ], className="mb-1 border-bottom pb-1")
+            for h in os_hist
+        ]
+        card_historico_content = html.Div(hist_rows)
+    else:
+        card_historico_content = html.P("Sem histórico.", className="text-muted small")
 
-    hist = api("get", f"/historico?lote_id={lote_id}&limite=200", token=token) or []
-    hist = list(reversed(hist))
-    fig = go.Figure()
-    if hist:
-        fig.add_trace(go.Scatter(x=[r["ts"] for r in hist], y=[r["valor"] for r in hist],
-            mode="lines", line=dict(color=AZUL, width=2.5),
-            fill="tozeroy", fillcolor="rgba(0,48,135,0.08)", name="Contagem"))
-        fig.add_hline(y=meta, line_dash="dash", line_color=VERM,
-                      annotation_text=f"Meta: {meta:,}", annotation_position="top right")
-    fig.update_layout(paper_bgcolor="white", plot_bgcolor="white",
-        margin=dict(l=10, r=10, t=10, b=30),
-        xaxis=dict(showgrid=False, tickangle=-30, tickfont=dict(size=10)),
-        yaxis=dict(showgrid=True, gridcolor="#f0f0f0"),
-        hovermode="x unified", showlegend=False)
+    return (
+        badge_alarmes,
+        badge_os,
+        card_os,
+        card_cnc,
+        card_dispensers,
+        card_alarmes_content,
+        card_log_content,
+        card_historico_content,
+    )
 
-    gauge = go.Figure(go.Indicator(
-        mode="gauge+number+delta", value=prog,
-        delta={"reference": 100, "relative": False, "valueformat": ".1f", "suffix": "%"},
-        number={"suffix": "%", "font": {"size": 32, "color": AZUL}},
-        gauge={"axis": {"range": [0, 100], "tickcolor": "#ccc"}, "bar": {"color": AZUL},
-               "steps": [{"range": [0, 50], "color": "#f8f9fa"},
-                          {"range": [50, 80], "color": "#e8f4fd"},
-                          {"range": [80, 100], "color": "#d4edda"}],
-               "threshold": {"line": {"color": VERDE, "width": 3}, "thickness": 0.75, "value": 100}}))
-    gauge.update_layout(paper_bgcolor="white", margin=dict(l=20, r=20, t=20, b=20), height=200)
 
-    ordens = api("get", "/ordens?status_os=em_andamento", token=token) or []
-    os_items = []
-    for o in ordens[:4]:
-        s = o.get("status", "")
-        cor = {"em_andamento": VERDE, "aberto": AZUL, "concluido": CINZA}.get(s, CINZA)
-        os_items.append(html.Div([
-            html.Div([
-                html.Strong(o["os_id"], style={"fontSize": "13px", "color": AZUL}),
-                html.Span(s.replace("_", " ").upper(),
-                          style={"fontSize": "10px", "fontWeight": "700",
-                                 "background": cor, "color": "#fff",
-                                 "borderRadius": "4px", "padding": "1px 8px", "marginLeft": "8px"}),
-            ]),
-            html.Div(o["produto"], style={"fontSize": "12px", "color": "#888"}),
-            html.Div(f"Meta: {o['meta']:,} un | Resp: {o.get('responsavel','—')}",
-                     style={"fontSize": "11px", "color": "#aaa"}),
-        ], style={"borderBottom": "1px solid #f0f0f0", "paddingBottom": "10px", "marginBottom": "10px"}))
-
-    painel_os = html.Div([
-        html.H3("Ordens em Andamento",
-                style={"margin": "0 0 14px", "fontSize": "15px", "color": AZUL, "fontWeight": "700"}),
-        *(os_items or [html.P("Nenhuma OS em andamento.", style={"color": "#aaa", "fontSize": "13px"})]),
-    ])
-
-    return kpis, banner, fig, gauge, painel_os
-
+# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8050, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8050")),
+        debug=os.getenv("DEBUG", "false").lower() == "true",
+    )

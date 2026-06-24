@@ -1,9 +1,8 @@
 """
 APSEN - Banco de Dados MySQL (PyMySQL)
-Substitui a implementação SQLite anterior.
-Usa autocommit=True para leituras/escritas simples e transação
-explícita somente em criar_os() para geração atômica do OS-XXXX.
+Schema v2.0 — ordens, dispensas, CNC, sensores, manutenção, usuários
 """
+import json
 import logging
 import time
 from contextlib import contextmanager
@@ -35,7 +34,6 @@ def _make_conn(autocommit: bool = True) -> pymysql.Connection:
 
 @contextmanager
 def _conn(autocommit: bool = True):
-    """Context manager que garante fechamento da conexão."""
     conn = _make_conn(autocommit=autocommit)
     try:
         yield conn
@@ -47,98 +45,135 @@ def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
+def _row(r) -> dict | None:
+    if r is None:
+        return None
+    out = {}
+    for k, v in r.items():
+        out[k] = v.isoformat() if isinstance(v, datetime) else v
+    return out
+
+
+def _rows(rs) -> list:
+    return [_row(r) for r in rs]
+
+
 # ── Inicialização ──────────────────────────────────────────────────────────────
 
 def init_db():
-    """Aguarda MySQL ficar disponível e cria tabelas + seed de usuários."""
     for attempt in range(30):
         try:
             with _conn() as conn:
                 _create_tables(conn)
+            _seed_usuarios()
             logger.info("MySQL conectado e schema verificado.")
-            break
+            return
         except pymysql.OperationalError as exc:
-            logger.warning(f"MySQL indisponível (tentativa {attempt + 1}/30): {exc}")
+            logger.warning(f"MySQL não disponível ({attempt+1}/30): {exc}")
             if attempt < 29:
                 time.sleep(2)
             else:
                 raise
-    _seed_usuarios()
 
 
 def _create_tables(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS contagens (
+    ddl_list = [
+        """CREATE TABLE IF NOT EXISTS ordens (
+            id           INT AUTO_INCREMENT PRIMARY KEY,
+            os_id        VARCHAR(60)  NOT NULL UNIQUE,
+            descricao    VARCHAR(200) NOT NULL DEFAULT '',
+            status       VARCHAR(30)  NOT NULL DEFAULT 'aguardando',
+            payload_json TEXT         NOT NULL,
+            criado_em    DATETIME(3)  NOT NULL,
+            concluida_em DATETIME(3)  NULL,
+            INDEX idx_os_status (status),
+            INDEX idx_os_criado (criado_em)
+        ) ENGINE=InnoDB""",
+
+        """CREATE TABLE IF NOT EXISTS os_itens (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            os_id           VARCHAR(60)  NOT NULL,
+            dispenser_id    TINYINT      NOT NULL,
+            medicamento     VARCHAR(100) NOT NULL,
+            quantidade_alvo INT          NOT NULL,
+            quantidade_real INT          NOT NULL DEFAULT 0,
+            status          VARCHAR(30)  NOT NULL DEFAULT 'pendente',
+            INDEX idx_ositem_os (os_id, dispenser_id)
+        ) ENGINE=InnoDB""",
+
+        """CREATE TABLE IF NOT EXISTS dispensas (
+            id                   INT AUTO_INCREMENT PRIMARY KEY,
+            os_id                VARCHAR(60)  NOT NULL,
+            dispenser_id         TINYINT      NOT NULL,
+            medicamento          VARCHAR(100) NOT NULL,
+            quantidade_dispensada INT         NOT NULL,
+            quantidade_alvo      INT          NOT NULL,
+            validado             TINYINT(1)   NOT NULL DEFAULT 1,
+            motivo_falha         TEXT         NULL,
+            ts                   DATETIME(3)  NOT NULL,
+            INDEX idx_disp_os (os_id, dispenser_id, ts),
+            INDEX idx_disp_ts (ts)
+        ) ENGINE=InnoDB""",
+
+        """CREATE TABLE IF NOT EXISTS cnc_eventos (
+            id             INT AUTO_INCREMENT PRIMARY KEY,
+            os_id          VARCHAR(60)  NULL,
+            status         VARCHAR(30)  NOT NULL,
+            dispenser_alvo TINYINT      NULL,
+            posicao_x      DECIMAL(8,3) NULL,
+            posicao_y      DECIMAL(8,3) NULL,
+            ciclo_atual    INT          NOT NULL DEFAULT 0,
+            total_ciclos   INT          NOT NULL DEFAULT 0,
+            ts             DATETIME(3)  NOT NULL,
+            INDEX idx_cnc_ts (ts),
+            INDEX idx_cnc_os (os_id, ts)
+        ) ENGINE=InnoDB""",
+
+        """CREATE TABLE IF NOT EXISTS leituras_sensores (
             id         INT AUTO_INCREMENT PRIMARY KEY,
-            lote_id    VARCHAR(100) NOT NULL,
-            valor      INT NOT NULL,
-            velocidade DECIMAL(10,2) DEFAULT 0,
-            ts         DATETIME(3) NOT NULL,
-            INDEX idx_cont_lote (lote_id, ts)
-        ) ENGINE=InnoDB
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS eventos (
-            id      INT AUTO_INCREMENT PRIMARY KEY,
-            lote_id VARCHAR(100) NOT NULL,
-            tipo    VARCHAR(50)  NOT NULL,
-            detalhe TEXT,
-            ts      DATETIME(3) NOT NULL,
-            INDEX idx_evt_lote (lote_id, ts)
-        ) ENGINE=InnoDB
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS usuarios (
+            componente VARCHAR(100) NOT NULL,
+            tipo       VARCHAR(30)  NOT NULL,
+            valor      DECIMAL(10,3) NOT NULL,
+            unidade    VARCHAR(20)  NOT NULL,
+            ts         DATETIME(3)  NOT NULL,
+            INDEX idx_sensor_comp (componente, ts),
+            INDEX idx_sensor_ts   (ts)
+        ) ENGINE=InnoDB""",
+
+        """CREATE TABLE IF NOT EXISTS alarmes (
+            id        INT AUTO_INCREMENT PRIMARY KEY,
+            fonte     VARCHAR(50)  NOT NULL,
+            tipo      VARCHAR(60)  NOT NULL,
+            descricao TEXT         NOT NULL,
+            resolvido TINYINT(1)   NOT NULL DEFAULT 0,
+            ts        DATETIME(3)  NOT NULL,
+            INDEX idx_alarm_resolvido (resolvido, ts),
+            INDEX idx_alarm_ts        (ts)
+        ) ENGINE=InnoDB""",
+
+        """CREATE TABLE IF NOT EXISTS log_manutencao (
+            id         INT AUTO_INCREMENT PRIMARY KEY,
+            tipo       VARCHAR(50)  NOT NULL,
+            componente VARCHAR(100) NOT NULL,
+            descricao  TEXT         NOT NULL,
+            tecnico    VARCHAR(100) NOT NULL,
+            ts         DATETIME(3)  NOT NULL,
+            INDEX idx_manut_ts (ts)
+        ) ENGINE=InnoDB""",
+
+        """CREATE TABLE IF NOT EXISTS usuarios (
             id            INT AUTO_INCREMENT PRIMARY KEY,
             username      VARCHAR(100) NOT NULL UNIQUE,
-            senha_hash    TEXT NOT NULL,
-            role          VARCHAR(50)  NOT NULL DEFAULT 'operador',
+            senha_hash    TEXT         NOT NULL,
             nome_completo VARCHAR(200) NOT NULL DEFAULT '',
             ativo         TINYINT(1)   NOT NULL DEFAULT 1,
             criado_em     DATETIME(3)  NOT NULL,
-            INDEX idx_user_ativo (username, ativo)
-        ) ENGINE=InnoDB
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS ordens_servico (
-            id            INT AUTO_INCREMENT PRIMARY KEY,
-            os_id         VARCHAR(20)  UNIQUE DEFAULT NULL,
-            produto       VARCHAR(200) NOT NULL,
-            lote_id       VARCHAR(100) NOT NULL,
-            meta          INT NOT NULL,
-            status        VARCHAR(50)  NOT NULL DEFAULT 'aberto',
-            responsavel   VARCHAR(200) NOT NULL DEFAULT '',
-            criado_por    VARCHAR(100) NOT NULL,
-            criado_em     DATETIME(3)  NOT NULL,
-            atualizado_em DATETIME(3)  NOT NULL,
-            INDEX idx_os_lote   (lote_id),
-            INDEX idx_os_status (status)
-        ) ENGINE=InnoDB
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS ocorrencias_os (
-            id        INT AUTO_INCREMENT PRIMARY KEY,
-            os_id     VARCHAR(20)  NOT NULL,
-            tipo      VARCHAR(100) NOT NULL,
-            descricao TEXT NOT NULL,
-            usuario   VARCHAR(100) NOT NULL DEFAULT '',
-            contagem  INT DEFAULT NULL,
-            ts        DATETIME(3)  NOT NULL,
-            INDEX idx_ocorr_os (os_id, ts)
-        ) ENGINE=InnoDB
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS log_manutencao (
-            id          INT AUTO_INCREMENT PRIMARY KEY,
-            tipo        VARCHAR(50)  NOT NULL,
-            descricao   TEXT NOT NULL,
-            responsavel VARCHAR(100) NOT NULL,
-            componente  VARCHAR(100) DEFAULT '',
-            ts          DATETIME(3)  NOT NULL,
-            INDEX idx_manut_ts (ts)
-        ) ENGINE=InnoDB
-        """)
+            INDEX idx_user (username, ativo)
+        ) ENGINE=InnoDB""",
+    ]
+    with conn.cursor() as cur:
+        for ddl in ddl_list:
+            cur.execute(ddl)
 
 
 def _seed_usuarios():
@@ -149,243 +184,252 @@ def _seed_usuarios():
                 return
         ts = _ts()
         seeds = [
-            ("admin",     "admin123",  "admin",      "Administrador"),
-            ("operador1", "op123",     "operador",   "Operador 1"),
-            ("manut1",    "mnt123",    "manutencao", "Técnico Manutenção"),
+            ("admin",  "admin123", "Administrador"),
+            ("manut1", "mnt123",   "Técnico de Manutenção"),
         ]
         with conn.cursor() as cur:
-            for username, senha, role, nome in seeds:
+            for username, senha, nome in seeds:
                 cur.execute(
                     "INSERT IGNORE INTO usuarios "
-                    "(username, senha_hash, role, nome_completo, criado_em) "
-                    "VALUES (%s, %s, %s, %s, %s)",
-                    (username, hash_senha(senha), role, nome, ts),
+                    "(username, senha_hash, nome_completo, criado_em) VALUES (%s,%s,%s,%s)",
+                    (username, hash_senha(senha), nome, ts),
                 )
     logger.info("Usuários seed inseridos.")
 
 
-# ── Contagens ──────────────────────────────────────────────────────────────────
+# ── Ordens ─────────────────────────────────────────────────────────────────────
 
-def salvar_contagem(lote_id: str, valor: int, velocidade: float = 0):
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO contagens (lote_id, valor, velocidade, ts) VALUES (%s, %s, %s, %s)",
-                (lote_id, valor, velocidade, _ts()),
-            )
-
-
-def salvar_evento(lote_id: str, tipo: str, detalhe: str = ""):
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO eventos (lote_id, tipo, detalhe, ts) VALUES (%s, %s, %s, %s)",
-                (lote_id, tipo, detalhe, _ts()),
-            )
-
-
-def get_historico(lote_id: str = None, limite: int = 200) -> list:
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            if lote_id:
-                cur.execute(
-                    "SELECT * FROM contagens WHERE lote_id=%s ORDER BY ts DESC LIMIT %s",
-                    (lote_id, limite),
-                )
-            else:
-                cur.execute(
-                    "SELECT * FROM contagens ORDER BY ts DESC LIMIT %s", (limite,)
-                )
-            rows = cur.fetchall()
-    # Converte datetime para string ISO para serialização JSON
-    return [_row_to_dict(r) for r in rows]
-
-
-def get_lote_atual(lote_id: str) -> dict:
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT valor, velocidade, ts FROM contagens "
-                "WHERE lote_id=%s ORDER BY ts DESC LIMIT 1",
-                (lote_id,),
-            )
-            cont = cur.fetchone()
-            cur.execute(
-                "SELECT tipo, detalhe, ts FROM eventos "
-                "WHERE lote_id=%s ORDER BY ts DESC LIMIT 10",
-                (lote_id,),
-            )
-            evts = cur.fetchall()
-    return {
-        "lote_id": lote_id,
-        "ultima_contagem": _row_to_dict(cont) if cont else None,
-        "eventos_recentes": [_row_to_dict(e) for e in evts],
-    }
-
-
-# ── Usuários ───────────────────────────────────────────────────────────────────
-
-def get_usuario(username: str) -> dict | None:
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM usuarios WHERE username=%s AND ativo=1", (username,)
-            )
-            row = cur.fetchone()
-    return _row_to_dict(row) if row else None
-
-
-def listar_usuarios() -> list:
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, username, role, nome_completo, ativo, criado_em "
-                "FROM usuarios ORDER BY id"
-            )
-            rows = cur.fetchall()
-    return [_row_to_dict(r) for r in rows]
-
-
-def criar_usuario(username: str, senha: str, role: str, nome: str) -> dict:
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO usuarios (username, senha_hash, role, nome_completo, criado_em) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (username, hash_senha(senha), role, nome, _ts()),
-            )
-    return {"ok": True, "username": username}
-
-
-def atualizar_usuario(username: str, campos: dict) -> dict:
-    if "senha" in campos:
-        campos["senha_hash"] = hash_senha(campos.pop("senha"))
-    sets = ", ".join(f"{k}=%s" for k in campos)
-    vals = list(campos.values()) + [username]
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"UPDATE usuarios SET {sets} WHERE username=%s", vals)
-    return {"ok": True}
-
-
-# ── Ordens de Serviço ──────────────────────────────────────────────────────────
-
-def criar_os(produto: str, lote_id: str, meta: int, responsavel: str, criado_por: str) -> dict:
-    """
-    Cria OS com ID atômico usando AUTO_INCREMENT do MySQL:
-    1. INSERT sem os_id (NULL) — gera id único via AUTO_INCREMENT
-    2. Deriva os_id = "OS-XXXX" a partir de lastrowid
-    3. UPDATE seta os_id — dentro da mesma conexão/transação
-    """
+def salvar_ordem(os_id: str, descricao: str, medicamentos: list, payload_raw: dict):
     ts = _ts()
-    # Transação explícita (autocommit=False) para garantir atomicidade
     with _conn(autocommit=False) as conn:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO ordens_servico "
-                    "(produto, lote_id, meta, status, responsavel, criado_por, criado_em, atualizado_em) "
-                    "VALUES (%s, %s, %s, 'aberto', %s, %s, %s, %s)",
-                    (produto, lote_id, meta, responsavel, criado_por, ts, ts),
+                    "INSERT IGNORE INTO ordens "
+                    "(os_id, descricao, status, payload_json, criado_em) "
+                    "VALUES (%s,%s,'aguardando',%s,%s)",
+                    (os_id, descricao, json.dumps(payload_raw), ts),
                 )
-                new_id = cur.lastrowid
-                os_id = f"OS-{new_id:04d}"
-                cur.execute(
-                    "UPDATE ordens_servico SET os_id=%s WHERE id=%s",
-                    (os_id, new_id),
-                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    return  # OS duplicada — ignora
+                for item in medicamentos:
+                    cur.execute(
+                        "INSERT INTO os_itens "
+                        "(os_id, dispenser_id, medicamento, quantidade_alvo) "
+                        "VALUES (%s,%s,%s,%s)",
+                        (os_id, item["dispenser_id"], item["medicamento"], item["quantidade"]),
+                    )
             conn.commit()
+            logger.info(f"[DB] OS {os_id} salva com {len(medicamentos)} item(ns).")
         except Exception:
             conn.rollback()
             raise
-    registrar_ocorrencia(os_id, "criacao", f"OS criada por {criado_por}", criado_por)
-    return {"os_id": os_id}
 
 
-def listar_os(status: str = None) -> list:
+def atualizar_status_ordem(os_id: str, status: str):
+    ts = _ts()
+    concluida_em = ts if status == "concluida" else None
     with _conn() as conn:
         with conn.cursor() as cur:
-            if status:
+            if concluida_em:
                 cur.execute(
-                    "SELECT * FROM ordens_servico WHERE status=%s "
-                    "ORDER BY criado_em DESC",
-                    (status,),
+                    "UPDATE ordens SET status=%s, concluida_em=%s WHERE os_id=%s",
+                    (status, concluida_em, os_id),
                 )
             else:
                 cur.execute(
-                    "SELECT * FROM ordens_servico ORDER BY criado_em DESC"
+                    "UPDATE ordens SET status=%s WHERE os_id=%s",
+                    (status, os_id),
                 )
-            rows = cur.fetchall()
-    return [_row_to_dict(r) for r in rows]
 
 
-def get_os(os_id: str) -> dict | None:
+def atualizar_item_os(os_id: str, dispenser_id: int, quantidade_real: int, status: str):
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM ordens_servico WHERE os_id=%s", (os_id,)
+                "UPDATE os_itens SET quantidade_real=%s, status=%s "
+                "WHERE os_id=%s AND dispenser_id=%s",
+                (quantidade_real, status, os_id, dispenser_id),
             )
-            row = cur.fetchone()
-    return _row_to_dict(row) if row else None
 
 
-def atualizar_os(os_id: str, campos: dict, usuario: str) -> dict:
-    campos["atualizado_em"] = _ts()
-    sets = ", ".join(f"{k}=%s" for k in campos)
-    vals = list(campos.values()) + [os_id]
+def get_ordem_ativa() -> dict | None:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"UPDATE ordens_servico SET {sets} WHERE os_id=%s", vals
+                "SELECT * FROM ordens "
+                "WHERE status IN ('aguardando','em_andamento') "
+                "ORDER BY criado_em DESC LIMIT 1"
             )
-    if "status" in campos:
-        registrar_ocorrencia(
-            os_id,
-            f"status_{campos['status']}",
-            f"Status alterado para '{campos['status']}'",
-            usuario,
-        )
-    return {"ok": True}
+            ordem = _row(cur.fetchone())
+            if not ordem:
+                return None
+            cur.execute(
+                "SELECT * FROM os_itens WHERE os_id=%s ORDER BY dispenser_id",
+                (ordem["os_id"],),
+            )
+            ordem["itens"] = _rows(cur.fetchall())
+    return ordem
 
 
-# ── Ocorrências ────────────────────────────────────────────────────────────────
+def get_historico_ordens(limite: int = 20) -> list:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT o.*, "
+                "  (SELECT COUNT(*) FROM os_itens i WHERE i.os_id=o.os_id) AS total_itens "
+                "FROM ordens o ORDER BY o.criado_em DESC LIMIT %s",
+                (limite,),
+            )
+            return _rows(cur.fetchall())
 
-def registrar_ocorrencia(
-    os_id: str, tipo: str, descricao: str, usuario: str, contagem: int = None
+
+# ── Dispensas ──────────────────────────────────────────────────────────────────
+
+def salvar_dispensa(
+    os_id: str, dispenser_id: int, medicamento: str,
+    quantidade_dispensada: int, quantidade_alvo: int,
+    validado: bool, motivo_falha: str = None,
 ):
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO ocorrencias_os "
-                "(os_id, tipo, descricao, usuario, contagem, ts) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (os_id, tipo, descricao, usuario, contagem, _ts()),
+                "INSERT INTO dispensas "
+                "(os_id, dispenser_id, medicamento, quantidade_dispensada, "
+                " quantidade_alvo, validado, motivo_falha, ts) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (os_id, dispenser_id, medicamento, quantidade_dispensada,
+                 quantidade_alvo, 1 if validado else 0, motivo_falha, _ts()),
             )
 
 
-def get_ocorrencias(os_id: str) -> list:
+def get_dispensas(os_id: str, limite: int = 200) -> list:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM ocorrencias_os WHERE os_id=%s ORDER BY ts DESC",
-                (os_id,),
+                "SELECT * FROM dispensas WHERE os_id=%s ORDER BY ts DESC LIMIT %s",
+                (os_id, limite),
             )
-            rows = cur.fetchall()
-    return [_row_to_dict(r) for r in rows]
+            return _rows(cur.fetchall())
+
+
+def get_dispensas_recentes(limite: int = 50) -> list:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM dispensas ORDER BY ts DESC LIMIT %s", (limite,)
+            )
+            return _rows(cur.fetchall())
+
+
+# ── CNC ────────────────────────────────────────────────────────────────────────
+
+def salvar_cnc_evento(
+    os_id: str, status: str,
+    dispenser_alvo: int = None, posicao_x: float = None, posicao_y: float = None,
+    ciclo_atual: int = 0, total_ciclos: int = 0,
+):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO cnc_eventos "
+                "(os_id, status, dispenser_alvo, posicao_x, posicao_y, "
+                " ciclo_atual, total_ciclos, ts) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (os_id, status, dispenser_alvo, posicao_x, posicao_y,
+                 ciclo_atual, total_ciclos, _ts()),
+            )
+
+
+def get_cnc_recentes(limite: int = 50) -> list:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM cnc_eventos ORDER BY ts DESC LIMIT %s", (limite,)
+            )
+            return _rows(cur.fetchall())
+
+
+# ── Sensores ───────────────────────────────────────────────────────────────────
+
+def salvar_leitura_sensor(componente: str, tipo: str, valor: float, unidade: str):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO leituras_sensores (componente, tipo, valor, unidade, ts) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                (componente, tipo, valor, unidade, _ts()),
+            )
+
+
+def get_ultimas_leituras() -> list:
+    """Retorna a leitura mais recente de cada componente+tipo."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT l1.*
+                FROM leituras_sensores l1
+                INNER JOIN (
+                    SELECT componente, tipo, MAX(ts) AS max_ts
+                    FROM leituras_sensores
+                    GROUP BY componente, tipo
+                ) l2 ON l1.componente=l2.componente AND l1.tipo=l2.tipo AND l1.ts=l2.max_ts
+                ORDER BY l1.componente, l1.tipo
+            """)
+            return _rows(cur.fetchall())
+
+
+def get_historico_sensor(componente: str, tipo: str, limite: int = 60) -> list:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM leituras_sensores "
+                "WHERE componente=%s AND tipo=%s ORDER BY ts DESC LIMIT %s",
+                (componente, tipo, limite),
+            )
+            return _rows(cur.fetchall())
+
+
+# ── Alarmes ────────────────────────────────────────────────────────────────────
+
+def salvar_alarme(fonte: str, tipo: str, descricao: str) -> int:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO alarmes (fonte, tipo, descricao, ts) VALUES (%s,%s,%s,%s)",
+                (fonte, tipo, descricao, _ts()),
+            )
+            return cur.lastrowid
+
+
+def resolver_alarme(alarme_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE alarmes SET resolvido=1 WHERE id=%s", (alarme_id,)
+            )
+
+
+def get_alarmes(resolvido: bool = False, limite: int = 100) -> list:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM alarmes WHERE resolvido=%s ORDER BY ts DESC LIMIT %s",
+                (1 if resolvido else 0, limite),
+            )
+            return _rows(cur.fetchall())
 
 
 # ── Manutenção ─────────────────────────────────────────────────────────────────
 
-def registrar_manutencao(
-    tipo: str, descricao: str, responsavel: str, componente: str = ""
-) -> dict:
+def salvar_manutencao(tipo: str, componente: str, descricao: str, tecnico: str) -> dict:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO log_manutencao "
-                "(tipo, descricao, responsavel, componente, ts) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (tipo, descricao, responsavel, componente, _ts()),
+                "(tipo, componente, descricao, tecnico, ts) VALUES (%s,%s,%s,%s,%s)",
+                (tipo, componente, descricao, tecnico, _ts()),
             )
     return {"ok": True}
 
@@ -396,33 +440,15 @@ def get_log_manutencao(limite: int = 100) -> list:
             cur.execute(
                 "SELECT * FROM log_manutencao ORDER BY ts DESC LIMIT %s", (limite,)
             )
-            rows = cur.fetchall()
-    return [_row_to_dict(r) for r in rows]
+            return _rows(cur.fetchall())
 
 
-def get_alarmes(limite: int = 100) -> list:
+# ── Usuários ───────────────────────────────────────────────────────────────────
+
+def get_usuario(username: str) -> dict | None:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT tipo, detalhe AS descricao, ts FROM eventos "
-                "WHERE tipo IN ('alarme','alarm','falha','erro') "
-                "ORDER BY ts DESC LIMIT %s",
-                (limite,),
+                "SELECT * FROM usuarios WHERE username=%s AND ativo=1", (username,)
             )
-            rows = cur.fetchall()
-    return [_row_to_dict(r) for r in rows]
-
-
-# ── Utilitário ─────────────────────────────────────────────────────────────────
-
-def _row_to_dict(row) -> dict | None:
-    """Converte row do PyMySQL para dict, normalizando datetime para string ISO."""
-    if row is None:
-        return None
-    result = {}
-    for k, v in row.items():
-        if isinstance(v, datetime):
-            result[k] = v.isoformat()
-        else:
-            result[k] = v
-    return result
+            return _row(cur.fetchone())
