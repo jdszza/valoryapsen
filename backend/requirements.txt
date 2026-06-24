@@ -4,3 +4,5 @@ paho-mqtt==1.6.1
 python-jose[cryptography]==3.3.0
 bcrypt==4.2.0
 pydantic==2.7.1
+requests==2.32.3
+PyMySQL==1.1.1

@@ -156,16 +156,31 @@ def pagina_dash(auth):
     ])
 
 # ── Layout ──────────────────────────────────────────────────────────────────────
+# Mesmo guard de hidratação da IHM: evita flash de login antes do sessionStorage
+# carregar e previne o loop causado pelo logout callback disparar com n_clicks=0.
 app.layout = html.Div([
     dcc.Location(id="url"),
     dcc.Store(id="auth-store", storage_type="session"),
+    dcc.Store(id="_ready", data=False),
+    dcc.Interval(id="_hydrated", interval=100, max_intervals=1),
     html.Div(id="app-root"),
 ])
 
+@callback(Output("_ready", "data"),
+          Input("_hydrated", "n_intervals"),
+          prevent_initial_call=True)
+def _mark_ready(_):
+    return True
+
 @callback(Output("app-root", "children"),
-          Input("auth-store", "data"), Input("url", "pathname"))
-def root(auth, _):
-    if not auth or not auth.get("token"): return pagina_login()
+          Input("auth-store", "data"),
+          Input("url", "pathname"),
+          Input("_ready", "data"))
+def root(auth, _, ready):
+    if not ready:
+        return html.Div()
+    if not auth or not auth.get("token"):
+        return pagina_login()
     return pagina_dash(auth)
 
 @callback(Output("auth-store", "data"),
@@ -174,6 +189,9 @@ def root(auth, _):
           State("login-user", "value"), State("login-senha", "value"),
           prevent_initial_call=True)
 def fazer_login(n, username, senha):
+    # Guard: btn-login aparece dinamicamente com n_clicks=0
+    if not n:
+        return dash.no_update, dash.no_update
     if not username or not senha:
         return dash.no_update, pagina_login("Preencha usuario e senha.")
     resp = api("post", "/auth/login", json={"username": username, "senha": senha})
@@ -184,13 +202,19 @@ def fazer_login(n, username, senha):
 
 @callback(Output("auth-store", "data", allow_duplicate=True),
           Input("btn-logout", "n_clicks"), prevent_initial_call=True)
-def logout(_):
+def logout(n):
+    # Guard: btn-logout aparece dinamicamente com n_clicks=0 — sem isso
+    # o auth é limpo automaticamente ao renderizar pagina_dash(), causando
+    # o KeyError no atualizar e o loop de login.
+    if not n:
+        return dash.no_update
     return None
 
 @callback(Output("kpis", "children"), Output("alarme-banner", "children"),
           Output("graph-prod", "figure"), Output("gauge-prog", "figure"),
           Output("painel-os", "children"),
-          Input("iv-dash", "n_intervals"), State("auth-store", "data"))
+          Input("iv-dash", "n_intervals"), State("auth-store", "data"),
+          prevent_initial_call=True)
 def atualizar(_, auth):
     token = (auth or {}).get("token")
     with _lock:

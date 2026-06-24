@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from auth import (criar_token, decodificar_token, tem_permissao, verificar_senha)
 from config import settings
+from erp_integration import processar_novo_lote_bg
 from database import (
     atualizar_os, atualizar_usuario, criar_os, criar_usuario,
     get_alarmes, get_historico, get_log_manutencao, get_lote_atual,
@@ -89,11 +90,22 @@ def on_message(client, userdata, msg):
                                   payload.get("detalhe", ""))
 
             elif topic == "apsen/lote":
-                estado["lote_id"] = payload.get("lote_id", estado["lote_id"])
-                estado["meta"]    = payload.get("meta", estado["meta"])
+                novo_lote_id = payload.get("lote_id", estado["lote_id"])
+                novo_meta    = payload.get("meta",    estado["meta"])
+                novo_produto = payload.get("produto", "Produto APSEN")
+                estado["lote_id"]  = novo_lote_id
+                estado["meta"]     = novo_meta
                 estado["contagem"] = 0
+                # Gerar OS automaticamente fora do lock (operação de DB)
+                _novo_lote = (novo_lote_id, novo_produto, novo_meta)
+            else:
+                _novo_lote = None
 
             snapshot = dict(estado)
+
+        # Criar OS e notificar ERP em background (fora do _estado_lock)
+        if topic == "apsen/lote" and _novo_lote:
+            processar_novo_lote_bg(*_novo_lote, criado_por="sistema/mqtt")
 
         # call_soon_threadsafe é o único modo thread-safe de enfileirar
         # tarefas num asyncio.Queue a partir de uma thread não-asyncio (como a do MQTT)
@@ -224,10 +236,21 @@ def lote_atual(user=Depends(get_current_user)):
     return get_lote_atual(estado["lote_id"])
 
 @app.post("/cmd/lote")
-def novo_lote(lote_id: str, meta: int, user=Depends(require_role("operador"))):
-    mqtt_client.publish("apsen/cmd/lote", json.dumps({"lote_id": lote_id, "meta": meta}))
-    estado.update({"lote_id": lote_id, "meta": meta, "contagem": 0})
-    return {"ok": True}
+def novo_lote(
+    lote_id: str,
+    meta: int,
+    produto: str = "Produto APSEN",
+    user=Depends(require_role("operador")),
+):
+    mqtt_client.publish(
+        "apsen/cmd/lote",
+        json.dumps({"lote_id": lote_id, "meta": meta, "produto": produto}),
+    )
+    with _estado_lock:
+        estado.update({"lote_id": lote_id, "meta": meta, "contagem": 0})
+    # Gerar OS e notificar ERP em background (não bloqueia o response)
+    processar_novo_lote_bg(lote_id, produto, meta, criado_por=user["sub"])
+    return {"ok": True, "lote_id": lote_id, "meta": meta, "produto": produto}
 
 @app.post("/cmd/reset")
 def reset(user=Depends(require_role("operador"))):

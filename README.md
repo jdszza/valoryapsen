@@ -184,9 +184,6 @@ APSEN - VALORY/
 
 ## Próximos Passos
 
-### Prioridade alta
-- **Corrigir perda de sessão na IHM Web** — a página está pedindo login repetidamente após refresh. O token JWT é salvo no `dcc.Store(storage_type="session")`, mas o callback do router pode estar re-renderizando o login antes do store carregar do browser. Investigar race condition entre `url.pathname` e `auth-store.data` no callback `router`.
-
 ### Funcionalidades
 - **Gerador automático de OS** — inspirado em `sap_integration.py`: ao iniciar um novo lote (via MQTT `apsen/lote` ou comando manual), o sistema gera automaticamente uma OS com os dados do lote, produto e meta. Opcionalmente envia um payload JSON para um ERP externo (SAP ou sistema da APSEN) via `POST /api/sap/registro`, com campos: `lote`, `produto`, `meta`, `centro`, `timestamp`. Implementar como módulo `erp_integration.py` no backend, chamado dentro do handler do tópico `apsen/lote`.
 - **Edição e encerramento de OS** — a rota `PUT /ordens/{os_id}` já existe no backend, mas a IHM não tem botão para mudar status (aberto → em andamento → concluído). Adicionar ações na tabela de OS.

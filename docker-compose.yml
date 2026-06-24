@@ -1,7 +1,47 @@
 version: "3.9"
 
+# ═══════════════════════════════════════════════════════════════════
+# APSEN - Sistema de Contagem de Medicamentos
+#
+# Serviços:
+#   mysql        → banco de dados (acessar via Workbench: localhost:3306)
+#   mosquitto    → broker MQTT
+#   backend      → API FastAPI + bridge MQTT
+#   cnc_simulator→ simula a máquina CNC contando remédios
+#   app          → interface web unificada (localhost:8050)
+#
+# Rebuild completo:
+#   docker compose down -v && docker compose build --no-cache && docker compose up
+# ═══════════════════════════════════════════════════════════════════
+
 services:
 
+  # ── MySQL ──────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: apsen-mysql
+    restart: unless-stopped
+    ports:
+      - "3306:3306"          # conectar via MySQL Workbench na porta 3306
+    environment:
+      MYSQL_ROOT_PASSWORD: apsen_root_2024
+      MYSQL_DATABASE:      apsen_db
+      MYSQL_USER:          apsen
+      MYSQL_PASSWORD:      apsen_pass_2024
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
+             "-u", "apsen", "-papsen_pass_2024"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    networks:
+      - apsen-net
+
+  # ── Mosquitto MQTT ─────────────────────────────────────────────
   mosquitto:
     image: eclipse-mosquitto:2.0
     container_name: apsen-mqtt
@@ -15,6 +55,7 @@ services:
     networks:
       - apsen-net
 
+  # ── Backend FastAPI ─────────────────────────────────────────────
   backend:
     build: ./backend
     container_name: apsen-backend
@@ -22,37 +63,52 @@ services:
     ports:
       - "8000:8000"
     environment:
+      MQTT_HOST:   mosquitto
+      MQTT_PORT:   1883
+      MYSQL_HOST:  mysql
+      MYSQL_PORT:  3306
+      MYSQL_DB:    apsen_db
+      MYSQL_USER:  apsen
+      MYSQL_PASS:  apsen_pass_2024
+      SECRET_KEY:  apsen-mude-esta-chave-em-producao-2024
+      # ERP (opcional) — defina ERP_ENABLED=true e ERP_URL quando disponível
+      ERP_ENABLED: "false"
+      ERP_URL:     ""
+      ERP_CENTRO:  "APSEN-SP-01"
+      ERP_TIMEOUT: "3"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    networks:
+      - apsen-net
+
+  # ── Simulador CNC ───────────────────────────────────────────────
+  # Simula o firmware da máquina CNC contando medicamentos via MQTT.
+  # Remove este serviço quando conectar o ESP32/CNC real.
+  cnc_simulator:
+    build: ./cnc_simulator
+    container_name: apsen-cnc-sim
+    restart: unless-stopped
+    environment:
       MQTT_HOST:  mosquitto
       MQTT_PORT:  1883
-      DB_PATH:    /data/apsen.db
-      SECRET_KEY: apsen-mude-esta-chave-em-producao-2024
-    volumes:
-      - db_data:/data
+      VEL_BASE:   "120"      # unidades/min em regime estável
+      INTERVALO:  "1.0"      # segundos entre publicações de contagem
+      WARMUP:     "2.0"      # segundos de aquecimento antes de iniciar contagem
     depends_on:
       - mosquitto
     networks:
       - apsen-net
 
-  dashboard:
-    build: ./dashboard
-    container_name: apsen-dash
+  # ── App Web (IHM + Dashboard) ───────────────────────────────────
+  app:
+    build: ./app
+    container_name: apsen-app
     restart: unless-stopped
     ports:
       - "8050:8050"
-    environment:
-      BACKEND_URL: http://backend:8000
-      BACKEND_WS:  ws://backend:8000/ws
-    depends_on:
-      - backend
-    networks:
-      - apsen-net
-
-  ihm_web:
-    build: ./ihm_web
-    container_name: apsen-ihm-web
-    restart: unless-stopped
-    ports:
-      - "8051:8051"
     environment:
       BACKEND_URL: http://backend:8000
     depends_on:
@@ -61,8 +117,8 @@ services:
       - apsen-net
 
 volumes:
+  mysql_data:
   mqtt_data:
-  db_data:
 
 networks:
   apsen-net:

@@ -161,9 +161,31 @@ def pagina_ordens(token, role):
 def pagina_operacao(token, role):
     est = api("get", "/estado", token=token) or {}
     can = role in ("operador", "manutencao", "admin")
+    lote_atual = est.get("lote_id", "—")
+    meta_atual  = est.get("meta", 0)
     return html.Div([
         html.H4("Operacao em Tempo Real", style={"color": VERDE, "marginBottom": "20px"}),
         html.Div(_render_op_kpis(est), id="op-live-section"),
+
+        # ── Iniciar Novo Lote ──────────────────────────────────────────────────
+        # Chama POST /cmd/lote → publica MQTT apsen/cmd/lote para o ESP32
+        # e gera automaticamente a Ordem de Serviço no sistema.
+        card("Iniciar Novo Lote", html.Div([
+            html.Small(
+                f"Lote atual: {lote_atual}  |  Meta: {meta_atual:,} un",
+                style={"color": "#888", "display": "block", "marginBottom": "12px"},
+            ),
+            dbc.Row([
+                dbc.Col(dbc.Input(id="inp-lote-id",    placeholder="ID do Lote  (ex: LOTE-002)",  size="sm"), width=12, md=4, className="mb-2"),
+                dbc.Col(dbc.Input(id="inp-lote-prod",  placeholder="Produto  (ex: Comp. 500mg)",  size="sm"), width=12, md=4, className="mb-2"),
+                dbc.Col(dbc.Input(id="inp-lote-meta",  placeholder="Meta (unidades)", type="number", size="sm"), width=12, md=2, className="mb-2"),
+                dbc.Col(dbc.Button("Iniciar Lote", id="btn-iniciar-lote", color="success",
+                                   size="sm", className="w-100", disabled=not can), width=12, md=2, className="mb-2"),
+            ], className="g-2"),
+            html.Div(id="lote-fb", style={"fontSize": "13px", "marginTop": "4px"}),
+        ]), cor=VERDE),
+
+        # ── Controles da máquina ───────────────────────────────────────────────
         card("Controles", html.Div([
             dbc.Row([
                 dbc.Col(dbc.Button("▶ INICIAR", id="btn-op-start", color="success", size="lg", className="w-100", disabled=not can), width=6, md=3, className="mb-2"),
@@ -389,6 +411,28 @@ def controles(ns, np, nst, nr, auth):
         api("post", f"/cmd/status?cmd={cmd}", token=token)
         return html.Span(msg, style={"color": cor})
     return dash.no_update
+
+@callback(Output("lote-fb", "children"),
+          Input("btn-iniciar-lote", "n_clicks"),
+          State("inp-lote-id",   "value"),
+          State("inp-lote-prod", "value"),
+          State("inp-lote-meta", "value"),
+          State("auth-store", "data"),
+          prevent_initial_call=True)
+def iniciar_lote(n, lote_id, produto, meta, auth):
+    if not n:
+        return dash.no_update
+    token = (auth or {}).get("token")
+    if not token:
+        return html.Span("Sem autorizacao.", style={"color": VERM})
+    if not lote_id or not meta:
+        return html.Span("Preencha Lote ID e Meta.", style={"color": AMAR})
+    produto = produto or "Produto APSEN"
+    r = api("post", f"/cmd/lote?lote_id={lote_id}&meta={int(meta)}&produto={produto}", token=token)
+    if r:
+        os_hint = f" — OS gerada automaticamente." if r.get("ok") else ""
+        return html.Span(f"✔ Lote {lote_id} iniciado.{os_hint}", style={"color": VERDE})
+    return html.Span("Falha ao iniciar lote.", style={"color": VERM})
 
 @callback(Output("manut-cmd-fb", "children"),
           Input("btn-cmd-manut", "n_clicks"),
