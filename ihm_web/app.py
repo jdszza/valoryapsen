@@ -429,9 +429,10 @@ def _render_dispensers(token):
     cards = []
     for d in dispensers:
         d_id  = d.get("dispenser_id", "?")
-        med   = d.get("medicamento") or "—"
-        cat   = d.get("categoria") or "—"
+        med_raw = d.get("medicamento")
         qty   = d.get("quantidade_atual", 0)
+        med   = med_raw if med_raw and qty > 0 else ("— Vazio —" if med_raw and qty == 0 else "— Livre —")
+        cat   = d.get("categoria") or "—"
         cap   = d.get("capacidade", 100)
         os_id = d.get("ultima_os_id") or "—"
         cor   = _cor_disp(qty, cap)
@@ -886,8 +887,4 @@ def _toggle_ativo(n_clicks_list, labels, token):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8051")),
-        debug=os.getenv("DEBUG", "false").lower() == "true",
-    )
+    app.run(host="0.0.0.0", port=8051, debug=False)

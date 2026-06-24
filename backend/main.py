@@ -295,27 +295,47 @@ def _handle_dispenser_evento(payload: dict):
             logger.warning(f"[DB] Erro ao atualizar item OS: {exc}")
 
     # Persiste quantidade residual + medicamento (slot dinâmico — sem medicamento fixo)
+    # Quando residual == 0, limpa o medicamento no banco (slot fica "vazio")
     if disp_id and qtd_disp >= qtd_alvo:
         try:
             categoria = payload.get("categoria")
-            salvar_dispenser_estado(disp_id, residual, os_id, med or None, categoria)
+            med_db    = (med or None) if residual > 0 else None
+            cat_db    = categoria      if residual > 0 else None
+            salvar_dispenser_estado(disp_id, residual, os_id, med_db, cat_db)
         except Exception as exc:
             logger.warning(f"[DB] Erro ao salvar estado dispenser {disp_id}: {exc}")
 
 
 def _handle_dispenser_status(payload: dict):
-    """Atualiza snapshot em memória com estado completo do slot (dinâmico)."""
-    disp_id = str(payload.get("dispenser_id", "?"))
+    """Atualiza snapshot em memória E banco com estado completo do slot."""
+    disp_id_raw = payload.get("dispenser_id")
+    if disp_id_raw is None:
+        return
+    disp_id_str = str(disp_id_raw)
+    med      = payload.get("medicamento")
+    cat      = payload.get("categoria")
+    qty      = payload.get("quantidade", 0)
+    os_id    = payload.get("os_id")
+
     with _lock:
-        if disp_id in _estado["dispensers"]:
-            _estado["dispensers"][disp_id].update({
+        if disp_id_str in _estado["dispensers"]:
+            _estado["dispensers"][disp_id_str].update({
                 "status":      payload.get("status", "idle"),
-                "medicamento": payload.get("medicamento"),
+                "medicamento": med,
                 "sku":         payload.get("sku"),
-                "categoria":   payload.get("categoria"),
-                "quantidade":  payload.get("quantidade", 0),
-                "os_id":       payload.get("os_id"),
+                "categoria":   cat,
+                "quantidade":  qty,
+                "os_id":       os_id,
             })
+
+    # Sincroniza DB para que a IHM (/dispensers/estado) reflita o estado real
+    # Só persiste quando há medicamento definido OU quando o slot ficou vazio (qty=0 + med=None)
+    try:
+        med_db = med if qty > 0 else None
+        cat_db = cat if qty > 0 else None
+        salvar_dispenser_estado(int(disp_id_raw), qty, os_id, med_db, cat_db)
+    except Exception as exc:
+        logger.warning(f"[DB] Erro ao sincronizar estado dispenser {disp_id_raw}: {exc}")
 
 
 def _handle_dispenser_limpeza_ok(payload: dict):
@@ -414,17 +434,34 @@ def _handle_manut_uso(payload: dict):
 
 
 def _handle_os_concluida(payload: dict):
-    """OS processada com sucesso — libera slot de os_ativa e rastreia fila."""
-    os_id          = payload.get("os_id")
-    fila_restante  = payload.get("fila_restante", 0)
+    """OS finalizada (com sucesso, erro ou abort) — atualiza DB e libera estado."""
+    os_id         = payload.get("os_id")
+    sts_disp      = payload.get("status", "concluida")  # concluida | abortada | erro_carregamento | sem_slot_disponivel
+    fila_restante = payload.get("fila_restante", 0)
+
+    # Mapeia status do dispenser → status no banco
+    if sts_disp == "concluida":
+        db_status = "concluida"
+    else:
+        db_status = "erro"
+
+    # Garante que o banco reflete o status final — caminho principal para OS abortadas/erro,
+    # pois nesses casos o CNC nunca publica sts="concluido" que atualizaria via _handle_cnc_status.
+    if os_id:
+        try:
+            atualizar_status_ordem(os_id, db_status)
+            logger.info(f"[OS] {os_id} → {db_status} (via apsen/os/concluida, sts_disp={sts_disp})")
+        except Exception as exc:
+            logger.warning(f"[DB] Erro ao atualizar status OS {os_id}: {exc}")
+
     with _lock:
         if _estado["os_ativa"] and _estado["os_ativa"].get("os_id") == os_id:
             _estado["os_ativa"] = None
-        # Remove da fila de rastreio se ainda estava lá
         if os_id in _estado["fila_os"]:
             _estado["fila_os"].remove(os_id)
         _estado["fila_tamanho"] = len(_estado["fila_os"])
-    _log("os_concluida", f"OS {os_id} concluída. Fila restante: {fila_restante}.")
+
+    _log("os_concluida", f"OS {os_id} → {db_status}. Fila restante: {fila_restante}.")
 
 
 # ── MQTT Client ────────────────────────────────────────────────────────────────
@@ -780,12 +817,13 @@ def desativar_usuario(username: str, user=Depends(_get_admin)):
     return toggle_usuario_ativo(username, False)
 
 
+
 @app.put("/manutencao/usuarios/{username}/ativar")
 def ativar_usuario(username: str, user=Depends(_get_admin)):
     return toggle_usuario_ativo(username, True)
 
 
-# ── WebSocket ──────────────────────────────────────────────────────────────────
+# ── WebSocket ──────────────────────────────────────────────────────────────────────────────
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await _ws_manager.connect(ws)

@@ -309,10 +309,15 @@ def _render(estado: dict, eventos: list, os_hist: list):
         pct     = (qtd_d / qtd_a * 100) if qtd_a > 0 else 0
 
         # Rótulo do slot
-        if med:
+        if med and qtd_res > 0:
             med_label  = med
             cat_label  = html.Small(f"[{cat}]", className="text-muted ms-1") if cat else ""
             res_label  = html.Small(f" {qtd_res} un. residuais", className="text-muted")
+        elif med and qtd_res == 0:
+            # Slot ficou sem estoque mas ainda não foi limpo pelo MQTT
+            med_label  = "— Vazio —"
+            cat_label  = html.Small(f"(era {med})", className="text-muted ms-1")
+            res_label  = html.Small("sem estoque", className="text-danger fst-italic")
         else:
             med_label  = "— Slot livre —"
             cat_label  = ""
@@ -438,7 +443,7 @@ def _render(estado: dict, eventos: list, os_hist: list):
     )
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",

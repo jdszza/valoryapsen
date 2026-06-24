@@ -631,6 +631,12 @@ class DispenserSimulator:
         with self._lock:
             residual_final = max(0, self._estoque[slot_id]["quantidade"] - quantidade)
             self._estoque[slot_id]["quantidade"] = residual_final
+            # Slot esgotado — limpa o medicamento para que apareça como "vazio" no front
+            # e fique disponível para nova atribuição na próxima OS
+            if residual_final == 0:
+                self._estoque[slot_id]["medicamento"] = None
+                self._estoque[slot_id]["sku"]         = None
+                self._estoque[slot_id]["categoria"]   = None
             self._estado[slot_id].update({
                 "status":         "concluido",
                 "qtd_dispensada": dispensado,
@@ -693,6 +699,7 @@ class DispenserSimulator:
             PROB_FALHA_IA * 100, PROB_ERRO_CV * 100, TIMEOUT_CNC_POS,
         )
         threading.Thread(target=self._telemetria_loop, daemon=True, name="telemetria").start()
+
 
         while True:
             try:

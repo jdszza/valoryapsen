@@ -623,21 +623,15 @@ def get_dispenser_estado(dispenser_id: int) -> dict | None:
 
 
 def salvar_dispenser_estado(dispenser_id, quantidade_atual, os_id=None, medicamento=None, categoria=None):
+    """Persiste estado do slot. Sempre atualiza medicamento/categoria (inclusive NULL = vazio)."""
     ts = _ts()
     with _conn() as conn:
         with conn.cursor() as cur:
-            if medicamento:
-                cur.execute(
-                    "UPDATE dispenser_estado SET quantidade_atual=%s, ultima_os_id=%s, "
-                    "medicamento=%s, categoria=%s, atualizado_em=%s WHERE dispenser_id=%s",
-                    (quantidade_atual, os_id, medicamento, categoria, ts, dispenser_id),
-                )
-            else:
-                cur.execute(
-                    "UPDATE dispenser_estado SET quantidade_atual=%s, ultima_os_id=%s, "
-                    "atualizado_em=%s WHERE dispenser_id=%s",
-                    (quantidade_atual, os_id, ts, dispenser_id),
-                )
+            cur.execute(
+                "UPDATE dispenser_estado SET quantidade_atual=%s, ultima_os_id=%s, "
+                "medicamento=%s, categoria=%s, atualizado_em=%s WHERE dispenser_id=%s",
+                (quantidade_atual, os_id, medicamento, categoria, ts, dispenser_id),
+            )
 
 
 def limpar_dispenser_estado(dispenser_id: int):

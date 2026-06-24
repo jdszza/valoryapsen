@@ -204,10 +204,14 @@ class CNCSimulator:
             self.total_ciclos    = len(self.os_itens)
             self.state           = "aguardando_atribuicao"
 
+        meds_str = ", ".join(
+            i.get("medicamento", "?") + " x" + str(i.get("quantidade", "?"))
+            for i in self.os_itens
+        )
         logger.info(
             f"\n{'='*60}\n"
             f"  [CNC] OS RECEBIDA: {self.os_id}\n"
-            f"  Medicamentos: {[(i['dispenser_id'], i['medicamento']) for i in self.os_itens]}\n"
+            f"  Medicamentos ({len(self.os_itens)}): {meds_str}\n"
             f"  Aguardando atribuição da IA...\n"
             f"{'='*60}"
         )
@@ -557,7 +561,7 @@ class CNCSimulator:
                 self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
                 self.client.loop_forever(retry_first_connection=True)
             except Exception as exc:
-                logger.error(f"Erro MQTT: {exc}. Reconectando em {RECONNECT_DELAY}s...")
+                logger.error("Erro MQTT: %s. Reconectando em %ds...", exc, RECONNECT_DELAY)
                 time.sleep(RECONNECT_DELAY)
 
 
