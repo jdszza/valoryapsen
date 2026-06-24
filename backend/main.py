@@ -35,14 +35,15 @@ from pydantic import BaseModel
 from auth import criar_token, decodificar_token, verificar_senha
 from config import settings
 from database import (
-    atualizar_item_os, atualizar_status_ordem,
+    atribuir_dispenser_item, atualizar_item_os, atualizar_status_ordem,
     atualizar_usuario, criar_usuario,
     get_alarmes, get_cnc_recentes, get_dispensas, get_dispensas_recentes,
     get_dispenser_estado, get_dispensers_estado,
     get_historico_ordens, get_historico_sensor, get_log_manutencao,
     get_ordem_ativa, get_ordem_por_id, get_ultimas_leituras,
     get_usuario, get_usuarios,
-    init_db, limpar_dispenser_estado, resolver_alarme,
+    init_db, limpar_dispenser_estado, listar_categorias, listar_medicamentos,
+    resolver_alarme,
     salvar_alarme, salvar_cnc_evento, salvar_dispensa, salvar_dispenser_estado,
     salvar_leitura_sensor, salvar_manutencao, salvar_ordem,
     toggle_usuario_ativo,
@@ -66,18 +67,21 @@ _estado = {
     "os_ativa": None,
     "dispensers": {
         str(i): {
-            "status":             "idle",
-            "medicamento":        None,   # preenchido dinamicamente pelo dispenser_simulator
-            "sku":                None,
-            "categoria":          None,
-            "quantidade":         0,      # estoque residual atual no slot
-            "quantidade_alvo":    0,
+            "status":                "idle",
+            "medicamento":           None,   # preenchido dinamicamente
+            "sku":                   None,
+            "categoria":             None,
+            "quantidade":            0,      # estoque residual no slot
+            "quantidade_alvo":       0,
             "quantidade_dispensada": 0,
             "quantidade_residual":   0,
-            "os_id":              None,
+            "os_id":                 None,
         }
         for i in range(1, 7)
     },
+    # Fila de OS (FIFO) — rastreada no backend para exibição no dashboard
+    "fila_os": [],        # lista de os_id aguardando processamento
+    "fila_tamanho": 0,    # contagem para exibição rápida
     "atribuicao_ia": [],
     "alarmes_ativos": 0,
 }
@@ -137,35 +141,74 @@ def _enfileirar_broadcast(data: dict):
 # ── Handlers MQTT ──────────────────────────────────────────────────────────────
 
 def _handle_os_nova(payload: dict):
-    os_id       = payload.get("os_id")
-    descricao   = payload.get("descricao", "")
+    os_id        = payload.get("os_id")
+    descricao    = payload.get("descricao", "")
     medicamentos = payload.get("medicamentos", [])
 
     if not os_id or not medicamentos:
         logger.warning("[MQTT] OS inválida recebida — ignorando.")
         return
 
-    salvar_ordem(os_id, descricao, medicamentos, payload)
+    # Persiste no banco (não falha a memória se houver erro de DB)
+    try:
+        salvar_ordem(os_id, descricao, medicamentos, payload)
+    except Exception as exc:
+        logger.error(f"[DB] Erro ao salvar OS {os_id}: {exc}", exc_info=True)
+
+    # Atualiza estado em memória (sempre, independente do DB)
     with _lock:
-        _estado["os_ativa"] = {
-            "os_id": os_id,
-            "descricao": descricao,
-            "status": "aguardando",
-            "itens": medicamentos,
-        }
+        # Se não há OS ativa, esta vira a ativa; senão vai para a fila de rastreio
+        if _estado["os_ativa"] is None:
+            _estado["os_ativa"] = {
+                "os_id":    os_id,
+                "descricao": descricao,
+                "status":   "aguardando",
+                "categoria": payload.get("categoria", ""),
+                "itens":    medicamentos,
+            }
+        else:
+            # OS vai para a fila do dispenser_simulator — rastreia aqui para exibição
+            if os_id not in _estado["fila_os"]:
+                _estado["fila_os"].append(os_id)
+                _estado["fila_tamanho"] = len(_estado["fila_os"])
+
     _log("os_nova", f"OS {os_id} recebida da SAP — {len(medicamentos)} medicamento(s).")
-    logger.info(f"[OS] {os_id} registrada: {descricao}")
+    logger.info(f"[OS] {os_id} | {descricao}")
 
 
 def _handle_ia_atribuicao(payload: dict):
-    os_id = payload.get("os_id")
+    os_id      = payload.get("os_id")
     atribuicoes = payload.get("atribuicoes", [])
+
     with _lock:
         _estado["atribuicao_ia"] = atribuicoes
+        # Se esta OS era a ativa, torna-a em andamento e registra os dispensers atribuídos
         if _estado["os_ativa"] and _estado["os_ativa"].get("os_id") == os_id:
-            _estado["os_ativa"]["status"] = "atribuicao_recebida"
-    _log("ia_atribuicao", f"IA atribuiu {len(atribuicoes)} dispenser(s) para OS {os_id}.", payload)
-    logger.info(f"[IA] Atribuição para {os_id}: {atribuicoes}")
+            _estado["os_ativa"]["status"] = "em_andamento"
+            _estado["os_ativa"]["atribuicoes"] = atribuicoes
+        # Se estava na fila, promove para ativa
+        elif os_id in _estado["fila_os"]:
+            _estado["fila_os"].remove(os_id)
+            _estado["fila_tamanho"] = len(_estado["fila_os"])
+            _estado["os_ativa"] = {
+                "os_id":       os_id,
+                "status":      "em_andamento",
+                "atribuicoes": atribuicoes,
+            }
+
+    # Atualiza dispenser_id nos itens do DB (roteamento dinâmico)
+    for a in atribuicoes:
+        try:
+            atribuir_dispenser_item(os_id, a.get("medicamento", ""), a["dispenser_id"])
+        except Exception as exc:
+            logger.warning(f"[DB] Erro ao atribuir dispenser item: {exc}")
+
+    _log("ia_atribuicao", f"Roteamento: {len(atribuicoes)} slot(s) para OS {os_id}.", payload)
+    log_str = " | ".join(
+        f"D{a['dispenser_id']}←{a.get('medicamento','?')}×{a.get('quantidade','?')}"
+        for a in atribuicoes
+    )
+    logger.info(f"[IA] {os_id}: {log_str}")
 
 
 def _handle_dispenser_carregamento(payload: dict):
@@ -334,6 +377,10 @@ def _handle_cnc_status(payload: dict):
         except Exception as exc:
             logger.warning(f"[DB] Erro ao fechar OS {os_id}: {exc}")
         _log("cnc_concluido", f"CNC concluiu OS {os_id}")
+        # Libera slot de OS ativa (próxima da fila será ativada quando chegar atribuicao_ia)
+        with _lock:
+            if _estado["os_ativa"] and _estado["os_ativa"].get("os_id") == os_id:
+                _estado["os_ativa"] = None
 
     if sts == "erro":
         falha = payload.get("mensagem", "Erro desconhecido na CNC")
@@ -366,15 +413,31 @@ def _handle_manut_uso(payload: dict):
         logger.warning(f"[DB] Sensor uso: {exc}")
 
 
+def _handle_os_concluida(payload: dict):
+    """OS processada com sucesso — libera slot de os_ativa e rastreia fila."""
+    os_id          = payload.get("os_id")
+    fila_restante  = payload.get("fila_restante", 0)
+    with _lock:
+        if _estado["os_ativa"] and _estado["os_ativa"].get("os_id") == os_id:
+            _estado["os_ativa"] = None
+        # Remove da fila de rastreio se ainda estava lá
+        if os_id in _estado["fila_os"]:
+            _estado["fila_os"].remove(os_id)
+        _estado["fila_tamanho"] = len(_estado["fila_os"])
+    _log("os_concluida", f"OS {os_id} concluída. Fila restante: {fila_restante}.")
+
+
 # ── MQTT Client ────────────────────────────────────────────────────────────────
 _HANDLERS = {
     "apsen/os/nova":                _handle_os_nova,
+    "apsen/os/concluida":           _handle_os_concluida,
     "apsen/ia/atribuicao":          _handle_ia_atribuicao,
     "apsen/dispenser/carregamento": _handle_dispenser_carregamento,
     "apsen/dispenser/pronto":       _handle_dispenser_pronto,
     "apsen/dispenser/evento":       _handle_dispenser_evento,
     "apsen/dispenser/status":       _handle_dispenser_status,
     "apsen/dispenser/limpeza_ok":   _handle_dispenser_limpeza_ok,
+    "apsen/dispenser/limpeza_erro": lambda p: _log("limpeza_erro", p.get("mensagem", "Erro limpeza")),
     "apsen/cnc/status":             _handle_cnc_status,
     "apsen/manut/temperatura":      _handle_manut_temperatura,
     "apsen/manut/uso":              _handle_manut_uso,
@@ -484,6 +547,11 @@ class UsuarioUpdateReq(BaseModel):
 # ENDPOINTS — DASHBOARD (sem autenticação — read-only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@app.get("/ping")
+def ping():
+    return {"status": "ok", "service": "apsen-backend"}
+
+
 @app.get("/estado")
 def get_estado():
     with _lock:
@@ -510,6 +578,22 @@ def os_detalhe(os_id: str):
     if not ordem:
         raise HTTPException(404, "OS não encontrada")
     return ordem
+
+
+@app.get("/medicamentos")
+def get_medicamentos(categoria: str = None):
+    """
+    Catálogo completo de medicamentos APSEN.
+    Query param opcional: ?categoria=snc | cardiologia | infectologia | ...
+    Retorna lista com: nome, sku, categoria, categoria_desc, dimensao
+    """
+    return listar_medicamentos(categoria)
+
+
+@app.get("/medicamentos/categorias")
+def get_categorias():
+    """Lista as 12 categorias terapêuticas com total de medicamentos cada."""
+    return listar_categorias()
 
 
 @app.get("/dispensas")
@@ -619,26 +703,46 @@ def manut_resolver_alarme(alarme_id: int, user=Depends(_get_tecnico)):
 
 @app.post("/manutencao/dispensers/{dispenser_id}/limpar")
 def manut_limpar_dispenser(dispenser_id: int, user=Depends(_get_tecnico)):
-    """Publica comando de limpeza no MQTT. O dispenser confirma via limpeza_ok."""
+    """Publica comando de limpeza no MQTT. Bloqueado se slot está em operação."""
     if dispenser_id not in range(1, 7):
         raise HTTPException(400, "dispenser_id deve ser 1-6")
 
-    payload = json.dumps({
-        "dispenser_id": dispenser_id,
-        "solicitado_por": user["sub"],
-        "timestamp": _ts(),
-    })
-    _mqtt.publish(f"apsen/dispenser/limpar", payload)
+    # Verifica se o slot está em operação ativa
+    with _lock:
+        d_info   = _estado["dispensers"].get(str(dispenser_id), {})
+        d_status = d_info.get("status", "idle")
+        os_ativa = _estado["os_ativa"]
 
-    # Registra no log de manutenção
+    STATUS_BLOQUEADOS = {"carregando", "pronto", "dispensando"}
+    if d_status in STATUS_BLOQUEADOS:
+        med = d_info.get("medicamento", f"Dispenser {dispenser_id}")
+        os_id_ativo = (os_ativa or {}).get("os_id", "?")
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Dispenser {dispenser_id} ({med}) está em operação "
+            f"(status: '{d_status}') na OS {os_id_ativo}. "
+            "Aguarde a contagem finalizar antes de limpar."
+        )
+
+    payload = json.dumps({
+        "dispenser_id":  dispenser_id,
+        "solicitado_por": user["sub"],
+        "timestamp":     _ts(),
+    })
+    _mqtt.publish("apsen/dispenser/limpar", payload)
+
     salvar_manutencao(
         tipo="limpeza_dispenser",
         componente=f"dispenser_{dispenser_id}",
         descricao=f"Limpeza manual solicitada pelo técnico {user['sub']}",
         tecnico=user["sub"],
     )
-    _log("limpeza_solicitada", f"Limpeza solicitada para dispenser {dispenser_id} por {user['sub']}")
-    return {"ok": True, "dispenser_id": dispenser_id, "msg": "Comando enviado. Aguardando confirmação."}
+    _log("limpeza_solicitada", f"Limpeza D{dispenser_id} por {user['sub']}")
+    return {
+        "ok": True,
+        "dispenser_id": dispenser_id,
+        "msg": "Comando enviado. Aguardando confirmação do dispenser.",
+    }
 
 
 # ── Usuários (somente admin) ───────────────────────────────────────────────────

@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+.env
+
+# Variáveis de ambiente
+.env.local
+.env.*.local
+*.env
+
+# Docker volumes (nunca commitar dados do banco)
+mysql_data/
+mqtt_data/
+
+# Logs
+*.log
+logs/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Arquivos temporários de desenvolvimento
+*.tmp
+*.bak
+test_sync*.txt

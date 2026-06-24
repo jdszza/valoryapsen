@@ -19,12 +19,20 @@ version: "3.9"
 #   docker compose down -v && docker compose build --no-cache && docker compose up -d
 # ═══════════════════════════════════════════════════════════════════════════════
 
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+    tag: "{{.Name}}"
+
 services:
 
   # ── MySQL ───────────────────────────────────────────────────────────────────
   mysql:
     image: mysql:8.0
     container_name: apsen-mysql
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "3306:3306"   # MySQL Workbench: localhost:3306 | user: apsen | pw: apsen_pass_2024
@@ -50,6 +58,7 @@ services:
   mosquitto:
     image: eclipse-mosquitto:2.0
     container_name: apsen-mqtt
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "1883:1883"   # MQTT TCP
@@ -70,6 +79,7 @@ services:
   backend:
     build: ./backend
     container_name: apsen-backend
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "8000:8000"   # API REST + WebSocket /ws
@@ -94,6 +104,7 @@ services:
   dashboard:
     build: ./dashboard
     container_name: apsen-dashboard
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "8050:8050"   # http://localhost:8050 — sem autenticação, somente leitura
@@ -109,6 +120,7 @@ services:
   ihm_web:
     build: ./ihm_web
     container_name: apsen-ihm
+    logging: *default-logging
     restart: unless-stopped
     ports:
       - "8051:8051"   # http://localhost:8051 — requer login (admin/admin123)
@@ -125,13 +137,21 @@ services:
   sap_simulator:
     build: ./sap_simulator
     container_name: apsen-sap-sim
+    logging: *default-logging
     restart: unless-stopped
     environment:
-      MQTT_HOST:    mosquitto
-      MQTT_PORT:    1883
-      INTERVALO_OS: 90      # segundos entre ordens (ajuste para demonstrações)
+      MQTT_HOST:           mosquitto
+      MQTT_PORT:           1883
+      BACKEND_URL:         http://backend:8000
+      INTERVALO_OS:        90      # segundos entre ordens (ajuste para demonstrações)
+      RELOAD_CATALOGO_MIN: 30      # recarregar catálogo do DB a cada 30 min
+      MIN_MEDS_POR_OS:     2       # mínimo de medicamentos distintos por OS
+      MAX_MEDS_POR_OS:     6       # máximo (= número de dispensers físicos)
+      QTD_MIN:             2       # unidades mínimas de cada medicamento
+      QTD_MAX:             15      # unidades máximas de cada medicamento
     depends_on:
       - mosquitto
+      - backend
     networks:
       - apsen-net
 
@@ -140,6 +160,7 @@ services:
   cnc_simulator:
     build: ./cnc_simulator
     container_name: apsen-cnc-sim
+    logging: *default-logging
     restart: unless-stopped
     environment:
       MQTT_HOST:       mosquitto
@@ -159,6 +180,7 @@ services:
   dispenser_simulator:
     build: ./dispenser_simulator
     container_name: apsen-dispenser-sim
+    logging: *default-logging
     restart: unless-stopped
     environment:
       MQTT_HOST:       mosquitto

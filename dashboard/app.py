@@ -208,33 +208,55 @@ def _render(estado: dict, eventos: list, os_hist: list):
     )
 
     # ── OS ativa ──────────────────────────────────────────────────────────────
+    fila_tamanho = estado.get("fila_tamanho", 0)
     if os_ativa:
         os_status = os_ativa.get("status", "?")
         badge_os  = _badge(os_status.upper(), _cor(os_status))
-        os_itens  = os_ativa.get("itens", [])
-        itens_rows = [
-            dbc.Row([
-                dbc.Col(
-                    html.Small(f"Dispenser {item.get('dispenser_id')}:",
-                               className="text-muted"), width=4),
-                dbc.Col(
-                    html.Small(item.get("medicamento", "?"),
-                               className="fw-bold"), width=5),
-                dbc.Col(
-                    html.Small(f"× {item.get('quantidade', 0)}",
-                               className="text-warning"), width=3),
-            ], className="mb-1")
-            for item in os_itens
-        ]
+
+        # Itens da OS — sem dispenser_id fixo (roteamento dinâmico)
+        # Prioriza atribuicoes (com slot atribuído) ou itens originais
+        atribuicoes = os_ativa.get("atribuicoes", [])
+        os_itens    = atribuicoes if atribuicoes else os_ativa.get("itens", [])
+
+        itens_rows = []
+        for item in os_itens:
+            d_id  = item.get("dispenser_id")
+            slot  = f"→ D{d_id}" if d_id else "→ aguardando slot"
+            itens_rows.append(
+                dbc.Row([
+                    dbc.Col(html.Small(slot, className="text-info"),    width=3),
+                    dbc.Col(html.Small(item.get("medicamento", "?"),
+                                       className="fw-bold"),            width=6),
+                    dbc.Col(html.Small(f"× {item.get('quantidade', 0)}",
+                                       className="text-warning"),       width=3),
+                ], className="mb-1")
+            )
+
+        fila_badge = (
+            dbc.Badge(f"📋 {fila_tamanho} na fila", color="warning", className="ms-2")
+            if fila_tamanho else ""
+        )
         card_os = html.Div([
-            html.H5(os_ativa.get("os_id", ""), className="text-primary mb-1"),
-            html.P(os_ativa.get("descricao", ""),
-                   className="text-muted small mb-2"),
+            html.H5([os_ativa.get("os_id", ""), fila_badge],
+                    className="text-primary mb-1"),
+            html.P(
+                [os_ativa.get("descricao", ""),
+                 html.Small(f" [{os_ativa.get('categoria', '')}]",
+                            className="text-muted ms-1")],
+                className="text-muted small mb-2",
+            ),
             *itens_rows,
         ])
     else:
         badge_os = _badge("SEM OS", "secondary")
-        card_os  = html.P("Nenhuma OS em andamento.", className="text-muted")
+        if fila_tamanho:
+            card_os = html.P(
+                [f"{fila_tamanho} OS(s) aguardando na fila…",
+                 dbc.Badge("FILA", color="warning", className="ms-2")],
+                className="text-warning",
+            )
+        else:
+            card_os = html.P("Nenhuma OS em andamento.", className="text-muted")
 
     # ── CNC ───────────────────────────────────────────────────────────────────
     cnc_status   = cnc.get("status", "idle")
@@ -378,24 +400,31 @@ def _render(estado: dict, eventos: list, os_hist: list):
 
     # ── Histórico OS ──────────────────────────────────────────────────────────
     if os_hist and isinstance(os_hist, list):
-        hist_rows = [
-            dbc.Row([
-                dbc.Col(
-                    html.Small(h.get("os_id", "?"),
-                               className="fw-bold text-primary"), md=4),
-                dbc.Col(
-                    html.Small(h.get("descricao", ""),
-                               className="text-muted"), md=5),
-                dbc.Col(
-                    _badge(h.get("status", "?"), _cor(h.get("status", ""))),
-                    md=3,
-                ),
-            ], className="mb-1 border-bottom pb-1")
-            for h in os_hist
-        ]
+        hist_rows = []
+        for h in os_hist:
+            criado = str(h.get("criado_em", ""))[:16].replace("T", " ")
+            hist_rows.append(
+                dbc.Row([
+                    dbc.Col(
+                        html.Small(h.get("os_id", "?")[:22],
+                                   className="fw-bold text-primary"), md=4),
+                    dbc.Col(
+                        [
+                            html.Small(h.get("categoria", ""),
+                                       className="text-info me-1"),
+                            html.Small(criado, className="text-muted"),
+                        ],
+                        md=5,
+                    ),
+                    dbc.Col(
+                        _badge(h.get("status", "?"), _cor(h.get("status", ""))),
+                        md=3,
+                    ),
+                ], className="mb-1 border-bottom pb-1")
+            )
         card_historico_content = html.Div(hist_rows)
     else:
-        card_historico_content = html.P("Sem histórico.", className="text-muted small")
+        card_historico_content = html.P("Sem histórico de OS.", className="text-muted small")
 
     return (
         badge_alarmes,

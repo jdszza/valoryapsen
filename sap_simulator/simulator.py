@@ -1,19 +1,6 @@
 """
-APSEN - Simulador SAP v2.3
-Publica Ordens de Saída agrupadas por categoria terapêutica no MQTT.
-
-IMPORTANTE — Arquitetura de dispensers:
-  - O SAP NÃO define qual dispenser físico recebe cada remédio.
-  - A OS contém apenas: medicamento + SKU + categoria + quantidade.
-  - O sistema de dispensers (dispenser_simulator) decide qual slot usar
-    baseado em estoque residual e disponibilidade de slots.
-
-Catálogo APSEN (Desafio FIAP - Dimensões e Base FINAL.xlsx):
-  SNC        : ALOIS 10MG, DONAREN 50MG, INSIT 75MG, ATENTAH 25MG
-  Alimentício: LACTOSIL 10.000 FCC, LACTOSIL FLORA, PROBID, FLORACOL
-  Cardiaco   : ZANIDIP 10MG, DOBEVEN 500MG, XAFAC 10MG
-  Reumatol.  : ARPADOL 400MG, REUQUINOL 400MG, COLCHIS 0,5MG
-  Infectologia: LEVOXIN 500MG, LECZA XR 500MG
+APSEN - Simulador SAP v3.0
+Gera Ordens de Saida (OS) aleatorias baseadas no catalogo real do banco de dados.
 """
 import json
 import logging
@@ -21,196 +8,162 @@ import os
 import random
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
+import requests
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [SAP-SIM] %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [SAP-SIM] %(levelname)s %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-MQTT_HOST    = os.getenv("MQTT_HOST",    "mosquitto")
-MQTT_PORT    = int(os.getenv("MQTT_PORT", 1883))
-INTERVALO_OS = int(os.getenv("INTERVALO_OS", 90))
-
-# ── Catálogo completo de medicamentos APSEN ──────────────────────────────────
-# Chave: nome do medicamento (como aparece no pedido)
-CATALOGO = {
-    # SNC / Neurologia / Psiquiatria
-    "ALOIS 10MG":       {"sku": "ALOIS 10MG CX C/7 CP",             "categoria": "snc"},
-    "DONAREN 50MG":     {"sku": "DONAREN 50MG CX C/5 CP",           "categoria": "snc"},
-    "INSIT 75MG":       {"sku": "INSIT 75MG CX C/7 CAPS",           "categoria": "snc"},
-    "ATENTAH 25MG":     {"sku": "ATENTAH 25MG CX C/10 CAPS",        "categoria": "snc"},
-    "LENIX 50MG":       {"sku": "LENIX 50MG CX C/2 CP",             "categoria": "snc"},
-    # Alimentício / Probióticos
-    "LACTOSIL 10.000 FCC": {"sku": "LACTOSIL 10.000 FCC CX C/2 COMPRIMIDOS", "categoria": "alimenticio"},
-    "LACTOSIL FLORA":   {"sku": "LACTOSIL FLORA CX C/2 CAPS",       "categoria": "alimenticio"},
-    "PROBID":           {"sku": "PROBID CX C/2 CAPS",               "categoria": "alimenticio"},
-    "FLORACOL":         {"sku": "FLORACOL CX C/2 CAPS",             "categoria": "alimenticio"},
-    # Cardiologia / Vascular
-    "ZANIDIP 10MG":     {"sku": "ZANIDIP 10MG C/5 CP",              "categoria": "cardiaco"},
-    "DOBEVEN 500MG":    {"sku": "DOBEVEN 500MG CX C/10 CP",         "categoria": "cardiaco"},
-    "XAFAC 10MG":       {"sku": "XAFAC 10MG CX C5 CP",              "categoria": "cardiaco"},
-    # Reumatologia / Dor
-    "ARPADOL 400MG":    {"sku": "ARPADOL 400MG CX C/5 CP",          "categoria": "reumatologia"},
-    "REUQUINOL 400MG":  {"sku": "REUQUINOL 400MG CX C/15 CP",       "categoria": "reumatologia"},
-    "COLCHIS 0,5MG":    {"sku": "COLCHIS 0,5MG CX C/15 CP",         "categoria": "reumatologia"},
-    # Infectologia
-    "LEVOXIN 500MG":    {"sku": "LEVOXIN 500MG CX C/3 CP",          "categoria": "infectologia"},
-    "LECZA XR 500MG":   {"sku": "LECZA XR 500MG CX C/5 CP",         "categoria": "infectologia"},
-}
-
-# ── Kits terapêuticos ─────────────────────────────────────────────────────────
-# Cada kit define: quais medicamentos compõem a OS e a faixa de quantidade.
-# Não há referência a dispensers — o sistema de dispensers decide o roteamento.
-KITS = [
-    # ── SNC ──────────────────────────────────────────────────────────────────
-    {
-        "nome":        "Kit SNC Completo — ALOIS + DONAREN",
-        "categoria":   "snc",
-        "medicamentos": ["ALOIS 10MG", "DONAREN 50MG"],
-        "qtd_range":   (5, 14),
-    },
-    {
-        "nome":        "Kit SNC Ansiolítico — DONAREN + INSIT",
-        "categoria":   "snc",
-        "medicamentos": ["DONAREN 50MG", "INSIT 75MG"],
-        "qtd_range":   (5, 10),
-    },
-    {
-        "nome":        "Kit SNC TDAH — ATENTAH + LENIX",
-        "categoria":   "snc",
-        "medicamentos": ["ATENTAH 25MG", "LENIX 50MG"],
-        "qtd_range":   (7, 14),
-    },
-    {
-        "nome":        "Kit SNC — ALOIS 10MG (unitário)",
-        "categoria":   "snc",
-        "medicamentos": ["ALOIS 10MG"],
-        "qtd_range":   (7, 21),
-    },
-    # ── Alimentício ───────────────────────────────────────────────────────────
-    {
-        "nome":        "Kit Alimentício Completo — LACTOSIL + FLORA",
-        "categoria":   "alimenticio",
-        "medicamentos": ["LACTOSIL 10.000 FCC", "LACTOSIL FLORA"],
-        "qtd_range":   (2, 8),
-    },
-    {
-        "nome":        "Kit Probiótico — PROBID + FLORACOL",
-        "categoria":   "alimenticio",
-        "medicamentos": ["PROBID", "FLORACOL"],
-        "qtd_range":   (2, 6),
-    },
-    {
-        "nome":        "Kit Intolerância à Lactose — LACTOSIL 10.000 (unitário)",
-        "categoria":   "alimenticio",
-        "medicamentos": ["LACTOSIL 10.000 FCC"],
-        "qtd_range":   (2, 10),
-    },
-    # ── Cardiaco ──────────────────────────────────────────────────────────────
-    {
-        "nome":        "Kit Cardiovascular — ZANIDIP + DOBEVEN",
-        "categoria":   "cardiaco",
-        "medicamentos": ["ZANIDIP 10MG", "DOBEVEN 500MG"],
-        "qtd_range":   (5, 10),
-    },
-    {
-        "nome":        "Kit Cardiológico Completo — ZANIDIP + DOBEVEN + XAFAC",
-        "categoria":   "cardiaco",
-        "medicamentos": ["ZANIDIP 10MG", "DOBEVEN 500MG", "XAFAC 10MG"],
-        "qtd_range":   (5, 10),
-    },
-    {
-        "nome":        "Kit Anti-hipertensivo — XAFAC 10MG (unitário)",
-        "categoria":   "cardiaco",
-        "medicamentos": ["XAFAC 10MG"],
-        "qtd_range":   (5, 15),
-    },
-    # ── Reumatologia ─────────────────────────────────────────────────────────
-    {
-        "nome":        "Kit Reumatologia — ARPADOL + REUQUINOL",
-        "categoria":   "reumatologia",
-        "medicamentos": ["ARPADOL 400MG", "REUQUINOL 400MG"],
-        "qtd_range":   (5, 15),
-    },
-    {
-        "nome":        "Kit Gota — COLCHIS + REUQUINOL",
-        "categoria":   "reumatologia",
-        "medicamentos": ["COLCHIS 0,5MG", "REUQUINOL 400MG"],
-        "qtd_range":   (5, 15),
-    },
-    # ── Infectologia ─────────────────────────────────────────────────────────
-    {
-        "nome":        "Kit Antibiótico — LEVOXIN + LECZA XR",
-        "categoria":   "infectologia",
-        "medicamentos": ["LEVOXIN 500MG", "LECZA XR 500MG"],
-        "qtd_range":   (3, 10),
-    },
-    # ── Multiterápicos ────────────────────────────────────────────────────────
-    {
-        "nome":        "Kit Neurológico + Suporte Intestinal",
-        "categoria":   "snc+alimenticio",
-        "medicamentos": ["ALOIS 10MG", "LACTOSIL FLORA"],
-        "qtd_range":   (5, 10),
-    },
-    {
-        "nome":        "Kit Cardiológico + Neurológico",
-        "categoria":   "cardiaco+snc",
-        "medicamentos": ["ZANIDIP 10MG", "DONAREN 50MG"],
-        "qtd_range":   (5, 10),
-    },
-]
+MQTT_HOST           = os.getenv("MQTT_HOST",           "mosquitto")
+MQTT_PORT           = int(os.getenv("MQTT_PORT",        1883))
+BACKEND_URL         = os.getenv("BACKEND_URL",          "http://backend:8000")
+INTERVALO_OS        = int(os.getenv("INTERVALO_OS",      90))
+RELOAD_CATALOGO_MIN = int(os.getenv("RELOAD_CATALOGO_MIN", 30))
+MIN_MEDS_POR_OS     = int(os.getenv("MIN_MEDS_POR_OS",  2))
+MAX_MEDS_POR_OS     = int(os.getenv("MAX_MEDS_POR_OS",  6))
+QTD_MIN             = int(os.getenv("QTD_MIN",          2))
+QTD_MAX             = int(os.getenv("QTD_MAX",         15))
 
 
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _gerar_os() -> dict:
-    kit = random.choice(KITS)
-    os_id = (
-        f"OS-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-        f"-{str(uuid.uuid4())[:6].upper()}"
-    )
-    qtd_min, qtd_max = kit["qtd_range"]
+# ── Catalogo ──────────────────────────────────────────────────────────────────
 
-    # Monta lista de medicamentos SEM dispenser_id
-    # O sistema de dispensers é responsável pelo roteamento físico
-    medicamentos = []
-    for med_nome in kit["medicamentos"]:
-        info = CATALOGO[med_nome]
-        medicamentos.append({
-            "medicamento": med_nome,
-            "sku":         info["sku"],
-            "categoria":   info["categoria"],
-            "quantidade":  random.randint(qtd_min, qtd_max),
-        })
+def _carregar_catalogo(tentativas: int = 20) -> dict:
+    """
+    Busca medicamentos do backend e organiza por categoria.
+    Retenta com espera progressiva para dar tempo ao DB popular os seeds.
+    """
+    url = BACKEND_URL + "/medicamentos"
+    for i in range(tentativas):
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            meds = resp.json()
 
-    paciente_id = f"PAC-{random.randint(10000, 99999)}"
-    lote        = f"LOTE-{random.randint(1000, 9999)}"
+            if not meds:
+                espera = min(10, 3 + i * 2)
+                logger.warning(
+                    "Catalogo vazio (DB ainda inicializando?). "
+                    "Tentativa %d/%d. Aguardando %ds...", i + 1, tentativas, espera
+                )
+                time.sleep(espera)
+                continue
+
+            catalogo = defaultdict(list)
+            for m in meds:
+                catalogo[m["categoria"]].append(m)
+
+            catalogo = {
+                cat: lista
+                for cat, lista in catalogo.items()
+                if len(lista) >= MIN_MEDS_POR_OS
+            }
+
+            total = sum(len(v) for v in catalogo.values())
+            if total == 0:
+                logger.warning("Nenhuma categoria valida ainda. Tentativa %d/%d.", i + 1, tentativas)
+                time.sleep(5)
+                continue
+
+            logger.info("Catalogo carregado: %d medicamentos em %d categorias", total, len(catalogo))
+            for cat, meds_cat in sorted(catalogo.items()):
+                logger.info("  [%s] %d medicamentos", cat, len(meds_cat))
+            return dict(catalogo)
+
+        except Exception as exc:
+            espera = min(15, 5 + i * 2)
+            logger.warning("Catalogo: tentativa %d/%d falhou - %s. Aguardando %ds...",
+                           i + 1, tentativas, exc, espera)
+            time.sleep(espera)
+
+    logger.error("Nao foi possivel carregar o catalogo. Encerrando.")
+    raise SystemExit(1)
+
+
+# ── Geracao de OS ─────────────────────────────────────────────────────────────
+
+def _gerar_os(catalogo: dict) -> dict:
+    """
+    Gera uma OS aleatoria:
+    - Escolhe categoria aleatoria ponderada pelo tamanho
+    - Sorteia N medicamentos distintos (MIN_MEDS_POR_OS <= N <= MAX_MEDS_POR_OS)
+    - Atribui quantidade aleatoria para cada
+    """
+    if not catalogo:
+        raise ValueError("Catalogo de medicamentos esta vazio.")
+
+    categorias = list(catalogo.keys())
+    pesos      = [len(catalogo[c]) for c in categorias]
+    categoria  = random.choices(categorias, weights=pesos, k=1)[0]
+
+    meds_disponiveis = catalogo[categoria]
+    n            = min(random.randint(MIN_MEDS_POR_OS, MAX_MEDS_POR_OS), len(meds_disponiveis))
+    selecionados = random.sample(meds_disponiveis, n)
+
+    ts_str      = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    uid_str     = str(uuid.uuid4())[:6].upper()
+    os_id       = "OS-" + ts_str + "-" + uid_str
+    paciente_id = "PAC-" + str(random.randint(10000, 99999))
+    lote        = "LOTE-" + str(random.randint(1000, 9999))
+
+    medicamentos = [
+        {
+            "medicamento": m["nome"],
+            "sku":         m["sku"],
+            "categoria":   m["categoria"],
+            "quantidade":  random.randint(QTD_MIN, QTD_MAX),
+        }
+        for m in selecionados
+    ]
+
+    cat_desc  = selecionados[0].get("categoria_desc", categoria)
+    descricao = cat_desc + " - " + paciente_id
 
     return {
-        "os_id":        os_id,
-        "descricao":    f"{kit['nome']} — {paciente_id}",
-        "categoria":    kit["categoria"],
-        "kit":          kit["nome"],
-        "lote":         lote,
-        "paciente_id":  paciente_id,
-        "medicamentos": medicamentos,
-        "criado_em":    _ts(),
-        "origem":       "SAP_SIM_v2.3",
+        "os_id":          os_id,
+        "descricao":      descricao,
+        "categoria":      categoria,
+        "categoria_desc": cat_desc,
+        "lote":           lote,
+        "paciente_id":    paciente_id,
+        "medicamentos":   medicamentos,
+        "criado_em":      _ts(),
+        "origem":         "SAP_SIM_v3.0",
     }
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
-    client = mqtt.Client(client_id="apsen-sap-simulator-v23")
+    logger.info("Aguardando backend (%s)...", BACKEND_URL)
+    for i in range(40):
+        try:
+            requests.get(BACKEND_URL + "/ping", timeout=5)
+            logger.info("Backend disponivel.")
+            break
+        except Exception:
+            logger.info("  backend nao disponivel ainda (%d/40)...", i + 1)
+            time.sleep(5)
+
+    catalogo      = _carregar_catalogo()
+    ultimo_reload = time.time()
+
+    client = mqtt.Client(client_id="apsen-sap-simulator-v30")
 
     def on_connect(c, userdata, flags, rc):
         if rc == 0:
-            logger.info(f"SAP Simulator v2.3 conectado ({MQTT_HOST}:{MQTT_PORT})")
+            logger.info("MQTT conectado - %s:%d", MQTT_HOST, MQTT_PORT)
         else:
-            logger.error(f"Falha MQTT rc={rc}")
+            logger.error("MQTT falhou rc=%d", rc)
 
     client.on_connect = on_connect
 
@@ -219,31 +172,48 @@ def main():
             client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
             break
         except Exception as exc:
-            logger.warning(f"Aguardando broker ({attempt+1}/30): {exc}")
+            logger.warning("Broker nao disponivel (%d/30): %s", attempt + 1, exc)
             time.sleep(3)
     else:
-        logger.error("Falha ao conectar ao broker após 30 tentativas.")
+        logger.error("Nao foi possivel conectar ao broker MQTT.")
         return
 
     client.loop_start()
-    time.sleep(5)
+    time.sleep(3)
 
-    logger.info(f"SAP Simulator v2.3 pronto — OS a cada {INTERVALO_OS}s")
-    logger.info(f"{len(CATALOGO)} medicamentos no catálogo | {len(KITS)} kits disponíveis")
-    logger.info("Dispensers: roteamento dinâmico (nenhum slot é fixo)")
+    total_meds = sum(len(v) for v in catalogo.values())
+    logger.info("SAP Simulator v3.0 pronto - OS a cada %ds | %d medicamentos disponiveis",
+                INTERVALO_OS, total_meds)
 
     while True:
+        if time.time() - ultimo_reload > RELOAD_CATALOGO_MIN * 60:
+            try:
+                catalogo      = _carregar_catalogo(tentativas=3)
+                ultimo_reload = time.time()
+            except Exception as exc:
+                logger.warning("Falha ao recarregar catalogo: %s. Usando anterior.", exc)
+
         try:
-            os_payload = _gerar_os()
-            client.publish("apsen/os/nova", json.dumps(os_payload, ensure_ascii=False), qos=1)
-            itens_str = " | ".join(
-                f"{m['medicamento']} ×{m['quantidade']}"
-                for m in os_payload["medicamentos"]
+            if not catalogo:
+                logger.warning("Catalogo vazio - recarregando antes de gerar OS...")
+                catalogo      = _carregar_catalogo()
+                ultimo_reload = time.time()
+
+            os_payload = _gerar_os(catalogo)
+            client.publish(
+                "apsen/os/nova",
+                json.dumps(os_payload, ensure_ascii=False),
+                qos=1,
             )
-            logger.info(f"[OS] {os_payload['os_id']} — {os_payload['kit']}")
-            logger.info(f"     Medicamentos: {itens_str}")
+            meds = os_payload["medicamentos"]
+            itens_str = " | ".join(m["medicamento"] + " x" + str(m["quantidade"]) for m in meds)
+            logger.info("[OS] %s | categoria=%s | %d medicamentos",
+                        os_payload["os_id"], os_payload["categoria"], len(meds))
+            logger.info("     %s", itens_str)
         except Exception as exc:
-            logger.error(f"Erro ao publicar OS: {exc}", exc_info=True)
+            logger.error("Erro ao gerar/publicar OS: %s", exc, exc_info=True)
+            if "vazio" in str(exc) or "Catalogo" in str(exc):
+                catalogo = {}
 
         time.sleep(INTERVALO_OS)
 
