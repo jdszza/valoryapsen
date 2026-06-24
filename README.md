@@ -125,7 +125,7 @@ Todos os serviços devem estar com status `Up`.
 |---------|-----|
 | Dashboard (monitoramento) | http://localhost:8050 |
 | IHM de Manutenção | http://localhost:8051 |
-| API Backend | http://localhost:8000/docs |
+| API Backend SWAGGER | http://localhost:8000/docs |
 | MySQL Workbench | localhost:3306 — user: `apsen` / pw: `apsen_pass_2024` |
 
 ### 5. Login IHM

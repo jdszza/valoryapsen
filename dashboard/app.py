@@ -273,14 +273,28 @@ def _render(estado: dict, eventos: list, os_hist: list):
     ])
 
     # ── Dispensers ────────────────────────────────────────────────────────────
+    # Slots são dinâmicos — nenhum é fixo para um medicamento.
+    # O dispenser_simulator publica o medicamento atual via MQTT.
     disp_cards = []
     for disp_id in range(1, 7):
-        info  = disp_map.get(str(disp_id), {})
-        d_sts = info.get("status", "idle")
-        med   = info.get("medicamento") or f"Dispenser {disp_id}"
-        qtd_d = info.get("quantidade_dispensada", 0)
-        qtd_a = info.get("quantidade_alvo", 0)
-        pct   = (qtd_d / qtd_a * 100) if qtd_a > 0 else 0
+        info    = disp_map.get(str(disp_id), {})
+        d_sts   = info.get("status", "idle")
+        med     = info.get("medicamento")
+        cat     = info.get("categoria")
+        qtd_d   = info.get("quantidade_dispensada", 0)
+        qtd_a   = info.get("quantidade_alvo", 0)
+        qtd_res = info.get("quantidade", info.get("quantidade_residual", 0))
+        pct     = (qtd_d / qtd_a * 100) if qtd_a > 0 else 0
+
+        # Rótulo do slot
+        if med:
+            med_label  = med
+            cat_label  = html.Small(f"[{cat}]", className="text-muted ms-1") if cat else ""
+            res_label  = html.Small(f" {qtd_res} un. residuais", className="text-muted")
+        else:
+            med_label  = "— Slot livre —"
+            cat_label  = ""
+            res_label  = html.Small("aguardando OS", className="text-muted fst-italic")
 
         disp_cards.append(
             dbc.Col(
@@ -294,10 +308,11 @@ def _render(estado: dict, eventos: list, os_hist: list):
                     ),
                     dbc.CardBody([
                         html.P(
-                            med,
-                            className="mb-1 fw-semibold",
+                            [med_label, cat_label],
+                            className="mb-0 fw-semibold",
                             style={"fontSize": "0.68rem"},
                         ),
+                        html.Div(res_label, className="mb-1"),
                         html.Div(
                             f"{qtd_d} / {qtd_a}" if qtd_a else "—",
                             className="text-center fw-bold mb-1 small",

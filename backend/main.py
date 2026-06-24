@@ -1,5 +1,5 @@
 """
-APSEN - Backend FastAPI v2.0
+APSEN - Backend FastAPI v2.1
 Bridge MQTT → MySQL + API REST para Dashboard (read-only) e IHM (manutenção)
 
 Tópicos MQTT consumidos:
@@ -9,11 +9,12 @@ Tópicos MQTT consumidos:
   apsen/dispenser/pronto        ← Dispenser carregado e pronto
   apsen/dispenser/evento        ← Cada remédio dispensado
   apsen/dispenser/status        ← Status geral dos dispensers
+  apsen/dispenser/limpeza_ok    ← Dispenser confirmou limpeza (novo)
   apsen/cnc/status              ← Status e posição da CNC
   apsen/manut/temperatura       ← Leituras de temperatura (sensores)
   apsen/manut/uso               ← Leituras de desgaste/horas de uso
 
-O backend NÃO controla nenhum sistema. Apenas armazena e serve dados.
+O backend NÃO controla nenhum sistema. Exceto: publica limpar dispenser via MQTT.
 """
 import asyncio
 import collections
@@ -35,11 +36,16 @@ from auth import criar_token, decodificar_token, verificar_senha
 from config import settings
 from database import (
     atualizar_item_os, atualizar_status_ordem,
+    atualizar_usuario, criar_usuario,
     get_alarmes, get_cnc_recentes, get_dispensas, get_dispensas_recentes,
+    get_dispenser_estado, get_dispensers_estado,
     get_historico_ordens, get_historico_sensor, get_log_manutencao,
-    get_ordem_ativa, get_ultimas_leituras, get_usuario,
-    init_db, resolver_alarme, salvar_alarme, salvar_cnc_evento,
-    salvar_dispensa, salvar_leitura_sensor, salvar_manutencao, salvar_ordem,
+    get_ordem_ativa, get_ordem_por_id, get_ultimas_leituras,
+    get_usuario, get_usuarios,
+    init_db, limpar_dispenser_estado, resolver_alarme,
+    salvar_alarme, salvar_cnc_evento, salvar_dispensa, salvar_dispenser_estado,
+    salvar_leitura_sensor, salvar_manutencao, salvar_ordem,
+    toggle_usuario_ativo,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -48,7 +54,6 @@ logger = logging.getLogger(__name__)
 
 # ── Estado em memória (snapshot do sistema) ────────────────────────────────────
 _estado = {
-    # CNC
     "cnc": {
         "status": "idle",
         "os_id": None,
@@ -58,27 +63,26 @@ _estado = {
         "ciclo_atual": 0,
         "total_ciclos": 0,
     },
-    # OS ativa
-    "os_ativa": None,       # dict com os_id, descricao, itens[], status
-    # Dispensers (1-6)
+    "os_ativa": None,
     "dispensers": {
         str(i): {
-            "status": "idle",
-            "medicamento": None,
+            "status":             "idle",
+            "medicamento":        None,   # preenchido dinamicamente pelo dispenser_simulator
+            "sku":                None,
+            "categoria":          None,
+            "quantidade":         0,      # estoque residual atual no slot
+            "quantidade_alvo":    0,
             "quantidade_dispensada": 0,
-            "quantidade_alvo": 0,
+            "quantidade_residual":   0,
+            "os_id":              None,
         }
         for i in range(1, 7)
     },
-    # Atribuições da IA para a OS atual
     "atribuicao_ia": [],
-    # Alarmes ativos (contagem)
     "alarmes_ativos": 0,
 }
 _lock = threading.Lock()
 _loop: Optional[asyncio.AbstractEventLoop] = None
-
-# Buffer em memória de eventos recentes (para dashboard em tempo real)
 _log_eventos: collections.deque = collections.deque(maxlen=100)
 
 
@@ -133,7 +137,6 @@ def _enfileirar_broadcast(data: dict):
 # ── Handlers MQTT ──────────────────────────────────────────────────────────────
 
 def _handle_os_nova(payload: dict):
-    """SAP publica nova Ordem de Saída."""
     os_id       = payload.get("os_id")
     descricao   = payload.get("descricao", "")
     medicamentos = payload.get("medicamentos", [])
@@ -155,7 +158,6 @@ def _handle_os_nova(payload: dict):
 
 
 def _handle_ia_atribuicao(payload: dict):
-    """IA publicou a atribuição de dispensers para a OS."""
     os_id = payload.get("os_id")
     atribuicoes = payload.get("atribuicoes", [])
     with _lock:
@@ -167,19 +169,17 @@ def _handle_ia_atribuicao(payload: dict):
 
 
 def _handle_dispenser_carregamento(payload: dict):
-    """CV monitora carregamento do dispenser."""
     disp_id  = str(payload.get("dispenser_id", "?"))
-    status   = payload.get("status", "")
+    sts      = payload.get("status", "")
     med      = payload.get("medicamento", "")
-    os_id    = payload.get("os_id", "")
     falha    = payload.get("motivo_falha")
 
     with _lock:
         if disp_id in _estado["dispensers"]:
             _estado["dispensers"][disp_id]["medicamento"] = med
-            _estado["dispensers"][disp_id]["status"] = f"carregando_{status}"
+            _estado["dispensers"][disp_id]["status"] = f"carregando_{sts}"
 
-    if status == "erro":
+    if sts == "erro":
         salvar_alarme(
             fonte=f"dispenser_{disp_id}",
             tipo="erro_carregamento",
@@ -190,12 +190,11 @@ def _handle_dispenser_carregamento(payload: dict):
         _log("alarme", f"ERRO carregamento dispenser {disp_id}: {falha}")
         logger.error(f"[DISP-{disp_id}] Erro de carregamento: {falha}")
     else:
-        _log("carregamento", f"Dispenser {disp_id} carregando {med} — CV: {status}")
-        logger.info(f"[DISP-{disp_id}] Carregamento {status}: {med}")
+        _log("carregamento", f"Dispenser {disp_id} carregando {med} — CV: {sts}")
+        logger.info(f"[DISP-{disp_id}] Carregamento {sts}: {med}")
 
 
 def _handle_dispenser_pronto(payload: dict):
-    """Dispenser carregado e pronto para dispensar."""
     disp_id = str(payload.get("dispenser_id", "?"))
     med     = payload.get("medicamento", "")
     alvo    = payload.get("quantidade_alvo", 0)
@@ -214,22 +213,22 @@ def _handle_dispenser_pronto(payload: dict):
 
 
 def _handle_dispenser_evento(payload: dict):
-    """Cada remédio dispensado para a caixa."""
     os_id    = payload.get("os_id", "")
     disp_id  = payload.get("dispenser_id")
     med      = payload.get("medicamento", "")
-    qtd_disp = payload.get("quantidade_dispensada", 0)  # acumulado
+    qtd_disp = payload.get("quantidade_dispensada", 0)
     qtd_alvo = payload.get("quantidade_alvo", 0)
     validado = payload.get("validado", True)
     falha    = payload.get("motivo_falha")
+    residual = payload.get("quantidade_residual", 0)
 
-    # Persiste no banco
     salvar_dispensa(os_id, disp_id, med, qtd_disp, qtd_alvo, validado, falha)
 
     disp_key = str(disp_id)
     with _lock:
         if disp_key in _estado["dispensers"]:
             _estado["dispensers"][disp_key]["quantidade_dispensada"] = qtd_disp
+            _estado["dispensers"][disp_key]["quantidade_residual"] = residual
             if qtd_disp >= qtd_alvo:
                 _estado["dispensers"][disp_key]["status"] = "concluido"
 
@@ -243,9 +242,8 @@ def _handle_dispenser_evento(payload: dict):
             _estado["alarmes_ativos"] += 1
         _log("falha_ia", f"Dispenser {disp_id} falha IA: {falha}")
     else:
-        _log("dispensa", f"Dispenser {disp_id} dispensou {qtd_disp}/{qtd_alvo} × {med}")
+        _log("dispensa", f"Dispenser {disp_id} dispensou {qtd_disp}/{qtd_alvo} × {med} | residual={residual}")
 
-    # Atualiza item da OS
     if os_id:
         novo_status = "concluido" if qtd_disp >= qtd_alvo else "em_andamento"
         try:
@@ -253,18 +251,53 @@ def _handle_dispenser_evento(payload: dict):
         except Exception as exc:
             logger.warning(f"[DB] Erro ao atualizar item OS: {exc}")
 
+    # Persiste quantidade residual + medicamento (slot dinâmico — sem medicamento fixo)
+    if disp_id and qtd_disp >= qtd_alvo:
+        try:
+            categoria = payload.get("categoria")
+            salvar_dispenser_estado(disp_id, residual, os_id, med or None, categoria)
+        except Exception as exc:
+            logger.warning(f"[DB] Erro ao salvar estado dispenser {disp_id}: {exc}")
+
 
 def _handle_dispenser_status(payload: dict):
-    """Status geral de um dispenser."""
+    """Atualiza snapshot em memória com estado completo do slot (dinâmico)."""
     disp_id = str(payload.get("dispenser_id", "?"))
-    status  = payload.get("status", "idle")
     with _lock:
         if disp_id in _estado["dispensers"]:
-            _estado["dispensers"][disp_id]["status"] = status
+            _estado["dispensers"][disp_id].update({
+                "status":      payload.get("status", "idle"),
+                "medicamento": payload.get("medicamento"),
+                "sku":         payload.get("sku"),
+                "categoria":   payload.get("categoria"),
+                "quantidade":  payload.get("quantidade", 0),
+                "os_id":       payload.get("os_id"),
+            })
+
+
+def _handle_dispenser_limpeza_ok(payload: dict):
+    """Dispenser confirmou limpeza manual."""
+    disp_id = payload.get("dispenser_id")
+    if not disp_id:
+        return
+    disp_key = str(disp_id)
+    with _lock:
+        if disp_key in _estado["dispensers"]:
+            _estado["dispensers"][disp_key].update({
+                "status": "limpo",
+                "quantidade_dispensada": 0,
+                "quantidade_alvo": 0,
+                "quantidade_residual": 0,
+            })
+    try:
+        limpar_dispenser_estado(disp_id)
+    except Exception as exc:
+        logger.warning(f"[DB] Erro ao limpar estado dispenser {disp_id}: {exc}")
+    _log("limpeza_ok", f"Dispenser {disp_id} limpo com sucesso.")
+    logger.info(f"[DISP-{disp_id}] Limpeza confirmada.")
 
 
 def _handle_cnc_status(payload: dict):
-    """Status e posição da CNC."""
     os_id   = payload.get("os_id")
     sts     = payload.get("status", "idle")
     disp_al = payload.get("dispenser_alvo")
@@ -283,14 +316,12 @@ def _handle_cnc_status(payload: dict):
             "ciclo_atual": ciclo,
             "total_ciclos": total,
         })
-        # Atualiza status da OS ativa
         if _estado["os_ativa"] and os_id and _estado["os_ativa"].get("os_id") == os_id:
             if sts == "concluido":
                 _estado["os_ativa"]["status"] = "concluida"
             elif sts not in ("idle",):
                 _estado["os_ativa"]["status"] = "em_andamento"
 
-    # Persiste no banco (somente mudanças relevantes)
     if sts in ("posicionado", "concluido", "erro", "movendo"):
         try:
             salvar_cnc_evento(os_id, sts, disp_al, pos_x, pos_y, ciclo, total)
@@ -343,6 +374,7 @@ _HANDLERS = {
     "apsen/dispenser/pronto":       _handle_dispenser_pronto,
     "apsen/dispenser/evento":       _handle_dispenser_evento,
     "apsen/dispenser/status":       _handle_dispenser_status,
+    "apsen/dispenser/limpeza_ok":   _handle_dispenser_limpeza_ok,
     "apsen/cnc/status":             _handle_cnc_status,
     "apsen/manut/temperatura":      _handle_manut_temperatura,
     "apsen/manut/uso":              _handle_manut_uso,
@@ -389,18 +421,18 @@ async def lifespan(app: FastAPI):
     _mqtt.connect(settings.MQTT_HOST, settings.MQTT_PORT, keepalive=60)
     _mqtt.loop_start()
     task = asyncio.create_task(_broadcast_worker())
-    logger.info("Backend APSEN v2.0 iniciado.")
+    logger.info("Backend APSEN v2.1 iniciado.")
     yield
     task.cancel()
     _mqtt.loop_stop()
     _mqtt.disconnect()
 
 
-app = FastAPI(title="APSEN Backend v2", lifespan=lifespan)
+app = FastAPI(title="APSEN Backend v2.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
-# ── Auth helpers (somente para IHM) ───────────────────────────────────────────
+# ── Auth helpers ───────────────────────────────────────────────────────────────
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -411,6 +443,12 @@ def _get_tecnico(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer
     if not payload:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token inválido")
     return payload
+
+
+def _get_admin(user=Depends(_get_tecnico)):
+    if user.get("role") != "admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Requer perfil admin")
+    return user
 
 
 # ── Modelos ────────────────────────────────────────────────────────────────────
@@ -425,20 +463,35 @@ class ManutencaoReq(BaseModel):
     descricao: str
 
 
+class StatusOSReq(BaseModel):
+    status: str  # aguardando | em_andamento | concluida | erro | cancelada
+
+
+class UsuarioReq(BaseModel):
+    username: str
+    senha: str
+    nome_completo: str
+    role: str = "manutencao"
+
+
+class UsuarioUpdateReq(BaseModel):
+    nome_completo: Optional[str] = None
+    role: Optional[str] = None
+    nova_senha: Optional[str] = None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS — DASHBOARD (sem autenticação — read-only público)
+# ENDPOINTS — DASHBOARD (sem autenticação — read-only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/estado")
 def get_estado():
-    """Snapshot completo do estado atual do sistema."""
     with _lock:
         return dict(_estado)
 
 
 @app.get("/os/ativa")
 def os_ativa():
-    """OS em andamento com itens e progresso de cada dispenser."""
     ordem = get_ordem_ativa()
     if not ordem:
         return {"os_ativa": None}
@@ -446,8 +499,17 @@ def os_ativa():
 
 
 @app.get("/os/historico")
-def os_historico(limite: int = 20):
+def os_historico(limite: int = 50):
     return get_historico_ordens(limite)
+
+
+@app.get("/os/{os_id}")
+def os_detalhe(os_id: str):
+    """Retorna OS completa com payload_json e itens."""
+    ordem = get_ordem_por_id(os_id)
+    if not ordem:
+        raise HTTPException(404, "OS não encontrada")
+    return ordem
 
 
 @app.get("/dispensas")
@@ -455,6 +517,12 @@ def dispensas(os_id: str = None, limite: int = 100):
     if os_id:
         return get_dispensas(os_id, limite)
     return get_dispensas_recentes(limite)
+
+
+@app.get("/dispensers/estado")
+def dispensers_estado():
+    """Estado atual de todos os 6 dispensers (quantidade residual, medicamento)."""
+    return get_dispensers_estado()
 
 
 @app.get("/cnc/historico")
@@ -469,7 +537,6 @@ def alarmes(resolvido: bool = False, limite: int = 50):
 
 @app.get("/log/eventos")
 def log_eventos(limite: int = 50):
-    """Log em memória de eventos recentes (dashboard tempo real)."""
     return list(_log_eventos)[:limite]
 
 
@@ -482,18 +549,38 @@ def login(req: LoginReq):
     user = get_usuario(req.username)
     if not user or not verificar_senha(req.senha, user["senha_hash"]):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Credenciais inválidas")
-    token = criar_token(user["username"], user["nome_completo"])
-    return {"token": token, "username": user["username"], "nome": user["nome_completo"]}
+    role  = user.get("role", "manutencao")
+    token = criar_token(user["username"], user["nome_completo"], role)
+    return {
+        "token": token,
+        "username": user["username"],
+        "nome": user["nome_completo"],
+        "role": role,
+    }
 
 
 @app.get("/auth/me")
 def me(user=Depends(_get_tecnico)):
-    return {"username": user["sub"], "nome": user["nome"]}
+    return {"username": user["sub"], "nome": user["nome"], "role": user.get("role")}
 
+
+# ── OS ─────────────────────────────────────────────────────────────────────────
+
+@app.put("/ordens/{os_id}/status")
+def alterar_status_os(os_id: str, req: StatusOSReq, user=Depends(_get_tecnico)):
+    """Altera o status de uma OS manualmente (IHM)."""
+    validos = {"aguardando", "em_andamento", "concluida", "erro", "cancelada"}
+    if req.status not in validos:
+        raise HTTPException(400, f"Status inválido. Use: {validos}")
+    atualizar_status_ordem(os_id, req.status)
+    _log("os_status", f"OS {os_id} → {req.status} por {user['sub']}")
+    return {"ok": True, "os_id": os_id, "status": req.status}
+
+
+# ── Sensores ───────────────────────────────────────────────────────────────────
 
 @app.get("/manutencao/sensores")
 def manut_sensores(user=Depends(_get_tecnico)):
-    """Última leitura de cada componente+tipo."""
     return get_ultimas_leituras()
 
 
@@ -502,6 +589,8 @@ def manut_sensor_hist(componente: str, tipo: str = "temperatura", limite: int = 
                       user=Depends(_get_tecnico)):
     return get_historico_sensor(componente, tipo, limite)
 
+
+# ── Log manutenção ──────────────────────────────────────────────────────────────
 
 @app.get("/manutencao/log")
 def manut_log(limite: int = 100, user=Depends(_get_tecnico)):
@@ -512,6 +601,8 @@ def manut_log(limite: int = 100, user=Depends(_get_tecnico)):
 def manut_registrar(req: ManutencaoReq, user=Depends(_get_tecnico)):
     return salvar_manutencao(req.tipo, req.componente, req.descricao, user["sub"])
 
+
+# ── Alarmes ────────────────────────────────────────────────────────────────────
 
 @app.get("/manutencao/alarmes")
 def manut_alarmes(resolvido: bool = False, limite: int = 100, user=Depends(_get_tecnico)):
@@ -524,11 +615,76 @@ def manut_resolver_alarme(alarme_id: int, user=Depends(_get_tecnico)):
     return {"ok": True}
 
 
+# ── Dispensers ─────────────────────────────────────────────────────────────────
+
+@app.post("/manutencao/dispensers/{dispenser_id}/limpar")
+def manut_limpar_dispenser(dispenser_id: int, user=Depends(_get_tecnico)):
+    """Publica comando de limpeza no MQTT. O dispenser confirma via limpeza_ok."""
+    if dispenser_id not in range(1, 7):
+        raise HTTPException(400, "dispenser_id deve ser 1-6")
+
+    payload = json.dumps({
+        "dispenser_id": dispenser_id,
+        "solicitado_por": user["sub"],
+        "timestamp": _ts(),
+    })
+    _mqtt.publish(f"apsen/dispenser/limpar", payload)
+
+    # Registra no log de manutenção
+    salvar_manutencao(
+        tipo="limpeza_dispenser",
+        componente=f"dispenser_{dispenser_id}",
+        descricao=f"Limpeza manual solicitada pelo técnico {user['sub']}",
+        tecnico=user["sub"],
+    )
+    _log("limpeza_solicitada", f"Limpeza solicitada para dispenser {dispenser_id} por {user['sub']}")
+    return {"ok": True, "dispenser_id": dispenser_id, "msg": "Comando enviado. Aguardando confirmação."}
+
+
+# ── Usuários (somente admin) ───────────────────────────────────────────────────
+
+@app.get("/manutencao/usuarios")
+def listar_usuarios(user=Depends(_get_admin)):
+    return get_usuarios()
+
+
+@app.post("/manutencao/usuarios")
+def criar_novo_usuario(req: UsuarioReq, user=Depends(_get_admin)):
+    resultado = criar_usuario(req.username, req.senha, req.nome_completo, req.role)
+    if not resultado.get("ok"):
+        raise HTTPException(409, resultado.get("erro", "Erro ao criar usuário"))
+    return resultado
+
+
+@app.put("/manutencao/usuarios/{username}")
+def editar_usuario(username: str, req: UsuarioUpdateReq, user=Depends(_get_admin)):
+    resultado = atualizar_usuario(
+        username,
+        nome_completo=req.nome_completo,
+        role=req.role,
+        nova_senha=req.nova_senha,
+    )
+    if not resultado.get("ok"):
+        raise HTTPException(400, resultado.get("erro", "Erro ao atualizar"))
+    return resultado
+
+
+@app.put("/manutencao/usuarios/{username}/desativar")
+def desativar_usuario(username: str, user=Depends(_get_admin)):
+    if username == user["sub"]:
+        raise HTTPException(400, "Não pode desativar a própria conta")
+    return toggle_usuario_ativo(username, False)
+
+
+@app.put("/manutencao/usuarios/{username}/ativar")
+def ativar_usuario(username: str, user=Depends(_get_admin)):
+    return toggle_usuario_ativo(username, True)
+
+
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await _ws_manager.connect(ws)
-    # Envia estado atual ao conectar
     with _lock:
         snap = dict(_estado)
     await ws.send_text(json.dumps({"tipo": "estado", **snap}, default=str))

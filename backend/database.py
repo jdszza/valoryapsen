@@ -1,6 +1,6 @@
 """
 APSEN - Banco de Dados MySQL (PyMySQL)
-Schema v2.0 — ordens, dispensas, CNC, sensores, manutenção, usuários
+Schema v2.1 — ordens, dispensas, CNC, sensores, manutenção, usuários, dispenser_estado
 """
 import json
 import logging
@@ -66,7 +66,7 @@ def init_db():
             with _conn() as conn:
                 _create_tables(conn)
             _seed_usuarios()
-            logger.info("MySQL conectado e schema verificado.")
+            logger.info("MySQL conectado e schema v2.1 verificado.")
             return
         except pymysql.OperationalError as exc:
             logger.warning(f"MySQL não disponível ({attempt+1}/30): {exc}")
@@ -82,6 +82,7 @@ def _create_tables(conn):
             id           INT AUTO_INCREMENT PRIMARY KEY,
             os_id        VARCHAR(60)  NOT NULL UNIQUE,
             descricao    VARCHAR(200) NOT NULL DEFAULT '',
+            categoria    VARCHAR(100) NOT NULL DEFAULT '',
             status       VARCHAR(30)  NOT NULL DEFAULT 'aguardando',
             payload_json TEXT         NOT NULL,
             criado_em    DATETIME(3)  NOT NULL,
@@ -102,15 +103,15 @@ def _create_tables(conn):
         ) ENGINE=InnoDB""",
 
         """CREATE TABLE IF NOT EXISTS dispensas (
-            id                   INT AUTO_INCREMENT PRIMARY KEY,
-            os_id                VARCHAR(60)  NOT NULL,
-            dispenser_id         TINYINT      NOT NULL,
-            medicamento          VARCHAR(100) NOT NULL,
-            quantidade_dispensada INT         NOT NULL,
-            quantidade_alvo      INT          NOT NULL,
-            validado             TINYINT(1)   NOT NULL DEFAULT 1,
-            motivo_falha         TEXT         NULL,
-            ts                   DATETIME(3)  NOT NULL,
+            id                    INT AUTO_INCREMENT PRIMARY KEY,
+            os_id                 VARCHAR(60)  NOT NULL,
+            dispenser_id          TINYINT      NOT NULL,
+            medicamento           VARCHAR(100) NOT NULL,
+            quantidade_dispensada INT          NOT NULL,
+            quantidade_alvo       INT          NOT NULL,
+            validado              TINYINT(1)   NOT NULL DEFAULT 1,
+            motivo_falha          TEXT         NULL,
+            ts                    DATETIME(3)  NOT NULL,
             INDEX idx_disp_os (os_id, dispenser_id, ts),
             INDEX idx_disp_ts (ts)
         ) ENGINE=InnoDB""",
@@ -131,11 +132,11 @@ def _create_tables(conn):
 
         """CREATE TABLE IF NOT EXISTS leituras_sensores (
             id         INT AUTO_INCREMENT PRIMARY KEY,
-            componente VARCHAR(100) NOT NULL,
-            tipo       VARCHAR(30)  NOT NULL,
+            componente VARCHAR(100)  NOT NULL,
+            tipo       VARCHAR(30)   NOT NULL,
             valor      DECIMAL(10,3) NOT NULL,
-            unidade    VARCHAR(20)  NOT NULL,
-            ts         DATETIME(3)  NOT NULL,
+            unidade    VARCHAR(20)   NOT NULL,
+            ts         DATETIME(3)   NOT NULL,
             INDEX idx_sensor_comp (componente, ts),
             INDEX idx_sensor_ts   (ts)
         ) ENGINE=InnoDB""",
@@ -161,11 +162,23 @@ def _create_tables(conn):
             INDEX idx_manut_ts (ts)
         ) ENGINE=InnoDB""",
 
+        # Estado persistente de cada dispenser (quantidade residual entre OS)
+        """CREATE TABLE IF NOT EXISTS dispenser_estado (
+            dispenser_id      TINYINT      PRIMARY KEY,
+            medicamento       VARCHAR(100) NULL,
+            categoria         VARCHAR(100) NULL,
+            quantidade_atual  INT          NOT NULL DEFAULT 0,
+            capacidade        INT          NOT NULL DEFAULT 100,
+            ultima_os_id      VARCHAR(60)  NULL,
+            atualizado_em     DATETIME(3)  NOT NULL
+        ) ENGINE=InnoDB""",
+
         """CREATE TABLE IF NOT EXISTS usuarios (
             id            INT AUTO_INCREMENT PRIMARY KEY,
             username      VARCHAR(100) NOT NULL UNIQUE,
             senha_hash    TEXT         NOT NULL,
             nome_completo VARCHAR(200) NOT NULL DEFAULT '',
+            role          VARCHAR(30)  NOT NULL DEFAULT 'manutencao',
             ativo         TINYINT(1)   NOT NULL DEFAULT 1,
             criado_em     DATETIME(3)  NOT NULL,
             INDEX idx_user (username, ativo)
@@ -174,6 +187,38 @@ def _create_tables(conn):
     with conn.cursor() as cur:
         for ddl in ddl_list:
             cur.execute(ddl)
+
+        # Migrations: adiciona colunas que podem não existir em DB antigas
+        for alter in [
+            "ALTER TABLE ordens ADD COLUMN categoria VARCHAR(100) NOT NULL DEFAULT '' AFTER descricao",
+            "ALTER TABLE usuarios ADD COLUMN role VARCHAR(30) NOT NULL DEFAULT 'manutencao' AFTER nome_completo",
+        ]:
+            try:
+                cur.execute(alter)
+            except Exception:
+                pass  # Coluna já existe
+
+        # Seed dispenser_estado se vazio
+        cur.execute("SELECT COUNT(*) AS n FROM dispenser_estado")
+        if cur.fetchone()["n"] == 0:
+            ts = _ts()
+            # Slots dinâmicos — sem medicamento fixo.
+            # O dispenser_simulator atribui medicamentos conforme as OS chegam.
+            seeds = [
+                (1, None, None, 100),
+                (2, None, None, 100),
+                (3, None, None, 100),
+                (4, None, None, 100),
+                (5, None, None, 100),
+                (6, None, None, 100),
+            ]
+            for d_id, med, cat, cap in seeds:
+                cur.execute(
+                    "INSERT IGNORE INTO dispenser_estado "
+                    "(dispenser_id, medicamento, categoria, quantidade_atual, capacidade, atualizado_em) "
+                    "VALUES (%s,%s,%s,0,%s,%s)",
+                    (d_id, med, cat, cap, ts),
+                )
 
 
 def _seed_usuarios():
@@ -184,15 +229,16 @@ def _seed_usuarios():
                 return
         ts = _ts()
         seeds = [
-            ("admin",  "admin123", "Administrador"),
-            ("manut1", "mnt123",   "Técnico de Manutenção"),
+            ("admin",  "admin123", "Administrador",          "admin"),
+            ("manut1", "mnt123",   "Técnico de Manutenção",  "manutencao"),
         ]
         with conn.cursor() as cur:
-            for username, senha, nome in seeds:
+            for username, senha, nome, role in seeds:
                 cur.execute(
                     "INSERT IGNORE INTO usuarios "
-                    "(username, senha_hash, nome_completo, criado_em) VALUES (%s,%s,%s,%s)",
-                    (username, hash_senha(senha), nome, ts),
+                    "(username, senha_hash, nome_completo, role, criado_em) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (username, hash_senha(senha), nome, role, ts),
                 )
     logger.info("Usuários seed inseridos.")
 
@@ -201,14 +247,15 @@ def _seed_usuarios():
 
 def salvar_ordem(os_id: str, descricao: str, medicamentos: list, payload_raw: dict):
     ts = _ts()
+    categoria = payload_raw.get("categoria", "")
     with _conn(autocommit=False) as conn:
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT IGNORE INTO ordens "
-                    "(os_id, descricao, status, payload_json, criado_em) "
-                    "VALUES (%s,%s,'aguardando',%s,%s)",
-                    (os_id, descricao, json.dumps(payload_raw), ts),
+                    "(os_id, descricao, categoria, status, payload_json, criado_em) "
+                    "VALUES (%s,%s,%s,'aguardando',%s,%s)",
+                    (os_id, descricao, categoria, json.dumps(payload_raw), ts),
                 )
                 if cur.rowcount == 0:
                     conn.rollback()
@@ -273,7 +320,7 @@ def get_ordem_ativa() -> dict | None:
     return ordem
 
 
-def get_historico_ordens(limite: int = 20) -> list:
+def get_historico_ordens(limite: int = 50) -> list:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -283,6 +330,21 @@ def get_historico_ordens(limite: int = 20) -> list:
                 (limite,),
             )
             return _rows(cur.fetchall())
+
+
+def get_ordem_por_id(os_id: str) -> dict | None:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM ordens WHERE os_id=%s", (os_id,))
+            ordem = _row(cur.fetchone())
+            if not ordem:
+                return None
+            cur.execute(
+                "SELECT * FROM os_itens WHERE os_id=%s ORDER BY dispenser_id",
+                (os_id,),
+            )
+            ordem["itens"] = _rows(cur.fetchall())
+    return ordem
 
 
 # ── Dispensas ──────────────────────────────────────────────────────────────────
@@ -364,7 +426,6 @@ def salvar_leitura_sensor(componente: str, tipo: str, valor: float, unidade: str
 
 
 def get_ultimas_leituras() -> list:
-    """Retorna a leitura mais recente de cada componente+tipo."""
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -443,6 +504,65 @@ def get_log_manutencao(limite: int = 100) -> list:
             return _rows(cur.fetchall())
 
 
+# ── Dispenser Estado ───────────────────────────────────────────────────────────
+
+def get_dispensers_estado() -> list:
+    """Retorna o estado atual dos 6 dispensers."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM dispenser_estado ORDER BY dispenser_id"
+            )
+            return _rows(cur.fetchall())
+
+
+def get_dispenser_estado(dispenser_id: int) -> dict | None:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM dispenser_estado WHERE dispenser_id=%s",
+                (dispenser_id,),
+            )
+            return _row(cur.fetchone())
+
+
+def salvar_dispenser_estado(
+    dispenser_id: int,
+    quantidade_atual: int,
+    os_id: str = None,
+    medicamento: str = None,
+    categoria: str = None,
+):
+    """Atualiza quantidade residual e opcionalmente o medicamento do dispenser."""
+    ts = _ts()
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            if medicamento:
+                cur.execute(
+                    "UPDATE dispenser_estado SET quantidade_atual=%s, ultima_os_id=%s, "
+                    "medicamento=%s, categoria=%s, atualizado_em=%s "
+                    "WHERE dispenser_id=%s",
+                    (quantidade_atual, os_id, medicamento, categoria, ts, dispenser_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE dispenser_estado SET quantidade_atual=%s, ultima_os_id=%s, "
+                    "atualizado_em=%s WHERE dispenser_id=%s",
+                    (quantidade_atual, os_id, ts, dispenser_id),
+                )
+
+
+def limpar_dispenser_estado(dispenser_id: int):
+    """Zera o dispenser após limpeza manual."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE dispenser_estado SET quantidade_atual=0, ultima_os_id=NULL, "
+                "atualizado_em=%s WHERE dispenser_id=%s",
+                (_ts(), dispenser_id),
+            )
+
+
 # ── Usuários ───────────────────────────────────────────────────────────────────
 
 def get_usuario(username: str) -> dict | None:
@@ -452,3 +572,56 @@ def get_usuario(username: str) -> dict | None:
                 "SELECT * FROM usuarios WHERE username=%s AND ativo=1", (username,)
             )
             return _row(cur.fetchone())
+
+
+def get_usuarios() -> list:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, nome_completo, role, ativo, criado_em "
+                "FROM usuarios ORDER BY criado_em DESC"
+            )
+            return _rows(cur.fetchall())
+
+
+def criar_usuario(username: str, senha: str, nome_completo: str, role: str = "manutencao") -> dict:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "INSERT INTO usuarios (username, senha_hash, nome_completo, role, criado_em) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (username, hash_senha(senha), nome_completo, role, _ts()),
+                )
+                return {"ok": True, "id": cur.lastrowid}
+            except pymysql.IntegrityError:
+                return {"ok": False, "erro": "username já existe"}
+
+
+def atualizar_usuario(username: str, nome_completo: str = None, role: str = None, nova_senha: str = None) -> dict:
+    updates, vals = [], []
+    if nome_completo is not None:
+        updates.append("nome_completo=%s"); vals.append(nome_completo)
+    if role is not None:
+        updates.append("role=%s"); vals.append(role)
+    if nova_senha is not None:
+        updates.append("senha_hash=%s"); vals.append(hash_senha(nova_senha))
+    if not updates:
+        return {"ok": False, "erro": "nada para atualizar"}
+    vals.append(username)
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE usuarios SET {', '.join(updates)} WHERE username=%s", vals
+            )
+            return {"ok": True, "afetados": cur.rowcount}
+
+
+def toggle_usuario_ativo(username: str, ativo: bool) -> dict:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE usuarios SET ativo=%s WHERE username=%s",
+                (1 if ativo else 0, username),
+            )
+            return {"ok": True, "ativo": ativo}

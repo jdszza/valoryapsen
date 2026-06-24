@@ -23,9 +23,9 @@ def verificar_senha(senha: str, hash_: str) -> bool:
     return _bcrypt.checkpw(senha.encode("utf-8"), hash_.encode("utf-8"))
 
 
-def criar_token(username: str, nome: str) -> str:
+def criar_token(username: str, nome: str, role: str = "manutencao") -> str:
     expira  = datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXP_HOURS)
-    payload = {"sub": username, "nome": nome, "exp": expira}
+    payload = {"sub": username, "nome": nome, "role": role, "exp": expira}
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
 
 
