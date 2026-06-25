@@ -133,13 +133,37 @@ CREATE TABLE IF NOT EXISTS usuarios (
 -- ── Catálogo de medicamentos APSEN (96 itens, 12 categorias terapêuticas) ─────
 -- Fonte: Desafio FIAP - Dimensões e Base FINAL.xlsx / Planilha1
 CREATE TABLE IF NOT EXISTS medicamentos (
-    id         INT AUTO_INCREMENT PRIMARY KEY,
-    nome       VARCHAR(150) NOT NULL UNIQUE,
-    sku        VARCHAR(200) NOT NULL,
-    categoria  VARCHAR(100) NOT NULL,   -- slug curto (snc, cardiologia, etc.)
-    categoria_desc VARCHAR(200) NOT NULL, -- descrição completa
-    dimensao   VARCHAR(60)  NULL,
+    id               INT AUTO_INCREMENT PRIMARY KEY,
+    nome             VARCHAR(150) NOT NULL UNIQUE,
+    sku              VARCHAR(200) NOT NULL,
+    categoria        VARCHAR(100) NOT NULL,   -- slug curto (snc, cardiologia, etc.)
+    categoria_desc   VARCHAR(200) NOT NULL,   -- descrição completa
+    dimensao         VARCHAR(60)  NULL,
+    peso_unitario_g  DECIMAL(8,2) NULL,       -- peso unitário da embalagem (gramas)
     INDEX idx_med_categoria (categoria)
+) ENGINE=InnoDB;
+
+-- Adiciona coluna em DBs já existentes (idempotente)
+ALTER TABLE medicamentos ADD COLUMN IF NOT EXISTS peso_unitario_g DECIMAL(8,2) NULL;
+
+-- ── Histórico de leituras de visão computacional ──────────────────────────────
+CREATE TABLE IF NOT EXISTS visao_leituras (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    os_id           VARCHAR(60)  NULL,
+    camera          VARCHAR(20)  NOT NULL,  -- "dispenser" | "mesa"
+    slot_id         TINYINT      NULL,
+    tipo            VARCHAR(50)  NOT NULL,  -- leitura_dispenser_ok, leitura_mesa_divergencia, etc.
+    sku_esperado    VARCHAR(200) NULL,
+    sku_lido        VARCHAR(200) NULL,
+    match_sku       TINYINT(1)   NULL,
+    confianca       DECIMAL(5,4) NULL,      -- 0.0 – 1.0
+    qtd_esperada    INT          NULL,
+    qtd_detectada   INT          NULL,
+    motivo          VARCHAR(255) NULL,
+    criado_em       DATETIME(3)  NOT NULL,
+    INDEX idx_vl_os     (os_id),
+    INDEX idx_vl_camera (camera),
+    INDEX idx_vl_criado (criado_em)
 ) ENGINE=InnoDB;
 
 INSERT IGNORE INTO medicamentos (nome, sku, categoria, categoria_desc, dimensao) VALUES
@@ -251,6 +275,24 @@ INSERT IGNORE INTO medicamentos (nome, sku, categoria, categoria_desc, dimensao)
 ('EXTIMA BAUNILHA',      'EXTIMA BAUNILHA 200ML',                       'vitaminas',         'Vitaminas / Nutrição / Suplementação',                        '72x42x115mm'),
 ('EXTIMA BANANA',        'EXTIMA BANANA 200ML',                         'vitaminas',         'Vitaminas / Nutrição / Suplementação',                        '72x42x115mm'),
 ('EXTIMA CHOCOLATE',     'EXTIMA CHOCOLATE 200ML',                      'vitaminas',         'Vitaminas / Nutrição / Suplementação',                        '72x42x115mm');
+
+-- ── Pesos estimados por dimensão da embalagem ────────────────────────────────
+-- Estimativas realistas baseadas nas dimensões físicas de cada embalagem APSEN.
+UPDATE medicamentos SET peso_unitario_g =  15.00 WHERE dimensao = '45x12x60mm';
+UPDATE medicamentos SET peso_unitario_g =  45.00 WHERE dimensao = '49x20x104mm';
+UPDATE medicamentos SET peso_unitario_g =  50.00 WHERE dimensao = '50x21x105mm';
+UPDATE medicamentos SET peso_unitario_g =  60.00 WHERE dimensao = '47x28x135mm';
+UPDATE medicamentos SET peso_unitario_g =  70.00 WHERE dimensao = '47x30x155mm';
+UPDATE medicamentos SET peso_unitario_g =  55.00 WHERE dimensao = '47x36x75mm';
+UPDATE medicamentos SET peso_unitario_g =  60.00 WHERE dimensao = '55x25x115mm';
+UPDATE medicamentos SET peso_unitario_g = 120.00 WHERE dimensao = '56x54x110mm';
+UPDATE medicamentos SET peso_unitario_g =  75.00 WHERE dimensao = '72x25x115mm';
+UPDATE medicamentos SET peso_unitario_g =  75.00 WHERE dimensao = '79x25x104mm';
+UPDATE medicamentos SET peso_unitario_g =  95.00 WHERE dimensao = '84x25x150mm';
+UPDATE medicamentos SET peso_unitario_g =  85.00 WHERE dimensao = '95x25x104mm';
+UPDATE medicamentos SET peso_unitario_g = 100.00 WHERE dimensao = '72x42x115mm';
+-- Fallback: embalagens sem dimensão definida recebem 50g
+UPDATE medicamentos SET peso_unitario_g = 50.00 WHERE peso_unitario_g IS NULL;
 
 -- ── Seed: 6 slots de dispenser — inicialmente VAZIOS ────────────────────────
 -- Nenhum slot é fixo para um medicamento específico.

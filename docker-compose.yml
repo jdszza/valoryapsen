@@ -1,17 +1,19 @@
 version: "3.9"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# APSEN - Sistema de Contagem de Medicamentos v3.1 (Arquitetura REST/HTTP)
+# APSEN - Sistema de Contagem de Medicamentos v3.2 (Arquitetura REST/HTTP)
 #
-# 11 serviços (sem MQTT):
+# 13 serviços (sem MQTT):
 #   mysql               → banco de dados MySQL 8 (porta 3306)
 #   central-computer    → FastAPI: orquestrador + API REST + WebSocket (porta 8000)
 #   dispenser-adapter   → bridge: central ↔ dispenser-simulator (porta 8100)
 #   cnc-adapter         → bridge: central ↔ cnc-simulator (porta 8101)
 #   vision-adapter      → bridge: central ↔ vision-simulator (porta 8102)
+#   weight-adapter      → bridge: central ↔ weight-simulator/HX711 (porta 8103)
 #   dispenser-simulator → simula 6 dispensers físicos, HTTP server (porta 8201)
 #   cnc-simulator       → simula firmware CNC, HTTP server (porta 8200)
 #   vision-simulator    → simula câmera dispenser + câmera mesa (porta 8202)
+#   weight-simulator    → simula célula de carga HX711 na mesa (porta 8203)
 #   order-generator     → gera OS aleatórias e envia ao central via HTTP
 #   dashboard           → Plotly Dash: monitoramento read-only (porta 8050)
 #   ihm_web             → Plotly Dash: IHM de manutenção com auth (porta 8051)
@@ -69,19 +71,25 @@ services:
       MYSQL_DB:               apsen_db
       MYSQL_USER:             apsen
       MYSQL_PASS:             apsen_pass_2024
-      SECRET_KEY:             apsen-mude-esta-chave-em-producao-2024
+      SECRET_KEY:             apsen-mude-esta-chave-em-producao-2024  # ALTERE EM PRODUÇÃO!
+      SEED_ADMIN_SENHA:       "Apsen@Admin#2024!"   # senha do usuário admin (seed inicial)
+      SEED_MANUT_SENHA:       "Apsen@Manut#2024!"   # senha do usuário manut1 (seed inicial)
       DISPENSER_ADAPTER_URL:  http://dispenser-adapter:8100
       CNC_ADAPTER_URL:        http://cnc-adapter:8101
       VISION_ADAPTER_URL:     http://vision-adapter:8102
+      WEIGHT_ADAPTER_URL:     http://weight-adapter:8103
       TIMEOUT_CARREGAMENTO:   180
       TIMEOUT_POSICIONAMENTO: 120
       TIMEOUT_DISPENSA:       120
       TIMEOUT_VISAO_DISPENSER: 30
       TIMEOUT_VISAO_MESA:      30
+      TIMEOUT_PESO:            15
     depends_on:
       mysql:
         condition: service_healthy
       vision-adapter:
+        condition: service_started
+      weight-adapter:
         condition: service_started
     networks:
       - apsen-net
@@ -140,6 +148,42 @@ services:
     depends_on:
       - central-computer
       - vision-simulator
+    networks:
+      - apsen-net
+
+  # ── Weight Adapter ───────────────────────────────────────────────────────────
+  weight-adapter:
+    build: ./weight-adapter
+    container_name: apsen-weight-adapter
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "8103:8103"
+    environment:
+      CENTRAL_URL:    http://central-computer:8000
+      WEIGHT_SIM_URL: http://weight-simulator:8203
+      TIMEOUT_CMD:    10
+      TIMEOUT_EVENT:  5
+    depends_on:
+      - central-computer
+      - weight-simulator
+    networks:
+      - apsen-net
+
+  # ── Weight Simulator (HX711) ─────────────────────────────────────────────────
+  weight-simulator:
+    build: ./weight-simulator
+    container_name: apsen-weight-sim
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "8203:8203"
+    environment:
+      ADAPTER_URL:       http://weight-adapter:8103
+      TOLERANCIA_PERC:   5.0    # tolerância de peso em %
+      PROB_ERRO_SENSOR:  0.01   # probabilidade de falha do sensor HX711
+      T_LEITURA:         1.5    # tempo de estabilização da leitura (s)
+      RUIDO_G:           2.0    # ruído gaussiano simulado (g)
     networks:
       - apsen-net
 

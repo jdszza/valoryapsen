@@ -29,6 +29,7 @@ from database import (
     atribuir_dispenser_item,
     atualizar_item_os,
     atualizar_status_ordem,
+    get_peso_medicamento,
     salvar_alarme,
     salvar_cnc_evento,
     salvar_dispensa,
@@ -61,18 +62,101 @@ _os_queue: asyncio.Queue = asyncio.Queue()
 _pending_events: dict[str, asyncio.Event] = {}
 _pending_data: dict[str, dict] = {}
 
+# ── Trava de erro (Triple Check) ───────────────────────────────────────────────
+# Quando ativada, a OS atual fica suspensa aguardando intervenção de supervisor.
+_trava_ativa: bool = False
+_trava_evento: Optional[asyncio.Event] = None   # set() para liberar a trava
+_trava_motivo: str = ""
+_trava_slot_id: Optional[int] = None
+_trava_os_id: Optional[str] = None
+
 
 def _ts() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_client: Optional[httpx.AsyncClient] = None
+
+
 def inicializar(estado: dict, lock, broadcast_fn, loop: asyncio.AbstractEventLoop):
     """Chamado pelo main.py no startup para injetar dependências."""
-    global _estado, _lock, _broadcast_fn, _loop
+    global _estado, _lock, _broadcast_fn, _loop, _client
     _estado       = estado
     _lock         = lock
     _broadcast_fn = broadcast_fn
     _loop         = loop
+    _client       = httpx.AsyncClient()
+    logger.info("[ORCH] httpx.AsyncClient criado")
+
+
+async def encerrar():
+    """Chamado pelo main.py no shutdown para fechar o cliente HTTP."""
+    global _client
+    if _client:
+        await _client.aclose()
+        logger.info("[ORCH] httpx.AsyncClient encerrado")
+
+
+# ── API de trava ───────────────────────────────────────────────────────────────
+
+def get_trava_estado() -> dict:
+    """Retorna o estado atual da trava para o dashboard/IHM."""
+    return {
+        "ativa":    _trava_ativa,
+        "motivo":   _trava_motivo,
+        "slot_id":  _trava_slot_id,
+        "os_id":    _trava_os_id,
+    }
+
+
+def liberar_trava(liberado_por: str) -> bool:
+    """
+    Libera a trava de erro — chamado pelo endpoint de admin.
+    Thread-safe: usa call_soon_threadsafe para setar o evento no loop correto.
+    Retorna False se não há trava ativa.
+    """
+    global _trava_ativa, _trava_evento, _trava_motivo, _trava_slot_id, _trava_os_id
+    if not _trava_ativa or _trava_evento is None:
+        return False
+    logger.warning("[TRAVA] Trava liberada por '%s'.", liberado_por)
+    _trava_ativa   = False
+    _trava_motivo  = ""
+    _trava_slot_id = None
+    _trava_os_id   = None
+    if _loop and not _loop.is_closed():
+        _loop.call_soon_threadsafe(_trava_evento.set)
+    else:
+        _trava_evento.set()
+    return True
+
+
+async def _ativar_trava(os_id: str, slot_id: Optional[int], motivo: str) -> asyncio.Event:
+    """
+    Ativa a trava de erro: suspende a OS até intervenção de supervisor.
+    Retorna o Event que será aguardado pelo orquestrador.
+    Deve ser chamado DENTRO do event loop (é async).
+    """
+    global _trava_ativa, _trava_evento, _trava_motivo, _trava_slot_id, _trava_os_id
+    _trava_ativa   = True
+    _trava_motivo  = motivo
+    _trava_slot_id = slot_id
+    _trava_os_id   = os_id
+    _trava_evento  = asyncio.Event()
+    logger.error(
+        "[TRAVA] ⛔ TRAVA ATIVADA — OS=%s slot=%s motivo=%s",
+        os_id, slot_id, motivo,
+    )
+    # Avisa todos os clientes conectados (dashboard, IHM) via WebSocket
+    if _broadcast_fn:
+        _broadcast_fn()
+    try:
+        await asyncio.to_thread(
+            salvar_alarme, "triple_check", "trava_ativada",
+            f"OS {os_id} slot {slot_id}: {motivo}",
+        )
+    except Exception as e:
+        logger.warning("[DB] salvar_alarme trava: %s", e)
+    return _trava_evento
 
 
 # ── Sistema de eventos async ───────────────────────────────────────────────────
@@ -202,8 +286,7 @@ async def _post(url: str, payload: dict, timeout: float = 10.0) -> bool:
     """POST HTTP com retry básico. Retorna True se 2xx."""
     for tentativa in range(3):
         try:
-            async with httpx.AsyncClient() as c:
-                r = await c.post(url, json=payload, timeout=timeout)
+            r = await _client.post(url, json=payload, timeout=timeout)
             if r.status_code < 300:
                 return True
             logger.warning("[HTTP] %s → status %d (tentativa %d)", url, r.status_code, tentativa + 1)
@@ -297,6 +380,29 @@ async def cmd_visao_mesa(slot_id: int, os_id: str, quantidade: int,
     )
 
 
+async def cmd_tara(os_id: str) -> bool:
+    """Zera a balança HX711 antes de iniciar as dispensas da OS."""
+    return await _post(
+        settings.WEIGHT_ADAPTER_URL + "/comandos/tara",
+        {"os_id": os_id},
+        timeout=8.0,
+    )
+
+
+async def cmd_pesar(slot_id: int, os_id: str, quantidade: int, peso_unitario_g: float) -> bool:
+    """Solicita pesagem após dispensa de um slot."""
+    return await _post(
+        settings.WEIGHT_ADAPTER_URL + "/comandos/pesar",
+        {
+            "os_id":               os_id,
+            "slot_id":             slot_id,
+            "quantidade_esperada": quantidade,
+            "peso_unitario_g":     peso_unitario_g,
+        },
+        timeout=5.0,
+    )
+
+
 # ── Processamento de uma OS ────────────────────────────────────────────────────
 
 async def _processar_os(os_payload: dict):
@@ -360,6 +466,14 @@ async def _processar_os(os_payload: dict):
     # Broadcast imediato para o dashboard ver atribuição de slots
     if _broadcast_fn:
         _broadcast_fn()
+
+    # Enriquece atribuições com peso unitário (lookup paralelo no DB)
+    pesos = await asyncio.gather(*[
+        asyncio.to_thread(get_peso_medicamento, a["medicamento"])
+        for a in atribuicoes
+    ])
+    for a, peso in zip(atribuicoes, pesos):
+        a["peso_unitario_g"] = peso
 
     # ── 2. Planejamento de rota ──────────────────────────────────────────────
     rota = planejar_rota([a["dispenser_id"] for a in atribuicoes], HOME)
@@ -442,7 +556,25 @@ async def _processar_os(os_payload: dict):
                 a["dispenser_id"], res.get("sku_lido", ""), (res.get("confianca", 0) or 0) * 100,
             )
 
-    logger.info("[ORCH] Validação de visão concluída. Iniciando ciclo CNC.")
+    logger.info("[ORCH] Validação de visão concluída. Realizando tara da balança.")
+
+    # ── 3c. Tara da balança HX711 (antes de qualquer dispensa) ───────────────
+    chave_tara = f"{os_id}:tara"
+    registrar_evento(chave_tara)
+    ok_tara = await cmd_tara(os_id)
+    if ok_tara:
+        resultado_tara = await aguardar_evento(chave_tara, settings.TIMEOUT_PESO)
+        if resultado_tara is None:
+            logger.warning("[ORCH] Timeout tara balança — continuando sem pesagem.")
+        elif resultado_tara.get("tipo") == "erro_sensor":
+            logger.warning("[ORCH] Sensor de peso indisponível — continuando sem pesagem.")
+        else:
+            logger.info("[ORCH] Tara OK. Offset=%.1fg", resultado_tara.get("peso_tara_g", 0))
+    else:
+        _pending_events.pop(chave_tara, None)
+        logger.warning("[ORCH] Weight adapter indisponível — continuando sem pesagem.")
+
+    logger.info("[ORCH] Iniciando ciclo CNC.")
 
     # ── 4. Ciclo CNC: mover → dispensar para cada slot na ordem ─────────────
     for seq, disp_id in enumerate(rota, start=1):
@@ -530,6 +662,92 @@ async def _processar_os(os_payload: dict):
                 disp_id,
                 resultado_mesa.get("quantidade_detectada", 0),
                 (resultado_mesa.get("confianca", 0) or 0) * 100,
+            )
+
+        # 4d. Pesagem HX711 (bloqueante se Triple Check divergir)
+        chave_peso = f"{os_id}:peso:{disp_id}"
+        registrar_evento(chave_peso)
+        peso_unit = a.get("peso_unitario_g", 50.0)
+        resultado_peso: Optional[dict] = None
+        ok_p = await cmd_pesar(disp_id, os_id, a["quantidade"], peso_unit)
+        if ok_p:
+            resultado_peso = await aguardar_evento(chave_peso, settings.TIMEOUT_PESO)
+            if resultado_peso is None:
+                logger.warning("[ORCH] Timeout pesagem D%d.", disp_id)
+            elif resultado_peso.get("tipo") == "peso_divergencia":
+                logger.warning(
+                    "[ORCH] ALARME PESO D%d: esp=%.1fg med=%.1fg (desvio=%.1f%%)",
+                    disp_id,
+                    resultado_peso.get("peso_esperado_g", 0),
+                    resultado_peso.get("peso_medido_g", 0),
+                    resultado_peso.get("desvio_pct", 0),
+                )
+            elif resultado_peso.get("tipo") == "erro_sensor":
+                logger.warning("[ORCH] Sensor de peso indisponível para D%d.", disp_id)
+            else:
+                logger.info(
+                    "[ORCH] Peso D%d OK — %.1fg (desvio=%.1f%%)",
+                    disp_id,
+                    resultado_peso.get("peso_medido_g", 0),
+                    resultado_peso.get("desvio_pct", 0),
+                )
+        else:
+            _pending_events.pop(chave_peso, None)
+            logger.warning("[ORCH] Weight adapter indisponível para D%d.", disp_id)
+
+        # ── 4e. TRIPLE CHECK — valida as 3 fontes (dispenser, câmera mesa, balança) ──
+        # Regra: se 2 ou mais fontes indicam divergência → ativar trava de emergência.
+        qtd_esperada = a["quantidade"]
+        qtd_dispensada = resultado_disp.get("quantidade_dispensada", qtd_esperada)
+
+        def _check_triple() -> tuple[int, list[str]]:
+            divergencias: list[str] = []
+            # Fonte 1 — dispenser
+            if qtd_dispensada != qtd_esperada:
+                divergencias.append(
+                    f"dispenser: dispensou {qtd_dispensada} de {qtd_esperada} esperados"
+                )
+            # Fonte 2 — câmera mesa
+            if resultado_mesa is not None and resultado_mesa.get("tipo") in (
+                "leitura_mesa_falha", "leitura_mesa_divergencia"
+            ):
+                det = resultado_mesa.get("quantidade_detectada", "?")
+                divergencias.append(f"câmera_mesa: detectou {det} de {qtd_esperada}")
+            # Fonte 3 — balança
+            if resultado_peso is not None and resultado_peso.get("tipo") == "peso_divergencia":
+                desvio = resultado_peso.get("desvio_pct") or 0
+                divergencias.append(f"balança: desvio={desvio:.1f}%")
+            return len(divergencias), divergencias
+
+        n_div, causas = _check_triple()
+        if n_div >= 2:
+            motivo_trava = (
+                f"Triple Check FALHOU ({n_div}/3 fontes divergentes) — D{disp_id}: "
+                + "; ".join(causas)
+            )
+            logger.error("[ORCH] ⛔ %s", motivo_trava)
+            with _lock:
+                _estado["trava"] = {
+                    "ativa": True,
+                    "os_id": os_id,
+                    "slot_id": disp_id,
+                    "motivo": motivo_trava,
+                }
+            if _broadcast_fn:
+                _broadcast_fn()
+            # Aguarda liberação manual por supervisor/admin — bloqueia aqui
+            evento_liberacao = await _ativar_trava(os_id, disp_id, motivo_trava)
+            logger.warning("[ORCH] Aguardando liberação da trava (OS %s, D%d)…", os_id, disp_id)
+            await evento_liberacao.wait()
+            logger.info("[ORCH] Trava liberada. Retomando OS %s a partir de D%d.", os_id, disp_id)
+            with _lock:
+                _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
+            if _broadcast_fn:
+                _broadcast_fn()
+        elif n_div == 1:
+            logger.warning(
+                "[ORCH] Triple Check: 1/3 fonte diverge (D%d) — alarme registrado, OS prossegue. %s",
+                disp_id, causas[0],
             )
 
     # ── 5. CNC retorna para home ─────────────────────────────────────────────

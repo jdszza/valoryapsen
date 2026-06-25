@@ -269,7 +269,10 @@ def _do_limpar(slot_id: int, solicitado_por: str):
     """Executa limpeza física do slot."""
     with _lock:
         status_atual = _estado[slot_id]["status"]
-        em_operacao  = status_atual in ("carregando", "pronto", "dispensando")
+        os_id_atual  = _estado[slot_id].get("os_id")
+        # Bloqueio: status ativo OU associado a uma OS em andamento
+        em_operacao  = status_atual in ("carregando", "pronto", "dispensando", "concluido") \
+                       or os_id_atual is not None
 
     if em_operacao:
         logger.warning("[DISP-%d] Limpeza recusada — em operação (status=%s).", slot_id, status_atual)
@@ -314,6 +317,13 @@ def status():
         for slot_id in range(1, NUM_SLOTS + 1):
             slots.append(_snapshot_slot(slot_id))
     return {"slots": slots, "ts": _ts()}
+
+
+@app.get("/status/{slot_id}")
+def status_slot(slot_id: int):
+    if slot_id not in range(1, NUM_SLOTS + 1):
+        raise HTTPException(400, f"slot_id deve ser 1-{NUM_SLOTS}")
+    return _snapshot_slot(slot_id)
 
 
 @app.post("/executar/carregar")

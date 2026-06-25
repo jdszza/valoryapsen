@@ -143,7 +143,23 @@ app.layout = dbc.Container(
             ]), md=7, className="mb-3"),
         ]),
 
-        # ── Row 4: Histórico OS ───────────────────────────────────────────────
+        # ── BANNER: Trava de Emergência (Triple Check) ────────────────────────
+        html.Div(id="banner-trava"),
+
+        # ── Row 4: Visão Computacional + Balança ─────────────────────────────
+        dbc.Row([
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("📷 Visão Computacional"),
+                dbc.CardBody(id="card-visao"),
+            ]), md=6, className="mb-3"),
+
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("⚖️ Balança HX711"),
+                dbc.CardBody(id="card-peso"),
+            ]), md=6, className="mb-3"),
+        ]),
+
+        # ── Row 5: Histórico OS ───────────────────────────────────────────────
         dbc.Row(
             dbc.Col(dbc.Card([
                 dbc.CardHeader("📂 Histórico de Ordens"),
@@ -183,6 +199,9 @@ def _fetch(_):
     Output("card-alarmes",    "children"),
     Output("card-log",        "children"),
     Output("card-historico",  "children"),
+    Output("banner-trava",    "children"),
+    Output("card-visao",      "children"),
+    Output("card-peso",       "children"),
     Input("store-estado",  "data"),
     Input("store-eventos", "data"),
     Input("store-os",      "data"),
@@ -190,7 +209,7 @@ def _fetch(_):
 def _render(estado: dict, eventos: list, os_hist: list):
     if not estado:
         vazio = html.P("Aguardando backend...", className="text-muted")
-        return (vazio,) * 8
+        return (vazio,) * 11
 
     estado    = estado or {}
     eventos   = eventos or []
@@ -431,6 +450,107 @@ def _render(estado: dict, eventos: list, os_hist: list):
     else:
         card_historico_content = html.P("Sem histórico de OS.", className="text-muted small")
 
+    # ── Banner de Trava (Triple Check) ───────────────────────────────────────
+    trava = estado.get("trava", {})
+    if trava.get("ativa"):
+        banner_trava = dbc.Alert([
+            html.H4("⛔ TRAVA DE EMERGÊNCIA ATIVA", className="alert-heading"),
+            html.Hr(),
+            html.P([
+                html.Strong("OS: "), trava.get("os_id", "?"), " | ",
+                html.Strong("Slot: "), f"D{trava.get('slot_id', '?')}", html.Br(),
+                html.Strong("Motivo: "), trava.get("motivo", ""),
+            ], className="mb-0 small"),
+            html.P(
+                "⚠ O sistema está aguardando intervenção de supervisor. "
+                "Acesse a IHM para liberar a OS.",
+                className="mt-2 mb-0 fw-bold",
+            ),
+        ], color="danger", className="mx-0 my-3")
+    else:
+        banner_trava = html.Div()
+
+    # ── Visão Computacional ───────────────────────────────────────────────────
+    visao = estado.get("visao", {})
+    cam_disp = visao.get("camera_dispenser", {})
+    cam_mesa = visao.get("camera_mesa", {})
+
+    def _cor_leitura(tipo):
+        if tipo is None:
+            return "secondary"
+        if "ok" in tipo:
+            return "success"
+        if "divergencia" in tipo or "falha" in tipo:
+            return "danger"
+        return "info"
+
+    card_visao = dbc.Row([
+        dbc.Col([
+            html.P("📷 Câmera Dispenser (SKU)", className="fw-bold mb-1 small"),
+            html.Div([
+                html.Span("Última: "),
+                _badge(cam_disp.get("ultima_leitura") or "—",
+                       _cor_leitura(cam_disp.get("ultima_leitura"))),
+            ], className="small mb-1"),
+            html.Div([
+                html.Small(f"Slot D{cam_disp.get('slot_id') or '?'}", className="text-muted me-2"),
+                html.Small(
+                    f"Conf: {int((cam_disp.get('confianca') or 0)*100)}%",
+                    className="text-muted",
+                ),
+            ], className="mb-1"),
+            html.Small(
+                f"Match SKU: {'✓' if cam_disp.get('match_sku') else ('✗' if cam_disp.get('match_sku') is False else '—')}",
+                className=("text-success" if cam_disp.get("match_sku")
+                           else "text-danger" if cam_disp.get("match_sku") is False
+                           else "text-muted"),
+            ),
+        ], md=6),
+        dbc.Col([
+            html.P("📷 Câmera Mesa (Contagem)", className="fw-bold mb-1 small"),
+            html.Div([
+                html.Span("Última: "),
+                _badge(cam_mesa.get("ultima_leitura") or "—",
+                       _cor_leitura(cam_mesa.get("ultima_leitura"))),
+            ], className="small mb-1"),
+            html.Div([
+                html.Small(f"Slot D{cam_mesa.get('slot_id') or '?'}", className="text-muted me-2"),
+                html.Small(
+                    f"Conf: {int((cam_mesa.get('confianca') or 0)*100)}%",
+                    className="text-muted",
+                ),
+            ], className="mb-1"),
+            html.Small(
+                f"Detectado: {cam_mesa.get('quantidade_detectada') or '—'} "
+                f"/ Esperado: {cam_mesa.get('quantidade_esperada') or '—'}",
+                className="text-muted",
+            ),
+        ], md=6),
+    ])
+
+    # ── Balança HX711 ─────────────────────────────────────────────────────────
+    peso = estado.get("peso", {})
+    tipo_peso  = peso.get("ultima_leitura")
+    cor_peso   = ("success" if tipo_peso == "peso_ok"
+                  else "danger" if tipo_peso == "peso_divergencia"
+                  else "warning" if tipo_peso == "tara_ok"
+                  else "secondary")
+    card_peso = html.Div([
+        html.Div([
+            html.Span("Status: "),
+            _badge(tipo_peso or "—", cor_peso),
+            html.Small(f"  Slot: D{peso.get('slot_id') or '?'}", className="text-muted ms-2"),
+        ], className="small mb-1"),
+        html.Small(
+            f"Leitura: {peso.get('peso_medido_g') or '—'} g"
+            f"  |  Esperado: {peso.get('peso_esperado_g') or '—'} g"
+            f"  |  Desvio: {peso.get('desvio_pct') or '—'}%"
+            if tipo_peso in ("peso_ok", "peso_divergencia") else
+            "Aguardando pesagem…",
+            className="text-muted",
+        ),
+    ])
+
     return (
         badge_alarmes,
         badge_os,
@@ -440,6 +560,9 @@ def _render(estado: dict, eventos: list, os_hist: list):
         card_alarmes_content,
         card_log_content,
         card_historico_content,
+        banner_trava,
+        card_visao,
+        card_peso,
     )
 
 

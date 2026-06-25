@@ -1,7 +1,8 @@
 """
 APSEN - IHM de Manutenção v2.1 (porta 8051)
 =============================================
-Requer autenticação JWT. Usuários: admin/admin123 | manut1/mnt123
+Requer autenticação JWT. Usuários padrão: admin / manut1
+(Senhas configuradas via SEED_ADMIN_SENHA e SEED_MANUT_SENHA no docker-compose.yml)
 
 Funcionalidades:
   • Login / Logout com JWT (role: admin | manutencao)
@@ -79,6 +80,8 @@ _SIDEBAR_LINKS = [
     ("🚨 Alarmes",         "alarmes"),
     ("➕ Nova Manutenção", "nova"),
     ("📦 Dispensers",      "dispensers"),
+    ("📷 Visão / Balança", "visao"),
+    ("⛔ Triple Check",    "trava"),
     ("🗂 Ordens (OS)",     "ordens"),
     ("👥 Usuários",        "usuarios"),
 ]
@@ -255,6 +258,8 @@ def _render_conteudo(tab, _, token, role):
         "alarmes":    lambda: _render_alarmes(token),
         "nova":       lambda: _render_nova_manut(),
         "dispensers": lambda: _render_dispensers(token),
+        "visao":      lambda: _render_visao(token),
+        "trava":      lambda: _render_trava(token, role),
         "ordens":     lambda: _render_ordens(token),
         "usuarios":   lambda: _render_usuarios(token, role),
     }
@@ -470,6 +475,197 @@ def _render_dispensers(token):
     ])
 
 
+# ── Visão Computacional + Balança ──────────────────────────────────────────────
+
+def _render_visao(token):
+    _, estado = _api("get", "/estado", token=token)
+    if not isinstance(estado, dict):
+        return html.P("Erro ao carregar estado.", className="text-danger small")
+
+    visao    = estado.get("visao", {})
+    peso     = estado.get("peso", {})
+    cam_disp = visao.get("camera_dispenser", {})
+    cam_mesa = visao.get("camera_mesa", {})
+
+    def _cor_leit(tipo):
+        if not tipo:
+            return "secondary"
+        if "ok" in tipo:    return "success"
+        if "divergencia" in tipo or "falha" in tipo: return "danger"
+        return "info"
+
+    # Buscar histórico recente de visão
+    _, hist_visao = _api("get", "/api/v1/visao/historico?limite=20", token=token)
+    hist_rows = []
+    if isinstance(hist_visao, dict):
+        for leit in hist_visao.get("leituras", []):
+            ts = str(leit.get("criado_em", ""))[:16].replace("T", " ")
+            hist_rows.append(
+                html.Tr([
+                    html.Td(html.Small(ts, className="text-muted")),
+                    html.Td(dbc.Badge(leit.get("camera", "?"), color="info", className="me-1")),
+                    html.Td(html.Small(f"D{leit.get('slot_id','?')}")),
+                    html.Td(dbc.Badge(leit.get("tipo","?"),
+                                      color=_cor_leit(leit.get("tipo","")))),
+                    html.Td(html.Small(leit.get("sku_lido") or leit.get("motivo") or "—",
+                                       className="text-muted")),
+                    html.Td(html.Small(
+                        f"{leit.get('qtd_detectada','—')} / {leit.get('qtd_esperada','—')}"
+                        if leit.get("qtd_esperada") else "—"
+                    )),
+                ])
+            )
+
+    hist_tabela = dbc.Table(
+        [
+            html.Thead(html.Tr([
+                html.Th("Horário"), html.Th("Câmera"), html.Th("Slot"),
+                html.Th("Tipo"), html.Th("SKU/Motivo"), html.Th("Qtd det/esp"),
+            ])),
+            html.Tbody(hist_rows if hist_rows else [html.Tr(html.Td("Sem leituras.", colSpan=6))]),
+        ],
+        bordered=True, hover=True, size="sm", responsive=True,
+    )
+
+    return html.Div([
+        html.H5("📷 Visão Computacional", className="mb-3"),
+        dbc.Row([
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Câmera Dispenser (SKU)"),
+                dbc.CardBody([
+                    html.P([
+                        "Última leitura: ",
+                        dbc.Badge(cam_disp.get("ultima_leitura") or "—",
+                                  color=_cor_leit(cam_disp.get("ultima_leitura"))),
+                    ], className="mb-1 small"),
+                    html.Small(f"Slot: D{cam_disp.get('slot_id') or '?'}", className="text-muted me-2"),
+                    html.Small(f"Confiança: {int((cam_disp.get('confianca') or 0)*100)}%",
+                               className="text-muted"),
+                ]),
+            ]), md=6, className="mb-3"),
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Câmera Mesa (Contagem)"),
+                dbc.CardBody([
+                    html.P([
+                        "Última leitura: ",
+                        dbc.Badge(cam_mesa.get("ultima_leitura") or "—",
+                                  color=_cor_leit(cam_mesa.get("ultima_leitura"))),
+                    ], className="mb-1 small"),
+                    html.Small(
+                        f"Detectado: {cam_mesa.get('quantidade_detectada') or '—'} / "
+                        f"Esperado: {cam_mesa.get('quantidade_esperada') or '—'}",
+                        className="text-muted",
+                    ),
+                ]),
+            ]), md=6, className="mb-3"),
+        ]),
+
+        html.H5("⚖️ Balança HX711", className="mb-2"),
+        dbc.Card(dbc.CardBody([
+            html.P([
+                "Status: ",
+                dbc.Badge(
+                    peso.get("ultima_leitura") or "—",
+                    color=("success" if peso.get("ultima_leitura") == "peso_ok"
+                           else "danger" if peso.get("ultima_leitura") == "peso_divergencia"
+                           else "warning" if peso.get("ultima_leitura") == "tara_ok"
+                           else "secondary"),
+                ),
+                html.Small(f"  Slot D{peso.get('slot_id') or '?'}", className="text-muted ms-2"),
+            ], className="mb-1 small"),
+            html.Small(
+                f"Medido: {peso.get('peso_medido_g') or '—'} g  |  "
+                f"Esperado: {peso.get('peso_esperado_g') or '—'} g  |  "
+                f"Desvio: {peso.get('desvio_pct') or '—'}%"
+                if peso.get("ultima_leitura") in ("peso_ok", "peso_divergencia")
+                else "Aguardando pesagem…",
+                className="text-muted",
+            ),
+        ]), className="mb-3"),
+
+        html.H5("📋 Histórico de Leituras de Visão", className="mb-2"),
+        html.Div(hist_tabela, style={"maxHeight": "350px", "overflowY": "auto"}),
+    ])
+
+
+# ── Triple Check — Trava de Emergência ─────────────────────────────────────────
+
+def _render_trava(token, role):
+    _, estado = _api("get", "/estado", token=token)
+    trava = (estado or {}).get("trava", {})
+    ativa = trava.get("ativa", False)
+
+    if ativa:
+        status_card = dbc.Alert([
+            html.H4("⛔ TRAVA ATIVA", className="alert-heading"),
+            html.Hr(),
+            html.P([html.Strong("OS: "), trava.get("os_id", "?")], className="mb-1 small"),
+            html.P([html.Strong("Slot: "), f"D{trava.get('slot_id', '?')}"], className="mb-1 small"),
+            html.P([html.Strong("Motivo: "), trava.get("motivo", "")], className="mb-2 small"),
+        ], color="danger")
+    else:
+        status_card = dbc.Alert([
+            html.H5("✅ Sistema liberado", className="alert-heading mb-0"),
+            html.P("Nenhuma trava de Triple Check ativa no momento.",
+                   className="mb-0 small mt-1"),
+        ], color="success")
+
+    # Botão de liberar só aparece para admin e se trava ativa
+    btn_liberar = html.Div()
+    if role == "admin" and ativa:
+        btn_liberar = html.Div([
+            html.Hr(),
+            html.P(
+                "⚠ Ao liberar, a OS retomará do ponto em que parou. "
+                "Verifique fisicamente se o erro foi corrigido antes de prosseguir.",
+                className="text-warning small",
+            ),
+            dbc.Button(
+                "🔓 Liberar Trava e Retomar OS",
+                id="btn-liberar-trava",
+                color="warning", size="lg", className="w-100",
+            ),
+            html.Div(id="msg-liberar-trava", className="mt-2"),
+        ])
+    elif not ativa:
+        btn_liberar = html.Div()
+    else:
+        btn_liberar = html.P(
+            "Apenas administradores podem liberar a trava.",
+            className="text-muted small mt-3",
+        )
+
+    return html.Div([
+        html.H5("⛔ Triple Check — Trava de Emergência", className="mb-3"),
+        html.P(
+            "O Triple Check valida 3 fontes independentes após cada dispensa: "
+            "contagem do dispenser, câmera de mesa e balança HX711. "
+            "Se 2 ou mais fontes divergirem, a OS é suspensa e aguarda intervenção.",
+            className="text-muted small mb-3",
+        ),
+        status_card,
+        btn_liberar,
+    ])
+
+
+@callback(
+    Output("msg-liberar-trava", "children"),
+    Input("btn-liberar-trava", "n_clicks"),
+    State("jwt-token", "data"),
+    prevent_initial_call=True,
+)
+def _cb_liberar_trava(n, token):
+    if not n:
+        return no_update
+    status, resp = _api("post", "/api/v1/admin/liberar-trava", token=token)
+    if status == 200:
+        return dbc.Alert("✅ Trava liberada com sucesso. OS retomando…", color="success")
+    return dbc.Alert(
+        f"Erro ao liberar trava: {resp.get('detail', 'Falha desconhecida')}",
+        color="danger",
+    )
+
+
 # ── Ordens (OS) ───────────────────────────────────────────────────────────────
 
 def _render_ordens(token):
@@ -485,7 +681,7 @@ def _render_ordens(token):
         {"label": "Cancelada",    "value": "cancelada"},
     ]
 
-    rows = []
+    rows_com_download = []
     for os_ in historico:
         os_id  = os_.get("os_id","?")
         sts    = os_.get("status","?")
@@ -493,7 +689,7 @@ def _render_ordens(token):
         cat    = os_.get("categoria","—")
         criado = str(os_.get("criado_em",""))[:16]
 
-        rows.append(dbc.Row([
+        rows_com_download.append(dbc.Row([
             dbc.Col(
                 dbc.Button(os_id, id={"type":"btn-os-detalhe","index":os_id},
                            color="link", size="sm", className="p-0 text-info"),
@@ -501,7 +697,14 @@ def _render_ordens(token):
             ),
             dbc.Col(html.Small(cat, className="text-muted"), md=2),
             dbc.Col(dbc.Badge(sts, color=cor, className="small"), md=2),
-            dbc.Col(html.Small(criado, className="text-muted"), md=2),
+            dbc.Col(html.Small(criado, className="text-muted"), md=1),
+            dbc.Col(
+                html.Div(
+                    id={"type": "div-relatorio", "index": os_id},
+                    children=[html.Small("…", className="text-muted")],
+                ),
+                md=1,
+            ),
             dbc.Col(
                 dbc.Row([
                     dbc.Col(dbc.Select(
@@ -521,16 +724,17 @@ def _render_ordens(token):
         dbc.Col(html.Small("OS ID", className="text-muted fw-bold"), md=3),
         dbc.Col(html.Small("Categoria", className="text-muted fw-bold"), md=2),
         dbc.Col(html.Small("Status", className="text-muted fw-bold"), md=2),
-        dbc.Col(html.Small("Criado em", className="text-muted fw-bold"), md=2),
+        dbc.Col(html.Small("Criado em", className="text-muted fw-bold"), md=1),
+        dbc.Col(html.Small("Relatório", className="text-muted fw-bold"), md=1),
         dbc.Col(html.Small("Alterar Status", className="text-muted fw-bold"), md=3),
     ], className="mb-2")
 
     return html.Div([
         html.H5("🗂 Histórico de Ordens (OS)", className="mb-1"),
-        html.P("Clique no ID da OS para ver o JSON completo. Use o seletor para alterar o status.",
+        html.P("Clique no ID da OS para ver o JSON. Botões CSV/XLSX para exportar relatório.",
                className="text-muted small mb-3"),
         header,
-        html.Div(rows) if rows else html.P("Sem ordens registradas.", className="text-muted small"),
+        html.Div(rows_com_download) if rows_com_download else html.P("Sem ordens registradas.", className="text-muted small"),
         html.Div(id="msg-alterar-status", className="mt-2"),
     ])
 
@@ -691,6 +895,38 @@ def _limpar_dispenser(n_clicks_list, token):
             color="success", dismissable=True,
         )
     return dbc.Alert(f"Erro: {data.get('detail','?')}", color="danger", dismissable=True)
+
+
+# ── Links de download de relatório (injeta token na URL) ─────────────────────
+
+@callback(
+    Output({"type": "div-relatorio", "index": ALL}, "children"),
+    Input("poll", "n_intervals"),
+    State("jwt-token", "data"),
+    State({"type": "div-relatorio", "index": ALL}, "id"),
+    prevent_initial_call=True,
+)
+def _cb_links_relatorio(_, token, ids):
+    if not token or not ids:
+        return [no_update] * len(ids)
+    links = []
+    for id_dict in ids:
+        os_id = id_dict.get("index", "")
+        links.append(dbc.ButtonGroup([
+            dbc.Button(
+                "CSV",
+                href=f"{BACKEND_URL}/api/v1/relatorio/os/{os_id}?formato=csv&token={token}",
+                external_link=True, target="_blank",
+                color="outline-success", size="sm",
+            ),
+            dbc.Button(
+                "XLSX",
+                href=f"{BACKEND_URL}/api/v1/relatorio/os/{os_id}?formato=xlsx&token={token}",
+                external_link=True, target="_blank",
+                color="outline-primary", size="sm",
+            ),
+        ], size="sm"))
+    return links
 
 
 # ── Alterar status da OS ───────────────────────────────────────────────────────

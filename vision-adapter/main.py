@@ -19,8 +19,10 @@ Contrato de normalização:
   Eventos recebidos do simulator são repassados ao Central sem alteração de schema,
   garantindo que o adapter possa ser substituído por hardware real sem mudar o Central.
 """
+import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
@@ -39,7 +41,35 @@ VISION_SIM_URL    = os.getenv("VISION_SIM_URL",     "http://vision-simulator:820
 TIMEOUT_CMD       = float(os.getenv("TIMEOUT_CMD",  "20"))
 TIMEOUT_EVENT     = float(os.getenv("TIMEOUT_EVENT", "5"))
 
-app = FastAPI(title="APSEN Vision Adapter v1.0")
+_client: httpx.AsyncClient | None = None
+
+
+async def _wait_for_upstream(name: str, url: str, retries: int = 30, interval: float = 2.0):
+    for i in range(retries):
+        try:
+            r = await _client.get(url, timeout=3.0)
+            if r.status_code < 300:
+                logger.info("[HEALTH] %s disponível após %d tentativa(s).", name, i + 1)
+                return
+        except Exception:
+            pass
+        logger.warning("[HEALTH] %s indisponível — aguardando (tentativa %d/%d)...", name, i + 1, retries)
+        await asyncio.sleep(interval)
+    logger.error("[HEALTH] %s não ficou disponível em %ds. Continuando assim mesmo.", name, retries * interval)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _client
+    _client = httpx.AsyncClient()
+    logger.info("[STARTUP] httpx.AsyncClient criado")
+    await _wait_for_upstream("vision-simulator", VISION_SIM_URL + "/ping")
+    yield
+    await _client.aclose()
+    logger.info("[SHUTDOWN] httpx.AsyncClient encerrado")
+
+
+app = FastAPI(title="APSEN Vision Adapter v1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -80,8 +110,7 @@ async def _post_sim(path: str, payload: dict, timeout: float = TIMEOUT_CMD) -> d
     """Envia comando ao vision-simulator. Lança HTTPException em falha."""
     url = VISION_SIM_URL + path
     try:
-        async with httpx.AsyncClient() as c:
-            r = await c.post(url, json=payload, timeout=timeout)
+        r = await _client.post(url, json=payload, timeout=timeout)
         if r.status_code >= 300:
             raise HTTPException(502, f"Vision simulator retornou {r.status_code}: {r.text[:200]}")
         return r.json()
@@ -92,12 +121,11 @@ async def _post_sim(path: str, payload: dict, timeout: float = TIMEOUT_CMD) -> d
 async def _post_central(payload: dict) -> bool:
     """Encaminha evento ao Central. Silencioso em falha (não aborta o fluxo de visão)."""
     try:
-        async with httpx.AsyncClient() as c:
-            r = await c.post(
-                CENTRAL_URL + "/api/v1/eventos/visao",
-                json=payload,
-                timeout=TIMEOUT_EVENT,
-            )
+        r = await _client.post(
+            CENTRAL_URL + "/api/v1/eventos/visao",
+            json=payload,
+            timeout=TIMEOUT_EVENT,
+        )
         return r.status_code < 300
     except Exception as exc:
         logger.warning("[FWD] Falha ao encaminhar evento ao Central: %s", exc)
@@ -109,6 +137,23 @@ async def _post_central(payload: dict) -> bool:
 @app.get("/ping")
 def ping():
     return {"status": "ok", "service": "apsen-vision-adapter"}
+
+
+@app.get("/health")
+async def health():
+    """Verifica conectividade com vision-simulator e central-computer."""
+    checks = {}
+    for name, url in [
+        ("vision-simulator", VISION_SIM_URL + "/ping"),
+        ("central-computer", CENTRAL_URL + "/ping"),
+    ]:
+        try:
+            r = await _client.get(url, timeout=3.0)
+            checks[name] = "ok" if r.status_code < 300 else f"http_{r.status_code}"
+        except Exception as exc:
+            checks[name] = f"erro: {exc}"
+    ok = all(v == "ok" for v in checks.values())
+    return {"status": "ok" if ok else "degradado", "checks": checks}
 
 
 @app.post("/comandos/capturar/dispenser")

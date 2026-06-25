@@ -325,23 +325,62 @@ _MEDICAMENTOS_SEED = [
 ]
 
 
+_PESO_POR_DIMENSAO: dict[str, float] = {
+    "45x12x60mm":   15.0,
+    "49x20x104mm":  45.0,
+    "50x21x105mm":  50.0,
+    "47x28x135mm":  60.0,
+    "47x30x155mm":  70.0,
+    "47x36x75mm":   55.0,
+    "55x25x115mm":  60.0,
+    "56x54x110mm": 120.0,
+    "72x25x115mm":  75.0,
+    "72x42x115mm": 100.0,
+    "79x25x104mm":  75.0,
+    "84x25x150mm":  95.0,
+    "95x25x104mm":  85.0,
+}
+_PESO_PADRAO = 50.0
+
+
 def _seed_medicamentos():
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM medicamentos")
-            if cur.fetchone()["n"] >= len(_MEDICAMENTOS_SEED):
-                return
+            count = cur.fetchone()["n"]
+
+        if count < len(_MEDICAMENTOS_SEED):
             inserted = 0
-            for nome, sku, cat, cat_desc, dim in _MEDICAMENTOS_SEED:
-                cur.execute(
-                    "INSERT IGNORE INTO medicamentos "
-                    "(nome, sku, categoria, categoria_desc, dimensao) "
-                    "VALUES (%s,%s,%s,%s,%s)",
-                    (nome, sku, cat, cat_desc, dim),
-                )
-                inserted += cur.rowcount
+            with conn.cursor() as cur:
+                for nome, sku, cat, cat_desc, dim in _MEDICAMENTOS_SEED:
+                    cur.execute(
+                        "INSERT IGNORE INTO medicamentos "
+                        "(nome, sku, categoria, categoria_desc, dimensao) "
+                        "VALUES (%s,%s,%s,%s,%s)",
+                        (nome, sku, cat, cat_desc, dim),
+                    )
+                    inserted += cur.rowcount
             if inserted:
                 logger.info(f"[DB] Seed medicamentos: {inserted} inseridos.")
+
+        # Preenche peso_unitario_g para registros sem peso (idempotente)
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM medicamentos WHERE peso_unitario_g IS NULL")
+            sem_peso = cur.fetchone()["n"]
+
+        if sem_peso > 0:
+            with conn.cursor() as cur:
+                for dimensao, peso in _PESO_POR_DIMENSAO.items():
+                    cur.execute(
+                        "UPDATE medicamentos SET peso_unitario_g=%s "
+                        "WHERE dimensao=%s AND peso_unitario_g IS NULL",
+                        (peso, dimensao),
+                    )
+                cur.execute(
+                    "UPDATE medicamentos SET peso_unitario_g=%s WHERE peso_unitario_g IS NULL",
+                    (_PESO_PADRAO,),
+                )
+            logger.info(f"[DB] Pesos populados para {sem_peso} medicamento(s).")
 
 
 def _seed_usuarios():
@@ -352,8 +391,8 @@ def _seed_usuarios():
                 return
         ts = _ts()
         seeds = [
-            ("admin",  "admin123", "Administrador",         "admin"),
-            ("manut1", "mnt123",   "Tecnico de Manutencao", "manutencao"),
+            ("admin",  settings.SEED_ADMIN_SENHA, "Administrador",         "admin"),
+            ("manut1", settings.SEED_MANUT_SENHA, "Tecnico de Manutencao", "manutencao"),
         ]
         with conn.cursor() as cur:
             for username, senha, nome, role in seeds:
@@ -559,6 +598,43 @@ def get_historico_sensor(componente: str, tipo: str, limite: int = 60) -> list:
 
 # ── Alarmes ────────────────────────────────────────────────────────────────────
 
+def salvar_leitura_visao(
+    os_id: str | None, camera: str, slot_id: int | None, tipo: str,
+    sku_esperado: str | None = None, sku_lido: str | None = None,
+    match_sku: bool | None = None, confianca: float | None = None,
+    qtd_esperada: int | None = None, qtd_detectada: int | None = None,
+    motivo: str | None = None,
+) -> int:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO visao_leituras "
+                "(os_id, camera, slot_id, tipo, sku_esperado, sku_lido, match_sku, "
+                " confianca, qtd_esperada, qtd_detectada, motivo, criado_em) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (os_id, camera, slot_id, tipo, sku_esperado, sku_lido,
+                 1 if match_sku else (0 if match_sku is False else None),
+                 confianca, qtd_esperada, qtd_detectada, motivo, _ts()),
+            )
+            return cur.lastrowid
+
+
+def get_historico_visao(os_id: str = None, limite: int = 100) -> list:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            if os_id:
+                cur.execute(
+                    "SELECT * FROM visao_leituras WHERE os_id=%s ORDER BY criado_em DESC LIMIT %s",
+                    (os_id, limite),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM visao_leituras ORDER BY criado_em DESC LIMIT %s",
+                    (limite,),
+                )
+            return _rows(cur.fetchall())
+
+
 def salvar_alarme(fonte: str, tipo: str, descricao: str) -> int:
     with _conn() as conn:
         with conn.cursor() as cur:
@@ -571,6 +647,17 @@ def resolver_alarme(alarme_id: int):
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE alarmes SET resolvido=1 WHERE id=%s", (alarme_id,))
+
+
+def get_alarmes_por_os(os_id: str, limite: int = 200) -> list:
+    """Retorna alarmes cuja descricao menciona a OS (para relatório)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM alarmes WHERE descricao LIKE %s ORDER BY ts ASC LIMIT %s",
+                (f"%{os_id}%", limite),
+            )
+            return _rows(cur.fetchall())
 
 
 def get_alarmes(resolvido: bool = False, limite: int = 100) -> list:
@@ -701,6 +788,19 @@ def listar_medicamentos(categoria: str = None) -> list:
             else:
                 cur.execute("SELECT * FROM medicamentos ORDER BY categoria, nome")
             return _rows(cur.fetchall())
+
+
+def get_peso_medicamento(nome: str) -> float:
+    """Retorna peso_unitario_g do medicamento. Padrão: 50.0g se não encontrado."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT peso_unitario_g FROM medicamentos WHERE nome=%s LIMIT 1", (nome,)
+            )
+            row = cur.fetchone()
+    if row and row.get("peso_unitario_g") is not None:
+        return float(row["peso_unitario_g"])
+    return 50.0  # fallback padrão
 
 
 def listar_categorias() -> list:

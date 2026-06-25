@@ -1,29 +1,37 @@
 """
-APSEN - Computador Central v3.1
+APSEN - Computador Central v3.2
 Orquestrador ativo: recebe OS do order-generator, comanda adapters,
 consolida eventos, persiste no DB, serve dashboard/IHM via REST + WebSocket.
 
 Comunicação: REST/HTTP/WebSocket — sem MQTT.
 
-FIX v3.1:
-  - asyncio.get_running_loop() (era get_event_loop(), deprecado em 3.10+)
-  - Handlers de evento agora são async (evita bloquear o event loop)
-  - DB writes via asyncio.to_thread() fora do _lock
-  - notificar_evento via loop.call_soon_threadsafe (seguro de qualquer contexto)
+Novidades v3.2:
+  - Weight adapter + HX711 simulator (balança de mesa)
+  - Triple Check: valida dispenser × câmera_mesa × balança após cada dispensa
+    → 2+ divergências ativam trava de emergência (bloqueia OS)
+  - GET /api/v1/trava — estado da trava
+  - POST /api/v1/admin/liberar-trava — libera trava (role admin)
+  - GET /api/v1/visao/historico — histórico de leituras CV
+  - POST /api/v1/eventos/peso — eventos da balança HX711
 
 Endpoints de entrada (dos adapters e order-generator):
   POST /api/v1/ordens              ← order-generator
   POST /api/v1/eventos/dispenser   ← dispenser-adapter
   POST /api/v1/eventos/cnc         ← cnc-adapter
   POST /api/v1/eventos/visao       ← vision-adapter
+  POST /api/v1/eventos/peso        ← weight-adapter
 
 Endpoints de leitura (dashboard, ihm_web):
   GET  /estado, /os/*, /dispensers/estado, /medicamentos, ...
+  GET  /api/v1/trava
+  GET  /api/v1/visao/historico
   WS   /ws
 """
 import asyncio
 import collections
 import copy
+import csv
+import io
 import json
 import logging
 import threading
@@ -33,6 +41,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
@@ -41,8 +50,9 @@ from auth import criar_token, decodificar_token, verificar_senha
 from config import settings
 from database import (
     atribuir_dispenser_item, atualizar_item_os, atualizar_status_ordem,
+    get_historico_visao, salvar_leitura_visao,
     atualizar_usuario, criar_usuario,
-    get_alarmes, get_cnc_recentes, get_dispensas, get_dispensas_recentes,
+    get_alarmes, get_alarmes_por_os, get_cnc_recentes, get_dispensas, get_dispensas_recentes,
     get_dispenser_estado, get_dispensers_estado,
     get_historico_ordens, get_historico_sensor, get_log_manutencao,
     get_ordem_ativa, get_ordem_por_id, get_ultimas_leituras,
@@ -88,6 +98,19 @@ _estado = {
     "fila_tamanho":  0,
     "atribuicao_ia": [],
     "alarmes_ativos": 0,
+    # Trava de Triple Check (bloqueio de OS até intervenção de supervisor)
+    "trava": {
+        "ativa":   False,
+        "os_id":   None,
+        "slot_id": None,
+        "motivo":  "",
+    },
+    # Última leitura da balança HX711
+    "peso": {
+        "ultima_leitura":  None,
+        "slot_id":         None,
+        "ts":              None,
+    },
     # Última leitura de cada câmera (atualizado por _handle_evento_visao)
     "visao": {
         "camera_dispenser": {
@@ -406,6 +429,14 @@ async def _handle_evento_visao(payload: dict):
                 "ts":             payload.get("ts"),
             })
 
+            # Persiste leitura no histórico (todos os tipos de câmera dispenser)
+            db_tasks.append((salvar_leitura_visao, (
+                os_id, "dispenser", slot_id, tipo,
+                payload.get("sku_esperado"), payload.get("sku_lido"),
+                payload.get("match_sku"), payload.get("confianca"),
+                None, None, payload.get("motivo"),
+            )))
+
             if tipo == "leitura_dispenser_falha":
                 descricao = (f"Falha câmera dispenser slot {slot_id}: "
                              f"{payload.get('motivo', 'desconhecido')}")
@@ -439,6 +470,14 @@ async def _handle_evento_visao(payload: dict):
                 "confianca":            payload.get("confianca"),
                 "ts":                   payload.get("ts"),
             })
+
+            # Persiste leitura no histórico (todos os tipos de câmera mesa)
+            db_tasks.append((salvar_leitura_visao, (
+                os_id, "mesa", slot_id, tipo,
+                None, None, None, payload.get("confianca"),
+                payload.get("quantidade_esperada"), payload.get("quantidade_detectada"),
+                payload.get("motivo"),
+            )))
 
             if tipo == "leitura_mesa_falha":
                 descricao = (f"Câmera mesa não detectou produto slot {slot_id}: "
@@ -487,6 +526,63 @@ async def _handle_evento_visao(payload: dict):
     _broadcast_estado()
 
 
+async def _handle_evento_peso(payload: dict):
+    """
+    Processa eventos do weight-adapter (balança HX711).
+    Tipos: tara_ok, peso_ok, peso_divergencia, erro_sensor, telemetria
+    """
+    tipo    = payload.get("tipo", "")
+    slot_id = payload.get("slot_id")
+    os_id   = payload.get("os_id")
+    db_tasks = []
+
+    with _lock:
+        if tipo in ("peso_ok", "peso_divergencia", "tara_ok"):
+            _estado["peso"].update({
+                "ultima_leitura":   tipo,
+                "slot_id":          slot_id,
+                "peso_medido_g":    payload.get("peso_medido_g"),
+                "peso_esperado_g":  payload.get("peso_esperado_g"),
+                "desvio_pct":       payload.get("desvio_pct"),
+                "ts":               payload.get("ts"),
+            })
+
+        if tipo == "peso_divergencia":
+            descricao = (
+                f"Divergência de peso slot {slot_id}: "
+                f"esperado={(payload.get('peso_esperado_g') or 0):.1f}g "
+                f"medido={(payload.get('peso_medido_g') or 0):.1f}g "
+                f"(desvio={(payload.get('desvio_pct') or 0):.1f}%)"
+            )
+            db_tasks.append((salvar_alarme,
+                             (f"balanca_{slot_id}", "divergencia_peso", descricao)))
+            _estado["alarmes_ativos"] = _estado.get("alarmes_ativos", 0) + 1
+            _log("alarme", descricao)
+
+        elif tipo == "erro_sensor":
+            descricao = f"Sensor HX711 falhou: {payload.get('descricao', '')}"
+            db_tasks.append((salvar_alarme,
+                             ("balanca", "erro_sensor_peso", descricao)))
+
+        elif tipo == "telemetria":
+            componente = payload.get("componente", "hx711_balanca_mesa")
+            db_tasks.append((salvar_leitura_sensor,
+                             (componente, "temperatura", payload.get("temperatura_c", 0), "°C")))
+
+    for fn, args in db_tasks:
+        await _db(fn, *args)
+
+    # Notifica orquestrador (para tara e pesagem de slots)
+    if os_id:
+        if tipo == "tara_ok":
+            orch.notificar_evento(f"{os_id}:tara", payload)
+        elif tipo in ("peso_ok", "peso_divergencia", "erro_sensor") and slot_id is not None:
+            orch.notificar_evento(f"{os_id}:peso:{slot_id}", payload)
+
+    _log(f"peso_{tipo}", f"slot={slot_id}", payload)
+    _broadcast_estado()
+
+
 # ── FastAPI Lifespan ───────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -499,6 +595,15 @@ async def lifespan(app: FastAPI):
     # Injeta loop no orquestrador para notificar_evento thread-safe
     orch.inicializar(_estado, _lock, _broadcast_estado, _loop)
 
+    # Aviso de segurança: SECRET_KEY padrão
+    from config import _DEFAULT_SECRET_KEY
+    if settings.SECRET_KEY == _DEFAULT_SECRET_KEY:
+        logger.warning(
+            "⚠️  SECRET_KEY está com valor padrão! "
+            "Defina a variável de ambiente SECRET_KEY antes de ir para produção. "
+            "Gere com: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
     task_broadcast = asyncio.create_task(_broadcast_worker())
     task_orch      = asyncio.create_task(orch.loop_orquestrador())
 
@@ -507,6 +612,7 @@ async def lifespan(app: FastAPI):
 
     task_broadcast.cancel()
     task_orch.cancel()
+    await orch.encerrar()
 
 
 app = FastAPI(title="APSEN Computador Central v3.1", lifespan=lifespan)
@@ -592,6 +698,14 @@ class EventoVisionReq(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class EventoPesoReq(BaseModel):
+    tipo: str                       # tara_ok | peso_ok | peso_divergencia | erro_sensor | telemetria
+    os_id: Optional[str] = None
+    slot_id: Optional[int] = None
+
+    model_config = {"extra": "allow"}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS — RECEBIMENTO (adapters e order-generator)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -645,6 +759,13 @@ async def evento_visao(req: EventoVisionReq):
     return {"ok": True}
 
 
+@app.post("/api/v1/eventos/peso")
+async def evento_peso(req: EventoPesoReq):
+    """Recebe leituras de pesagem do weight-adapter (balança HX711)."""
+    await _handle_evento_peso(req.model_dump())
+    return {"ok": True}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS — DASHBOARD (sem autenticação, read-only)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -679,6 +800,186 @@ def os_detalhe(os_id: str):
     if not ordem:
         raise HTTPException(404, "OS não encontrada")
     return ordem
+
+
+@app.get("/api/v1/relatorio/os/{os_id}")
+async def relatorio_os(
+    os_id: str,
+    formato: str = "csv",
+    token: Optional[str] = None,
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+):
+    """
+    Exporta relatório completo de uma OS em CSV ou XLSX.
+    Aceita token via Header Authorization Bearer OU via query param ?token=
+    para facilitar download direto pelo browser.
+    """
+    # Aceita token via query param (para links de download direto)
+    raw_token = (creds.credentials if creds else None) or token
+    if not raw_token or not decodificar_token(raw_token):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token ausente ou inválido")
+    # Buscar dados em paralelo
+    os_data, dispensas_data, visao_data, alarmes_data = await asyncio.gather(
+        asyncio.to_thread(get_ordem_por_id, os_id),
+        asyncio.to_thread(get_dispensas, os_id, 200),
+        asyncio.to_thread(get_historico_visao, os_id, 200),
+        asyncio.to_thread(get_alarmes_por_os, os_id),
+    )
+    if not os_data:
+        raise HTTPException(status_code=404, detail=f"OS '{os_id}' não encontrada.")
+
+    if formato.lower() == "xlsx":
+        return await _gerar_xlsx(os_id, os_data, dispensas_data, visao_data, alarmes_data)
+    return _gerar_csv(os_id, os_data, dispensas_data, visao_data, alarmes_data)
+
+
+def _gerar_csv(os_id, os_data, dispensas_data, visao_data, alarmes_data) -> StreamingResponse:
+    """Gera CSV com múltiplas seções separadas por linha em branco."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    # Cabeçalho OS
+    writer.writerow(["=== ORDEM DE SAÍDA ==="])
+    writer.writerow(["OS ID", "Status", "Categoria", "Descrição", "Criado em", "Atualizado em"])
+    writer.writerow([
+        os_data.get("os_id", ""), os_data.get("status", ""),
+        os_data.get("categoria", ""), os_data.get("descricao", ""),
+        str(os_data.get("criado_em", ""))[:19],
+        str(os_data.get("atualizado_em", ""))[:19],
+    ])
+    writer.writerow([])
+
+    # Dispensas
+    writer.writerow(["=== DISPENSAS ==="])
+    writer.writerow(["Dispenser", "Medicamento", "Qtd Dispensada", "Qtd Alvo", "Validado", "Horário"])
+    for d in (dispensas_data or []):
+        writer.writerow([
+            f"D{d.get('dispenser_id','')}",
+            d.get("medicamento", ""),
+            d.get("quantidade_dispensada", ""),
+            d.get("quantidade_alvo", ""),
+            "SIM" if d.get("validado") else "NÃO",
+            str(d.get("ts", ""))[:19],
+        ])
+    writer.writerow([])
+
+    # Visão computacional
+    writer.writerow(["=== LEITURAS DE VISÃO COMPUTACIONAL ==="])
+    writer.writerow(["Câmera", "Slot", "Tipo", "SKU Esperado", "SKU Lido", "Match", "Confiança", "Qtd Det.", "Qtd Esp.", "Horário"])
+    for v in (visao_data or []):
+        writer.writerow([
+            v.get("camera", ""), f"D{v.get('slot_id','')}",
+            v.get("tipo", ""),
+            v.get("sku_esperado", ""), v.get("sku_lido", ""),
+            "SIM" if v.get("match_sku") == 1 else ("NÃO" if v.get("match_sku") == 0 else "—"),
+            f"{(v.get('confianca') or 0)*100:.1f}%",
+            v.get("qtd_detectada", ""), v.get("qtd_esperada", ""),
+            str(v.get("criado_em", ""))[:19],
+        ])
+    writer.writerow([])
+
+    # Alarmes
+    writer.writerow(["=== ALARMES ==="])
+    writer.writerow(["Fonte", "Tipo", "Descrição", "Horário"])
+    for a in (alarmes_data or []):
+        writer.writerow([
+            a.get("fonte", ""), a.get("tipo", ""),
+            a.get("descricao", ""),
+            str(a.get("ts", ""))[:19],
+        ])
+
+    buf.seek(0)
+    filename = f"relatorio_{os_id}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+async def _gerar_xlsx(os_id, os_data, dispensas_data, visao_data, alarmes_data) -> StreamingResponse:
+    """Gera XLSX com múltiplas abas — requer openpyxl."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except ImportError:
+        raise HTTPException(
+            status_code=501,
+            detail="openpyxl não instalado no servidor. Use formato=csv.",
+        )
+
+    wb = openpyxl.Workbook()
+
+    def _header_style(ws, row, cols):
+        fill = PatternFill("solid", start_color="1F4E79", end_color="1F4E79")
+        font = Font(bold=True, color="FFFFFF")
+        for col, val in enumerate(cols, start=1):
+            c = ws.cell(row=row, column=col, value=val)
+            c.fill = fill
+            c.font = font
+            c.alignment = Alignment(horizontal="center")
+
+    # Aba: OS
+    ws_os = wb.active
+    ws_os.title = "OS"
+    _header_style(ws_os, 1, ["OS ID", "Status", "Categoria", "Descrição", "Criado em", "Atualizado em"])
+    ws_os.append([
+        os_data.get("os_id", ""), os_data.get("status", ""),
+        os_data.get("categoria", ""), os_data.get("descricao", ""),
+        str(os_data.get("criado_em", ""))[:19], str(os_data.get("atualizado_em", ""))[:19],
+    ])
+
+    # Aba: Dispensas
+    ws_d = wb.create_sheet("Dispensas")
+    _header_style(ws_d, 1, ["Dispenser", "Medicamento", "Qtd Dispensada", "Qtd Alvo", "Validado", "Horário"])
+    for d in (dispensas_data or []):
+        ws_d.append([
+            f"D{d.get('dispenser_id','')}", d.get("medicamento", ""),
+            d.get("quantidade_dispensada", ""), d.get("quantidade_alvo", ""),
+            "SIM" if d.get("validado") else "NÃO",
+            str(d.get("ts", ""))[:19],
+        ])
+
+    # Aba: Visão
+    ws_v = wb.create_sheet("Visão CV")
+    _header_style(ws_v, 1, ["Câmera", "Slot", "Tipo", "SKU Esp.", "SKU Lido", "Match", "Conf.", "Qtd Det.", "Qtd Esp.", "Horário"])
+    for v in (visao_data or []):
+        ws_v.append([
+            v.get("camera", ""), f"D{v.get('slot_id','')}",
+            v.get("tipo", ""), v.get("sku_esperado", ""), v.get("sku_lido", ""),
+            "SIM" if v.get("match_sku") == 1 else ("NÃO" if v.get("match_sku") == 0 else "—"),
+            f"{(v.get('confianca') or 0)*100:.1f}%",
+            v.get("qtd_detectada", ""), v.get("qtd_esperada", ""),
+            str(v.get("criado_em", ""))[:19],
+        ])
+
+    # Aba: Alarmes
+    ws_a = wb.create_sheet("Alarmes")
+    _header_style(ws_a, 1, ["Fonte", "Tipo", "Descrição", "Horário"])
+    for a in (alarmes_data or []):
+        ws_a.append([
+            a.get("fonte", ""), a.get("tipo", ""),
+            a.get("descricao", ""), str(a.get("ts", ""))[:19],
+        ])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"relatorio_{os_id}.xlsx"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/api/v1/visao/historico")
+async def visao_historico(os_id: str = None, limite: int = 100):
+    """Retorna histórico de leituras de visão computacional. Filtra por os_id se fornecido."""
+    if limite > 500:
+        limite = 500
+    rows = await asyncio.to_thread(get_historico_visao, os_id, limite)
+    return {"leituras": rows, "total": len(rows)}
 
 
 @app.get("/medicamentos")
@@ -784,6 +1085,30 @@ def manut_resolver_alarme(alarme_id: int, user=Depends(_get_tecnico)):
     return {"ok": True}
 
 
+# ── Triple Check — trava de emergência ────────────────────────────────────────
+
+@app.get("/api/v1/trava")
+def get_trava():
+    """Retorna estado atual da trava de Triple Check."""
+    return orch.get_trava_estado()
+
+
+@app.post("/api/v1/admin/liberar-trava")
+async def liberar_trava(user=Depends(_get_admin)):
+    """
+    Libera a trava de Triple Check. Exige role admin ou supervisor.
+    A OS retoma de onde parou após a liberação.
+    """
+    liberado = await asyncio.to_thread(orch.liberar_trava, user["sub"])
+    if not liberado:
+        raise HTTPException(status_code=409, detail="Nenhuma trava ativa no momento.")
+    _log("trava", f"Trava liberada por {user['sub']}")
+    with _lock:
+        _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
+    _broadcast_estado()
+    return {"ok": True, "liberado_por": user["sub"]}
+
+
 @app.post("/manutencao/dispensers/{dispenser_id}/limpar")
 async def manut_limpar_dispenser(dispenser_id: int, user=Depends(_get_tecnico)):
     """Envia comando de limpeza ao dispenser-adapter. Bloqueado se slot está em operação."""
@@ -795,14 +1120,22 @@ async def manut_limpar_dispenser(dispenser_id: int, user=Depends(_get_tecnico)):
         d_status = d_info.get("status", "idle")
         os_ativa = _estado["os_ativa"]
 
-    STATUS_BLOQUEADOS = {"carregando", "pronto", "dispensando", "aguardando_carga"}
-    if d_status in STATUS_BLOQUEADOS:
-        med      = d_info.get("medicamento", f"Dispenser {dispenser_id}")
+    # Bloqueio 1: OS ativa — nenhum dispenser pode ser limpo durante uma OS
+    if os_ativa:
         os_atual = (os_ativa or {}).get("os_id", "?")
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"Dispenser {dispenser_id} ({med}) em operação "
-            f"(status: '{d_status}') na OS {os_atual}.",
+            f"Limpeza bloqueada: OS {os_atual} em andamento. "
+            "Aguarde a conclusão da ordem de serviço.",
+        )
+    # Bloqueio 2: dispenser em operação ativa
+    STATUS_BLOQUEADOS = {"carregando", "pronto", "dispensando", "aguardando_carga", "concluido"}
+    if d_status in STATUS_BLOQUEADOS:
+        med = d_info.get("medicamento", f"Dispenser {dispenser_id}")
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Dispenser {dispenser_id} ({med}) em operação (status: '{d_status}'). "
+            "Aguarde o sistema finalizar antes de limpar.",
         )
 
     ok = await orch.cmd_limpar(dispenser_id, user["sub"])
