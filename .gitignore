@@ -23,7 +23,11 @@ env/
 
 # Docker volumes (nunca commitar dados do banco)
 mysql_data/
-mqtt_data/
+
+# Diretórios legados (MQTT — removidos na Fase 3)
+backend/
+sap_simulator/
+mosquitto/
 
 # Logs
 *.log

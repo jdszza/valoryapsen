@@ -1,32 +1,21 @@
 """
-APSEN - Simulador CNC v2.1
-===========================
-Simula o firmware da mesa CNC que movimenta a caixa sob cada dispenser.
+APSEN - CNC Simulator v3.0 (HTTP)
+Hardware puro: recebe comandos de movimento do cnc-adapter e reporta eventos de volta.
+Toda lógica de negócio (rota, sequenciamento, OS) foi movida para o central-computer.
 
-Fluxo completo:
-  1. Recebe OS via apsen/os/nova
-  2. Recebe atribuição da IA (apsen/ia/atribuicao) — sabe qual dispenser tem qual remédio
-  3. IA da CNC calcula a melhor ordem de visita (cartonização — nearest-neighbor)
-  4. Aguarda TODOS os dispensers da OS publicarem status "pronto"
-  5. Mesa inicia: para cada dispenser na ordem otimizada:
-       a. Publica "movendo" + log de cada passo (posição interpolada)
-       b. Publica "posicionado" ao chegar
-       c. Aguarda dispenser concluir a dispensa
-       d. Avança para o próximo
-  6. Ao finalizar todos: publica "concluido" e retorna para HOME
+Endpoints (servidor HTTP):
+  POST /executar/mover    ← adapter comanda mover para dispenser X
+  POST /executar/homing   ← adapter comanda retorno à HOME
+  GET  /status            ← estado atual da CNC
 
-Tópicos publicados:
-  apsen/cnc/status      → log de cada movimento + estado geral
-  apsen/manut/temperatura
-  apsen/manut/uso
-
-Tópicos assinados:
-  apsen/os/nova           — OS recebida da SAP
-  apsen/ia/atribuicao     — atribuição IA: qual dispenser tem qual remédio
-  apsen/dispenser/status  — aguarda "pronto" e "concluido" dos dispensers
+Eventos (cliente HTTP via requests.post → adapter):
+  tipo: "movendo"      → posição atual durante movimento
+  tipo: "posicionado"  → chegou ao destino
+  tipo: "retornando"   → em movimento para HOME
+  tipo: "concluido"    → homing finalizado
+  tipo: "erro"         → falha de movimento
+  tipo: "telemetria"   → leituras de sensores
 """
-
-import json
 import logging
 import math
 import os
@@ -34,8 +23,12 @@ import random
 import threading
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
-import paho.mqtt.client as mqtt
+import requests
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,15 +36,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MQTT_HOST       = os.getenv("MQTT_HOST",    "mosquitto")
-MQTT_PORT       = int(os.getenv("MQTT_PORT", "1883"))
-VELOCIDADE_MM_S = float(os.getenv("VEL_MM_S",   "80"))    # mm/s de movimento
-INTERVALO_PUB   = float(os.getenv("INTERVALO",  "0.5"))   # s entre publicações de posição
-TIMEOUT_PRONTO  = float(os.getenv("TIMEOUT_PRONTO", "180"))  # s aguardando todos prontos
-TIMEOUT_DISP    = float(os.getenv("TIMEOUT_DISP",   "120"))  # s aguardando dispenser dispensar
-RECONNECT_DELAY = 5
+ADAPTER_URL     = os.getenv("ADAPTER_URL",    "http://cnc-adapter:8101")
+VELOCIDADE_MM_S = float(os.getenv("VEL_MM_S",   "80"))   # mm/s
+INTERVALO_PUB   = float(os.getenv("INTERVALO",  "0.5"))  # s entre publicações de posição
 
-# Posições XY (mm) de cada dispenser na mesa
+# Posições XY (mm) dos dispensers na mesa
 POSICOES: dict[int, tuple[float, float]] = {
     1: (0.0,   0.0),
     2: (120.0, 0.0),
@@ -60,9 +49,8 @@ POSICOES: dict[int, tuple[float, float]] = {
     5: (480.0, 0.0),
     6: (600.0, 0.0),
 }
-HOME: tuple[float, float] = (0.0, -50.0)  # posição de repouso
+HOME: tuple[float, float] = (0.0, -50.0)
 
-# Componentes para telemetria de manutenção
 COMPONENTES_TEMP = [
     ("motor_eixo_x", 35, 55),
     ("motor_eixo_y", 33, 50),
@@ -78,492 +66,351 @@ COMPONENTES_USO = [
 ]
 
 
-def _nearest_neighbor(dispensers: list[int], start: tuple[float, float]) -> list[int]:
-    """
-    Calcula a ordem ótima de visita aos dispensers usando nearest-neighbor.
-    Simula a IA de cartonização: minimiza a distância total percorrida.
-    """
-    restantes = list(dispensers)
-    ordem     = []
-    pos_atual  = start
-
-    while restantes:
-        # Escolhe o dispenser mais próximo da posição atual
-        mais_proximo = min(
-            restantes,
-            key=lambda d: math.hypot(
-                POSICOES[d][0] - pos_atual[0],
-                POSICOES[d][1] - pos_atual[1],
-            ),
-        )
-        ordem.append(mais_proximo)
-        restantes.remove(mais_proximo)
-        pos_atual = POSICOES[mais_proximo]
-
-    return ordem
+def _ts() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-class CNCSimulator:
-    def __init__(self):
-        self.state          = "idle"
-        self.os_id          = None
-        self.os_itens       = []       # medicamentos da OS atual (raw)
-        self.atribuicoes    = {}       # {dispenser_id: {...}} da IA
-        self.ciclo_atual    = 0
-        self.total_ciclos   = 0
-        self.pos_x          = HOME[0]
-        self.pos_y          = HOME[1]
-        self.horas_uso      = random.uniform(120, 800)
-        self.ciclos_total   = random.randint(5000, 50000)
+def _evento(payload: dict) -> bool:
+    """Envia evento ao cnc-adapter. Não lança exceção."""
+    try:
+        r = requests.post(ADAPTER_URL + "/eventos", json=payload, timeout=5)
+        return r.status_code < 300
+    except Exception as exc:
+        logger.warning("[HTTP] Falha ao enviar evento: %s", exc)
+        return False
 
-        self._lock          = threading.Lock()
-        # Dispensers que já enviaram "pronto" para a OS atual
-        self._disp_prontos: set[int] = set()
-        # Dispensers aguardados (IDs inteiros)
-        self._disp_esperados: set[int] = set()
-        # Evento: todos os dispensers prontos
-        self._todos_prontos = threading.Event()
-        # Evento: dispenser atual concluiu a dispensa
-        self._disp_concluiu = threading.Event()
-        self._disp_atual_id: int | None = None
-        # Flag: erro de CV detectado — abortar espera
-        self._cv_erro       = False
 
-        self.client = mqtt.Client(client_id="apsen-cnc-simulator-v21", clean_session=True)
-        self.client.on_connect    = self._on_connect
-        self.client.on_disconnect = self._on_disconnect
-        self.client.on_message    = self._on_message
+# ── Estado da CNC ──────────────────────────────────────────────────────────────
+_lock = threading.Lock()
+_em_movimento = threading.Event()  # set=True enquanto CNC está em movimento
+_movimento_lock = threading.Lock()  # protege check-and-set atômico de _em_movimento
 
-    # ─────────────────────────────────────────────────── MQTT ──────────────────
+_cnc_state = {
+    "status":         "idle",
+    "os_id":          None,
+    "dispenser_alvo": None,
+    "pos_x":          HOME[0],
+    "pos_y":          HOME[1],
+    "ciclo_atual":    0,
+    "total_ciclos":   0,
+    "horas_uso":      random.uniform(120, 800),
+    "ciclos_total":   random.randint(5000, 50000),
+}
 
-    def _on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            client.subscribe("apsen/os/nova",              qos=1)
-            client.subscribe("apsen/ia/atribuicao",        qos=0)
-            client.subscribe("apsen/dispenser/status",     qos=0)
-            client.subscribe("apsen/dispenser/carregamento", qos=0)
-            logger.info("CNC conectada ao broker. Aguardando OS...")
-            self._pub_status()
 
-    def _on_disconnect(self, client, userdata, rc):
-        if rc != 0:
-            logger.warning(f"CNC desconectada (rc={rc}). Reconectando em {RECONNECT_DELAY}s...")
+# ── FastAPI App ────────────────────────────────────────────────────────────────
+app = FastAPI(title="APSEN CNC Simulator v3.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
-    def _on_message(self, client, userdata, msg):
-        try:
-            payload = json.loads(msg.payload.decode())
-            topic   = msg.topic
 
-            if topic == "apsen/os/nova":
-                self._handle_os_nova(payload)
+class MoverReq(BaseModel):
+    dispenser_alvo: int
+    os_id: str
+    posicao_x: float
+    posicao_y: float
+    ciclo_atual: int = 0
+    total_ciclos: int = 0
 
-            elif topic == "apsen/ia/atribuicao":
-                self._handle_ia_atribuicao(payload)
 
-            elif topic == "apsen/dispenser/status":
-                self._handle_dispenser_status(payload)
+class HomingReq(BaseModel):
+    os_id: str
 
-            elif topic == "apsen/dispenser/carregamento":
-                self._handle_dispenser_carregamento(payload)
 
-        except Exception as exc:
-            logger.error(f"[CNC] Erro em mensagem: {exc}", exc_info=True)
+# ── Lógica de movimento ────────────────────────────────────────────────────────
 
-    # ─────────────────────────────────────────────────── Handlers ──────────────
-
-    def _handle_dispenser_carregamento(self, payload: dict):
-        """Se CV reportar erro no carregamento → aborta espera imediatamente."""
-        status = payload.get("status")
-        os_id  = payload.get("os_id")
-        disp_id = payload.get("dispenser_id")
-        motivo  = payload.get("motivo_falha", "erro CV")
-
-        with self._lock:
-            if status == "erro" and os_id == self.os_id:
-                logger.error(
-                    f"[CNC] Dispenser {disp_id} — ERRO CV na OS {os_id}: {motivo}. "
-                    f"Abortando espera."
-                )
-                self._cv_erro = True
-                # Desbloqueia _aguardar_todos_prontos sem marcar como pronto
-                self._todos_prontos.set()
-
-    def _handle_os_nova(self, payload: dict):
-        with self._lock:
-            if self.state != "idle":
-                logger.warning(f"[CNC] OS recebida mas máquina em '{self.state}' — ignorando.")
-                return
-            self.os_id           = payload.get("os_id")
-            self.os_itens        = payload.get("medicamentos", [])
-            self.atribuicoes     = {}
-            self._disp_prontos   = set()
-            self._disp_esperados = set()
-            self._cv_erro        = False
-            self._todos_prontos.clear()
-            self.ciclo_atual     = 0
-            self.total_ciclos    = len(self.os_itens)
-            self.state           = "aguardando_atribuicao"
-
-        meds_str = ", ".join(
-            i.get("medicamento", "?") + " x" + str(i.get("quantidade", "?"))
-            for i in self.os_itens
-        )
-        logger.info(
-            f"\n{'='*60}\n"
-            f"  [CNC] OS RECEBIDA: {self.os_id}\n"
-            f"  Medicamentos ({len(self.os_itens)}): {meds_str}\n"
-            f"  Aguardando atribuição da IA...\n"
-            f"{'='*60}"
-        )
-        self._pub_status(status="aguardando_atribuicao")
-
-    def _handle_ia_atribuicao(self, payload: dict):
-        os_id = payload.get("os_id")
-        with self._lock:
-            if os_id != self.os_id:
-                return  # atribuição para outra OS
-            atribuicoes = payload.get("atribuicoes", [])
-            for a in atribuicoes:
-                disp_id = int(a["dispenser_id"])
-                self.atribuicoes[disp_id] = a
-                self._disp_esperados.add(disp_id)
-            self.state = "aguardando_abastecimento"
-
-        # Calcula a ordem ótima de visita (cartonização)
-        with self._lock:
-            dispenser_ids = list(self._disp_esperados)
-        ordem_otima = _nearest_neighbor(dispenser_ids, (self.pos_x, self.pos_y))
-
-        logger.info(
-            f"[CNC] IA: atribuição recebida para {len(dispenser_ids)} dispenser(s).\n"
-            f"       Ordem ótima calculada (cartonização): {ordem_otima}"
-        )
-        with self._lock:
-            self._ordem_visita = ordem_otima
-            self.total_ciclos  = len(ordem_otima)
-
-        self._pub_status(
-            status="aguardando_abastecimento",
-            extra={"ordem_visita": ordem_otima},
-        )
-
-        # Aguarda todos prontos em thread separada
-        threading.Thread(
-            target=self._aguardar_todos_prontos,
-            daemon=True,
-            name="aguardar-prontos",
-        ).start()
-
-    def _handle_dispenser_status(self, payload: dict):
-        disp_id = payload.get("dispenser_id")
-        status  = payload.get("status", "")
-        os_id   = payload.get("os_id")
-
-        with self._lock:
-            # Dispenser sinalizou que está pronto para dispensar
-            if (status == "pronto"
-                    and isinstance(disp_id, int)
-                    and disp_id in self._disp_esperados
-                    and os_id == self.os_id):
-                self._disp_prontos.add(disp_id)
-                faltam = self._disp_esperados - self._disp_prontos
-                logger.info(
-                    f"[CNC] Dispenser {disp_id} PRONTO. "
-                    f"Prontos: {len(self._disp_prontos)}/{len(self._disp_esperados)}. "
-                    f"Faltam: {sorted(faltam) or 'nenhum'}"
-                )
-                if self._disp_prontos >= self._disp_esperados:
-                    self._todos_prontos.set()
-
-            # Dispenser concluiu a dispensa (CNC pode avançar)
-            elif (status == "concluido"
-                      and isinstance(disp_id, int)
-                      and disp_id == self._disp_atual_id):
-                self._disp_concluiu.set()
-
-    # ─────────────────────────────────────── Processamento da OS ───────────────
-
-    def _aguardar_todos_prontos(self):
-        """Aguarda todos os dispensers reportarem 'pronto'. Então inicia a mesa."""
-        logger.info(f"[CNC] Aguardando {len(self._disp_esperados)} dispenser(s) carregar...")
-        ok = self._todos_prontos.wait(timeout=TIMEOUT_PRONTO)
-
-        with self._lock:
-            cv_erro = self._cv_erro
-            prontos = set(self._disp_prontos)
-            esperados = set(self._disp_esperados)
-
-        if cv_erro:
-            logger.error("[CNC] Erro de CV detectado nos dispensers — abortando OS.")
-            self._pub_status(status="erro", extra={"mensagem": "Erro de CV no carregamento"})
-            with self._lock:
-                self.state = "idle"
-                self.os_id = None
-                self._cv_erro = False
-            return
-
-        if not ok or prontos < esperados:
-            faltam = esperados - prontos
-            logger.error(f"[CNC] Timeout! Dispensers ainda não prontos: {sorted(faltam)}")
-            self._pub_status(status="erro", extra={"mensagem": "Timeout aguardando abastecimento"})
-            with self._lock:
-                self.state = "idle"
-            return
-
-        logger.info("\n[CNC] TODOS OS DISPENSERS PRONTOS. Mesa iniciando!\n")
-        self._processar_os()
-
-    def _processar_os(self):
-        """Visita cada dispenser na ordem otimizada e loga cada movimento."""
-        with self._lock:
-            ordem    = list(self._ordem_visita)
-            os_id    = self.os_id
-            total    = self.total_ciclos
-            self.state = "em_operacao"
-
-        self._pub_status(status="iniciando")
-        time.sleep(0.5)
-
-        for seq, disp_id in enumerate(ordem, start=1):
-            with self._lock:
-                self.ciclo_atual = seq
-                med = self.atribuicoes.get(disp_id, {}).get("medicamento", "?")
-
-            logger.info(
-                f"\n[CNC] ──── Ciclo {seq}/{total} ────\n"
-                f"       Destino: Dispenser {disp_id} ({med})\n"
-                f"       Posição alvo: {POSICOES[disp_id]} mm"
-            )
-
-            # Mover para o dispenser (publica cada passo de posição)
-            self._mover_para(disp_id, seq, total, os_id)
-
-            # Posicionado — notifica dispenser que pode dispensar
-            self._pub_status(status="posicionado", dispenser_alvo=disp_id)
-            logger.info(f"[CNC] POSICIONADA no Dispenser {disp_id}. Aguardando dispensa...")
-
-            # Aguarda dispenser concluir (timeout de segurança)
-            with self._lock:
-                self._disp_atual_id = disp_id
-                self._disp_concluiu.clear()
-
-            concluiu = self._disp_concluiu.wait(timeout=TIMEOUT_DISP)
-            if not concluiu:
-                logger.error(f"[CNC] Timeout aguardando Dispenser {disp_id} concluir!")
-                self._pub_status(
-                    status="erro",
-                    dispenser_alvo=disp_id,
-                    extra={"mensagem": f"Timeout dispenser {disp_id}"},
-                )
-                with self._lock:
-                    self.state = "idle"
-                return
-
-            logger.info(f"[CNC] Dispenser {disp_id} concluído. Avançando.")
-
-        # Todos visitados — retorna para HOME
-        self._mover_para_home(os_id)
-        self._pub_status(status="concluido")
-
-        with self._lock:
-            self.ciclos_total += total
-            self.horas_uso    += total * 0.01  # ~36s por ciclo em média
-            self.state         = "idle"
-            self.os_id         = None
-            self._ordem_visita = []
-
-        logger.info(
-            f"\n{'='*60}\n"
-            f"  [CNC] OS CONCLUIDA. {total} dispenser(s) visitados.\n"
-            f"  Retornando para HOME.\n"
-            f"{'='*60}"
-        )
-        time.sleep(1.0)
-        self._pub_status(status="idle")
-
-    # ─────────────────────────────────────────── Movimento ─────────────────────
-
-    def _mover_para(self, dispenser_id: int, ciclo: int, total: int, os_id: str):
-        """Interpola posição até o dispenser, publicando cada passo."""
-        alvo_x, alvo_y = POSICOES[dispenser_id]
-        with self._lock:
-            orig_x, orig_y = self.pos_x, self.pos_y
-
-        distancia = math.hypot(alvo_x - orig_x, alvo_y - orig_y)
-        if distancia < 0.1:
-            return  # já está no lugar
-
-        duracao = max(1.0, distancia / VELOCIDADE_MM_S)
-        passos  = max(3, int(duracao / INTERVALO_PUB))
-
-        logger.info(
-            f"[CNC] Movendo de ({orig_x:.1f}, {orig_y:.1f}) → "
-            f"({alvo_x:.1f}, {alvo_y:.1f}) | {distancia:.0f}mm | "
-            f"~{duracao:.1f}s | {passos} passos"
-        )
-
-        for i in range(1, passos + 1):
-            t     = i / passos
-            cur_x = orig_x + (alvo_x - orig_x) * t
-            cur_y = orig_y + (alvo_y - orig_y) * t
-
-            with self._lock:
-                self.pos_x = cur_x
-                self.pos_y = cur_y
-
-            self.client.publish(
-                "apsen/cnc/status",
-                json.dumps({
-                    "status":         "movendo",
-                    "os_id":          os_id,
-                    "dispenser_alvo": dispenser_id,
-                    "posicao_x":      round(cur_x, 2),
-                    "posicao_y":      round(cur_y, 2),
-                    "ciclo_atual":    ciclo,
-                    "total_ciclos":   total,
-                    "passo":          i,
-                    "total_passos":   passos,
-                    "progresso_pct":  round(t * 100, 1),
-                    "timestamp":      datetime.now(timezone.utc).isoformat(),
-                }),
-                qos=0,
-            )
-            time.sleep(INTERVALO_PUB)
-
-    def _mover_para_home(self, os_id: str):
-        """Move de volta para a posição HOME."""
-        with self._lock:
-            orig_x, orig_y = self.pos_x, self.pos_y
-
-        distancia = math.hypot(HOME[0] - orig_x, HOME[1] - orig_y)
-        duracao   = max(1.0, distancia / VELOCIDADE_MM_S)
-        passos    = max(3, int(duracao / INTERVALO_PUB))
-
-        for i in range(1, passos + 1):
-            t     = i / passos
-            cur_x = orig_x + (HOME[0] - orig_x) * t
-            cur_y = orig_y + (HOME[1] - orig_y) * t
-            with self._lock:
-                self.pos_x = cur_x
-                self.pos_y = cur_y
-            self.client.publish(
-                "apsen/cnc/status",
-                json.dumps({
-                    "status":     "retornando",
-                    "os_id":      os_id,
-                    "posicao_x":  round(cur_x, 2),
-                    "posicao_y":  round(cur_y, 2),
-                    "timestamp":  datetime.now(timezone.utc).isoformat(),
-                }),
-                qos=0,
-            )
-            time.sleep(INTERVALO_PUB)
-
-    # ─────────────────────────────────────── Publicação geral ──────────────────
-
-    def _pub_status(self, status: str = None, dispenser_alvo: int = None,
-                    extra: dict = None):
-        with self._lock:
-            sts   = status or self.state
-            os_id = self.os_id
-            px    = self.pos_x
-            py    = self.pos_y
-            ciclo = self.ciclo_atual
-            total = self.total_ciclos
-
-        payload = {
-            "status":         sts,
+def _mover_para(disp_id: int, alvo_x: float, alvo_y: float,
+                os_id: str, ciclo: int, total: int):
+    """Interpola posição até o destino, publicando cada passo."""
+    with _lock:
+        orig_x = _cnc_state["pos_x"]
+        orig_y = _cnc_state["pos_y"]
+        _cnc_state.update({
+            "status":         "movendo",
             "os_id":          os_id,
-            "dispenser_alvo": dispenser_alvo,
-            "posicao_x":      round(px, 2),
-            "posicao_y":      round(py, 2),
+            "dispenser_alvo": disp_id,
             "ciclo_atual":    ciclo,
             "total_ciclos":   total,
-            "timestamp":      datetime.now(timezone.utc).isoformat(),
-        }
-        if extra:
-            payload.update(extra)
+        })
 
-        self.client.publish("apsen/cnc/status", json.dumps(payload), qos=0, retain=True)
+    distancia = math.hypot(alvo_x - orig_x, alvo_y - orig_y)
+    if distancia < 0.1:
+        # Já está posicionado
+        with _lock:
+            _cnc_state["status"] = "posicionado"
+        _evento({
+            "tipo":           "posicionado",
+            "os_id":          os_id,
+            "dispenser_alvo": disp_id,
+            "posicao_x":      round(alvo_x, 2),
+            "posicao_y":      round(alvo_y, 2),
+            "ciclo_atual":    ciclo,
+            "total_ciclos":   total,
+            "ts":             _ts(),
+        })
+        return
 
-    # ─────────────────────────────────── Telemetria de manutenção ──────────────
+    duracao = max(1.0, distancia / VELOCIDADE_MM_S)
+    passos  = max(3, int(duracao / INTERVALO_PUB))
 
-    def _telemetria_loop(self):
-        """Publica leituras de sensores a cada 30 segundos."""
-        while True:
-            time.sleep(30)
-            with self._lock:
-                em_uso = self.state not in ("idle",)
-                horas  = self.horas_uso
-                ciclos = self.ciclos_total
+    logger.info("[CNC] Movendo de (%.1f, %.1f) → (%.1f, %.1f) | %.0fmm | ~%.1fs | %d passos",
+                orig_x, orig_y, alvo_x, alvo_y, distancia, duracao, passos)
 
-            ts = datetime.now(timezone.utc).isoformat()
+    for i in range(1, passos + 1):
+        t     = i / passos
+        cur_x = orig_x + (alvo_x - orig_x) * t
+        cur_y = orig_y + (alvo_y - orig_y) * t
 
-            for comp, t_min, t_max in COMPONENTES_TEMP:
-                base  = t_min + (t_max - t_min) * (0.75 if em_uso else 0.2)
-                valor = round(base + random.uniform(-1.5, 1.5), 1)
-                self.client.publish(
-                    "apsen/manut/temperatura",
-                    json.dumps({"componente": comp, "valor_c": valor, "timestamp": ts}),
-                    qos=0,
-                )
+        with _lock:
+            _cnc_state["pos_x"] = cur_x
+            _cnc_state["pos_y"] = cur_y
 
-            for comp, tipo in COMPONENTES_USO:
-                self.client.publish(
-                    "apsen/manut/uso",
-                    json.dumps({
-                        "componente": comp,
-                        "tipo":       tipo,
-                        "valor":      round(min(100.0, horas / 10.0), 1),
-                        "unidade":    "%",
-                        "timestamp":  ts,
-                    }),
-                    qos=0,
-                )
+        _evento({
+            "tipo":           "movendo",
+            "os_id":          os_id,
+            "dispenser_alvo": disp_id,
+            "posicao_x":      round(cur_x, 2),
+            "posicao_y":      round(cur_y, 2),
+            "ciclo_atual":    ciclo,
+            "total_ciclos":   total,
+            "passo":          i,
+            "total_passos":   passos,
+            "progresso_pct":  round(t * 100, 1),
+            "ts":             _ts(),
+        })
+        time.sleep(INTERVALO_PUB)
 
-            self.client.publish(
-                "apsen/manut/uso",
-                json.dumps({
-                    "componente": "cnc_geral",
-                    "tipo":       "horas_uso",
-                    "valor":      round(horas, 1),
-                    "unidade":    "h",
-                    "timestamp":  ts,
-                }),
-                qos=0,
-            )
-            self.client.publish(
-                "apsen/manut/uso",
-                json.dumps({
-                    "componente": "cnc_geral",
-                    "tipo":       "ciclos",
-                    "valor":      ciclos,
-                    "unidade":    "ciclos",
-                    "timestamp":  ts,
-                }),
-                qos=0,
-            )
+    with _lock:
+        _cnc_state.update({
+            "pos_x":  alvo_x,
+            "pos_y":  alvo_y,
+            "status": "posicionado",
+        })
 
-    # ──────────────────────────────────────────────────── Main ─────────────────
+    logger.info("[CNC] POSICIONADA em D%d (%.1f, %.1f).", disp_id, alvo_x, alvo_y)
+    _evento({
+        "tipo":           "posicionado",
+        "os_id":          os_id,
+        "dispenser_alvo": disp_id,
+        "posicao_x":      round(alvo_x, 2),
+        "posicao_y":      round(alvo_y, 2),
+        "ciclo_atual":    ciclo,
+        "total_ciclos":   total,
+        "ts":             _ts(),
+    })
 
-    def run(self):
-        logger.info(
-            f"CNC Simulator v2.1 | broker={MQTT_HOST}:{MQTT_PORT} "
-            f"| vel={VELOCIDADE_MM_S}mm/s | timeout_pronto={TIMEOUT_PRONTO}s"
-        )
-        self._ordem_visita = []
-        threading.Thread(
-            target=self._telemetria_loop, daemon=True, name="telemetria"
-        ).start()
 
-        while True:
-            try:
-                self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
-                self.client.loop_forever(retry_first_connection=True)
-            except Exception as exc:
-                logger.error("Erro MQTT: %s. Reconectando em %ds...", exc, RECONNECT_DELAY)
-                time.sleep(RECONNECT_DELAY)
+def _homing(os_id: str):
+    """Move a CNC de volta para HOME e reporta conclusão."""
+    with _lock:
+        orig_x = _cnc_state["pos_x"]
+        orig_y = _cnc_state["pos_y"]
+        _cnc_state.update({
+            "status":         "retornando",
+            "dispenser_alvo": None,
+        })
 
+    distancia = math.hypot(HOME[0] - orig_x, HOME[1] - orig_y)
+    duracao   = max(1.0, distancia / VELOCIDADE_MM_S)
+    passos    = max(3, int(duracao / INTERVALO_PUB))
+
+    logger.info("[CNC] HOMING: %.0fmm | ~%.1fs", distancia, duracao)
+
+    for i in range(1, passos + 1):
+        t     = i / passos
+        cur_x = orig_x + (HOME[0] - orig_x) * t
+        cur_y = orig_y + (HOME[1] - orig_y) * t
+
+        with _lock:
+            _cnc_state["pos_x"] = cur_x
+            _cnc_state["pos_y"] = cur_y
+
+        _evento({
+            "tipo":      "retornando",
+            "os_id":     os_id,
+            "posicao_x": round(cur_x, 2),
+            "posicao_y": round(cur_y, 2),
+            "ts":        _ts(),
+        })
+        time.sleep(INTERVALO_PUB)
+
+    with _lock:
+        _cnc_state.update({
+            "pos_x":       HOME[0],
+            "pos_y":       HOME[1],
+            "status":      "idle",
+            "os_id":       None,
+            "ciclo_atual": 0,
+            "total_ciclos": 0,
+            "ciclos_total": _cnc_state["ciclos_total"] + _cnc_state.get("total_ciclos", 0),
+            "horas_uso":    _cnc_state["horas_uso"] + _cnc_state.get("total_ciclos", 0) * 0.01,
+        })
+
+    logger.info("[CNC] HOME atingida. OS %s concluída.", os_id)
+    _evento({
+        "tipo":      "concluido",
+        "os_id":     os_id,
+        "posicao_x": HOME[0],
+        "posicao_y": HOME[1],
+        "ts":        _ts(),
+    })
+    _em_movimento.clear()
+
+
+def _thread_mover(disp_id: int, alvo_x: float, alvo_y: float,
+                  os_id: str, ciclo: int, total: int):
+    try:
+        _mover_para(disp_id, alvo_x, alvo_y, os_id, ciclo, total)
+    except Exception as exc:
+        logger.error("[CNC] Erro em movimento: %s", exc, exc_info=True)
+        with _lock:
+            _cnc_state["status"] = "erro"
+        _evento({
+            "tipo":           "erro",
+            "os_id":          os_id,
+            "dispenser_alvo": disp_id,
+            "codigo_erro":    "erro_movimento",
+            "descricao":      str(exc),
+            "ts":             _ts(),
+        })
+    finally:
+        _em_movimento.clear()
+
+
+def _thread_homing(os_id: str):
+    try:
+        _homing(os_id)
+    except Exception as exc:
+        logger.error("[CNC] Erro em homing: %s", exc, exc_info=True)
+        with _lock:
+            _cnc_state["status"] = "erro"
+        _evento({
+            "tipo":        "erro",
+            "os_id":       os_id,
+            "codigo_erro": "erro_homing",
+            "descricao":   str(exc),
+            "ts":          _ts(),
+        })
+        _em_movimento.clear()
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.get("/ping")
+def ping():
+    return {"status": "ok", "service": "apsen-cnc-simulator"}
+
+
+@app.get("/status")
+def status():
+    with _lock:
+        return dict(_cnc_state) | {"ts": _ts()}
+
+
+@app.post("/executar/mover")
+def executar_mover(req: MoverReq):
+    if req.dispenser_alvo not in POSICOES:
+        raise HTTPException(400, f"dispenser_alvo deve ser 1-6, recebido: {req.dispenser_alvo}")
+
+    # Verifica e seta _em_movimento atomicamente para evitar race condition
+    with _movimento_lock:
+        if _em_movimento.is_set():
+            raise HTTPException(409, "CNC em movimento — aguarde posicionamento atual")
+        _em_movimento.set()
+
+    threading.Thread(
+        target=_thread_mover,
+        args=(req.dispenser_alvo, req.posicao_x, req.posicao_y,
+              req.os_id, req.ciclo_atual, req.total_ciclos),
+        daemon=True,
+        name=f"cnc-mover-D{req.dispenser_alvo}",
+    ).start()
+
+    return {
+        "ok": True,
+        "msg": f"Movendo para D{req.dispenser_alvo}",
+        "destino": {"x": req.posicao_x, "y": req.posicao_y},
+    }
+
+
+@app.post("/executar/homing")
+def executar_homing(req: HomingReq):
+    # Verifica e seta _em_movimento atomicamente para evitar race condition
+    with _movimento_lock:
+        if _em_movimento.is_set():
+            raise HTTPException(409, "CNC em movimento — aguarde conclusão")
+        _em_movimento.set()
+
+    threading.Thread(
+        target=_thread_homing,
+        args=(req.os_id,),
+        daemon=True,
+        name="cnc-homing",
+    ).start()
+
+    return {"ok": True, "msg": "Homing iniciado", "home": {"x": HOME[0], "y": HOME[1]}}
+
+
+# ── Telemetria periódica ───────────────────────────────────────────────────────
+
+def _telemetria_loop():
+    while True:
+        time.sleep(30)
+        with _lock:
+            em_uso = _cnc_state["status"] not in ("idle",)
+            horas  = _cnc_state["horas_uso"]
+            ciclos = _cnc_state["ciclos_total"]
+
+        ts = _ts()
+
+        for comp, t_min, t_max in COMPONENTES_TEMP:
+            base  = t_min + (t_max - t_min) * (0.75 if em_uso else 0.2)
+            valor = round(base + random.uniform(-1.5, 1.5), 1)
+            _evento({
+                "tipo":         "telemetria",
+                "componente":   comp,
+                "tipo_leitura": "temperatura",
+                "valor":        valor,
+                "unidade":      "°C",
+                "ts":           ts,
+            })
+
+        for comp, tipo in COMPONENTES_USO:
+            _evento({
+                "tipo":         "telemetria",
+                "componente":   comp,
+                "tipo_leitura": tipo,
+                "valor":        round(min(100.0, horas / 10.0), 1),
+                "unidade":      "%",
+                "ts":           ts,
+            })
+
+        _evento({
+            "tipo":         "telemetria",
+            "componente":   "cnc_geral",
+            "tipo_leitura": "horas_uso",
+            "valor":        round(horas, 1),
+            "unidade":      "h",
+            "ts":           ts,
+        })
+        _evento({
+            "tipo":         "telemetria",
+            "componente":   "cnc_geral",
+            "tipo_leitura": "ciclos",
+            "valor":        ciclos,
+            "unidade":      "ciclos",
+            "ts":           ts,
+        })
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    CNCSimulator().run()
+    import uvicorn
+
+    threading.Thread(target=_telemetria_loop, daemon=True, name="telemetria").start()
+    logger.info(
+        "CNC Simulator v3.0 | adapter=%s | vel=%.0fmm/s | HOME=(%.0f, %.0f)",
+        ADAPTER_URL, VELOCIDADE_MM_S, HOME[0], HOME[1],
+    )
+    uvicorn.run(app, host="0.0.0.0", port=8200, log_level="warning")

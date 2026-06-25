@@ -17,8 +17,6 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 
-# ── Conexão ────────────────────────────────────────────────────────────────────
-
 def _make_conn(autocommit: bool = True) -> pymysql.Connection:
     return pymysql.connect(
         host=settings.MYSQL_HOST,
@@ -58,8 +56,6 @@ def _rows(rs) -> list:
     return [_row(r) for r in rs]
 
 
-# ── Inicialização ──────────────────────────────────────────────────────────────
-
 def init_db():
     for attempt in range(30):
         try:
@@ -82,9 +78,9 @@ def _create_tables(conn):
         """CREATE TABLE IF NOT EXISTS ordens (
             id           INT AUTO_INCREMENT PRIMARY KEY,
             os_id        VARCHAR(60)  NOT NULL UNIQUE,
-            descricao    VARCHAR(200) NOT NULL DEFAULT \'\',
-            categoria    VARCHAR(100) NOT NULL DEFAULT \'\',
-            status       VARCHAR(30)  NOT NULL DEFAULT \'aguardando\',
+            descricao    VARCHAR(200) NOT NULL DEFAULT '',
+            categoria    VARCHAR(100) NOT NULL DEFAULT '',
+            status       VARCHAR(30)  NOT NULL DEFAULT 'aguardando',
             payload_json TEXT         NOT NULL,
             criado_em    DATETIME(3)  NOT NULL,
             concluida_em DATETIME(3)  NULL,
@@ -101,7 +97,7 @@ def _create_tables(conn):
             categoria       VARCHAR(100) NULL,
             quantidade_alvo INT          NOT NULL,
             quantidade_real INT          NOT NULL DEFAULT 0,
-            status          VARCHAR(30)  NOT NULL DEFAULT \'pendente\',
+            status          VARCHAR(30)  NOT NULL DEFAULT 'pendente',
             INDEX idx_ositem_os  (os_id),
             INDEX idx_ositem_dis (os_id, dispenser_id)
         ) ENGINE=InnoDB""",
@@ -180,8 +176,8 @@ def _create_tables(conn):
             id            INT AUTO_INCREMENT PRIMARY KEY,
             username      VARCHAR(100) NOT NULL UNIQUE,
             senha_hash    TEXT         NOT NULL,
-            nome_completo VARCHAR(200) NOT NULL DEFAULT \'\',
-            role          VARCHAR(30)  NOT NULL DEFAULT \'manutencao\',
+            nome_completo VARCHAR(200) NOT NULL DEFAULT '',
+            role          VARCHAR(30)  NOT NULL DEFAULT 'manutencao',
             ativo         TINYINT(1)   NOT NULL DEFAULT 1,
             criado_em     DATETIME(3)  NOT NULL,
             INDEX idx_user (username, ativo)
@@ -202,13 +198,13 @@ def _create_tables(conn):
             cur.execute(ddl)
 
         for alter in [
-            "ALTER TABLE ordens ADD COLUMN categoria VARCHAR(100) NOT NULL DEFAULT \'\'  AFTER descricao",
-            "ALTER TABLE usuarios ADD COLUMN role VARCHAR(30) NOT NULL DEFAULT \'manutencao\' AFTER nome_completo",
+            "ALTER TABLE ordens ADD COLUMN categoria VARCHAR(100) NOT NULL DEFAULT ''  AFTER descricao",
+            "ALTER TABLE usuarios ADD COLUMN role VARCHAR(30) NOT NULL DEFAULT 'manutencao' AFTER nome_completo",
             "ALTER TABLE os_itens MODIFY COLUMN dispenser_id TINYINT NULL",
             "ALTER TABLE os_itens ADD COLUMN sku VARCHAR(150) NULL AFTER medicamento",
             "ALTER TABLE os_itens ADD COLUMN categoria VARCHAR(100) NULL AFTER sku",
-            "ALTER TABLE log_manutencao ADD COLUMN tecnico VARCHAR(100) NOT NULL DEFAULT \'sistema\' AFTER descricao",
-            "ALTER TABLE medicamentos ADD COLUMN categoria_desc VARCHAR(200) NOT NULL DEFAULT \'\'  AFTER categoria",
+            "ALTER TABLE log_manutencao ADD COLUMN tecnico VARCHAR(100) NOT NULL DEFAULT 'sistema' AFTER descricao",
+            "ALTER TABLE medicamentos ADD COLUMN categoria_desc VARCHAR(200) NOT NULL DEFAULT ''  AFTER categoria",
         ]:
             try:
                 cur.execute(alter)
@@ -330,7 +326,6 @@ _MEDICAMENTOS_SEED = [
 
 
 def _seed_medicamentos():
-    """Garante que os 96 medicamentos estao no DB - roda em todo startup."""
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM medicamentos")
@@ -346,7 +341,7 @@ def _seed_medicamentos():
                 )
                 inserted += cur.rowcount
             if inserted:
-                logger.info(f"[DB] Seed medicamentos: {inserted} inseridos ({len(_MEDICAMENTOS_SEED)} total).")
+                logger.info(f"[DB] Seed medicamentos: {inserted} inseridos.")
 
 
 def _seed_usuarios():
@@ -374,7 +369,6 @@ def _seed_usuarios():
 # ── Ordens ─────────────────────────────────────────────────────────────────────
 
 def salvar_ordem(os_id: str, descricao: str, medicamentos: list, payload_raw: dict):
-    """Salva a OS e seus itens. dispenser_id e NULL ate o roteamento dinamico ocorrer."""
     ts = _ts()
     categoria = payload_raw.get("categoria", "")
     with _conn(autocommit=False) as conn:
@@ -383,7 +377,7 @@ def salvar_ordem(os_id: str, descricao: str, medicamentos: list, payload_raw: di
                 cur.execute(
                     "INSERT IGNORE INTO ordens "
                     "(os_id, descricao, categoria, status, payload_json, criado_em) "
-                    "VALUES (%s,%s,%s,\'aguardando\',%s,%s)",
+                    "VALUES (%s,%s,%s,'aguardando',%s,%s)",
                     (os_id, descricao, categoria, json.dumps(payload_raw, ensure_ascii=False), ts),
                 )
                 if cur.rowcount == 0:
@@ -448,7 +442,7 @@ def get_ordem_ativa() -> dict | None:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM ordens WHERE status IN (\'aguardando\',\'em_andamento\') "
+                "SELECT * FROM ordens WHERE status IN ('aguardando','em_andamento') "
                 "ORDER BY criado_em DESC LIMIT 1"
             )
             ordem = _row(cur.fetchone())
@@ -623,7 +617,6 @@ def get_dispenser_estado(dispenser_id: int) -> dict | None:
 
 
 def salvar_dispenser_estado(dispenser_id, quantidade_atual, os_id=None, medicamento=None, categoria=None):
-    """Persiste estado do slot. Sempre atualiza medicamento/categoria (inclusive NULL = vazio)."""
     ts = _ts()
     with _conn() as conn:
         with conn.cursor() as cur:
@@ -639,7 +632,7 @@ def limpar_dispenser_estado(dispenser_id: int):
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE dispenser_estado SET quantidade_atual=0, ultima_os_id=NULL, "
-                "atualizado_em=%s WHERE dispenser_id=%s",
+                "medicamento=NULL, categoria=NULL, atualizado_em=%s WHERE dispenser_id=%s",
                 (_ts(), dispenser_id),
             )
 

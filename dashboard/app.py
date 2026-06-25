@@ -213,9 +213,9 @@ def _render(estado: dict, eventos: list, os_hist: list):
         os_status = os_ativa.get("status", "?")
         badge_os  = _badge(os_status.upper(), _cor(os_status))
 
-        # Itens da OS — sem dispenser_id fixo (roteamento dinâmico)
-        # Prioriza atribuicoes (com slot atribuído) ou itens originais
-        atribuicoes = os_ativa.get("atribuicoes", [])
+        # Itens da OS — usa atribuição IA (top-level do estado) ou itens originais
+        # A atribuição IA fica em estado["atribuicao_ia"], não dentro de os_ativa
+        atribuicoes = estado.get("atribuicao_ia", [])
         os_itens    = atribuicoes if atribuicoes else os_ativa.get("itens", [])
 
         itens_rows = []
@@ -296,7 +296,7 @@ def _render(estado: dict, eventos: list, os_hist: list):
 
     # ── Dispensers ────────────────────────────────────────────────────────────
     # Slots são dinâmicos — nenhum é fixo para um medicamento.
-    # O dispenser_simulator publica o medicamento atual via MQTT.
+    # Estado recebido via GET /estado (polling REST) do central-computer.
     disp_cards = []
     for disp_id in range(1, 7):
         info    = disp_map.get(str(disp_id), {})
@@ -314,7 +314,7 @@ def _render(estado: dict, eventos: list, os_hist: list):
             cat_label  = html.Small(f"[{cat}]", className="text-muted ms-1") if cat else ""
             res_label  = html.Small(f" {qtd_res} un. residuais", className="text-muted")
         elif med and qtd_res == 0:
-            # Slot ficou sem estoque mas ainda não foi limpo pelo MQTT
+            # Slot ficou sem estoque — aguardando limpeza manual ou nova OS
             med_label  = "— Vazio —"
             cat_label  = html.Small(f"(era {med})", className="text-muted ms-1")
             res_label  = html.Small("sem estoque", className="text-danger fst-italic")
@@ -365,7 +365,7 @@ def _render(estado: dict, eventos: list, os_hist: list):
                 html.Strong(f"[{a.get('tipo', '?').upper()}] "),
                 html.Span(a.get("descricao", "")),
                 html.Small(
-                    f" — {str(a.get('criado_em', ''))[:16]}",
+                    f" — {str(a.get('ts', ''))[:16].replace('T', ' ')}",
                     className="text-muted ms-2",
                 ),
             ], color="danger", className="py-1 px-2 mb-1 small")

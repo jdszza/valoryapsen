@@ -1,19 +1,20 @@
 version: "3.9"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# APSEN - Sistema de Contagem de Medicamentos v2.0
+# APSEN - Sistema de Contagem de Medicamentos v3.1 (Arquitetura REST/HTTP)
 #
-# 8 serviços:
-#   mysql             → banco de dados MySQL 8 (porta 3306)
-#   mosquitto         → broker MQTT (portas 1883 + 9001)
-#   backend           → FastAPI: bridge MQTT↔MySQL + API REST (porta 8000)
-#   dashboard         → Plotly Dash: monitoramento read-only (porta 8050)
-#   ihm_web           → Plotly Dash: IHM de manutenção com auth (porta 8051)
-#   sap_simulator     → simula ERP SAP publicando OS no MQTT
-#   cnc_simulator     → simula firmware da mesa CNC (movimento + telemetria)
-#   dispenser_simulator → simula 6 dispensers (CV + IA + dispensa)
-#
-# Remover os simuladores em produção quando o firmware real estiver disponível.
+# 11 serviços (sem MQTT):
+#   mysql               → banco de dados MySQL 8 (porta 3306)
+#   central-computer    → FastAPI: orquestrador + API REST + WebSocket (porta 8000)
+#   dispenser-adapter   → bridge: central ↔ dispenser-simulator (porta 8100)
+#   cnc-adapter         → bridge: central ↔ cnc-simulator (porta 8101)
+#   vision-adapter      → bridge: central ↔ vision-simulator (porta 8102)
+#   dispenser-simulator → simula 6 dispensers físicos, HTTP server (porta 8201)
+#   cnc-simulator       → simula firmware CNC, HTTP server (porta 8200)
+#   vision-simulator    → simula câmera dispenser + câmera mesa (porta 8202)
+#   order-generator     → gera OS aleatórias e envia ao central via HTTP
+#   dashboard           → Plotly Dash: monitoramento read-only (porta 8050)
+#   ihm_web             → Plotly Dash: IHM de manutenção com auth (porta 8051)
 #
 # Rebuild completo:
 #   docker compose down -v && docker compose build --no-cache && docker compose up -d
@@ -35,7 +36,7 @@ services:
     logging: *default-logging
     restart: unless-stopped
     ports:
-      - "3306:3306"   # MySQL Workbench: localhost:3306 | user: apsen | pw: apsen_pass_2024
+      - "3306:3306"
     environment:
       MYSQL_ROOT_PASSWORD: apsen_root_2024
       MYSQL_DATABASE:      apsen_db
@@ -54,49 +55,160 @@ services:
     networks:
       - apsen-net
 
-  # ── Mosquitto MQTT ──────────────────────────────────────────────────────────
-  mosquitto:
-    image: eclipse-mosquitto:2.0
-    container_name: apsen-mqtt
-    logging: *default-logging
-    restart: unless-stopped
-    ports:
-      - "1883:1883"   # MQTT TCP
-      - "9001:9001"   # MQTT WebSocket
-    volumes:
-      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
-      - mqtt_data:/mosquitto/data
-    healthcheck:
-      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "hc"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - apsen-net
-
-  # ── Backend FastAPI ─────────────────────────────────────────────────────────
-  backend:
-    build: ./backend
-    container_name: apsen-backend
+  # ── Computador Central ──────────────────────────────────────────────────────
+  central-computer:
+    build: ./central-computer
+    container_name: apsen-central
     logging: *default-logging
     restart: unless-stopped
     ports:
       - "8000:8000"   # API REST + WebSocket /ws
     environment:
-      MQTT_HOST:  mosquitto
-      MQTT_PORT:  1883
-      MYSQL_HOST: mysql
-      MYSQL_PORT: 3306
-      MYSQL_DB:   apsen_db
-      MYSQL_USER: apsen
-      MYSQL_PASS: apsen_pass_2024
-      SECRET_KEY: apsen-mude-esta-chave-em-producao-2024
+      MYSQL_HOST:             mysql
+      MYSQL_PORT:             3306
+      MYSQL_DB:               apsen_db
+      MYSQL_USER:             apsen
+      MYSQL_PASS:             apsen_pass_2024
+      SECRET_KEY:             apsen-mude-esta-chave-em-producao-2024
+      DISPENSER_ADAPTER_URL:  http://dispenser-adapter:8100
+      CNC_ADAPTER_URL:        http://cnc-adapter:8101
+      VISION_ADAPTER_URL:     http://vision-adapter:8102
+      TIMEOUT_CARREGAMENTO:   180
+      TIMEOUT_POSICIONAMENTO: 120
+      TIMEOUT_DISPENSA:       120
+      TIMEOUT_VISAO_DISPENSER: 30
+      TIMEOUT_VISAO_MESA:      30
     depends_on:
       mysql:
         condition: service_healthy
-      mosquitto:
+      vision-adapter:
         condition: service_started
+    networks:
+      - apsen-net
+
+  # ── Dispenser Adapter ────────────────────────────────────────────────────────
+  dispenser-adapter:
+    build: ./dispenser-adapter
+    container_name: apsen-dispenser-adapter
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    environment:
+      CENTRAL_URL:       http://central-computer:8000
+      DISPENSER_SIM_URL: http://dispenser-simulator:8201
+      TIMEOUT_CMD:       15
+      TIMEOUT_EVENT:     5
+    depends_on:
+      - central-computer
+      - dispenser-simulator
+    networks:
+      - apsen-net
+
+  # ── CNC Adapter ──────────────────────────────────────────────────────────────
+  cnc-adapter:
+    build: ./cnc-adapter
+    container_name: apsen-cnc-adapter
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "8101:8101"
+    environment:
+      CENTRAL_URL:  http://central-computer:8000
+      CNC_SIM_URL:  http://cnc-simulator:8200
+      TIMEOUT_CMD:  15
+      TIMEOUT_EVENT: 5
+    depends_on:
+      - central-computer
+      - cnc-simulator
+    networks:
+      - apsen-net
+
+  # ── Vision Adapter ───────────────────────────────────────────────────────────
+  vision-adapter:
+    build: ./vision-adapter
+    container_name: apsen-vision-adapter
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "8102:8102"
+    environment:
+      CENTRAL_URL:    http://central-computer:8000
+      VISION_SIM_URL: http://vision-simulator:8202
+      TIMEOUT_CMD:    20
+      TIMEOUT_EVENT:  5
+    depends_on:
+      - central-computer
+      - vision-simulator
+    networks:
+      - apsen-net
+
+  # ── Vision Simulator ──────────────────────────────────────────────────────────
+  vision-simulator:
+    build: ./vision-simulator
+    container_name: apsen-vision-sim
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "8202:8202"
+    environment:
+      ADAPTER_URL:                   http://vision-adapter:8102
+      PROB_FALHA_LEITURA_DISPENSER:  0.02   # 2% falha câmera dispenser
+      PROB_DIVERGENCIA_DISPENSER:    0.02   # 2% SKU errado no dispenser
+      PROB_FALHA_LEITURA_MESA:       0.02   # 2% câmera mesa não detecta
+      PROB_DIVERGENCIA_MESA:         0.02   # 2% contagem errada na mesa
+      T_SCAN_DISPENSER:              1.5    # segundos processamento scan dispenser
+      T_SCAN_MESA:                   2.0    # segundos processamento scan mesa
+    networks:
+      - apsen-net
+
+  # ── Dispenser Simulator ───────────────────────────────────────────────────────
+  dispenser-simulator:
+    build: ./dispenser_simulator
+    container_name: apsen-dispenser-sim
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "8201:8201"
+    environment:
+      ADAPTER_URL:        http://dispenser-adapter:8100
+      T_CARGA_UNID:       0.3
+      T_DISPENSA_UNID:    0.5
+      PROB_ERRO_MECANICO: 0.01   # falha mecânica (atolamento) — CV movido para vision-adapter
+    networks:
+      - apsen-net
+
+  # ── CNC Simulator ────────────────────────────────────────────────────────────
+  cnc-simulator:
+    build: ./cnc_simulator
+    container_name: apsen-cnc-sim
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "8200:8200"
+    environment:
+      ADAPTER_URL: http://cnc-adapter:8101
+      VEL_MM_S:    80
+      INTERVALO:   0.5
+    networks:
+      - apsen-net
+
+  # ── Order Generator ───────────────────────────────────────────────────────────
+  order-generator:
+    build: ./order-generator
+    container_name: apsen-order-gen
+    logging: *default-logging
+    restart: unless-stopped
+    environment:
+      CENTRAL_URL:         http://central-computer:8000
+      INTERVALO_OS:        90
+      RELOAD_CATALOGO_MIN: 30
+      MIN_MEDS_POR_OS:     2
+      MAX_MEDS_POR_OS:     6
+      QTD_MIN:             2
+      QTD_MAX:             15
+    depends_on:
+      - central-computer
     networks:
       - apsen-net
 
@@ -107,12 +219,12 @@ services:
     logging: *default-logging
     restart: unless-stopped
     ports:
-      - "8050:8050"   # http://localhost:8050 — sem autenticação, somente leitura
+      - "8050:8050"
     environment:
-      BACKEND_URL: http://backend:8000
+      BACKEND_URL: http://central-computer:8000
       POLL_MS:     2000
     depends_on:
-      - backend
+      - central-computer
     networks:
       - apsen-net
 
@@ -123,81 +235,17 @@ services:
     logging: *default-logging
     restart: unless-stopped
     ports:
-      - "8051:8051"   # http://localhost:8051 — requer login (admin/admin123)
+      - "8051:8051"
     environment:
-      BACKEND_URL: http://backend:8000
+      BACKEND_URL: http://central-computer:8000
       POLL_MS:     5000
     depends_on:
-      - backend
-    networks:
-      - apsen-net
-
-  # ── Simulador SAP ────────────────────────────────────────────────────────────
-  # Remove em produção quando SAP real publicar no MQTT.
-  sap_simulator:
-    build: ./sap_simulator
-    container_name: apsen-sap-sim
-    logging: *default-logging
-    restart: unless-stopped
-    environment:
-      MQTT_HOST:           mosquitto
-      MQTT_PORT:           1883
-      BACKEND_URL:         http://backend:8000
-      INTERVALO_OS:        90      # segundos entre ordens (ajuste para demonstrações)
-      RELOAD_CATALOGO_MIN: 30      # recarregar catálogo do DB a cada 30 min
-      MIN_MEDS_POR_OS:     2       # mínimo de medicamentos distintos por OS
-      MAX_MEDS_POR_OS:     6       # máximo (= número de dispensers físicos)
-      QTD_MIN:             2       # unidades mínimas de cada medicamento
-      QTD_MAX:             15      # unidades máximas de cada medicamento
-    depends_on:
-      - mosquitto
-      - backend
-    networks:
-      - apsen-net
-
-  # ── Simulador CNC ────────────────────────────────────────────────────────────
-  # Remove em produção quando o firmware CNC real estiver conectado.
-  cnc_simulator:
-    build: ./cnc_simulator
-    container_name: apsen-cnc-sim
-    logging: *default-logging
-    restart: unless-stopped
-    environment:
-      MQTT_HOST:       mosquitto
-      MQTT_PORT:       1883
-      VEL_MM_S:        80        # velocidade de movimento mm/s
-      INTERVALO:       0.5       # s entre publicações de posição
-      TIMEOUT_PRONTO:  180       # s aguardando dispensers ficarem prontos
-      TIMEOUT_DISP:    120       # s aguardando dispenser concluir
-    depends_on:
-      - mosquitto
-    networks:
-      - apsen-net
-
-  # ── Simulador de Dispensers ───────────────────────────────────────────────────
-  # Simula 6 dispensers com visão computacional e IA.
-  # Remove em produção quando o firmware dos dispensers estiver disponível.
-  dispenser_simulator:
-    build: ./dispenser_simulator
-    container_name: apsen-dispenser-sim
-    logging: *default-logging
-    restart: unless-stopped
-    environment:
-      MQTT_HOST:       mosquitto
-      MQTT_PORT:       1883
-      T_CARGA_UNID:    0.3     # s por unidade durante carregamento
-      T_DISPENSA_UNID: 0.5     # s por unidade durante dispensa
-      PROB_FALHA_IA:   0.05    # 5% falha na validação IA
-      PROB_ERRO_CV:    0.01    # 1% erro de CV por unidade (~10% por dispenser)
-      TIMEOUT_CNC_POS: 240     # s aguardando CNC posicionar antes de abortar
-    depends_on:
-      - mosquitto
+      - central-computer
     networks:
       - apsen-net
 
 volumes:
   mysql_data:
-  mqtt_data:
 
 networks:
   apsen-net:
