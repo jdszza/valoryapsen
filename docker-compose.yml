@@ -87,10 +87,6 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-      vision-adapter:
-        condition: service_started
-      weight-adapter:
-        condition: service_started
     networks:
       - apsen-net
 

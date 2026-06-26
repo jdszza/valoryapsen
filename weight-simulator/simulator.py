@@ -50,9 +50,10 @@ RUIDO_G          = float(os.getenv("RUIDO_G",           "2.0"))
 
 # ── Estado interno ─────────────────────────────────────────────────────────────
 
-_lock        = threading.Lock()
-_peso_tara_g = 0.0   # offset da tara (zera a balança)
-_peso_mesa_g = 0.0   # peso acumulado real na mesa (simulado)
+_lock           = threading.Lock()
+_peso_tara_g    = 0.0   # offset da tara (zera a balança)
+_peso_mesa_g    = 0.0   # peso acumulado real na mesa (simulado)
+_peso_anterior_g = 0.0  # peso líquido na última leitura — para calcular delta por slot
 
 
 def _ts() -> str:
@@ -105,9 +106,10 @@ def _do_tara(os_id: str):
         return
 
     with _lock:
-        global _peso_tara_g, _peso_mesa_g
-        _peso_tara_g = _peso_mesa_g  # offset de tara = peso atual da mesa
-        peso_offset = _peso_tara_g
+        global _peso_tara_g, _peso_mesa_g, _peso_anterior_g
+        _peso_tara_g    = _peso_mesa_g  # offset de tara = peso atual da mesa
+        _peso_anterior_g = 0.0          # zera delta — nova OS começa do zero
+        peso_offset     = _peso_tara_g
 
     logger.info("[HX711] Tara realizada. Offset=%.1fg | OS=%s", peso_offset, os_id)
     _evento({
@@ -135,23 +137,27 @@ def _do_pesar(os_id: str, slot_id: int, quantidade_esperada: int, peso_unitario_
 
     peso_esperado_g = quantidade_esperada * peso_unitario_g
 
-    # Simula o peso real na mesa: adiciona ruído gaussiano ao valor esperado
+    # A balança está sob a mesa da CNC: mede o peso TOTAL acumulado desde a tara.
+    # Para validar cada slot individualmente, comparamos o DELTA (incremento desta
+    # dispensa) com o peso esperado do slot — não o acumulado total.
     with _lock:
-        # Atualiza o peso simulado da mesa com os itens dispensados + ruído
-        _peso_mesa_g += peso_esperado_g + random.gauss(0, RUIDO_G)
-        peso_bruto_g = _peso_mesa_g
-        peso_liquido_g = max(0.0, peso_bruto_g - _peso_tara_g)
+        global _peso_anterior_g
+        _peso_mesa_g   += peso_esperado_g + random.gauss(0, RUIDO_G)
+        peso_bruto_g    = _peso_mesa_g
+        peso_liquido_g  = max(0.0, peso_bruto_g - _peso_tara_g)      # total desde tara
+        peso_delta_g    = max(0.0, peso_liquido_g - _peso_anterior_g) # incremento deste slot
+        _peso_anterior_g = peso_liquido_g                             # salva para próximo slot
 
-    # Calcula desvio em relação ao esperado acumulado
-    desvio_g   = peso_liquido_g - peso_esperado_g
+    # Desvio: delta medido vs peso esperado do slot
+    desvio_g   = peso_delta_g - peso_esperado_g
     desvio_pct = (abs(desvio_g) / peso_esperado_g * 100.0) if peso_esperado_g > 0 else 0.0
 
     dentro_tolerancia = desvio_pct <= TOLERANCIA_PERC
     tipo = "peso_ok" if dentro_tolerancia else "peso_divergencia"
 
     logger.info(
-        "[HX711] slot=%d | esperado=%.1fg | medido=%.1fg | desvio=%.1f%% | %s",
-        slot_id, peso_esperado_g, peso_liquido_g, desvio_pct,
+        "[HX711] slot=%d | esperado=%.1fg | delta=%.1fg | acum=%.1fg | desvio=%.1f%% | %s",
+        slot_id, peso_esperado_g, peso_delta_g, peso_liquido_g, desvio_pct,
         "OK" if dentro_tolerancia else "DIVERGÊNCIA",
     )
 
@@ -162,7 +168,8 @@ def _do_pesar(os_id: str, slot_id: int, quantidade_esperada: int, peso_unitario_
         "quantidade_esperada":  quantidade_esperada,
         "peso_unitario_g":      peso_unitario_g,
         "peso_esperado_g":      round(peso_esperado_g, 2),
-        "peso_medido_g":        round(peso_liquido_g, 2),
+        "peso_medido_g":        round(peso_delta_g, 2),      # delta deste slot
+        "peso_acumulado_g":     round(peso_liquido_g, 2),    # total na mesa (informativo)
         "desvio_g":             round(desvio_g, 2),
         "desvio_pct":           round(desvio_pct, 2),
         "tolerancia_pct":       TOLERANCIA_PERC,
