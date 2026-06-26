@@ -100,7 +100,7 @@ O Central emite o evento abaixo sempre que um produto é atribuído a um dispens
 6.  dispenser-simulator: carrega remédios, reporta "carregado"
 7.  central-computer  →  vision-adapter  →  POST /comandos/capturar/dispenser  (paralelo)
     ↳  vision-simulator: lê QR/barcode de cada slot, reporta leitura ao central via evento
-    ↳  central: registra alarme se SKU divergente (não-bloqueante)
+    ↳  central: SKU errado → trava imediata + retry após operador corrigir; falha de leitura → alarme não-bloqueante
 8.  Para cada slot na rota CNC:
     a. central-computer  →  cnc-adapter  →  POST /executar/mover
     b. cnc-simulator: interpola posição, reporta "posicionado"
@@ -150,7 +150,7 @@ A validação por CV é responsabilidade exclusiva do `vision-adapter` + `vision
 | Câmera Dispenser  | Sobre os slots   | QR/DataMatrix/barcode do produto | `leitura_dispenser_ok`, `falha`, `divergencia` (SKU errado) |
 | Câmera Mesa       | Sobre a coleta   | Posição e contagem de unidades  | `leitura_mesa_ok`, `falha`, `divergencia` (contagem errada) |
 
-Câmera dispenser: **não-bloqueante** — divergências geram alarmes mas não suspendem OS.  
+Câmera dispenser (SKU errado): **bloqueante** — aciona trava imediatamente. Operador remove o medicamento errado, admin libera a trava, sistema re-escaneia o slot. Repete até confirmar SKU correto. Falha de leitura (câmera não conseguiu ler) é não-bloqueante — gera alarme e continua.  
 Câmera mesa: **bloqueante via Triple Check** — faz parte da validação de 3 fontes por slot.
 
 Probabilidades configuráveis por env var (padrão 2% cada):

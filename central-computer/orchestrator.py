@@ -538,23 +538,93 @@ async def _processar_os(os_payload: dict):
         for chave in chaves_visao_disp
     ])
 
-    # Visão de dispenser é não-bloqueante: gera alarmes mas não aborta a OS
+    # ── Processa resultados da câmera dispenser ────────────────────────────────
+    # SKU errado (divergencia) → BLOQUEANTE: trava + retry até operador corrigir
+    # Falha de leitura / timeout → alarme informativo, não bloqueia
+    slots_sku_errado: list = []  # lista de (atribuicao, resultado)
+
     for i, res in enumerate(resultados_visao_disp):
         a = atribuicoes[i]
         if res is None:
             logger.warning(
-                "[ORCH] Timeout visão dispenser D%d — continuando sem validação de SKU.", a["dispenser_id"]
+                "[ORCH] Timeout visão dispenser D%d — sem validação de SKU.", a["dispenser_id"]
             )
-        elif res.get("tipo") in ("leitura_dispenser_falha", "leitura_dispenser_divergencia"):
+        elif res.get("tipo") == "leitura_dispenser_divergencia":
+            logger.error(
+                "[ORCH] ⛔ SKU ERRADO D%d: lido=%s esperado=%s — trava ativa.",
+                a["dispenser_id"], res.get("sku_lido"), res.get("sku_esperado"),
+            )
+            slots_sku_errado.append((a, res))
+        elif res.get("tipo") == "leitura_dispenser_falha":
             logger.warning(
-                "[ORCH] ALARME visão D%d: %s (sku_lido=%s, esperado=%s)",
-                a["dispenser_id"], res.get("tipo"), res.get("sku_lido"), res.get("sku_esperado"),
+                "[ORCH] ALARME câmera D%d: falha de leitura (continua sem validação SKU).",
+                a["dispenser_id"],
             )
         else:
             logger.info(
                 "[ORCH] Visão D%d OK — SKU=%s conf=%.0f%%",
                 a["dispenser_id"], res.get("sku_lido", ""), (res.get("confianca", 0) or 0) * 100,
             )
+
+    # Loop de bloqueio: mantém trava até todos os slots com SKU errado serem corrigidos
+    while slots_sku_errado:
+        a_err, res_err = slots_sku_errado[0]
+        motivo = (
+            f"SKU errado no dispenser D{a_err['dispenser_id']}: "
+            f"lido={res_err.get('sku_lido', '?')} | esperado={res_err.get('sku_esperado', '?')} — "
+            f"remova o medicamento incorreto e libere a trava para re-escanear."
+        )
+        logger.error("[ORCH] ⛔ %s", motivo)
+
+        with _lock:
+            _estado["trava"] = {
+                "ativa":   True,
+                "os_id":   os_id,
+                "slot_id": a_err["dispenser_id"],
+                "motivo":  motivo,
+            }
+        if _broadcast_fn:
+            _broadcast_fn()
+
+        evento_lib = await _ativar_trava(os_id, a_err["dispenser_id"], motivo)
+        logger.warning(
+            "[ORCH] Aguardando operador corrigir dispenser D%d (OS %s)…",
+            a_err["dispenser_id"], os_id,
+        )
+        await evento_lib.wait()
+
+        with _lock:
+            _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
+        if _broadcast_fn:
+            _broadcast_fn()
+
+        # Re-escaneia todos os slots que ainda têm divergência
+        logger.info("[ORCH] Trava liberada. Re-escaneando %d slot(s) com SKU errado…", len(slots_sku_errado))
+        atribuicoes_retry = [a for a, _ in slots_sku_errado]
+        chaves_retry = [f"{os_id}:visao_dispenser:{a['dispenser_id']}" for a in atribuicoes_retry]
+        for chave in chaves_retry:
+            registrar_evento(chave)
+        for a in atribuicoes_retry:
+            await cmd_visao_dispenser(
+                a["dispenser_id"], a.get("sku", ""), a["medicamento"], a["quantidade"], os_id,
+            )
+        resultados_retry = await asyncio.gather(*[
+            aguardar_evento(chave, settings.TIMEOUT_VISAO_DISPENSER)
+            for chave in chaves_retry
+        ])
+
+        # Verifica se ainda há divergência após a correção
+        slots_sku_errado = []
+        for a, res in zip(atribuicoes_retry, resultados_retry):
+            if res is None:
+                logger.warning("[ORCH] Timeout re-scan D%d — assumindo corrigido.", a["dispenser_id"])
+            elif res.get("tipo") == "leitura_dispenser_divergencia":
+                logger.error(
+                    "[ORCH] ⛔ Ainda SKU errado em D%d após re-scan. Nova trava.", a["dispenser_id"]
+                )
+                slots_sku_errado.append((a, res))
+            else:
+                logger.info("[ORCH] Re-scan D%d OK — SKU=%s.", a["dispenser_id"], res.get("sku_lido", ""))
 
     logger.info("[ORCH] Validação de visão concluída. Realizando tara da balança.")
 
