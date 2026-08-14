@@ -15,7 +15,10 @@ Eventos (cliente HTTP via requests.post → adapter):
   tipo: "limpeza_ok"  → slot limpo
   tipo: "erro"        → qualquer falha
   tipo: "telemetria"  → temperatura periódica
-  tipo: "status"      → estado periódico completo
+  tipo: "status"      → snapshot periódico do slot; para o central vale só a
+                        parte de estoque (medicamento/sku/categoria/quantidade).
+                        Os campos de fluxo (status, os_id) do snapshot são
+                        informativos: quem manda no fluxo é o orquestrador.
 """
 import logging
 import os

@@ -1,21 +1,29 @@
 """
-Infraestrutura compartilhada dos testes dos simuladores APSEN.
+Infraestrutura compartilhada dos testes do APSEN.
 
-Os simuladores não são pacotes importáveis: os diretórios têm hífen no nome
-(`weight-simulator`, `vision-simulator`) e o módulo sobe o uvicorn no bloco
-`__main__`. Por isso o carregamento é feito por CAMINHO, via
-`importlib.util.spec_from_file_location`.
+Nem os simuladores nem o computador central são pacotes importáveis: os
+diretórios têm hífen no nome (`weight-simulator`, `central-computer`) e os
+módulos sobem o uvicorn no bloco `__main__`. Por isso o carregamento é feito
+por CAMINHO, via `importlib.util.spec_from_file_location`.
 
-Durante o import, `requests` é substituído por um duplo que grava as chamadas em
-memória em vez de fazer HTTP — é assim que os testes inspecionam os eventos que o
-simulador emitiria para o seu adapter.
+Duas fábricas são oferecidas:
 
-Uso típico:
+  `carregar_simulador` — importa um simulador com `requests` substituído por um
+  duplo que grava as chamadas em memória em vez de fazer HTTP. É assim que os
+  testes inspecionam os eventos que o simulador emitiria para o seu adapter.
 
-    def test_algo(carregar_simulador):
-        sim = carregar_simulador("weight", env={"T_LEITURA": "0"})
-        sim.modulo._do_pesar("OS-1", 1, 10, 50.0)
-        assert sim.eventos_do_tipo("peso_ok")
+      def test_algo(carregar_simulador):
+          sim = carregar_simulador("weight", env={"T_LEITURA": "0"})
+          sim.modulo._do_pesar("OS-1", 1, 10, 50.0)
+          assert sim.eventos_do_tipo("peso_ok")
+
+  `carregar_central` — importa `central-computer/main.py` com todas as funções
+  de `database.py` trocadas por duplos, para que nenhum teste precise de MySQL.
+
+      def test_outra_coisa(carregar_central):
+          central = carregar_central()
+          asyncio.run(central.modulo._handle_evento_dispenser({...}))
+          assert central.banco.chamadas_de("salvar_dispenser_estado")
 """
 import importlib.util
 import sys
@@ -147,3 +155,89 @@ def carregar_simulador(monkeypatch):
         return SimuladorCarregado(modulo, requests_fake)
 
     return _carregar
+
+
+# ── Computador central ─────────────────────────────────────────────────────────
+
+CENTRAL_DIR = RAIZ_REPO / "central-computer"
+
+
+class BancoFake:
+    """Duplo de `database.py`: grava as escritas em vez de falar com o MySQL.
+
+    A instalação varre o `database` real e substitui, no módulo do central,
+    toda referência que aponte para uma função de lá. Assim nenhuma chamada de
+    banco escapa por esquecimento — inclusive as que surgirem no futuro.
+    """
+
+    def __init__(self):
+        self.chamadas: list[dict] = []
+
+    def instalar(self, modulo_central, monkeypatch) -> None:
+        import database
+
+        for nome in dir(database):
+            if nome.startswith("_"):
+                continue
+            real = getattr(database, nome)
+            if callable(real) and getattr(modulo_central, nome, None) is real:
+                monkeypatch.setattr(modulo_central, nome, self._duplo(nome))
+
+    def _duplo(self, nome: str):
+        def _registrar(*args, **kwargs):
+            self.chamadas.append({"fn": nome, "args": args, "kwargs": kwargs})
+            return None
+        return _registrar
+
+    def chamadas_de(self, nome: str) -> list[dict]:
+        return [c for c in self.chamadas if c["fn"] == nome]
+
+    def limpar_chamadas(self) -> None:
+        self.chamadas.clear()
+
+
+class CentralCarregado:
+    """Módulo `main.py` do central + o duplo de banco instalado nele."""
+
+    def __init__(self, modulo, banco: BancoFake):
+        self.modulo = modulo
+        self.banco = banco
+
+    def slot(self, slot_id) -> dict:
+        """Estado em memória de um slot — o dict que o dashboard enxerga."""
+        return self.modulo._estado["dispensers"][str(slot_id)]
+
+
+@pytest.fixture
+def carregar_central(monkeypatch):
+    """Fábrica que importa `central-computer/main.py` sem tocar no MySQL.
+
+    `main.py` importa os vizinhos por nome absoluto (`orchestrator`,
+    `database`, `auth`, `config`), então o diretório entra no `sys.path` antes
+    do exec. O import em si não abre conexão — `database.py` só conecta dentro
+    de cada função —, por isso basta trocar as funções por duplos depois.
+
+    Os módulos carregados de tabela são descartados no teardown: cada teste
+    recebe um central com `_estado` zerado.
+    """
+    modulos_antes = set(sys.modules)
+
+    def _carregar() -> CentralCarregado:
+        monkeypatch.syspath_prepend(str(CENTRAL_DIR))
+
+        spec = importlib.util.spec_from_file_location(
+            "apsen_central_main", CENTRAL_DIR / "main.py"
+        )
+        modulo = importlib.util.module_from_spec(spec)
+        # Registrado antes do exec para que pydantic resolva `__module__`.
+        sys.modules["apsen_central_main"] = modulo
+        spec.loader.exec_module(modulo)
+
+        banco = BancoFake()
+        banco.instalar(modulo, monkeypatch)
+        return CentralCarregado(modulo, banco)
+
+    yield _carregar
+
+    for nome in set(sys.modules) - modulos_antes:
+        del sys.modules[nome]

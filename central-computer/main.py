@@ -209,6 +209,15 @@ async def _handle_evento_dispenser(payload: dict):
     Atualização de estado (rápida, sob _lock) é síncrona.
     Escrita em DB é assíncrona (asyncio.to_thread) — não bloqueia o loop.
     Tipos: status, carregado, dispensado, erro, limpeza_ok, telemetria
+
+    Divisão de responsabilidade (ver ANALISE_ARQUITETURAL.md):
+      - o simulador é fonte de verdade sobre HARDWARE/ESTOQUE
+        (medicamento, sku, categoria, quantidade);
+      - o orquestrador é fonte de verdade sobre FLUXO
+        (status da etapa e os_id em execução).
+    O evento "status" é telemetria periódica (a cada 15s, para todos os slots)
+    e só pode tocar na primeira categoria. Os eventos de transição — carregado,
+    dispensado, limpeza_ok, erro — é que movem o fluxo.
     """
     tipo    = payload.get("tipo", "status")
     disp_id = payload.get("dispenser_id")
@@ -227,20 +236,22 @@ async def _handle_evento_dispenser(payload: dict):
         d = _estado["dispensers"][disp_key]
 
         if tipo == "status":
+            # Telemetria periódica: só estoque. Escrever "status"/"os_id" aqui
+            # desfazia, a cada 15s, o reset de fim de OS do orquestrador — o
+            # slot voltava a "concluido" para sempre e a limpeza dava 409.
             med = payload.get("medicamento")
             qty = payload.get("quantidade", 0)
             d.update({
-                "status":      payload.get("status", d["status"]),
                 "medicamento": med,
                 "sku":         payload.get("sku"),
                 "categoria":   payload.get("categoria"),
                 "quantidade":  qty,
-                "os_id":       payload.get("os_id", d["os_id"]),
             })
             med_db = med if (qty or 0) > 0 else None
             cat_db = payload.get("categoria") if (qty or 0) > 0 else None
+            # ultima_os_id vem do fluxo que o central conhece, não do payload.
             db_tasks.append((salvar_dispenser_estado,
-                             (int(disp_id), qty or 0, os_id, med_db, cat_db)))
+                             (int(disp_id), qty or 0, d["os_id"], med_db, cat_db)))
 
         elif tipo == "carregado":
             med = payload.get("medicamento")
@@ -1128,8 +1139,11 @@ async def manut_limpar_dispenser(dispenser_id: int, user=Depends(_get_tecnico)):
             f"Limpeza bloqueada: OS {os_atual} em andamento. "
             "Aguarde a conclusão da ordem de serviço.",
         )
-    # Bloqueio 2: dispenser em operação ativa
-    STATUS_BLOQUEADOS = {"carregando", "pronto", "dispensando", "aguardando_carga", "concluido"}
+    # Bloqueio 2: dispenser em operação ativa.
+    # "concluido" NÃO entra: o slot já terminou a dispensa e pode ter residual
+    # encalhado — limpar esse resto é justamente o propósito do botão da IHM.
+    # (O simulador aplica a mesma regra em _do_limpar.)
+    STATUS_BLOQUEADOS = {"carregando", "pronto", "dispensando", "aguardando_carga"}
     if d_status in STATUS_BLOQUEADOS:
         med = d_info.get("medicamento", f"Dispenser {dispenser_id}")
         raise HTTPException(
