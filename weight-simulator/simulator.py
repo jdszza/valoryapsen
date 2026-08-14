@@ -93,6 +93,8 @@ class PesarReq(BaseModel):
 
 def _do_tara(os_id: str):
     """Executa a tara (zera a balança)."""
+    global _peso_tara_g, _peso_anterior_g
+
     time.sleep(0.5)  # tempo de estabilização
 
     if random.random() < PROB_ERRO_SENSOR:
@@ -106,7 +108,6 @@ def _do_tara(os_id: str):
         return
 
     with _lock:
-        global _peso_tara_g, _peso_mesa_g, _peso_anterior_g
         _peso_tara_g    = _peso_mesa_g  # offset de tara = peso atual da mesa
         _peso_anterior_g = 0.0          # zera delta — nova OS começa do zero
         peso_offset     = _peso_tara_g
@@ -122,6 +123,8 @@ def _do_tara(os_id: str):
 
 def _do_pesar(os_id: str, slot_id: int, quantidade_esperada: int, peso_unitario_g: float):
     """Captura leitura de peso e calcula divergência."""
+    global _peso_mesa_g, _peso_anterior_g
+
     time.sleep(T_LEITURA)  # aguarda estabilização do sensor
 
     if random.random() < PROB_ERRO_SENSOR:
@@ -141,7 +144,6 @@ def _do_pesar(os_id: str, slot_id: int, quantidade_esperada: int, peso_unitario_
     # Para validar cada slot individualmente, comparamos o DELTA (incremento desta
     # dispensa) com o peso esperado do slot — não o acumulado total.
     with _lock:
-        global _peso_anterior_g
         _peso_mesa_g   += peso_esperado_g + random.gauss(0, RUIDO_G)
         peso_bruto_g    = _peso_mesa_g
         peso_liquido_g  = max(0.0, peso_bruto_g - _peso_tara_g)      # total desde tara
@@ -232,10 +234,11 @@ def leitura_atual():
 @app.post("/reset")
 def reset_estado():
     """Reseta o estado interno da balança (usado entre testes). Não exposto em produção."""
-    global _peso_mesa_g, _peso_tara_g
+    global _peso_mesa_g, _peso_tara_g, _peso_anterior_g
     with _lock:
         _peso_mesa_g = 0.0
         _peso_tara_g = 0.0
+        _peso_anterior_g = 0.0  # sem isto o delta do 1º slot pós-reset vem negativo/zerado
     return {"ok": True, "msg": "Balança resetada"}
 
 

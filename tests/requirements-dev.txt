@@ -1,0 +1,10 @@
+# Dependências de desenvolvimento/teste (não vão para as imagens Docker).
+#   pip install -r tests/requirements-dev.txt
+#   pytest tests/
+pytest==9.1.1
+pyflakes==3.4.0
+
+# Os simuladores importam fastapi/pydantic no topo do módulo; o conftest só
+# substitui `requests`, então estas duas precisam existir de verdade no venv.
+fastapi==0.111.0
+pydantic==2.7.1
