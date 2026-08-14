@@ -26,6 +26,7 @@ Duas fábricas são oferecidas:
           assert central.banco.chamadas_de("salvar_dispenser_estado")
 """
 import importlib.util
+import inspect
 import sys
 from pathlib import Path
 
@@ -166,8 +167,10 @@ class BancoFake:
     """Duplo de `database.py`: grava as escritas em vez de falar com o MySQL.
 
     A instalação varre o `database` real e substitui, no módulo do central,
-    toda referência que aponte para uma função de lá. Assim nenhuma chamada de
-    banco escapa por esquecimento — inclusive as que surgirem no futuro.
+    toda referência que aponte para uma função DEFINIDA lá. Assim nenhuma
+    chamada de banco escapa por esquecimento — inclusive as que surgirem no
+    futuro. O filtro por `__module__` é o que impede o duplo de engolir
+    `datetime`, `json` e companhia, que `database` só reexporta.
     """
 
     def __init__(self):
@@ -180,7 +183,9 @@ class BancoFake:
             if nome.startswith("_"):
                 continue
             real = getattr(database, nome)
-            if callable(real) and getattr(modulo_central, nome, None) is real:
+            if not (inspect.isfunction(real) and real.__module__ == database.__name__):
+                continue
+            if getattr(modulo_central, nome, None) is real:
                 monkeypatch.setattr(modulo_central, nome, self._duplo(nome))
 
     def _duplo(self, nome: str):
@@ -217,8 +222,9 @@ def carregar_central(monkeypatch):
     do exec. O import em si não abre conexão — `database.py` só conecta dentro
     de cada função —, por isso basta trocar as funções por duplos depois.
 
-    Os módulos carregados de tabela são descartados no teardown: cada teste
-    recebe um central com `_estado` zerado.
+    Os módulos do próprio central são descartados no teardown, para que cada
+    teste receba um `_estado` zerado. Os de terceiros ficam no cache: `bcrypt`
+    é uma extensão PyO3 que só aceita ser inicializada uma vez por processo.
     """
     modulos_antes = set(sys.modules)
 
@@ -240,4 +246,6 @@ def carregar_central(monkeypatch):
     yield _carregar
 
     for nome in set(sys.modules) - modulos_antes:
-        del sys.modules[nome]
+        origem = getattr(sys.modules[nome], "__file__", None)
+        if origem and Path(origem).parent == CENTRAL_DIR:
+            del sys.modules[nome]

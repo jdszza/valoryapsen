@@ -8,3 +8,12 @@ pyflakes==3.4.0
 # substitui `requests`, então estas duas precisam existir de verdade no venv.
 fastapi==0.111.0
 pydantic==2.7.1
+
+# test_central_eventos.py importa central-computer/main.py de verdade. O banco
+# é mockado (nenhum MySQL sobe), mas a cadeia de imports do módulo passa por
+# orchestrator.py → httpx, database.py → pymysql e auth.py → jose/bcrypt.
+# Versões espelhadas de central-computer/requirements.txt.
+httpx==0.27.0
+pymysql==1.1.1
+python-jose[cryptography]==3.3.0
+bcrypt==4.1.3
