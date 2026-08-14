@@ -181,8 +181,11 @@ def _do_carregar(slot_id: int, medicamento: str, sku: str, categoria: str,
                 f"Unidade {i} não detectada pelo sensor",
             ])
             logger.error("[DISP-%d] ERRO mecânico carregamento un. %d: %s", slot_id, i, motivo)
+            # Aborta a carga: nada mais se move neste slot. Solta o os_id junto com
+            # o status para o slot não ficar preso a uma OS que já morreu — o
+            # payload do evento abaixo usa o parâmetro `os_id`, não o estado.
             with _lock:
-                _estado[slot_id]["status"] = "erro"
+                _estado[slot_id].update({"status": "erro", "os_id": None})
             _evento({
                 "tipo":         "erro",
                 "dispenser_id": slot_id,
@@ -243,8 +246,14 @@ def _do_dispensar(slot_id: int, os_id: str):
             _estoque[slot_id]["medicamento"] = None
             _estoque[slot_id]["sku"]         = None
             _estoque[slot_id]["categoria"]   = None
+        # Estado terminal limpo: a dispensa acabou e o slot não pertence mais à OS.
+        # Sem soltar o os_id aqui, _do_limpar() nunca mais aceitaria limpar o slot
+        # (era ele o único caminho que zerava o campo — impasse permanente).
+        # O os_id do evento vem do parâmetro da função, capturado na chamada, então
+        # o payload abaixo continua carregando a OS correta.
         _estado[slot_id].update({
-            "status":         "concluido",
+            "status":         "idle",
+            "os_id":          None,
             "qtd_dispensada": dispensado,
         })
 
@@ -270,16 +279,17 @@ def _do_limpar(slot_id: int, solicitado_por: str):
     with _lock:
         status_atual = _estado[slot_id]["status"]
         os_id_atual  = _estado[slot_id].get("os_id")
-        # Bloqueio: status ativo OU associado a uma OS em andamento
-        em_operacao  = status_atual in ("carregando", "pronto", "dispensando", "concluido") \
-                       or os_id_atual is not None
+        # Bloqueia só o que tem peça se mexendo. "pronto", "concluido" e "erro" são
+        # estados parados: limpar um slot com estoque encalhado é exatamente o
+        # propósito do botão da IHM.
+        em_operacao  = status_atual in ("carregando", "dispensando")
 
     if em_operacao:
         logger.warning("[DISP-%d] Limpeza recusada — em operação (status=%s).", slot_id, status_atual)
         _evento({
             "tipo":         "erro",
             "dispenser_id": slot_id,
-            "os_id":        _estado[slot_id].get("os_id"),
+            "os_id":        os_id_atual,   # lido dentro do lock, junto com o status
             "codigo_erro":  "limpeza_em_operacao",
             "descricao":    f"Dispenser {slot_id} em operação (status: {status_atual})",
             "ts":           _ts(),
@@ -312,10 +322,11 @@ def ping():
 
 @app.get("/status")
 def status():
-    with _lock:
-        slots = []
-        for slot_id in range(1, NUM_SLOTS + 1):
-            slots.append(_snapshot_slot(slot_id))
+    # Sem lock aqui: _snapshot_slot() já trava por conta própria e _lock é um
+    # Lock simples, não reentrante — segurá-lo antes da chamada travava a request
+    # para sempre. Cada slot sai consistente consigo mesmo; não há snapshot
+    # atômico dos 6, mesma garantia que _telemetria_loop() já assume.
+    slots = [_snapshot_slot(slot_id) for slot_id in range(1, NUM_SLOTS + 1)]
     return {"slots": slots, "ts": _ts()}
 
 
