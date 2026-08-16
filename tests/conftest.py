@@ -6,7 +6,7 @@ diretórios têm hífen no nome (`weight-simulator`, `central-computer`) e os
 módulos sobem o uvicorn no bloco `__main__`. Por isso o carregamento é feito
 por CAMINHO, via `importlib.util.spec_from_file_location`.
 
-Duas fábricas são oferecidas:
+Três fábricas são oferecidas:
 
   `carregar_simulador` — importa um simulador com `requests` substituído por um
   duplo que grava as chamadas em memória em vez de fazer HTTP. É assim que os
@@ -24,10 +24,20 @@ Duas fábricas são oferecidas:
           central = carregar_central()
           asyncio.run(central.modulo._handle_evento_dispenser({...}))
           assert central.banco.chamadas_de("salvar_dispenser_estado")
+
+  `carregar_orquestrador` — importa `central-computer/orchestrator.py` sozinho,
+  com banco duplado e `_post` trocado por um adapter fake que grava os comandos
+  e responde no lugar do equipamento.
+
+      def test_mais_uma(carregar_orquestrador):
+          orq = carregar_orquestrador()
+          asyncio.run(orq.modulo._abortar_os("OS-1", "erro_cnc", atribuicoes))
+          assert orq.adapter.comandos("/comandos/limpar")
 """
 import importlib.util
 import inspect
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -242,6 +252,122 @@ def carregar_central(monkeypatch):
         banco = BancoFake()
         banco.instalar(modulo, monkeypatch)
         return CentralCarregado(modulo, banco)
+
+    yield _carregar
+
+    for nome in set(sys.modules) - modulos_antes:
+        origem = getattr(sys.modules[nome], "__file__", None)
+        if origem and Path(origem).parent == CENTRAL_DIR:
+            del sys.modules[nome]
+
+
+# ── Orquestrador ───────────────────────────────────────────────────────────────
+
+def _estado_zerado() -> dict:
+    """Recorte de `main._estado` com o que o orquestrador realmente toca."""
+    return {
+        "os_ativa":       None,
+        "atribuicao_ia":  [],
+        "fila_os":        [],
+        "fila_tamanho":   0,
+        "alarmes_ativos": 0,
+        "trava": {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""},
+        "dispensers": {
+            str(i): {
+                "status":                "idle",
+                "medicamento":           None,
+                "sku":                   None,
+                "categoria":             None,
+                "quantidade":            0,
+                "quantidade_alvo":       0,
+                "quantidade_dispensada": 0,
+                "quantidade_residual":   0,
+                "os_id":                 None,
+            }
+            for i in range(1, 7)
+        },
+    }
+
+
+class AdapterFake:
+    """Duplo de `orchestrator._post`: grava os comandos em vez de falar HTTP.
+
+    Faz também o papel do equipamento: um comando de limpeza aceito devolve
+    `limpeza_ok` pelo mesmo caminho que o dispenser-adapter usaria, porque o
+    orquestrador BLOQUEIA esperando essa confirmação. Os atributos mutáveis
+    simulam adapter fora do ar (`aceita = False`) e equipamento mudo
+    (`confirma_limpeza = False`, que leva o orquestrador ao timeout).
+    """
+
+    def __init__(self, modulo):
+        self.modulo = modulo
+        self.chamadas: list[dict] = []
+        self.aceita = True
+        self.confirma_limpeza = True
+
+    async def post(self, url: str, payload: dict, timeout: float = 10.0) -> bool:
+        self.chamadas.append({"url": url, "payload": payload})
+        if not self.aceita:
+            return False
+        if url.endswith("/comandos/limpar") and self.confirma_limpeza:
+            slot = payload["dispenser_id"]
+            self.modulo.notificar_evento(
+                f"limpeza:{slot}",
+                {"tipo": "limpeza_ok", "dispenser_id": slot, "medicamento_limpo": None},
+            )
+        return True
+
+    def comandos(self, sufixo: str) -> list[dict]:
+        """Payloads enviados para os endpoints terminados em `sufixo`."""
+        return [c["payload"] for c in self.chamadas if c["url"].endswith(sufixo)]
+
+
+class OrquestradorCarregado:
+    """Módulo `orchestrator.py` + duplos de banco e de HTTP instalados nele."""
+
+    def __init__(self, modulo, banco: BancoFake, adapter: AdapterFake, estado: dict):
+        self.modulo = modulo
+        self.banco = banco
+        self.adapter = adapter
+        self.estado = estado
+
+    def slot(self, slot_id) -> dict:
+        return self.estado["dispensers"][str(slot_id)]
+
+
+@pytest.fixture
+def carregar_orquestrador(monkeypatch):
+    """Fábrica que importa `central-computer/orchestrator.py` isolado.
+
+    Sem `main.py`: o orquestrador recebe as dependências por `inicializar()`,
+    então basta injetar um estado zerado e um lock próprios. O event loop vai
+    como `None` de propósito — `notificar_evento` então chama `Event.set()`
+    direto, em vez de agendar no loop, que é o que permite ao teste rodar cada
+    corrotina com um `asyncio.run()` descartável.
+    """
+    modulos_antes = set(sys.modules)
+
+    def _carregar() -> OrquestradorCarregado:
+        monkeypatch.syspath_prepend(str(CENTRAL_DIR))
+
+        spec = importlib.util.spec_from_file_location(
+            "apsen_central_orchestrator", CENTRAL_DIR / "orchestrator.py"
+        )
+        modulo = importlib.util.module_from_spec(spec)
+        sys.modules["apsen_central_orchestrator"] = modulo
+        spec.loader.exec_module(modulo)
+
+        banco = BancoFake()
+        banco.instalar(modulo, monkeypatch)
+
+        estado = _estado_zerado()
+        modulo.inicializar(estado, threading.Lock(), lambda: None, None)
+
+        adapter = AdapterFake(modulo)
+        monkeypatch.setattr(modulo, "_post", adapter.post)
+        monkeypatch.setattr(modulo, "_client", None)   # o duplo de _post cobre tudo
+
+        return OrquestradorCarregado(modulo, banco, adapter, estado)
 
     yield _carregar
 

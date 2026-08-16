@@ -340,6 +340,15 @@ async def _handle_evento_dispenser(payload: dict):
             orch.notificar_evento(f"{os_id}:carregado:{disp_id}", {**payload, "tipo": "erro"})
             orch.notificar_evento(f"{os_id}:dispensado:{disp_id}", {**payload, "tipo": "erro"})
 
+    # Limpeza é operação de slot, não de OS: o payload de "limpeza_ok" não traz
+    # os_id, então a chave é só o dispenser. O "erro" também entra aqui — é
+    # como o simulador recusa a limpeza (codigo_erro=limpeza_em_operacao) e o
+    # orquestrador não pode ficar esperando uma confirmação que não vem.
+    if tipo == "limpeza_ok":
+        orch.notificar_evento(f"limpeza:{disp_id}", payload)
+    elif tipo == "erro":
+        orch.notificar_evento(f"limpeza:{disp_id}", {**payload, "tipo": "erro"})
+
     _log(f"disp_{tipo}", f"D{disp_id}: {tipo}", payload)
     _broadcast_estado()
 

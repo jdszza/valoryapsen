@@ -5,7 +5,8 @@ planejamento de rota CNC, orquestração de carregamento e dispensa.
 
 Fluxo de uma OS:
   1. OS chega via POST /api/v1/ordens → entra na fila
-  2. IA atribui slots (nearest residual → slot vazio)
+  2. IA atribui slots (nearest residual → slot vazio → slot a limpar)
+  2b. Slots marcados para limpeza são esvaziados e confirmados antes da carga
   3. Central comanda carregamento paralelo de todos os slots
   4. Aguarda todos "carregado" (evento do dispenser-adapter)
   5. Para cada slot na rota otimizada (nearest-neighbor):
@@ -209,7 +210,15 @@ def atribuir_slots(medicamentos: list, estado_dispensers: dict) -> Optional[list
     Decide qual slot recebe qual medicamento.
     Prioridade 1: slot com o mesmo medicamento e residual suficiente.
     Prioridade 2: slot vazio (medicamento=None ou quantidade=0).
+    Prioridade 3: slot ocupado por OUTRO medicamento — marcado com
+                  `precisa_limpeza=True`, para o chamador descartar o resíduo
+                  antes de carregar.
     Retorna lista de atribuições ou None se não há slots suficientes.
+
+    Função PURA: não envia comando nenhum. Quem consome a lista é que dispara a
+    limpeza dos slots marcados (ver `_processar_os`). Com 96 medicamentos no
+    catálogo, sem o passo 3 qualquer resíduo órfão tirava o slot de circulação
+    até que uma OS pedisse exatamente aquele item.
     """
     atribuicoes: list[dict] = []
     slots_reservados: set[int] = set()
@@ -220,6 +229,7 @@ def atribuir_slots(medicamentos: list, estado_dispensers: dict) -> Optional[list
         cat = item.get("categoria", "")
         qtd = item["quantidade"]
         slot_escolhido: Optional[int] = None
+        precisa_limpeza = False
 
         # Passo 1: slot com mesmo medicamento e residual > 0
         for slot_id in range(1, NUM_SLOTS + 1):
@@ -244,17 +254,40 @@ def atribuir_slots(medicamentos: list, estado_dispensers: dict) -> Optional[list
                     logger.info("[IA] %s → D%d (slot livre)", med, slot_id)
                     break
 
+        # Passo 3: nenhum slot livre — sacrifica o de menor residual (menos
+        # estoque descartado), desempatando pelo menor id.
+        if slot_escolhido is None:
+            candidatos = [
+                slot_id for slot_id in range(1, NUM_SLOTS + 1)
+                if slot_id not in slots_reservados
+            ]
+            if candidatos:
+                slot_escolhido = min(
+                    candidatos,
+                    key=lambda s: (
+                        (estado_dispensers.get(str(s), {}).get("quantidade", 0) or 0), s
+                    ),
+                )
+                precisa_limpeza = True
+                disp = estado_dispensers.get(str(slot_escolhido), {})
+                logger.warning(
+                    "[IA] %s → D%d (limpeza necessária: descarta %s × %d)",
+                    med, slot_escolhido, disp.get("medicamento"),
+                    disp.get("quantidade", 0) or 0,
+                )
+
         if slot_escolhido is None:
             logger.error("[IA] Sem slot disponível para '%s'! Reservados: %s", med, slots_reservados)
             return None
 
         slots_reservados.add(slot_escolhido)
         atribuicoes.append({
-            "dispenser_id": slot_escolhido,
-            "medicamento":  med,
-            "sku":          sku,
-            "categoria":    cat,
-            "quantidade":   qtd,
+            "dispenser_id":    slot_escolhido,
+            "medicamento":     med,
+            "sku":             sku,
+            "categoria":       cat,
+            "quantidade":      qtd,
+            "precisa_limpeza": precisa_limpeza,
         })
 
     return atribuicoes
@@ -324,6 +357,49 @@ async def cmd_limpar(disp_id: int, solicitado_por: str) -> bool:
         settings.DISPENSER_ADAPTER_URL + "/comandos/limpar",
         {"dispenser_id": disp_id, "solicitado_por": solicitado_por},
     )
+
+
+async def _liberar_slot(disp_id: int, solicitado_por: str) -> bool:
+    """
+    Comanda a limpeza física de um slot e AGUARDA a confirmação do dispenser.
+
+    A chave do evento não leva os_id: o payload de `limpeza_ok` emitido pelo
+    simulador não carrega OS nenhuma (a limpeza é uma operação de slot, não de
+    OS). Por isso `_limpar_eventos_os` — que varre pelo prefixo `{os_id}:` —
+    não colide com essas chaves.
+
+    Nunca levanta: devolve False em recusa, falha de HTTP ou timeout, para que
+    o chamador decida o que fazer sem perder o erro que o trouxe até aqui.
+    """
+    chave = f"limpeza:{disp_id}"
+    registrar_evento(chave)
+
+    try:
+        enviado = await cmd_limpar(disp_id, solicitado_por)
+    except Exception as exc:
+        _pending_events.pop(chave, None)
+        logger.error("[ORCH] Exceção ao comandar limpeza de D%d: %s", disp_id, exc)
+        return False
+
+    if not enviado:
+        _pending_events.pop(chave, None)
+        logger.error("[ORCH] Dispenser-adapter não aceitou a limpeza de D%d.", disp_id)
+        return False
+
+    resultado = await aguardar_evento(chave, settings.TIMEOUT_LIMPEZA)
+    if resultado is None:
+        logger.error("[ORCH] Timeout aguardando limpeza de D%d.", disp_id)
+        return False
+    if resultado.get("tipo") == "erro":
+        logger.error(
+            "[ORCH] Limpeza de D%d recusada: %s",
+            disp_id, resultado.get("descricao", resultado.get("codigo_erro", "?")),
+        )
+        return False
+
+    logger.info("[ORCH] D%d limpo (resíduo descartado: %s).",
+                disp_id, resultado.get("medicamento_limpo") or "vazio")
+    return True
 
 
 async def cmd_mover(disp_id: int, os_id: str, ciclo: int, total: int) -> bool:
@@ -440,6 +516,26 @@ async def _processar_os(os_payload: dict):
                            for a in atribuicoes)
     logger.info("[ORCH] Atribuição: %s", log_atrib)
 
+    # ── 1b. Limpeza prévia dos slots reaproveitados (passo 3 da IA) ──────────
+    # `atribuir_slots` é pura: ela só MARCA o slot que está ocupado por outro
+    # medicamento. Descartar o resíduo é responsabilidade daqui, e tem que
+    # terminar antes de qualquer carregamento — senão o slot recusa a carga.
+    slots_sujos = [a for a in atribuicoes if a.get("precisa_limpeza")]
+    if slots_sujos:
+        logger.warning(
+            "[ORCH] %d slot(s) ocupado(s) por outro medicamento — limpando antes da carga: %s",
+            len(slots_sujos), ", ".join(f"D{a['dispenser_id']}" for a in slots_sujos),
+        )
+        for a in slots_sujos:
+            if not await _liberar_slot(a["dispenser_id"], f"pre_carga:{os_id}"):
+                logger.error(
+                    "[ORCH] Limpeza prévia de D%d falhou. Abortando OS %s.",
+                    a["dispenser_id"], os_id,
+                )
+                # Sem atribuições: nada foi carregado ainda, não há o que descartar.
+                await _abortar_os(os_id, "erro_limpeza_previa")
+                return
+
     # Registra atribuição no DB (async — não bloqueia o event loop)
     for a in atribuicoes:
         try:
@@ -507,12 +603,12 @@ async def _processar_os(os_payload: dict):
         if resultado is None:
             logger.error("[ORCH] Timeout carregamento D%d (%s). Abortando OS %s.",
                          a["dispenser_id"], a["medicamento"], os_id)
-            await _abortar_os(os_id, "erro_carregamento")
+            await _abortar_os(os_id, "erro_carregamento", atribuicoes)
             return
         if resultado.get("tipo") == "erro":
             logger.error("[ORCH] ERRO carregamento D%d: %s. Abortando OS %s.",
                          a["dispenser_id"], resultado.get("descricao", ""), os_id)
-            await _abortar_os(os_id, "erro_carregamento")
+            await _abortar_os(os_id, "erro_carregamento", atribuicoes)
             return
 
     logger.info("[ORCH] Todos os dispensers prontos. Iniciando validação de visão.")
@@ -661,18 +757,18 @@ async def _processar_os(os_payload: dict):
         ok = await cmd_mover(disp_id, os_id, seq, total)
         if not ok:
             logger.error("[ORCH] Falha ao enviar cmd mover para D%d.", disp_id)
-            await _abortar_os(os_id, "erro_cnc")
+            await _abortar_os(os_id, "erro_cnc", atribuicoes)
             return
 
         resultado_pos = await aguardar_evento(chave_pos, settings.TIMEOUT_POSICIONAMENTO)
         if resultado_pos is None:
             logger.error("[ORCH] Timeout CNC posicionando em D%d.", disp_id)
-            await _abortar_os(os_id, "erro_cnc")
+            await _abortar_os(os_id, "erro_cnc", atribuicoes)
             return
         if resultado_pos.get("tipo") == "erro":
             logger.error("[ORCH] ERRO CNC ao mover para D%d: %s.",
                          disp_id, resultado_pos.get("descricao", ""))
-            await _abortar_os(os_id, "erro_cnc")
+            await _abortar_os(os_id, "erro_cnc", atribuicoes)
             return
 
         logger.info("[ORCH] CNC posicionada em D%d. Disparando dispensa.", disp_id)
@@ -684,18 +780,18 @@ async def _processar_os(os_payload: dict):
         ok = await cmd_dispensar(disp_id, os_id)
         if not ok:
             logger.error("[ORCH] Falha ao enviar cmd dispensar para D%d.", disp_id)
-            await _abortar_os(os_id, "erro_dispenser")
+            await _abortar_os(os_id, "erro_dispenser", atribuicoes)
             return
 
         resultado_disp = await aguardar_evento(chave_disp, settings.TIMEOUT_DISPENSA)
         if resultado_disp is None:
             logger.error("[ORCH] Timeout dispensando D%d.", disp_id)
-            await _abortar_os(os_id, "erro_dispenser")
+            await _abortar_os(os_id, "erro_dispenser", atribuicoes)
             return
         if resultado_disp.get("tipo") == "erro":
             logger.error("[ORCH] ERRO dispensa D%d: %s.",
                          disp_id, resultado_disp.get("descricao", ""))
-            await _abortar_os(os_id, "erro_dispenser")
+            await _abortar_os(os_id, "erro_dispenser", atribuicoes)
             return
 
         logger.info("[ORCH] D%d dispensou %d/%d × %s.",
@@ -855,7 +951,16 @@ def _limpar_eventos_os(os_id: str):
         logger.debug("[ORCH] Limpou %d evento(s) pendente(s) da OS %s.", len(chaves_remover), os_id)
 
 
-async def _abortar_os(os_id: str, motivo: str):
+async def _abortar_os(os_id: str, motivo: str, atribuicoes: Optional[list] = None):
+    """
+    Encerra a OS em erro e devolve os slots ao pool.
+
+    O estoque já carregado continua FISICAMENTE no dispenser depois do abort —
+    resetar só a memória do central deixava o slot ocupado por um medicamento
+    órfão que nenhuma OS futura reclamaria. Por isso cada slot atribuído leva um
+    comando de limpeza aqui. A falha da limpeza vira alarme próprio, sem
+    sobrescrever `motivo`, que é o que explica o abort.
+    """
     logger.error("[ORCH] Abortando OS %s — motivo: %s", os_id, motivo)
     _limpar_eventos_os(os_id)
     try:
@@ -865,6 +970,27 @@ async def _abortar_os(os_id: str, motivo: str):
         )
     except Exception as e:
         logger.warning("[DB] _abortar_os: %s", e)
+
+    # ── Descarta o estoque órfão dos slots que a OS chegou a reservar ────────
+    nao_liberados: list[int] = []
+    for a in atribuicoes or []:
+        disp_id = a["dispenser_id"]
+        if not await _liberar_slot(disp_id, f"abort_os:{os_id}"):
+            nao_liberados.append(disp_id)
+
+    if nao_liberados:
+        slots_txt = ", ".join(f"D{d}" for d in nao_liberados)
+        logger.error(
+            "[ORCH] Limpeza NÃO confirmada em %s após abort da OS %s — "
+            "estoque órfão pode ter ficado no slot.", slots_txt, os_id,
+        )
+        try:
+            await asyncio.to_thread(
+                salvar_alarme, "orchestrator", "limpeza_pos_abort_falhou",
+                f"OS {os_id} abortada ({motivo}): limpeza não confirmada em {slots_txt}",
+            )
+        except Exception as e:
+            logger.warning("[DB] salvar_alarme limpeza_pos_abort_falhou: %s", e)
 
     with _lock:
         _estado["os_ativa"] = None

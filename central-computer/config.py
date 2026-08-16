@@ -39,6 +39,7 @@ class Settings:
     TIMEOUT_VISAO_DISPENSER:     float = float(os.getenv("TIMEOUT_VISAO_DISPENSER",     "30"))
     TIMEOUT_VISAO_MESA:          float = float(os.getenv("TIMEOUT_VISAO_MESA",          "30"))
     TIMEOUT_PESO:                float = float(os.getenv("TIMEOUT_PESO",                "15"))
+    TIMEOUT_LIMPEZA:             float = float(os.getenv("TIMEOUT_LIMPEZA",             "60"))
 
 
 settings = Settings()
