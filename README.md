@@ -111,7 +111,8 @@ O Central emite o evento abaixo sempre que um produto é atribuído a um dispens
     f. central-computer  →  weight-adapter  →  POST /pesar
        ↳  weight-simulator: lê delta de peso na mesa, reporta desvio em relação ao esperado
     g. Triple Check: compara as 3 fontes (dispenser, câmera mesa, balança)
-       • Divergência → trava_ativa=True, OS suspensa até liberação por admin/supervisor
+       • 1 fonte divergente já basta → trava.ativa=True, OS suspensa até
+         liberação por admin/supervisor
        • OK → continua para o próximo slot
 9.  cnc-adapter  →  POST /executar/homing
 10. OS marcada como "concluída" no MySQL
@@ -124,20 +125,32 @@ O Central emite o evento abaixo sempre que um produto é atribuído a um dispens
 
 Após cada dispensa de slot, o orquestrador valida **3 fontes independentes**:
 
-| Fonte          | O que mede                               | Evento                          |
+| Fonte          | O que mede                               | Evento divergente               |
 |----------------|------------------------------------------|---------------------------------|
-| Dispenser      | Quantidade contada mecanicamente         | `dispensado` → `qtd_dispensada` |
-| Câmera da mesa | Contagem por visão computacional         | `leitura_mesa_ok` → `contagem`  |
-| Balança HX711  | Delta de peso (incremento do slot) em g  | `peso_ok` → `peso_medido_g`     |
+| Dispenser      | Quantidade contada mecanicamente         | `dispensado` → `quantidade_dispensada` ≠ alvo |
+| Câmera da mesa | Contagem por visão computacional         | `leitura_mesa_divergencia`      |
+| Balança HX711  | Delta de peso (incremento do slot) em g  | `peso_divergencia`              |
 
 Se **qualquer** das 3 fontes divergir além da tolerância, o sistema ativa a **trava de erro**:
 - A OS é suspensa (não abortada)
-- Um alarme `triple_check_falha` é registrado no banco
-- O estado `trava_ativa = True` é transmitido via WebSocket
+- Um alarme `trava_ativada` (componente `triple_check`) é registrado no banco
+- O estado `trava.ativa = True` é transmitido via WebSocket
 - O dashboard exibe banner vermelho
 - Apenas admin ou supervisor pode liberar via `POST /api/v1/admin/liberar-trava`
 
-A balança mede o peso **total acumulado** desde a tara. Para validar cada slot individualmente, o sistema calcula o **delta** (incremento desde a última leitura), eliminando o efeito do acúmulo de slots anteriores na mesa.
+O limiar é uma unidade porque os dois erros não custam a mesma coisa: parar uma OS boa custa uma liberação de supervisor, deixar passar uma OS ruim custa medicamento errado — ou na quantidade errada — chegando ao paciente. Se em campo uma fonte específica provar gerar trava sem causa real, o limiar é ajustável por env var no `central-computer`, **sem alterar código**:
+
+| Env var                         | Default | Efeito                                        |
+|---------------------------------|---------|-----------------------------------------------|
+| `TRIPLE_CHECK_MIN_DIVERGENCIAS` | `1`     | Nº de fontes divergentes que ativa a trava (faixa 1–3; valor fora da faixa cai no default) |
+
+Com limiar acima de 1, a divergência que não trava ainda vira alarme `divergencia_abaixo_do_limiar` no banco — quem elevou o limiar precisa poder auditar o que passou por baixo dele.
+
+**Fonte que não mediu não é fonte que divergiu.** Timeout e falha de leitura da câmera (`leitura_mesa_falha`), ou `erro_sensor` da balança, entram como *fonte indisponível*: são registradas em log, mas não contam para o limiar. Elas não contradizem nada — apenas deixam de confirmar. Contá-las transformaria os ~2% de falha de leitura da câmera em trava por ruído, e trava por ruído é trava desligada em campo. É o mesmo critério já aplicado à câmera do dispenser, onde SKU errado bloqueia e falha de leitura não.
+
+A balança mede o peso **total acumulado** desde a tara. Para validar cada slot individualmente, o sistema calcula o **delta** (incremento desde a última leitura), eliminando o efeito do acúmulo de slots anteriores na mesa. O comando de pesagem carrega duas quantidades — `quantidade_esperada` (alvo da OS, base do peso esperado) e `quantidade_real` (o que o dispenser reportou ter soltado, base do peso que entra na mesa) —, e é da diferença entre as duas que a divergência de peso emerge.
+
+A regra vive em `orchestrator.avaliar_triple_check()`, função pura e testada em `tests/test_orchestrator.py`.
 
 ---
 
@@ -214,7 +227,7 @@ docker compose logs -f cnc-simulator
 ```
 GET  /ping                               → health check
 GET  /estado                             → estado completo em memória
-GET  /os/ativa                           → OS em execução
+GET  /os/ativa                           → OS em execução (ou a próxima da fila)
 GET  /os/historico                       → histórico de OS
 GET  /medicamentos                       → catálogo (96 medicamentos APSEN)
 GET  /dispensers/estado                  → estado dos 6 slots no DB
@@ -316,4 +329,4 @@ valoryapsen/
 - `threading.Lock` + `_peso_anterior_g` no weight-simulator para leitura delta thread-safe
 - Pré-registro de eventos antes de enviar comandos (resposta rápida nunca perdida)
 - JWT + bcrypt para autenticação da IHM
-- Triple Check com trava de erro garante intervenção humana em qualquer divergência
+- Triple Check com trava de erro garante intervenção humana em qualquer divergência (limiar 1, ajustável por `TRIPLE_CHECK_MIN_DIVERGENCIAS`)

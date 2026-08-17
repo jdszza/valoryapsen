@@ -7,6 +7,31 @@ _cfg_logger = logging.getLogger(__name__)
 _DEFAULT_SECRET_KEY = "apsen-mude-esta-chave-em-producao-2024"
 
 
+def _limiar_triple_check() -> int:
+    """Nº de fontes divergentes que ativa a trava. Faixa válida: 1..3.
+
+    O default é 1 — a regra conservadora. Este é um sistema farmacêutico de
+    contagem: um falso negativo é medicamento errado, ou na quantidade errada,
+    chegando ao paciente. Só suba o limiar com evidência de que uma fonte
+    específica gera trava sem causa real.
+
+    Valor fora da faixa cai no default em vez de virar comportamento silencioso:
+    0 travaria toda dispensa e >3 nunca travaria — os dois esvaziam a trava de
+    sentido, um por excesso e o outro por ausência.
+    """
+    bruto = os.getenv("TRIPLE_CHECK_MIN_DIVERGENCIAS", "1")
+    try:
+        valor = int(bruto)
+    except ValueError:
+        valor = 0
+    if not 1 <= valor <= 3:
+        _cfg_logger.warning(
+            "TRIPLE_CHECK_MIN_DIVERGENCIAS=%r fora da faixa 1..3 — usando 1.", bruto
+        )
+        return 1
+    return valor
+
+
 @dataclass
 class Settings:
     # ── MySQL ─────────────────────────────────────────────────────────────────
@@ -40,6 +65,9 @@ class Settings:
     TIMEOUT_VISAO_MESA:          float = float(os.getenv("TIMEOUT_VISAO_MESA",          "30"))
     TIMEOUT_PESO:                float = float(os.getenv("TIMEOUT_PESO",                "15"))
     TIMEOUT_LIMPEZA:             float = float(os.getenv("TIMEOUT_LIMPEZA",             "60"))
+
+    # ── Triple Check ──────────────────────────────────────────────────────────
+    TRIPLE_CHECK_MIN_DIVERGENCIAS: int = _limiar_triple_check()
 
 
 settings = Settings()

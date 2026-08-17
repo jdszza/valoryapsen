@@ -46,6 +46,8 @@ services:
       MYSQL_PASSWORD:      apsen_pass_2024
     volumes:
       - mysql_data:/var/lib/mysql
+      # Só charset/collation do banco. O schema (tabelas, colunas, seeds) é
+      # criado pelo central-computer a cada startup — ver CLAUDE.md.
       - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
@@ -84,6 +86,9 @@ services:
       TIMEOUT_VISAO_DISPENSER: 30
       TIMEOUT_VISAO_MESA:      30
       TIMEOUT_PESO:            15
+      # Nº de fontes do Triple Check que precisam divergir para travar a OS.
+      # 1 = regra conservadora (default). Faixa 1..3 — ver README.
+      TRIPLE_CHECK_MIN_DIVERGENCIAS: 1
     depends_on:
       mysql:
         condition: service_healthy

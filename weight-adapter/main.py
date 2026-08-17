@@ -5,6 +5,8 @@ Bridge bidirecional entre o Computador Central e o Weight Simulator (HX711).
 Fluxo entrada (← Central):
   POST /comandos/tara     → repassa ao weight-simulator POST /executar/tara
   POST /comandos/pesar    → repassa ao weight-simulator POST /executar/pesar
+                            (leva `quantidade_esperada` E `quantidade_real`;
+                             ver docstring de `cmd_pesar`)
 
 Fluxo saída (← Weight Simulator):
   POST /eventos           → normaliza e encaminha ao central POST /api/v1/eventos/peso
@@ -73,7 +75,8 @@ class TaraReq(BaseModel):
 class PesarReq(BaseModel):
     os_id: str
     slot_id: int
-    quantidade_esperada: int
+    quantidade_esperada: int               # alvo da OS — base do peso ESPERADO
+    quantidade_real: Optional[int] = None  # o que o dispenser soltou — vira peso na mesa
     peso_unitario_g: float
 
 
@@ -143,10 +146,22 @@ async def cmd_tara(req: TaraReq):
 
 @app.post("/comandos/pesar")
 async def cmd_pesar(req: PesarReq):
-    """Solicita leitura de peso após dispensa no slot especificado."""
+    """Solicita leitura de peso após dispensa no slot especificado.
+
+    As duas quantidades atravessam o adapter sem interpretação: o simulador
+    incrementa a mesa pela REAL e mede o desvio contra a ESPERADA. Repassar só
+    a esperada — o contrato antigo — fazia a balança comparar o valor consigo
+    mesma, cega a qualquer falha de dispensa.
+
+    `quantidade_real` ausente cai na esperada, preservando o contrato antigo.
+    """
+    quantidade_real = (
+        req.quantidade_esperada if req.quantidade_real is None else req.quantidade_real
+    )
     logger.info(
-        "[CMD] PESAR slot=%d | qtd=%d | peso_unit=%.1fg | OS=%s",
-        req.slot_id, req.quantidade_esperada, req.peso_unitario_g, req.os_id,
+        "[CMD] PESAR slot=%d | qtd esperada=%d real=%d | peso_unit=%.1fg | OS=%s",
+        req.slot_id, req.quantidade_esperada, quantidade_real,
+        req.peso_unitario_g, req.os_id,
     )
     resultado = await _post_sim(
         "/executar/pesar",
@@ -154,6 +169,7 @@ async def cmd_pesar(req: PesarReq):
             "os_id":               req.os_id,
             "slot_id":             req.slot_id,
             "quantidade_esperada": req.quantidade_esperada,
+            "quantidade_real":     quantidade_real,
             "peso_unitario_g":     req.peso_unitario_g,
         },
     )

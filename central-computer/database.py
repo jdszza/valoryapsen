@@ -1,6 +1,9 @@
 """
 APSEN - Banco de Dados MySQL (PyMySQL)
-Schema v2.1 — ordens, dispensas, CNC, sensores, manutenção, usuários, dispenser_estado
+
+Fonte de verdade ÚNICA do schema: ordens, dispensas, CNC, sensores, visão,
+manutenção, alarmes, usuários, medicamentos, dispenser_estado. `mysql/init.sql`
+não declara nada — ver CLAUDE.md, "Schema do banco".
 """
 import json
 import logging
@@ -56,8 +59,43 @@ def _rows(rs) -> list:
     return [_row(r) for r in rs]
 
 
+class BancoIndisponivel(RuntimeError):
+    """MySQL não aceitou conexão dentro da janela de espera do startup."""
+
+
+class ConfiguracaoInvalida(RuntimeError):
+    """MySQL respondeu e recusou: credencial ou nome de banco errados."""
+
+
+class SchemaInvalido(RuntimeError):
+    """MySQL aceitou a conexão, mas o schema não é o que este módulo espera."""
+
+
+_TENTATIVAS_CONEXAO      = 30
+_ESPERA_ENTRE_TENTATIVAS = 2.0
+
+# Apenas estes erros significam "ainda não dá para conectar" e merecem retry.
+# 2002/2003/2006/2013 vêm do cliente (CR_*): socket recusado, servidor sumiu no
+# meio do handshake. 1040/1053: servidor de pé, mas ainda subindo ou saturado.
+_ERROS_TRANSITORIOS = {2002, 2003, 2006, 2013, 1040, 1053}
+
+# O servidor respondeu e disse não. Esperar não conserta, e o problema não é o
+# schema: separar os dois evita mandar quem lê o log caçar tabela errada.
+_ERROS_CONFIGURACAO = {1044, 1045, 1049, 1698}
+
+# Todo o resto é schema — 1054 coluna inexistente, 1146 tabela inexistente,
+# 1064 sintaxe. PyMySQL entrega esses códigos como OperationalError também, e
+# era isso que os escondia atrás de 30 retries de "MySQL não disponível".
+
+
+def _codigo_erro(exc: Exception) -> int | None:
+    codigo = exc.args[0] if exc.args else None
+    return codigo if isinstance(codigo, int) else None
+
+
 def init_db():
-    for attempt in range(30):
+    ultimo: Exception | None = None
+    for tentativa in range(1, _TENTATIVAS_CONEXAO + 1):
         try:
             with _conn() as conn:
                 _create_tables(conn)
@@ -65,164 +103,270 @@ def init_db():
             _seed_medicamentos()
             logger.info("MySQL conectado e schema verificado. Medicamentos OK.")
             return
-        except pymysql.OperationalError as exc:
-            logger.warning(f"MySQL não disponível ({attempt+1}/30): {exc}")
-            if attempt < 29:
-                time.sleep(2)
-            else:
-                raise
+        except pymysql.Error as exc:
+            codigo = _codigo_erro(exc)
+            if codigo in _ERROS_CONFIGURACAO:
+                raise ConfiguracaoInvalida(
+                    f"MySQL recusou a conexão: {exc}. O servidor está de pé e "
+                    "respondendo, então esperar não resolve — confira MYSQL_DB, "
+                    "MYSQL_USER e MYSQL_PASS do central-computer."
+                ) from exc
+            if codigo not in _ERROS_TRANSITORIOS:
+                raise SchemaInvalido(
+                    f"MySQL respondeu, mas a inicialização do schema falhou: {exc}. "
+                    "Isto NÃO é indisponibilidade — o banco provavelmente está numa "
+                    "versão anterior do schema. Confira _DDL_TABELAS e "
+                    "_COLUNAS_EVOLUTIVAS em central-computer/database.py."
+                ) from exc
+            ultimo = exc
+            logger.warning(
+                f"MySQL não disponível ({tentativa}/{_TENTATIVAS_CONEXAO}): {exc}"
+            )
+            if tentativa < _TENTATIVAS_CONEXAO:
+                time.sleep(_ESPERA_ENTRE_TENTATIVAS)
+
+    raise BancoIndisponivel(
+        f"MySQL não respondeu após {_TENTATIVAS_CONEXAO} tentativas "
+        f"(~{_TENTATIVAS_CONEXAO * _ESPERA_ENTRE_TENTATIVAS:.0f}s). "
+        f"Último erro: {ultimo}"
+    ) from ultimo
+
+
+# ── Schema ─────────────────────────────────────────────────────────────────────
+# FONTE DE VERDADE ÚNICA do schema (ver CLAUDE.md). `mysql/init.sql` não declara
+# mais tabela nenhuma: ele só roda na primeira criação do volume, enquanto isto
+# roda em TODO startup do central — inclusive contra um MySQL pré-existente.
+
+_DDL_TABELAS = [
+    """CREATE TABLE IF NOT EXISTS ordens (
+        id           INT AUTO_INCREMENT PRIMARY KEY,
+        os_id        VARCHAR(60)  NOT NULL UNIQUE,
+        descricao    VARCHAR(200) NOT NULL DEFAULT '',
+        categoria    VARCHAR(100) NOT NULL DEFAULT '',
+        status       VARCHAR(30)  NOT NULL DEFAULT 'aguardando',
+        payload_json TEXT         NOT NULL,
+        criado_em    DATETIME(3)  NOT NULL,
+        concluida_em DATETIME(3)  NULL,
+        INDEX idx_os_status (status),
+        INDEX idx_os_criado (criado_em)
+    ) ENGINE=InnoDB""",
+
+    """CREATE TABLE IF NOT EXISTS os_itens (
+        id              INT AUTO_INCREMENT PRIMARY KEY,
+        os_id           VARCHAR(60)  NOT NULL,
+        dispenser_id    TINYINT      NULL,
+        medicamento     VARCHAR(100) NOT NULL,
+        sku             VARCHAR(150) NULL,
+        categoria       VARCHAR(100) NULL,
+        quantidade_alvo INT          NOT NULL,
+        quantidade_real INT          NOT NULL DEFAULT 0,
+        status          VARCHAR(30)  NOT NULL DEFAULT 'pendente',
+        INDEX idx_ositem_os  (os_id),
+        INDEX idx_ositem_dis (os_id, dispenser_id)
+    ) ENGINE=InnoDB""",
+
+    """CREATE TABLE IF NOT EXISTS dispensas (
+        id                    INT AUTO_INCREMENT PRIMARY KEY,
+        os_id                 VARCHAR(60)  NOT NULL,
+        dispenser_id          TINYINT      NOT NULL,
+        medicamento           VARCHAR(100) NOT NULL,
+        quantidade_dispensada INT          NOT NULL,
+        quantidade_alvo       INT          NOT NULL,
+        validado              TINYINT(1)   NOT NULL DEFAULT 1,
+        motivo_falha          TEXT         NULL,
+        ts                    DATETIME(3)  NOT NULL,
+        INDEX idx_disp_os (os_id, dispenser_id, ts),
+        INDEX idx_disp_ts (ts)
+    ) ENGINE=InnoDB""",
+
+    """CREATE TABLE IF NOT EXISTS cnc_eventos (
+        id             INT AUTO_INCREMENT PRIMARY KEY,
+        os_id          VARCHAR(60)  NULL,
+        status         VARCHAR(30)  NOT NULL,
+        dispenser_alvo TINYINT      NULL,
+        posicao_x      DECIMAL(8,3) NULL,
+        posicao_y      DECIMAL(8,3) NULL,
+        ciclo_atual    INT          NOT NULL DEFAULT 0,
+        total_ciclos   INT          NOT NULL DEFAULT 0,
+        ts             DATETIME(3)  NOT NULL,
+        INDEX idx_cnc_ts (ts),
+        INDEX idx_cnc_os (os_id, ts)
+    ) ENGINE=InnoDB""",
+
+    """CREATE TABLE IF NOT EXISTS leituras_sensores (
+        id         INT AUTO_INCREMENT PRIMARY KEY,
+        componente VARCHAR(100)  NOT NULL,
+        tipo       VARCHAR(30)   NOT NULL,
+        valor      DECIMAL(10,3) NOT NULL,
+        unidade    VARCHAR(20)   NOT NULL,
+        ts         DATETIME(3)   NOT NULL,
+        INDEX idx_sensor_comp (componente, ts),
+        INDEX idx_sensor_ts   (ts)
+    ) ENGINE=InnoDB""",
+
+    """CREATE TABLE IF NOT EXISTS alarmes (
+        id        INT AUTO_INCREMENT PRIMARY KEY,
+        fonte     VARCHAR(50)  NOT NULL,
+        tipo      VARCHAR(60)  NOT NULL,
+        descricao TEXT         NOT NULL,
+        resolvido TINYINT(1)   NOT NULL DEFAULT 0,
+        ts        DATETIME(3)  NOT NULL,
+        INDEX idx_alarm_resolvido (resolvido, ts),
+        INDEX idx_alarm_ts        (ts)
+    ) ENGINE=InnoDB""",
+
+    """CREATE TABLE IF NOT EXISTS log_manutencao (
+        id         INT AUTO_INCREMENT PRIMARY KEY,
+        tipo       VARCHAR(50)  NOT NULL,
+        componente VARCHAR(100) NOT NULL,
+        descricao  TEXT         NOT NULL,
+        tecnico    VARCHAR(100) NOT NULL,
+        ts         DATETIME(3)  NOT NULL,
+        INDEX idx_manut_ts (ts)
+    ) ENGINE=InnoDB""",
+
+    """CREATE TABLE IF NOT EXISTS dispenser_estado (
+        dispenser_id      TINYINT      PRIMARY KEY,
+        medicamento       VARCHAR(100) NULL,
+        categoria         VARCHAR(100) NULL,
+        quantidade_atual  INT          NOT NULL DEFAULT 0,
+        capacidade        INT          NOT NULL DEFAULT 100,
+        ultima_os_id      VARCHAR(60)  NULL,
+        atualizado_em     DATETIME(3)  NOT NULL
+    ) ENGINE=InnoDB""",
+
+    """CREATE TABLE IF NOT EXISTS usuarios (
+        id            INT AUTO_INCREMENT PRIMARY KEY,
+        username      VARCHAR(100) NOT NULL UNIQUE,
+        senha_hash    TEXT         NOT NULL,
+        nome_completo VARCHAR(200) NOT NULL DEFAULT '',
+        role          VARCHAR(30)  NOT NULL DEFAULT 'manutencao',
+        ativo         TINYINT(1)   NOT NULL DEFAULT 1,
+        criado_em     DATETIME(3)  NOT NULL,
+        INDEX idx_user (username, ativo)
+    ) ENGINE=InnoDB""",
+
+    """CREATE TABLE IF NOT EXISTS medicamentos (
+        id              INT AUTO_INCREMENT PRIMARY KEY,
+        nome            VARCHAR(150) NOT NULL UNIQUE,
+        sku             VARCHAR(200) NOT NULL,
+        categoria       VARCHAR(100) NOT NULL,
+        categoria_desc  VARCHAR(200) NOT NULL,
+        dimensao        VARCHAR(60)  NULL,
+        peso_unitario_g DECIMAL(8,2) NULL,
+        INDEX idx_med_categoria (categoria)
+    ) ENGINE=InnoDB""",
+
+    """CREATE TABLE IF NOT EXISTS visao_leituras (
+        id            INT AUTO_INCREMENT PRIMARY KEY,
+        os_id         VARCHAR(60)  NULL,
+        camera        VARCHAR(20)  NOT NULL,
+        slot_id       TINYINT      NULL,
+        tipo          VARCHAR(50)  NOT NULL,
+        sku_esperado  VARCHAR(200) NULL,
+        sku_lido      VARCHAR(200) NULL,
+        match_sku     TINYINT(1)   NULL,
+        confianca     DECIMAL(5,4) NULL,
+        qtd_esperada  INT          NULL,
+        qtd_detectada INT          NULL,
+        motivo        VARCHAR(255) NULL,
+        criado_em     DATETIME(3)  NOT NULL,
+        INDEX idx_vl_os     (os_id),
+        INDEX idx_vl_camera (camera),
+        INDEX idx_vl_criado (criado_em)
+    ) ENGINE=InnoDB""",
+]
+
+
+# Colunas acrescentadas depois que o schema já tinha rodado em algum lugar.
+# `CREATE TABLE IF NOT EXISTS` não toca em tabela existente, então um banco de
+# versão anterior nunca ganharia a coluna sozinho — daí o ALTER condicional.
+_COLUNAS_EVOLUTIVAS: dict[str, dict[str, str]] = {
+    "ordens": {
+        "categoria": "VARCHAR(100) NOT NULL DEFAULT '' AFTER descricao",
+    },
+    "os_itens": {
+        "sku":       "VARCHAR(150) NULL AFTER medicamento",
+        "categoria": "VARCHAR(100) NULL AFTER sku",
+    },
+    "usuarios": {
+        "role": "VARCHAR(30) NOT NULL DEFAULT 'manutencao' AFTER nome_completo",
+    },
+    "log_manutencao": {
+        "tecnico": "VARCHAR(100) NOT NULL DEFAULT 'sistema' AFTER descricao",
+    },
+    "medicamentos": {
+        "categoria_desc":  "VARCHAR(200) NOT NULL DEFAULT '' AFTER categoria",
+        "peso_unitario_g": "DECIMAL(8,2) NULL AFTER dimensao",
+    },
+}
+
+_SLOTS_DISPENSER = 6
+_CAPACIDADE_SLOT = 100
+
+
+def _colunas_existentes(cur) -> dict[str, dict[str, str]]:
+    """Mapa `{tabela: {coluna: IS_NULLABLE}}` do banco conectado."""
+    cur.execute(
+        "SELECT TABLE_NAME AS tabela, COLUMN_NAME AS coluna, IS_NULLABLE AS nulavel "
+        "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=%s",
+        (settings.MYSQL_DB,),
+    )
+    mapa: dict[str, dict[str, str]] = {}
+    for linha in cur.fetchall():
+        mapa.setdefault(linha["tabela"].lower(), {})[linha["coluna"].lower()] = linha["nulavel"]
+    return mapa
+
+
+def _aplicar_colunas_faltantes(cur) -> None:
+    """Repara bancos de versões anteriores, comparando com o information_schema.
+
+    Idempotente: consulta o que existe e só emite ALTER para o que falta — sem
+    `try/except: pass` engolindo erro de verdade no caminho.
+    """
+    existentes = _colunas_existentes(cur)
+
+    for tabela, colunas in _COLUNAS_EVOLUTIVAS.items():
+        presentes = existentes.get(tabela, {})
+        for coluna, definicao in colunas.items():
+            if coluna in presentes:
+                continue
+            logger.warning(f"[DB] Coluna ausente: {tabela}.{coluna} — aplicando ALTER TABLE.")
+            cur.execute(f"ALTER TABLE {tabela} ADD COLUMN {coluna} {definicao}")
+
+    # `dispenser_id` nasceu NOT NULL; o roteamento dinâmico só define o slot
+    # depois que a OS entra em execução, então a coluna precisa aceitar NULL.
+    if existentes.get("os_itens", {}).get("dispenser_id") == "NO":
+        logger.warning("[DB] os_itens.dispenser_id ainda é NOT NULL — relaxando.")
+        cur.execute("ALTER TABLE os_itens MODIFY COLUMN dispenser_id TINYINT NULL")
+
+
+def _seed_dispenser_estado(cur) -> None:
+    """Garante as 6 linhas de slot, todas VAZIAS.
+
+    Nenhum slot é fixo para um medicamento: o orquestrador atribui conforme as
+    OS chegam. Só as linhas precisam existir de antemão, porque
+    `salvar_dispenser_estado` faz UPDATE, não upsert.
+    """
+    cur.execute("SELECT COUNT(*) AS n FROM dispenser_estado")
+    if cur.fetchone()["n"] >= _SLOTS_DISPENSER:
+        return
+    ts = _ts()
+    for slot in range(1, _SLOTS_DISPENSER + 1):
+        cur.execute(
+            "INSERT IGNORE INTO dispenser_estado "
+            "(dispenser_id, medicamento, categoria, quantidade_atual, capacidade, atualizado_em) "
+            "VALUES (%s,NULL,NULL,0,%s,%s)",
+            (slot, _CAPACIDADE_SLOT, ts),
+        )
 
 
 def _create_tables(conn):
-    ddl_list = [
-        """CREATE TABLE IF NOT EXISTS ordens (
-            id           INT AUTO_INCREMENT PRIMARY KEY,
-            os_id        VARCHAR(60)  NOT NULL UNIQUE,
-            descricao    VARCHAR(200) NOT NULL DEFAULT '',
-            categoria    VARCHAR(100) NOT NULL DEFAULT '',
-            status       VARCHAR(30)  NOT NULL DEFAULT 'aguardando',
-            payload_json TEXT         NOT NULL,
-            criado_em    DATETIME(3)  NOT NULL,
-            concluida_em DATETIME(3)  NULL,
-            INDEX idx_os_status (status),
-            INDEX idx_os_criado (criado_em)
-        ) ENGINE=InnoDB""",
-
-        """CREATE TABLE IF NOT EXISTS os_itens (
-            id              INT AUTO_INCREMENT PRIMARY KEY,
-            os_id           VARCHAR(60)  NOT NULL,
-            dispenser_id    TINYINT      NULL,
-            medicamento     VARCHAR(100) NOT NULL,
-            sku             VARCHAR(150) NULL,
-            categoria       VARCHAR(100) NULL,
-            quantidade_alvo INT          NOT NULL,
-            quantidade_real INT          NOT NULL DEFAULT 0,
-            status          VARCHAR(30)  NOT NULL DEFAULT 'pendente',
-            INDEX idx_ositem_os  (os_id),
-            INDEX idx_ositem_dis (os_id, dispenser_id)
-        ) ENGINE=InnoDB""",
-
-        """CREATE TABLE IF NOT EXISTS dispensas (
-            id                    INT AUTO_INCREMENT PRIMARY KEY,
-            os_id                 VARCHAR(60)  NOT NULL,
-            dispenser_id          TINYINT      NOT NULL,
-            medicamento           VARCHAR(100) NOT NULL,
-            quantidade_dispensada INT          NOT NULL,
-            quantidade_alvo       INT          NOT NULL,
-            validado              TINYINT(1)   NOT NULL DEFAULT 1,
-            motivo_falha          TEXT         NULL,
-            ts                    DATETIME(3)  NOT NULL,
-            INDEX idx_disp_os (os_id, dispenser_id, ts),
-            INDEX idx_disp_ts (ts)
-        ) ENGINE=InnoDB""",
-
-        """CREATE TABLE IF NOT EXISTS cnc_eventos (
-            id             INT AUTO_INCREMENT PRIMARY KEY,
-            os_id          VARCHAR(60)  NULL,
-            status         VARCHAR(30)  NOT NULL,
-            dispenser_alvo TINYINT      NULL,
-            posicao_x      DECIMAL(8,3) NULL,
-            posicao_y      DECIMAL(8,3) NULL,
-            ciclo_atual    INT          NOT NULL DEFAULT 0,
-            total_ciclos   INT          NOT NULL DEFAULT 0,
-            ts             DATETIME(3)  NOT NULL,
-            INDEX idx_cnc_ts (ts),
-            INDEX idx_cnc_os (os_id, ts)
-        ) ENGINE=InnoDB""",
-
-        """CREATE TABLE IF NOT EXISTS leituras_sensores (
-            id         INT AUTO_INCREMENT PRIMARY KEY,
-            componente VARCHAR(100)  NOT NULL,
-            tipo       VARCHAR(30)   NOT NULL,
-            valor      DECIMAL(10,3) NOT NULL,
-            unidade    VARCHAR(20)   NOT NULL,
-            ts         DATETIME(3)   NOT NULL,
-            INDEX idx_sensor_comp (componente, ts),
-            INDEX idx_sensor_ts   (ts)
-        ) ENGINE=InnoDB""",
-
-        """CREATE TABLE IF NOT EXISTS alarmes (
-            id        INT AUTO_INCREMENT PRIMARY KEY,
-            fonte     VARCHAR(50)  NOT NULL,
-            tipo      VARCHAR(60)  NOT NULL,
-            descricao TEXT         NOT NULL,
-            resolvido TINYINT(1)   NOT NULL DEFAULT 0,
-            ts        DATETIME(3)  NOT NULL,
-            INDEX idx_alarm_resolvido (resolvido, ts),
-            INDEX idx_alarm_ts        (ts)
-        ) ENGINE=InnoDB""",
-
-        """CREATE TABLE IF NOT EXISTS log_manutencao (
-            id         INT AUTO_INCREMENT PRIMARY KEY,
-            tipo       VARCHAR(50)  NOT NULL,
-            componente VARCHAR(100) NOT NULL,
-            descricao  TEXT         NOT NULL,
-            tecnico    VARCHAR(100) NOT NULL,
-            ts         DATETIME(3)  NOT NULL,
-            INDEX idx_manut_ts (ts)
-        ) ENGINE=InnoDB""",
-
-        """CREATE TABLE IF NOT EXISTS dispenser_estado (
-            dispenser_id      TINYINT      PRIMARY KEY,
-            medicamento       VARCHAR(100) NULL,
-            categoria         VARCHAR(100) NULL,
-            quantidade_atual  INT          NOT NULL DEFAULT 0,
-            capacidade        INT          NOT NULL DEFAULT 100,
-            ultima_os_id      VARCHAR(60)  NULL,
-            atualizado_em     DATETIME(3)  NOT NULL
-        ) ENGINE=InnoDB""",
-
-        """CREATE TABLE IF NOT EXISTS usuarios (
-            id            INT AUTO_INCREMENT PRIMARY KEY,
-            username      VARCHAR(100) NOT NULL UNIQUE,
-            senha_hash    TEXT         NOT NULL,
-            nome_completo VARCHAR(200) NOT NULL DEFAULT '',
-            role          VARCHAR(30)  NOT NULL DEFAULT 'manutencao',
-            ativo         TINYINT(1)   NOT NULL DEFAULT 1,
-            criado_em     DATETIME(3)  NOT NULL,
-            INDEX idx_user (username, ativo)
-        ) ENGINE=InnoDB""",
-
-        """CREATE TABLE IF NOT EXISTS medicamentos (
-            id              INT AUTO_INCREMENT PRIMARY KEY,
-            nome            VARCHAR(150) NOT NULL UNIQUE,
-            sku             VARCHAR(200) NOT NULL,
-            categoria       VARCHAR(100) NOT NULL,
-            categoria_desc  VARCHAR(200) NOT NULL,
-            dimensao        VARCHAR(60)  NULL,
-            INDEX idx_med_categoria (categoria)
-        ) ENGINE=InnoDB""",
-    ]
     with conn.cursor() as cur:
-        for ddl in ddl_list:
+        for ddl in _DDL_TABELAS:
             cur.execute(ddl)
-
-        for alter in [
-            "ALTER TABLE ordens ADD COLUMN categoria VARCHAR(100) NOT NULL DEFAULT ''  AFTER descricao",
-            "ALTER TABLE usuarios ADD COLUMN role VARCHAR(30) NOT NULL DEFAULT 'manutencao' AFTER nome_completo",
-            "ALTER TABLE os_itens MODIFY COLUMN dispenser_id TINYINT NULL",
-            "ALTER TABLE os_itens ADD COLUMN sku VARCHAR(150) NULL AFTER medicamento",
-            "ALTER TABLE os_itens ADD COLUMN categoria VARCHAR(100) NULL AFTER sku",
-            "ALTER TABLE log_manutencao ADD COLUMN tecnico VARCHAR(100) NOT NULL DEFAULT 'sistema' AFTER descricao",
-            "ALTER TABLE medicamentos ADD COLUMN categoria_desc VARCHAR(200) NOT NULL DEFAULT ''  AFTER categoria",
-        ]:
-            try:
-                cur.execute(alter)
-            except Exception:
-                pass
-
-        cur.execute("SELECT COUNT(*) AS n FROM dispenser_estado")
-        if cur.fetchone()["n"] == 0:
-            ts = _ts()
-            seeds = [(1,None,None,100),(2,None,None,100),(3,None,None,100),
-                     (4,None,None,100),(5,None,None,100),(6,None,None,100)]
-            for d_id, med, cat, cap in seeds:
-                cur.execute(
-                    "INSERT IGNORE INTO dispenser_estado "
-                    "(dispenser_id, medicamento, categoria, quantidade_atual, capacidade, atualizado_em) "
-                    "VALUES (%s,%s,%s,0,%s,%s)",
-                    (d_id, med, cat, cap, ts),
-                )
+        _aplicar_colunas_faltantes(cur)
+        _seed_dispenser_estado(cur)
 
 
 _MEDICAMENTOS_SEED = [
@@ -478,13 +622,30 @@ def atualizar_item_os(os_id: str, dispenser_id: int, quantidade_real: int, statu
 
 
 def get_ordem_ativa() -> dict | None:
+    """A OS em execução — e, se não houver nenhuma, a próxima da fila.
+
+    Quem está rodando é dito pelo STATUS, não pela data: `_processar_os` grava
+    'em_andamento' assim que tira a OS da fila. O fallback para 'aguardando'
+    existe para a IHM não ficar em branco entre duas OS, e aí a "próxima" é a
+    mais ANTIGA — a ordem em que o orquestrador vai puxá-las.
+
+    Uma única query com `criado_em DESC` sobre os dois status — como era antes —
+    devolvia, sempre que existisse fila, a OS enfileirada por ÚLTIMO: a que
+    ainda nem começou, em vez da que está no meio da execução.
+    """
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM ordens WHERE status IN ('aguardando','em_andamento') "
-                "ORDER BY criado_em DESC LIMIT 1"
+                "SELECT * FROM ordens WHERE status='em_andamento' "
+                "ORDER BY criado_em ASC LIMIT 1"
             )
             ordem = _row(cur.fetchone())
+            if ordem is None:
+                cur.execute(
+                    "SELECT * FROM ordens WHERE status='aguardando' "
+                    "ORDER BY criado_em ASC LIMIT 1"
+                )
+                ordem = _row(cur.fetchone())
             if not ordem:
                 return None
             cur.execute("SELECT * FROM os_itens WHERE os_id=%s ORDER BY dispenser_id", (ordem["os_id"],))

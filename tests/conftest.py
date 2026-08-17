@@ -290,13 +290,21 @@ def _estado_zerado() -> dict:
 
 
 class AdapterFake:
-    """Duplo de `orchestrator._post`: grava os comandos em vez de falar HTTP.
+    """Duplo de `orchestrator._post`: grava os comandos e responde pela planta.
 
-    Faz também o papel do equipamento: um comando de limpeza aceito devolve
-    `limpeza_ok` pelo mesmo caminho que o dispenser-adapter usaria, porque o
-    orquestrador BLOQUEIA esperando essa confirmação. Os atributos mutáveis
-    simulam adapter fora do ar (`aceita = False`) e equipamento mudo
-    (`confirma_limpeza = False`, que leva o orquestrador ao timeout).
+    Gravar não basta. O orquestrador BLOQUEIA em `aguardar_evento` depois de
+    quase todo comando, então um duplo mudo trava a OS no primeiro timeout —
+    por isso cada comando aceito devolve aqui, por `notificar_evento`, o mesmo
+    evento que o adapter real devolveria. É o que permite rodar uma OS inteira
+    dentro de um `asyncio.run()`, sem HTTP e sem simulador.
+
+    Os eventos são emitidos de dentro do próprio `post`, ou seja, antes de o
+    orquestrador começar a esperar. Não há corrida: todas essas chaves são
+    pré-registradas com `registrar_evento` ANTES do comando sair.
+
+    Atributos mutáveis para encenar falha: `aceita=False` (adapter fora do ar),
+    `confirma_limpeza=False` (equipamento mudo → timeout) e
+    `quantidade_dispensada` (falha mecânica: solta menos que o alvo).
     """
 
     def __init__(self, modulo):
@@ -304,18 +312,86 @@ class AdapterFake:
         self.chamadas: list[dict] = []
         self.aceita = True
         self.confirma_limpeza = True
+        self.quantidade_dispensada: int | None = None   # None = dispensa o alvo
+        self._carga: dict[int, int] = {}                # slot → quantidade carregada
 
     async def post(self, url: str, payload: dict, timeout: float = 10.0) -> bool:
         self.chamadas.append({"url": url, "payload": payload})
         if not self.aceita:
             return False
-        if url.endswith("/comandos/limpar") and self.confirma_limpeza:
-            slot = payload["dispenser_id"]
-            self.modulo.notificar_evento(
-                f"limpeza:{slot}",
-                {"tipo": "limpeza_ok", "dispenser_id": slot, "medicamento_limpo": None},
-            )
+        self._responder(url, payload)
         return True
+
+    def _responder(self, url: str, payload: dict) -> None:
+        os_id = payload.get("os_id")
+
+        if url.endswith("/comandos/limpar"):
+            if not self.confirma_limpeza:
+                return
+            slot = payload["dispenser_id"]
+            self._evento(f"limpeza:{slot}", tipo="limpeza_ok",
+                         dispenser_id=slot, medicamento_limpo=None)
+
+        elif url.endswith("/comandos/carregar"):
+            slot = payload["dispenser_id"]
+            self._carga[slot] = payload["quantidade"]
+            self._evento(f"{os_id}:carregado:{slot}", tipo="carregado",
+                         dispenser_id=slot, quantidade=payload["quantidade"])
+
+        elif url.endswith("/comandos/capturar/dispenser"):
+            slot = payload["slot_id"]
+            self._evento(f"{os_id}:visao_dispenser:{slot}",
+                         tipo="leitura_dispenser_ok",
+                         sku_lido=payload.get("sku_esperado", ""), confianca=0.99)
+
+        elif url.endswith("/comandos/tara"):
+            self._evento(f"{os_id}:tara", tipo="tara_ok", peso_tara_g=0.0)
+
+        elif url.endswith("/comandos/mover"):
+            slot = payload["dispenser_alvo"]
+            self._evento(f"{os_id}:posicionado:{slot}", tipo="posicionado",
+                         posicao_x=payload["posicao_x"], posicao_y=payload["posicao_y"])
+
+        elif url.endswith("/comandos/dispensar"):
+            slot = payload["dispenser_id"]
+            qtd = (self._carga.get(slot, 0) if self.quantidade_dispensada is None
+                   else self.quantidade_dispensada)
+            self._evento(f"{os_id}:dispensado:{slot}", tipo="dispensado",
+                         dispenser_id=slot, quantidade_dispensada=qtd)
+
+        elif url.endswith("/comandos/capturar/mesa"):
+            slot = payload["slot_id"]
+            self._evento(f"{os_id}:visao_mesa:{slot}", tipo="leitura_mesa_ok",
+                         quantidade_detectada=payload["quantidade_esperada"],
+                         confianca=0.98)
+
+        elif url.endswith("/comandos/pesar"):
+            self._evento(f"{os_id}:peso:{payload['slot_id']}", **self._pesagem(payload))
+
+        # `/comandos/homing` não tem evento aguardado — nada a devolver.
+
+    @staticmethod
+    def _pesagem(payload: dict) -> dict:
+        """Reproduz a decisão do weight-simulator a partir das DUAS quantidades.
+
+        A mesa ganha o peso do que foi REALMENTE dispensado e o esperado vem do
+        alvo da OS; comparar um com o outro é o que faz a balança enxergar uma
+        falha mecânica (ver CLAUDE.md, "O comando de pesagem leva DUAS
+        quantidades"). Tolerância de 5%, como o `TOLERANCIA_PERC` do simulador.
+        """
+        unitario = payload.get("peso_unitario_g") or 50.0
+        esperado = payload["quantidade_esperada"] * unitario
+        medido   = payload["quantidade_real"] * unitario
+        desvio   = abs(medido - esperado) / esperado * 100.0 if esperado > 0 else 0.0
+        return {
+            "tipo":            "peso_ok" if desvio <= 5.0 else "peso_divergencia",
+            "peso_esperado_g": esperado,
+            "peso_medido_g":   medido,
+            "desvio_pct":      desvio,
+        }
+
+    def _evento(self, chave: str, **dados) -> None:
+        self.modulo.notificar_evento(chave, dados)
 
     def comandos(self, sufixo: str) -> list[dict]:
         """Payloads enviados para os endpoints terminados em `sufixo`."""

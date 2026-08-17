@@ -14,6 +14,8 @@ Fluxo de uma OS:
        b. Aguarda "posicionado"
        c. Comanda dispenser: dispensar
        d. Aguarda "dispensado"
+       e. Triple Check: dispenser × câmera da mesa × balança — 1 fonte
+          divergente já ativa a trava (ver `avaliar_triple_check`)
   6. Comanda CNC: homing
   7. OS concluída → DB atualizado → broadcast WebSocket
 """
@@ -21,7 +23,7 @@ import asyncio
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import httpx
 
@@ -293,6 +295,94 @@ def atribuir_slots(medicamentos: list, estado_dispensers: dict) -> Optional[list
     return atribuicoes
 
 
+# ── Triple Check: as 3 fontes de contagem de um slot ───────────────────────────
+
+class ResultadoTripleCheck(NamedTuple):
+    """Veredito do Triple Check para uma dispensa.
+
+    `divergencias` são fontes que CONTRADIZEM o alvo da OS; `fontes_indisponiveis`
+    são fontes que não responderam ou não conseguiram medir. A distinção é o que
+    permite o limiar 1 — ver `avaliar_triple_check`.
+    """
+    travar: bool
+    divergencias: list[str]
+    fontes_indisponiveis: list[str]
+    limiar: int
+
+
+def avaliar_triple_check(
+    quantidade_esperada: int,
+    quantidade_dispensada: int,
+    resultado_mesa: Optional[dict],
+    resultado_peso: Optional[dict],
+    min_divergencias: Optional[int] = None,
+) -> ResultadoTripleCheck:
+    """
+    Confronta as 3 fontes independentes de contagem e decide se a OS trava.
+
+    Fonte 1 — dispenser: quantidade contada mecanicamente (`quantidade_dispensada`).
+    Fonte 2 — câmera da mesa: contagem por visão (`leitura_mesa_divergencia`).
+    Fonte 3 — balança HX711: delta de peso vs esperado (`peso_divergencia`).
+
+    **Uma divergência basta para travar** (`TRIPLE_CHECK_MIN_DIVERGENCIAS`,
+    default 1). O limiar antigo de 2 fazia do Triple Check um double check: a
+    fonte solitária que acusasse erro virava alarme e a OS seguia para o
+    paciente. Em contagem farmacêutica o custo dos dois erros não é simétrico —
+    parar uma OS boa custa uma liberação de supervisor, deixar passar uma OS
+    ruim custa medicamento errado no leito.
+
+    **Fonte que não mediu não é fonte que divergiu.** Timeout da câmera e
+    `leitura_mesa_falha` (a câmera não conseguiu ler) entram em
+    `fontes_indisponiveis`, não em `divergencias`: elas não contradizem nada,
+    apenas deixam de confirmar. Contá-las como divergência com limiar 1
+    transformaria os ~2% de falha de leitura da câmera em trava por ruído —
+    exatamente o que a regra conservadora não pode custar, sob pena de ser
+    desligada em campo. O mesmo critério já vale para a câmera do dispenser,
+    onde falha de leitura é não-bloqueante e SKU errado é bloqueante.
+
+    Função PURA: não envia comando, não toca no estado. `min_divergencias`
+    sobrepõe o limiar de configuração (usado pelos testes).
+    """
+    limiar = (
+        settings.TRIPLE_CHECK_MIN_DIVERGENCIAS if min_divergencias is None
+        else min_divergencias
+    )
+
+    divergencias: list[str] = []
+    indisponiveis: list[str] = []
+
+    # Fonte 1 — dispenser (sempre presente: sem o evento a OS já teria abortado)
+    if quantidade_dispensada != quantidade_esperada:
+        divergencias.append(
+            f"dispenser: dispensou {quantidade_dispensada} de {quantidade_esperada} esperados"
+        )
+
+    # Fonte 2 — câmera da mesa
+    if resultado_mesa is None:
+        indisponiveis.append("câmera_mesa: sem resposta (timeout)")
+    elif resultado_mesa.get("tipo") == "leitura_mesa_divergencia":
+        det = resultado_mesa.get("quantidade_detectada", "?")
+        divergencias.append(f"câmera_mesa: detectou {det} de {quantidade_esperada}")
+    elif resultado_mesa.get("tipo") == "leitura_mesa_falha":
+        indisponiveis.append("câmera_mesa: falha de leitura")
+
+    # Fonte 3 — balança HX711
+    if resultado_peso is None:
+        indisponiveis.append("balança: sem resposta (timeout)")
+    elif resultado_peso.get("tipo") == "peso_divergencia":
+        desvio = resultado_peso.get("desvio_pct") or 0
+        divergencias.append(f"balança: desvio={desvio:.1f}%")
+    elif resultado_peso.get("tipo") == "erro_sensor":
+        indisponiveis.append("balança: sensor indisponível")
+
+    return ResultadoTripleCheck(
+        travar=len(divergencias) >= limiar,
+        divergencias=divergencias,
+        fontes_indisponiveis=indisponiveis,
+        limiar=limiar,
+    )
+
+
 # ── Planejamento de rota CNC (nearest-neighbor) ────────────────────────────────
 
 def planejar_rota(dispenser_ids: list[int], pos_inicial: tuple[float, float]) -> list[int]:
@@ -465,14 +555,33 @@ async def cmd_tara(os_id: str) -> bool:
     )
 
 
-async def cmd_pesar(slot_id: int, os_id: str, quantidade: int, peso_unitario_g: float) -> bool:
-    """Solicita pesagem após dispensa de um slot."""
+async def cmd_pesar(slot_id: int, os_id: str, quantidade: int, peso_unitario_g: float,
+                    quantidade_real: Optional[int] = None) -> bool:
+    """Solicita pesagem após dispensa de um slot.
+
+    Os dois campos de quantidade têm papéis distintos e ambos precisam viajar:
+
+    - `quantidade_esperada` é o ALVO da OS — é sobre ele que a balança calcula
+      o peso esperado e, portanto, o desvio;
+    - `quantidade_real` é o que o dispenser reportou ter efetivamente soltado
+      (`quantidade_dispensada`) — é o que de fato caiu na mesa.
+
+    Mandar só o alvo tornava a balança cega: o simulador incrementava a mesa
+    pelo peso esperado e comparava com ele mesmo, então a fonte 3 só divergia
+    por ruído gaussiano (σ=2 g contra ≥100 g esperados — praticamente nunca).
+    A divergência tem que emergir da diferença entre depositado e esperado, que
+    é o que uma célula de carga mede na vida real.
+
+    `None` mantém o contrato antigo (real = esperada) para chamadores que não
+    têm a contagem do dispenser em mãos.
+    """
     return await _post(
         settings.WEIGHT_ADAPTER_URL + "/comandos/pesar",
         {
             "os_id":               os_id,
             "slot_id":             slot_id,
             "quantidade_esperada": quantidade,
+            "quantidade_real":     quantidade if quantidade_real is None else quantidade_real,
             "peso_unitario_g":     peso_unitario_g,
         },
         timeout=5.0,
@@ -499,17 +608,25 @@ async def _processar_os(os_payload: dict):
         }
         disp_snapshot = {k: dict(v) for k, v in _estado["dispensers"].items()}
 
+    # O banco também precisa saber que esta OS saiu da fila: `get_ordem_ativa`
+    # — e o GET /os/ativa que a IHM consome — separa a OS em execução das que
+    # esperam pelo STATUS. Enquanto "em_andamento" só existia neste dicionário
+    # em memória, toda OS do banco continuava "aguardando" e o endpoint
+    # devolvia a última enfileirada, não a que estava rodando.
+    try:
+        await asyncio.to_thread(atualizar_status_ordem, os_id, "em_andamento")
+    except Exception as e:
+        logger.warning("[DB] atualizar_status_ordem em_andamento: %s", e)
+
     # ── 1. Atribuição de slots (IA) ──────────────────────────────────────────
     atribuicoes = atribuir_slots(medicamentos, disp_snapshot)
     if atribuicoes is None:
         logger.error("[ORCH] OS %s REJEITADA — sem slots disponíveis.", os_id)
-        try:
-            atualizar_status_ordem(os_id, "erro")
-            salvar_alarme("orchestrator", "sem_slot", f"OS {os_id}: sem slots disponíveis")
-        except Exception as e:
-            logger.warning("[DB] %s", e)
-        with _lock:
-            _estado["os_ativa"] = None
+        # Rejeição também é uma saída de `_processar_os`, e agora a OS já está
+        # "em_andamento" no banco: sem o abort ela ficaria eternamente em
+        # execução para o GET /os/ativa. Sem atribuições, nenhum slot foi
+        # reservado — não há estoque órfão a descartar.
+        await _abortar_os(os_id, "sem_slot")
         return
 
     log_atrib = " | ".join(f"D{a['dispenser_id']}←{a['medicamento']}×{a['quantidade']}"
@@ -794,11 +911,14 @@ async def _processar_os(os_payload: dict):
             await _abortar_os(os_id, "erro_dispenser", atribuicoes)
             return
 
+        # Contagem da fonte 1, necessária tanto para a pesagem (4d) quanto para
+        # o Triple Check (4e). Ausente do payload, assume-se o alvo — o que
+        # deixa a decisão nas outras duas fontes.
+        qtd_esperada   = a["quantidade"]
+        qtd_dispensada = resultado_disp.get("quantidade_dispensada", qtd_esperada)
+
         logger.info("[ORCH] D%d dispensou %d/%d × %s.",
-                    disp_id,
-                    resultado_disp.get("quantidade_dispensada", 0),
-                    a["quantidade"],
-                    a["medicamento"])
+                    disp_id, qtd_dispensada, qtd_esperada, a["medicamento"])
 
         # 4c. Scan da câmera da mesa (não-bloqueante)
         chave_visao_mesa = f"{os_id}:visao_mesa:{disp_id}"
@@ -835,7 +955,7 @@ async def _processar_os(os_payload: dict):
         registrar_evento(chave_peso)
         peso_unit = a.get("peso_unitario_g", 50.0)
         resultado_peso: Optional[dict] = None
-        ok_p = await cmd_pesar(disp_id, os_id, a["quantidade"], peso_unit)
+        ok_p = await cmd_pesar(disp_id, os_id, qtd_esperada, peso_unit, qtd_dispensada)
         if ok_p:
             resultado_peso = await aguardar_evento(chave_peso, settings.TIMEOUT_PESO)
             if resultado_peso is None:
@@ -862,34 +982,27 @@ async def _processar_os(os_payload: dict):
             logger.warning("[ORCH] Weight adapter indisponível para D%d.", disp_id)
 
         # ── 4e. TRIPLE CHECK — valida as 3 fontes (dispenser, câmera mesa, balança) ──
-        # Regra: se 2 ou mais fontes indicam divergência → ativar trava de emergência.
-        qtd_esperada = a["quantidade"]
-        qtd_dispensada = resultado_disp.get("quantidade_dispensada", qtd_esperada)
+        # Regra em `avaliar_triple_check`: por default 1 divergência já trava.
+        veredito = avaliar_triple_check(
+            quantidade_esperada=qtd_esperada,
+            quantidade_dispensada=qtd_dispensada,
+            resultado_mesa=resultado_mesa,
+            resultado_peso=resultado_peso,
+        )
+        n_div  = len(veredito.divergencias)
+        causas = veredito.divergencias
 
-        def _check_triple() -> tuple[int, list[str]]:
-            divergencias: list[str] = []
-            # Fonte 1 — dispenser
-            if qtd_dispensada != qtd_esperada:
-                divergencias.append(
-                    f"dispenser: dispensou {qtd_dispensada} de {qtd_esperada} esperados"
-                )
-            # Fonte 2 — câmera mesa
-            if resultado_mesa is not None and resultado_mesa.get("tipo") in (
-                "leitura_mesa_falha", "leitura_mesa_divergencia"
-            ):
-                det = resultado_mesa.get("quantidade_detectada", "?")
-                divergencias.append(f"câmera_mesa: detectou {det} de {qtd_esperada}")
-            # Fonte 3 — balança
-            if resultado_peso is not None and resultado_peso.get("tipo") == "peso_divergencia":
-                desvio = resultado_peso.get("desvio_pct") or 0
-                divergencias.append(f"balança: desvio={desvio:.1f}%")
-            return len(divergencias), divergencias
+        if veredito.fontes_indisponiveis:
+            logger.warning(
+                "[ORCH] Triple Check D%d com %d fonte(s) sem medição: %s",
+                disp_id, len(veredito.fontes_indisponiveis),
+                "; ".join(veredito.fontes_indisponiveis),
+            )
 
-        n_div, causas = _check_triple()
-        if n_div >= 2:
+        if veredito.travar:
             motivo_trava = (
-                f"Triple Check FALHOU ({n_div}/3 fontes divergentes) — D{disp_id}: "
-                + "; ".join(causas)
+                f"Triple Check FALHOU ({n_div}/3 fontes divergentes, "
+                f"limiar={veredito.limiar}) — D{disp_id}: " + "; ".join(causas)
             )
             logger.error("[ORCH] ⛔ %s", motivo_trava)
             with _lock:
@@ -910,11 +1023,21 @@ async def _processar_os(os_payload: dict):
                 _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
             if _broadcast_fn:
                 _broadcast_fn()
-        elif n_div == 1:
-            logger.warning(
-                "[ORCH] Triple Check: 1/3 fonte diverge (D%d) — alarme registrado, OS prossegue. %s",
-                disp_id, causas[0],
+        elif causas:
+            # Só alcançável com TRIPLE_CHECK_MIN_DIVERGENCIAS > 1: divergência
+            # abaixo do limiar não trava, mas fica registrada no banco — quem
+            # subiu o limiar precisa poder auditar o que passou por baixo dele.
+            descricao = (
+                f"Triple Check D{disp_id} OS {os_id}: {n_div}/3 fontes divergentes "
+                f"(limiar={veredito.limiar}, OS prossegue) — " + "; ".join(causas)
             )
+            logger.warning("[ORCH] %s", descricao)
+            try:
+                await asyncio.to_thread(
+                    salvar_alarme, "triple_check", "divergencia_abaixo_do_limiar", descricao
+                )
+            except Exception as e:
+                logger.warning("[DB] salvar_alarme triple_check: %s", e)
 
     # ── 5. CNC retorna para home ─────────────────────────────────────────────
     logger.info("[ORCH] Ciclo completo. CNC retornando para HOME.")

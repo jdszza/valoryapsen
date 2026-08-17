@@ -5,6 +5,11 @@ Simula a célula de carga HX711 instalada na mesa de dispensação.
 A célula mede o peso acumulado na mesa após cada dispensa.
 Usada para Triple Check: comparar peso medido × peso esperado (qtd × peso_unitario_g).
 
+O comando de pesagem carrega DUAS quantidades, e a distinção é o que dá à
+balança poder de detectar falha de dispensa (ver `_do_pesar`):
+  `quantidade_esperada` → alvo da OS, base do peso ESPERADO (e do desvio);
+  `quantidade_real`     → o que o dispenser soltou, base do peso que a mesa ganha.
+
 Fluxo:
   Central → POST /executar/tara         → zera a balança (tara antes da OS)
   Central → POST /executar/pesar        → captura leitura de peso na mesa
@@ -30,6 +35,7 @@ import random
 import threading
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -85,7 +91,8 @@ class TaraReq(BaseModel):
 class PesarReq(BaseModel):
     os_id: str
     slot_id: int
-    quantidade_esperada: int
+    quantidade_esperada: int              # alvo da OS — base do peso ESPERADO
+    quantidade_real: Optional[int] = None  # o que o dispenser soltou — vira peso na mesa
     peso_unitario_g: float  # gramas por unidade (vem do catálogo de medicamentos)
 
 
@@ -121,9 +128,28 @@ def _do_tara(os_id: str):
     })
 
 
-def _do_pesar(os_id: str, slot_id: int, quantidade_esperada: int, peso_unitario_g: float):
-    """Captura leitura de peso e calcula divergência."""
+def _do_pesar(os_id: str, slot_id: int, quantidade_esperada: int, peso_unitario_g: float,
+              quantidade_real: Optional[int] = None):
+    """Captura leitura de peso e calcula divergência.
+
+    `quantidade_esperada` é o alvo da OS; `quantidade_real` é o que o dispenser
+    reportou ter soltado. A mesa ganha peso pelo REAL, o desvio é medido contra
+    o ESPERADO — é dessa diferença que a divergência emerge, como numa célula
+    de carga de verdade.
+
+    Antes a mesa crescia pelo peso esperado, então a balança comparava o valor
+    consigo mesmo: uma falha mecânica que soltasse 8 de 10 unidades continuava
+    "pesando" 10. A fonte 3 do Triple Check só divergia por ruído gaussiano
+    (σ=2 g contra ≥100 g esperados — praticamente nunca), o que reduzia o
+    Triple Check a um double check.
+
+    `None` mantém o contrato antigo (real = esperada), para chamador que não
+    tenha a contagem do dispenser.
+    """
     global _peso_mesa_g, _peso_anterior_g
+
+    if quantidade_real is None:
+        quantidade_real = quantidade_esperada
 
     time.sleep(T_LEITURA)  # aguarda estabilização do sensor
 
@@ -138,13 +164,14 @@ def _do_pesar(os_id: str, slot_id: int, quantidade_esperada: int, peso_unitario_
         })
         return
 
-    peso_esperado_g = quantidade_esperada * peso_unitario_g
+    peso_esperado_g = quantidade_esperada * peso_unitario_g   # alvo da OS
+    peso_real_g     = quantidade_real * peso_unitario_g       # o que caiu na mesa
 
     # A balança está sob a mesa da CNC: mede o peso TOTAL acumulado desde a tara.
     # Para validar cada slot individualmente, comparamos o DELTA (incremento desta
     # dispensa) com o peso esperado do slot — não o acumulado total.
     with _lock:
-        _peso_mesa_g   += peso_esperado_g + random.gauss(0, RUIDO_G)
+        _peso_mesa_g   += peso_real_g + random.gauss(0, RUIDO_G)
         peso_bruto_g    = _peso_mesa_g
         peso_liquido_g  = max(0.0, peso_bruto_g - _peso_tara_g)      # total desde tara
         peso_delta_g    = max(0.0, peso_liquido_g - _peso_anterior_g) # incremento deste slot
@@ -158,8 +185,10 @@ def _do_pesar(os_id: str, slot_id: int, quantidade_esperada: int, peso_unitario_
     tipo = "peso_ok" if dentro_tolerancia else "peso_divergencia"
 
     logger.info(
-        "[HX711] slot=%d | esperado=%.1fg | delta=%.1fg | acum=%.1fg | desvio=%.1f%% | %s",
-        slot_id, peso_esperado_g, peso_delta_g, peso_liquido_g, desvio_pct,
+        "[HX711] slot=%d | qtd esp/real=%d/%d | esperado=%.1fg | delta=%.1fg | "
+        "acum=%.1fg | desvio=%.1f%% | %s",
+        slot_id, quantidade_esperada, quantidade_real, peso_esperado_g, peso_delta_g,
+        peso_liquido_g, desvio_pct,
         "OK" if dentro_tolerancia else "DIVERGÊNCIA",
     )
 
@@ -168,6 +197,7 @@ def _do_pesar(os_id: str, slot_id: int, quantidade_esperada: int, peso_unitario_
         "os_id":                os_id,
         "slot_id":              slot_id,
         "quantidade_esperada":  quantidade_esperada,
+        "quantidade_real":      quantidade_real,
         "peso_unitario_g":      peso_unitario_g,
         "peso_esperado_g":      round(peso_esperado_g, 2),
         "peso_medido_g":        round(peso_delta_g, 2),      # delta deste slot
@@ -207,14 +237,19 @@ def executar_pesar(req: PesarReq):
         raise HTTPException(400, "slot_id deve ser 1-6")
     if req.peso_unitario_g <= 0:
         raise HTTPException(400, "peso_unitario_g deve ser > 0")
+    if req.quantidade_real is not None and req.quantidade_real < 0:
+        raise HTTPException(400, "quantidade_real não pode ser negativa")
 
     logger.info(
-        "[CMD] PESAR slot=%d | qtd=%d | peso_unit=%.1fg | OS=%s",
-        req.slot_id, req.quantidade_esperada, req.peso_unitario_g, req.os_id,
+        "[CMD] PESAR slot=%d | qtd esperada=%d real=%s | peso_unit=%.1fg | OS=%s",
+        req.slot_id, req.quantidade_esperada,
+        req.quantidade_esperada if req.quantidade_real is None else req.quantidade_real,
+        req.peso_unitario_g, req.os_id,
     )
     threading.Thread(
         target=_do_pesar,
-        args=(req.os_id, req.slot_id, req.quantidade_esperada, req.peso_unitario_g),
+        args=(req.os_id, req.slot_id, req.quantidade_esperada, req.peso_unitario_g,
+              req.quantidade_real),
         daemon=True,
         name=f"pesar-{req.slot_id}",
     ).start()

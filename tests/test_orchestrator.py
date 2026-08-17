@@ -1,5 +1,5 @@
 """
-Testes do orquestrador: atribuição de slots e abort de OS.
+Testes do orquestrador: atribuição de slots, abort de OS e Triple Check.
 
 O que está em teste é o caminho que levava o sistema à parada total. Cada OS
 abortada deixava o estoque físico no dispenser — o abort só resetava a memória
@@ -262,3 +262,217 @@ def test_liberar_slot_falha_quando_a_limpeza_e_recusada(carregar_orquestrador,
         return await tarefa
 
     assert asyncio.run(_cenario()) is False
+
+
+# ── Status da OS no banco: quem está de fato em execução ───────────────────────
+#
+# "em_andamento" existia no enum, na IHM e no dashboard, mas NUNCA era gravado:
+# o orquestrador só o escrevia no dicionário em memória. Com todas as OS do
+# banco paradas em "aguardando", o `ORDER BY criado_em DESC` de
+# `get_ordem_ativa` devolvia a última OS ENFILEIRADA — então o GET /os/ativa
+# mostrava a OS errada sempre que houvesse fila.
+#
+# O outro lado da mesma regra: toda saída de `_processar_os` tem que deixar um
+# status terminal. Gravar "em_andamento" sem fechá-lo troca o sintoma antigo
+# por um pior — OS eternamente em execução para quem consulta o banco.
+
+def _payload_os(os_id: str, *itens) -> dict:
+    return {
+        "os_id":        os_id,
+        "descricao":    "teste",
+        "medicamentos": list(itens) or [_item("Dipirona")],
+    }
+
+
+def _status_gravados(orq) -> list:
+    return [c["args"] for c in orq.banco.chamadas_de("atualizar_status_ordem")]
+
+
+def test_inicio_do_processamento_grava_em_andamento(carregar_orquestrador):
+    """É o que distingue a OS em execução das que ainda esperam na fila."""
+    orq = carregar_orquestrador()
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-7")))
+
+    assert _status_gravados(orq)[0] == ("OS-7", "em_andamento")
+
+
+def test_os_completa_termina_em_concluida(carregar_orquestrador):
+    orq = carregar_orquestrador()
+
+    asyncio.run(orq.modulo._processar_os(
+        _payload_os("OS-7", _item("Dipirona"), _item("Paracetamol"))
+    ))
+
+    assert _status_gravados(orq) == [("OS-7", "em_andamento"), ("OS-7", "concluida")]
+    assert orq.adapter.comandos("/comandos/homing")   # a OS chegou mesmo ao fim
+    assert orq.estado["os_ativa"] is None
+
+
+def test_abort_no_meio_da_os_termina_em_erro(carregar_orquestrador, monkeypatch):
+    """Adapter fora do ar no carregamento: a OS fecha em erro, não em aberto."""
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.modulo.settings, "TIMEOUT_CARREGAMENTO", 0.01)
+    orq.adapter.aceita = False
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-8")))
+
+    assert _status_gravados(orq) == [("OS-8", "em_andamento"), ("OS-8", "erro")]
+    assert orq.estado["os_ativa"] is None
+
+
+def test_os_rejeitada_por_falta_de_slot_termina_em_erro(carregar_orquestrador):
+    """A rejeição é uma saída como as outras — e a mais fácil de esquecer.
+
+    7 itens para 6 slots: `atribuir_slots` devolve None e a OS nunca chega a
+    reservar slot nenhum, então nada há para limpar no hardware.
+    """
+    orq = carregar_orquestrador()
+
+    asyncio.run(orq.modulo._processar_os(
+        _payload_os("OS-9", *[_item(f"Med{i}") for i in range(7)])
+    ))
+
+    assert _status_gravados(orq) == [("OS-9", "em_andamento"), ("OS-9", "erro")]
+    assert [c["args"][1] for c in orq.banco.chamadas_de("salvar_alarme")] == ["sem_slot"]
+    assert orq.adapter.comandos("/comandos/limpar") == []
+    assert orq.estado["os_ativa"] is None
+
+
+# ── avaliar_triple_check: a regra das 3 fontes ─────────────────────────────────
+#
+# A regra era `n_div >= 2`: uma fonte solitária acusando erro virava alarme e a
+# OS seguia para o paciente — o Triple Check operava como double check, e o
+# README ainda descrevia a regra conservadora. Agora 1 divergência trava
+# (`TRIPLE_CHECK_MIN_DIVERGENCIAS`, default 1).
+#
+# A decisão foi extraída para função de módulo — era uma closure dentro de
+# `_processar_os`, alcançável só depois de encenar carga, CNC, visão e pesagem.
+
+QTD_ALVO = 10
+
+MESA_OK          = {"tipo": "leitura_mesa_ok", "quantidade_detectada": QTD_ALVO}
+MESA_DIVERGENTE  = {"tipo": "leitura_mesa_divergencia", "quantidade_detectada": 8}
+MESA_FALHA       = {"tipo": "leitura_mesa_falha"}
+
+PESO_OK          = {"tipo": "peso_ok", "desvio_pct": 0.4}
+PESO_DIVERGENTE  = {"tipo": "peso_divergencia", "desvio_pct": 20.0}
+PESO_ERRO_SENSOR = {"tipo": "erro_sensor"}
+
+
+def _avaliar(orq, dispensado=QTD_ALVO, mesa=MESA_OK, peso=PESO_OK, limiar=None):
+    return orq.modulo.avaliar_triple_check(
+        quantidade_esperada=QTD_ALVO,
+        quantidade_dispensada=dispensado,
+        resultado_mesa=mesa,
+        resultado_peso=peso,
+        min_divergencias=limiar,
+    )
+
+
+@pytest.mark.parametrize("dispensado, mesa, peso, n_esperado", [
+    # 0 divergências — as 3 fontes concordam com o alvo
+    (QTD_ALVO, MESA_OK,         PESO_OK,         0),
+    # 1 divergência — cada fonte sozinha
+    (8,        MESA_OK,         PESO_OK,         1),
+    (QTD_ALVO, MESA_DIVERGENTE, PESO_OK,         1),
+    (QTD_ALVO, MESA_OK,         PESO_DIVERGENTE, 1),
+    # 2 divergências
+    (8,        MESA_DIVERGENTE, PESO_OK,         2),
+    (8,        MESA_OK,         PESO_DIVERGENTE, 2),
+    # 3 divergências — o caso real de falha mecânica, agora que a balança enxerga
+    (8,        MESA_DIVERGENTE, PESO_DIVERGENTE, 3),
+])
+def test_uma_divergencia_ja_trava(carregar_orquestrador, dispensado, mesa, peso,
+                                  n_esperado):
+    """Default conservador: qualquer fonte que contradiga o alvo suspende a OS."""
+    orq = carregar_orquestrador()
+
+    veredito = _avaliar(orq, dispensado=dispensado, mesa=mesa, peso=peso)
+
+    assert len(veredito.divergencias) == n_esperado
+    assert veredito.travar is (n_esperado >= 1)
+    assert veredito.limiar == 1
+
+
+def test_limiar_default_vem_da_configuracao(carregar_orquestrador, monkeypatch):
+    """Sem `min_divergencias`, a função lê TRIPLE_CHECK_MIN_DIVERGENCIAS."""
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.modulo.settings, "TRIPLE_CHECK_MIN_DIVERGENCIAS", 2)
+
+    veredito = _avaliar(orq, dispensado=8)
+
+    assert veredito.limiar == 2
+    assert veredito.divergencias  # a divergência continua registrada…
+    assert veredito.travar is False  # …mas não trava com o limiar elevado
+
+
+@pytest.mark.parametrize("limiar, travar_esperado", [(1, True), (2, True), (3, False)])
+def test_limiar_configurado_desloca_a_decisao(carregar_orquestrador, limiar,
+                                              travar_esperado):
+    """Duas fontes divergentes: trava com limiar 1 e 2, não com 3."""
+    orq = carregar_orquestrador()
+
+    veredito = _avaliar(orq, dispensado=8, mesa=MESA_DIVERGENTE, limiar=limiar)
+
+    assert len(veredito.divergencias) == 2
+    assert veredito.travar is travar_esperado
+
+
+@pytest.mark.parametrize("mesa, peso, indisponiveis", [
+    (MESA_FALHA, PESO_OK,          1),   # câmera não conseguiu ler
+    (None,       PESO_OK,          1),   # timeout da câmera
+    (MESA_OK,    PESO_ERRO_SENSOR, 1),   # HX711 fora do ar
+    (MESA_OK,    None,             1),   # timeout da balança
+    (None,       None,             2),   # só o dispenser respondeu
+])
+def test_fonte_que_nao_mediu_nao_e_fonte_que_divergiu(carregar_orquestrador, mesa,
+                                                       peso, indisponiveis):
+    """Falha de leitura e timeout não contradizem nada — não travam sozinhos.
+
+    É o que torna o limiar 1 sustentável: os ~2% de falha de leitura da câmera
+    viravam trava por ruído, e trava por ruído é trava desligada em campo.
+    """
+    orq = carregar_orquestrador()
+
+    veredito = _avaliar(orq, mesa=mesa, peso=peso)
+
+    assert veredito.divergencias == []
+    assert veredito.travar is False
+    assert len(veredito.fontes_indisponiveis) == indisponiveis
+
+
+def test_fonte_indisponivel_nao_esconde_divergencia_das_outras(carregar_orquestrador):
+    """Câmera cega + dispensa parcial: a fonte que mediu ainda trava a OS."""
+    orq = carregar_orquestrador()
+
+    veredito = _avaliar(orq, dispensado=8, mesa=MESA_FALHA, peso=PESO_DIVERGENTE)
+
+    assert len(veredito.divergencias) == 2
+    assert veredito.fontes_indisponiveis == ["câmera_mesa: falha de leitura"]
+    assert veredito.travar is True
+
+
+def test_causas_nomeiam_a_fonte_e_os_numeros(carregar_orquestrador):
+    """O motivo da trava vai para a IHM — precisa dizer o que divergiu e quanto."""
+    orq = carregar_orquestrador()
+
+    veredito = _avaliar(orq, dispensado=8, mesa=MESA_DIVERGENTE, peso=PESO_DIVERGENTE)
+
+    dispenser, camera, balanca = veredito.divergencias
+    assert "dispensou 8 de 10" in dispenser
+    assert "detectou 8 de 10" in camera
+    assert "20.0%" in balanca
+
+
+def test_avaliar_triple_check_e_pura(carregar_orquestrador):
+    """Nenhum comando enviado, nenhum dict de entrada alterado."""
+    orq = carregar_orquestrador()
+    mesa = dict(MESA_DIVERGENTE)
+    peso = dict(PESO_DIVERGENTE)
+
+    _avaliar(orq, dispensado=8, mesa=mesa, peso=peso)
+
+    assert mesa == MESA_DIVERGENTE
+    assert peso == PESO_DIVERGENTE
+    assert orq.adapter.chamadas == []

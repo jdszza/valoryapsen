@@ -640,7 +640,9 @@ def _render_trava(token, role):
         html.P(
             "O Triple Check valida 3 fontes independentes após cada dispensa: "
             "contagem do dispenser, câmera de mesa e balança HX711. "
-            "Se 2 ou mais fontes divergirem, a OS é suspensa e aguarda intervenção.",
+            "Basta UMA fonte divergir para a OS ser suspensa e aguardar intervenção. "
+            "Fonte que não conseguiu medir (falha de leitura da câmera, sensor fora "
+            "do ar, timeout) não conta como divergência: gera alarme, não trava.",
             className="text-muted small mb-3",
         ),
         status_card,
