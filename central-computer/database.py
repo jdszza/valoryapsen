@@ -829,6 +829,20 @@ def get_alarmes(resolvido: bool = False, limite: int = 100) -> list:
             return _rows(cur.fetchall())
 
 
+def get_total_alarmes_ativos() -> int:
+    """Quantos alarmes estão abertos — o número do badge do dashboard.
+
+    COUNT em vez de `len(get_alarmes())`: o badge só precisa do total, e trazer
+    as linhas ainda mentiria por causa do LIMIT (101 alarmes abertos virariam
+    100). O índice `idx_alarm_resolvido` cobre a query inteira.
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS total FROM alarmes WHERE resolvido=0")
+            linha = cur.fetchone() or {}
+            return int(linha.get("total") or 0)
+
+
 # ── Manutencao ─────────────────────────────────────────────────────────────────
 
 def salvar_manutencao(tipo: str, componente: str, descricao: str, tecnico: str) -> dict:

@@ -35,6 +35,7 @@ import io
 import json
 import logging
 import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -55,7 +56,7 @@ from database import (
     get_alarmes, get_alarmes_por_os, get_cnc_recentes, get_dispensas, get_dispensas_recentes,
     get_dispenser_estado, get_dispensers_estado,
     get_historico_ordens, get_historico_sensor, get_log_manutencao,
-    get_ordem_ativa, get_ordem_por_id, get_ultimas_leituras,
+    get_ordem_ativa, get_ordem_por_id, get_total_alarmes_ativos, get_ultimas_leituras,
     get_usuario, get_usuarios,
     init_db, limpar_dispenser_estado, listar_categorias, listar_medicamentos,
     resolver_alarme,
@@ -97,6 +98,7 @@ _estado = {
     "fila_os":       [],
     "fila_tamanho":  0,
     "atribuicao_ia": [],
+    # Derivado do banco por _contar_alarmes_ativos() — nunca incrementado à mão.
     "alarmes_ativos": 0,
     # Trava de Triple Check (bloqueio de OS até intervenção de supervisor)
     "trava": {
@@ -201,6 +203,84 @@ async def _db(fn, *args):
         logger.warning("[DB] %s(%s): %s", fn.__name__, args[:2], exc)
 
 
+# ── Alarmes ativos: derivado do banco, com cache curto ────────────────────────
+# `alarmes_ativos` já foi um contador em memória incrementado nos handlers. Ele
+# só subia: resolver um alarme pela IHM não o baixava, e um restart o zerava
+# mesmo com alarmes abertos no banco. Agora o valor é sempre uma leitura de
+# `get_total_alarmes_ativos()`.
+#
+# O número vai em TODO payload de `_broadcast_estado()`, que roda a cada evento
+# — só a telemetria periódica são 6 slots a cada 15s, mais CNC, visão e peso.
+# Uma query por evento seria desperdício, então a leitura é cacheada por
+# `_ALARMES_TTL_S`.
+#
+# Por que TTL, e não invalidar só quando o central cria/resolve um alarme: o
+# central NÃO é o único a escrever na tabela. `orchestrator.py` grava alarmes
+# de trava do Triple Check, de abort de OS e de falha de limpeza chamando
+# `salvar_alarme` direto, sem passar por aqui — um cache invalidado apenas
+# pelos caminhos deste módulo ficaria permanentemente atrasado em relação a
+# eles. O TTL converge sozinho, seja quem for que escreveu. Os pontos que o
+# central conhece (handler que abriu alarme, resolução pela IHM, startup)
+# passam `forcar=True` para não fazer o badge esperar a janela.
+_ALARMES_TTL_S = 5.0
+_alarmes_lock = threading.Lock()
+_alarmes_cache = {"valor": 0, "lido_em": None}   # lido_em None = nunca lido
+
+
+def _alarmes_em_cache() -> Optional[int]:
+    """Valor cacheado ainda válido, ou None se nunca lido / expirado."""
+    with _alarmes_lock:
+        lido_em = _alarmes_cache["lido_em"]
+        if lido_em is None or (time.monotonic() - lido_em) >= _ALARMES_TTL_S:
+            return None
+        return _alarmes_cache["valor"]
+
+
+def _contar_alarmes_ativos(forcar: bool = False) -> int:
+    """Relê o total de alarmes abertos e publica em `_estado`.
+
+    Bloqueante (toca o banco): chamar de endpoint síncrono ou via
+    `asyncio.to_thread`. Nunca chamar com `_lock` em mãos — a função o adquire.
+    """
+    if not forcar:
+        cacheado = _alarmes_em_cache()
+        if cacheado is not None:
+            return cacheado
+
+    try:
+        total = int(get_total_alarmes_ativos() or 0)
+    except Exception as exc:
+        # Banco fora do ar não pode derrubar o handler do evento: mantém o
+        # último valor conhecido e tenta de novo na próxima chamada.
+        logger.warning("[DB] get_total_alarmes_ativos: %s", exc)
+        with _alarmes_lock:
+            return _alarmes_cache["valor"]
+
+    with _alarmes_lock:
+        _alarmes_cache.update({"valor": total, "lido_em": time.monotonic()})
+    with _lock:
+        _estado["alarmes_ativos"] = total
+    return total
+
+
+async def _atualizar_alarmes_ativos(forcar: bool = False) -> int:
+    """Versão para o event loop: só vai ao threadpool se o cache não servir."""
+    if not forcar:
+        cacheado = _alarmes_em_cache()
+        if cacheado is not None:
+            return cacheado
+    return await asyncio.to_thread(_contar_alarmes_ativos, forcar)
+
+
+def _abriu_alarme(db_tasks: list) -> bool:
+    """Algum dos writes deste evento é um alarme novo?
+
+    Lido das próprias `db_tasks` em vez de uma flag por handler: ponto de
+    alarme novo entra na conta sozinho, sem depender de alguém lembrar.
+    """
+    return any(fn is salvar_alarme for fn, _ in db_tasks)
+
+
 # ── Handlers de eventos vindos dos adapters ────────────────────────────────────
 
 async def _handle_evento_dispenser(payload: dict):
@@ -301,7 +381,6 @@ async def _handle_evento_dispenser(payload: dict):
                 db_tasks.append((salvar_alarme,
                                  (f"dispenser_{disp_id}", "falha_validacao",
                                   falha or f"Remédio rejeitado D{disp_id}")))
-                _estado["alarmes_ativos"] = _estado.get("alarmes_ativos", 0) + 1
 
         elif tipo == "erro":
             d["status"] = "erro"
@@ -309,7 +388,6 @@ async def _handle_evento_dispenser(payload: dict):
             db_tasks.append((salvar_alarme,
                              (f"dispenser_{disp_id}",
                               payload.get("codigo_erro", "erro"), descricao)))
-            _estado["alarmes_ativos"] = _estado.get("alarmes_ativos", 0) + 1
             _log("alarme", f"ERRO D{disp_id}: {descricao}")
 
         elif tipo == "limpeza_ok":
@@ -329,6 +407,11 @@ async def _handle_evento_dispenser(payload: dict):
     # ── Escreve no DB (async, fora do lock) ───────────────────────────────
     for fn, args in db_tasks:
         await _db(fn, *args)
+
+    # Alarme recém-gravado entra na conta agora; sem alarme, a releitura só
+    # acontece se o cache de _ALARMES_TTL_S tiver expirado. Vale para os quatro
+    # handlers — o valor sai daqui direto para o `_broadcast_estado()` do fim.
+    await _atualizar_alarmes_ativos(forcar=_abriu_alarme(db_tasks))
 
     # ── Notifica orquestrador (no event loop, seguro) ─────────────────────
     if os_id:
@@ -390,7 +473,6 @@ async def _handle_evento_cnc(payload: dict):
             descricao = payload.get("descricao", "Erro desconhecido na CNC")
             db_tasks.append((salvar_alarme,
                              ("cnc", payload.get("codigo_erro", "erro_cnc"), descricao)))
-            _estado["alarmes_ativos"] = _estado.get("alarmes_ativos", 0) + 1
             _log("alarme", f"ERRO CNC: {descricao}")
 
         elif tipo == "telemetria":
@@ -404,6 +486,8 @@ async def _handle_evento_cnc(payload: dict):
     # DB fora do lock
     for fn, args in db_tasks:
         await _db(fn, *args)
+
+    await _atualizar_alarmes_ativos(forcar=_abriu_alarme(db_tasks))
 
     # Notifica orquestrador
     if os_id and disp_alvo is not None:
@@ -463,7 +547,6 @@ async def _handle_evento_visao(payload: dict):
                 db_tasks.append((salvar_alarme,
                                  (f"camera_dispenser_{slot_id}",
                                   "falha_leitura_dispenser", descricao)))
-                _estado["alarmes_ativos"] = _estado.get("alarmes_ativos", 0) + 1
                 _log("alarme", descricao)
 
             elif tipo == "leitura_dispenser_divergencia":
@@ -473,7 +556,6 @@ async def _handle_evento_visao(payload: dict):
                 db_tasks.append((salvar_alarme,
                                  (f"camera_dispenser_{slot_id}",
                                   "divergencia_sku", descricao)))
-                _estado["alarmes_ativos"] = _estado.get("alarmes_ativos", 0) + 1
                 _log("alarme", descricao)
 
         # ── Câmera da Mesa ─────────────────────────────────────────────────
@@ -505,7 +587,6 @@ async def _handle_evento_visao(payload: dict):
                 db_tasks.append((salvar_alarme,
                                  (f"camera_mesa_{slot_id}",
                                   "falha_deteccao_mesa", descricao)))
-                _estado["alarmes_ativos"] = _estado.get("alarmes_ativos", 0) + 1
                 _log("alarme", descricao)
 
             elif tipo == "leitura_mesa_divergencia":
@@ -517,7 +598,6 @@ async def _handle_evento_visao(payload: dict):
                 db_tasks.append((salvar_alarme,
                                  (f"camera_mesa_{slot_id}",
                                   "divergencia_contagem", descricao)))
-                _estado["alarmes_ativos"] = _estado.get("alarmes_ativos", 0) + 1
                 _log("alarme", descricao)
 
         # ── Telemetria das câmeras ──────────────────────────────────────────
@@ -532,6 +612,8 @@ async def _handle_evento_visao(payload: dict):
     # ── DB fora do lock ────────────────────────────────────────────────────
     for fn, args in db_tasks:
         await _db(fn, *args)
+
+    await _atualizar_alarmes_ativos(forcar=_abriu_alarme(db_tasks))
 
     # ── Notifica orquestrador ──────────────────────────────────────────────
     if os_id and slot_id is not None:
@@ -576,7 +658,6 @@ async def _handle_evento_peso(payload: dict):
             )
             db_tasks.append((salvar_alarme,
                              (f"balanca_{slot_id}", "divergencia_peso", descricao)))
-            _estado["alarmes_ativos"] = _estado.get("alarmes_ativos", 0) + 1
             _log("alarme", descricao)
 
         elif tipo == "erro_sensor":
@@ -591,6 +672,8 @@ async def _handle_evento_peso(payload: dict):
 
     for fn, args in db_tasks:
         await _db(fn, *args)
+
+    await _atualizar_alarmes_ativos(forcar=_abriu_alarme(db_tasks))
 
     # Notifica orquestrador (para tara e pesagem de slots)
     if os_id:
@@ -611,6 +694,10 @@ async def lifespan(app: FastAPI):
     _loop = asyncio.get_running_loop()
 
     await asyncio.to_thread(init_db)
+
+    # Alarmes abertos sobrevivem ao processo: sem esta leitura o badge nasce em
+    # 0 depois de todo restart, com o banco cheio de alarmes por resolver.
+    await _atualizar_alarmes_ativos(forcar=True)
 
     # Injeta loop no orquestrador para notificar_evento thread-safe
     orch.inicializar(_estado, _lock, _broadcast_estado, _loop)
@@ -797,6 +884,10 @@ def ping():
 
 @app.get("/estado")
 def get_estado():
+    # Endpoint síncrono (roda em threadpool), então a releitura pode bloquear.
+    # Sujeita ao mesmo cache dos handlers: o polling do dashboard não vira uma
+    # query por request.
+    _contar_alarmes_ativos()
     with _lock:
         return dict(_estado)
 
@@ -1102,7 +1193,13 @@ def manut_alarmes(resolvido: bool = False, limite: int = 100, user=Depends(_get_
 @app.put("/manutencao/alarmes/{alarme_id}/resolver")
 def manut_resolver_alarme(alarme_id: int, user=Depends(_get_tecnico)):
     resolver_alarme(alarme_id)
-    return {"ok": True}
+    # Único caminho que ABAIXA o total — o que o contador manual nunca fez.
+    # `forcar` porque o técnico está olhando o badge: esperar o TTL aqui é
+    # exatamente o que faz o número parecer travado.
+    total = _contar_alarmes_ativos(forcar=True)
+    _log("alarme_resolvido", f"Alarme {alarme_id} resolvido por {user['sub']}")
+    _broadcast_estado()
+    return {"ok": True, "alarmes_ativos": total}
 
 
 # ── Triple Check — trava de emergência ────────────────────────────────────────

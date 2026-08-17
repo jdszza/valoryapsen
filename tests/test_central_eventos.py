@@ -251,3 +251,100 @@ def test_limpeza_bloqueada_com_os_ativa(carregar_central, monkeypatch):
 
     assert exc.value.status_code == 409
     assert "OS-42" in exc.value.detail
+
+
+# ── Contador de alarmes ativos ────────────────────────────────────────────────
+#
+# `_estado["alarmes_ativos"]` já foi um contador incrementado à mão nos
+# handlers: só subia. Resolver um alarme pela IHM não o baixava e um restart o
+# zerava com o banco cheio de alarmes abertos — o badge do dashboard crescia
+# para sempre sem relação com a realidade. Hoje o número é sempre uma leitura
+# de `get_total_alarmes_ativos()`, e é isso que estes testes prendem.
+
+
+class ContadorDeAlarmes:
+    """Duplo de `get_total_alarmes_ativos`: a única fonte do badge.
+
+    `abertos` é o que a tabela `alarmes` responderia. O teste mexe nele para
+    encenar alarme criado ou resolvido por QUALQUER produtor — inclusive o
+    orquestrador, que grava alarme de trava e de abort sem passar pelo main.
+    """
+
+    def __init__(self, abertos: int):
+        self.abertos = abertos
+        self.leituras = 0
+
+    def __call__(self) -> int:
+        self.leituras += 1
+        return self.abertos
+
+
+def _contador(central, monkeypatch, abertos: int) -> ContadorDeAlarmes:
+    contador = ContadorDeAlarmes(abertos)
+    monkeypatch.setattr(central.modulo, "get_total_alarmes_ativos", contador)
+    return contador
+
+
+def _evento_com_alarme(central) -> None:
+    """Erro de dispenser — o caminho mais curto que grava um alarme."""
+    _evento(central, {
+        "tipo":         "erro",
+        "dispenser_id": 1,
+        "codigo_erro":  "motor_travado",
+        "descricao":    "Motor do dispenser 1 travado",
+    })
+
+
+def test_alarme_novo_le_o_total_do_banco(carregar_central, monkeypatch):
+    """O badge sai do COUNT, não de um incremento: 0 → 4 em um evento só."""
+    central = carregar_central()
+    contador = _contador(central, monkeypatch, abertos=4)
+
+    _evento_com_alarme(central)
+
+    assert central.banco.chamadas_de("salvar_alarme")
+    assert contador.leituras == 1
+    assert central.modulo._estado["alarmes_ativos"] == 4
+
+
+def test_evento_sem_alarme_nao_consulta_o_banco(carregar_central, monkeypatch):
+    """O valor entra em todo broadcast: telemetria não pode virar query."""
+    central = carregar_central()
+    contador = _contador(central, monkeypatch, abertos=4)
+
+    _evento_com_alarme(central)          # força a leitura e aquece o cache
+    for slot in (2, 3, 4):
+        _evento(central, {"tipo": "status", "dispenser_id": slot, "quantidade": 5})
+
+    assert contador.leituras == 1
+    assert central.modulo._estado["alarmes_ativos"] == 4
+
+
+def test_resolver_alarme_abaixa_o_contador(carregar_central, monkeypatch):
+    """Resolver é o único caminho que DIMINUI — e não espera o TTL do cache."""
+    central = carregar_central()
+    contador = _contador(central, monkeypatch, abertos=4)
+    _evento_com_alarme(central)
+    assert central.modulo._estado["alarmes_ativos"] == 4
+
+    contador.abertos = 3                 # o UPDATE resolvido=1 já entrou
+    resposta = central.modulo.manut_resolver_alarme(7, {"sub": "tecnico1"})
+
+    assert central.banco.chamadas_de("resolver_alarme")
+    assert resposta["alarmes_ativos"] == 3
+    assert central.modulo._estado["alarmes_ativos"] == 3
+
+
+def test_reinicio_carrega_o_contador_do_banco(carregar_central, monkeypatch):
+    """Processo novo nasce com a memória zerada; o banco, não."""
+    central = carregar_central()
+    contador = _contador(central, monkeypatch, abertos=5)
+    assert central.modulo._estado["alarmes_ativos"] == 0   # antes da lifespan
+
+    async def _subir_e_descer():
+        async with central.modulo.lifespan(central.modulo.app):
+            # Startup concluído: é aqui que o dashboard faz o primeiro GET.
+            assert central.modulo._estado["alarmes_ativos"] == 5
+
+    asyncio.run(_subir_e_descer())
+    assert contador.leituras == 1
