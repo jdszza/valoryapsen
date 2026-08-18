@@ -41,10 +41,9 @@ import random
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Optional
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -299,7 +298,6 @@ def executar_capturar_dispenser(req: CapturarDispenserReq):
     O resultado é enviado via POST /eventos → adapter → central.
     """
     if req.slot_id not in range(1, 7):
-        from fastapi import HTTPException
         raise HTTPException(400, "slot_id deve ser 1-6")
 
     threading.Thread(
@@ -326,7 +324,6 @@ def executar_capturar_mesa(req: CapturarMesaReq):
     O resultado é enviado via POST /eventos → adapter → central.
     """
     if req.slot_id not in range(1, 7):
-        from fastapi import HTTPException
         raise HTTPException(400, "slot_id deve ser 1-6")
 
     threading.Thread(

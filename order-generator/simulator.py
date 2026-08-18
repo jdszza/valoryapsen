@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 CENTRAL_URL         = os.getenv("CENTRAL_URL",         "http://central-computer:8000")
 INTERVALO_OS        = int(os.getenv("INTERVALO_OS",     "90"))
+# Backpressure: quanto esperar quando a fila do central está cheia, e quantas
+# vezes esperar antes de desistir do ciclo (e voltar a dormir INTERVALO_OS).
+ESPERA_FILA_CHEIA   = int(os.getenv("ESPERA_FILA_CHEIA", "20"))
+MAX_ESPERAS_FILA    = int(os.getenv("MAX_ESPERAS_FILA",  "15"))
 RELOAD_CATALOGO_MIN = int(os.getenv("RELOAD_CATALOGO_MIN", "30"))
 MIN_MEDS_POR_OS     = int(os.getenv("MIN_MEDS_POR_OS",  "2"))
 MAX_MEDS_POR_OS     = int(os.getenv("MAX_MEDS_POR_OS",  "6"))
@@ -121,8 +125,72 @@ def _gerar_os(catalogo: dict) -> dict:
     }
 
 
+# ── Backpressure ───────────────────────────────────────────────────────────────
+
+def _detalhe_fila(resp) -> str:
+    """Resumo legível do corpo de um 429, para o log não virar adivinhação."""
+    try:
+        fila = (resp.json() or {}).get("fila", {})
+        return f"({fila.get('tamanho', '?')}/{fila.get('capacidade', '?')} na fila)"
+    except Exception:
+        return ""
+
+def _consultar_fila() -> dict | None:
+    """Ocupação da fila do central, ou None se não deu para saber."""
+    try:
+        r = requests.get(CENTRAL_URL + "/api/v1/fila", timeout=5)
+        if r.status_code < 300:
+            return r.json()
+        logger.warning("[FILA] Central respondeu %d ao consultar a fila.", r.status_code)
+    except Exception as exc:
+        logger.warning("[FILA] Não foi possível consultar a fila: %s", exc)
+    return None
+
+
+def _esperar_vaga_na_fila() -> bool:
+    """Espera a fila abrir vaga. True se há espaço, False se desistiu do ciclo.
+
+    Uma OS de 6 slots leva de 90 a 140s e o gerador posta a cada 90s: sem esta
+    checagem, o excesso ia bater no 429 do central toda vez. Pior sob trava do
+    Triple Check, quando o orquestrador para por tempo indeterminado.
+
+    Duas decisões deliberadas:
+
+      * fila indisponível (central reiniciando, endpoint fora) devolve True —
+        seguir e deixar o POST decidir é melhor do que travar a geração por
+        causa de uma consulta auxiliar;
+      * a espera é limitada a `MAX_ESPERAS_FILA` ciclos de `ESPERA_FILA_CHEIA`
+        segundos. Vencido o teto, desiste DESTE ciclo e volta ao laço normal —
+        nada de `sleep` apertado e nada de sair do processo.
+    """
+    for tentativa in range(1, MAX_ESPERAS_FILA + 1):
+        fila = _consultar_fila()
+        if fila is None:
+            return True
+        if not fila.get("cheia"):
+            return True
+        logger.info(
+            "[FILA] Cheia (%s/%s)%s — aguardando %ds (%d/%d).",
+            fila.get("tamanho", "?"), fila.get("capacidade", "?"),
+            " com TRAVA ATIVA" if fila.get("trava_ativa") else "",
+            ESPERA_FILA_CHEIA, tentativa, MAX_ESPERAS_FILA,
+        )
+        time.sleep(ESPERA_FILA_CHEIA)
+    logger.warning("[FILA] Continua cheia após %d esperas — pulando este ciclo.",
+                   MAX_ESPERAS_FILA)
+    return False
+
+
 def _enviar_os(os_payload: dict) -> bool:
-    """Envia OS ao central-computer via HTTP POST. Retorna True se aceita."""
+    """Envia OS ao central-computer via HTTP POST. Retorna True se aceita.
+
+    Recusa NÃO é retentada, de propósito. O central recusa em dois casos
+    (ANALISE_ARQUITETURAL §4.1): 409 quando a OS já está registrada e 503
+    quando não consegue persistir. Reenviar a mesma OS daria 409 para sempre;
+    no 503, encheria o log enquanto o banco está fora. Cada OS nasce com
+    `os_id` próprio, então a próxima do ciclo já é outra OS — aqui basta logar
+    e devolver False, que o `main()` ignora antes de dormir `INTERVALO_OS`.
+    """
     try:
         r = requests.post(
             CENTRAL_URL + "/api/v1/ordens",
@@ -134,6 +202,21 @@ def _enviar_os(os_payload: dict) -> bool:
             logger.info("[OS] %s aceita — posição na fila: %d",
                         os_payload["os_id"], resp.get("posicao_fila", "?"))
             return True
+        elif r.status_code == 409:
+            logger.warning("[OS] %s já registrada no central (409). Descartada.",
+                           os_payload["os_id"])
+            return False
+        elif r.status_code == 503:
+            logger.error("[OS] %s descartada: central sem persistência (503). "
+                         "A OS NÃO foi processada.", os_payload["os_id"])
+            return False
+        elif r.status_code == 429:
+            # Fila cheia: o central nem persistiu a OS. Descartar é seguro e é
+            # o que evita laço — a próxima OS nasce com os_id novo depois da
+            # espera do backpressure.
+            logger.warning("[OS] %s descartada: fila do central cheia (429). %s",
+                           os_payload["os_id"], _detalhe_fila(r))
+            return False
         else:
             logger.error("[OS] Central rejeitou OS %s: %d — %s",
                          os_payload["os_id"], r.status_code, r.text[:200])
@@ -181,6 +264,12 @@ def main():
             if not catalogo:
                 catalogo      = _carregar_catalogo()
                 ultimo_reload = time.time()
+
+            # Backpressure ANTES de gerar: OS gerada e descartada só polui log
+            # e queima os_id. Se a fila não abrir, este ciclo passa em branco.
+            if not _esperar_vaga_na_fila():
+                time.sleep(INTERVALO_OS)
+                continue
 
             os_payload = _gerar_os(catalogo)
 

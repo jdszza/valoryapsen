@@ -189,7 +189,12 @@ Probabilidades configuráveis por env var (padrão 2% cada):
 git clone https://github.com/seu-usuario/valoryapsen.git
 cd valoryapsen
 
-# 2. Build e start
+# 2. Configure os segredos (OBRIGATÓRIO — nada sobe sem isto)
+cp .env.example .env
+python -c "import secrets; print(secrets.token_hex(32))"   # cole em SECRET_KEY
+#   preencha também MYSQL_ROOT_PASS, MYSQL_PASS, SEED_ADMIN_SENHA e SEED_MANUT_SENHA
+
+# 3. Build e start
 docker compose down -v
 docker compose build --no-cache
 docker compose up -d
@@ -215,10 +220,31 @@ docker compose logs -f cnc-simulator
 
 **Usuários padrão (IHM):**
 
-| Usuário  | Senha               | Perfil      |
-|----------|---------------------|-------------|
-| `admin`  | `Apsen@Admin#2024!` | admin       |
-| `manut1` | `Apsen@Manut#2024!` | manutencao  |
+| Usuário  | Senha                        | Perfil      |
+|----------|------------------------------|-------------|
+| `admin`  | `SEED_ADMIN_SENHA` do `.env` | admin       |
+| `manut1` | `SEED_MANUT_SENHA` do `.env` | manutencao  |
+
+> **Troque as duas após o primeiro login**, pela própria IHM (aba 👥 Usuários).
+> As senhas seed ficam em arquivo, em claro, e são lidas apenas na criação do
+> banco — depois disso o `.env` só serve para lembrar quem tem acesso.
+
+### Segredos
+
+Nada de segredo entra no repositório. O `docker-compose.yml` lê tudo do `.env`
+(ignorado pelo git) e **falha ao subir** se faltar algo:
+
+| Variável | Para quê |
+|----------|----------|
+| `SECRET_KEY` | assina os JWT. Gere com `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `MYSQL_ROOT_PASS`, `MYSQL_PASS` | credenciais do banco (lidas na criação do volume) |
+| `SEED_ADMIN_SENHA`, `SEED_MANUT_SENHA` | senhas iniciais da IHM |
+| `APSEN_ENV` | `prod` (default) recusa segredo fraco; `dev` só avisa |
+
+O central **se recusa a subir** com `SECRET_KEY` default, vazia ou com menos de
+32 caracteres, a não ser com `APSEN_ENV=dev`. O valor default antigo está no
+histórico público deste repositório: com ele qualquer pessoa forja um token
+`role=admin`, libera a trava do Triple Check e altera usuários.
 
 ---
 
@@ -235,6 +261,9 @@ GET  /alarmes                            → alarmes ativos/resolvidos
 WS   /ws                                 → push de estado em tempo real
 
 POST /api/v1/ordens                      → recebe nova OS (order-generator)
+                                           409 os_duplicada | 429 fila_cheia |
+                                           503 persistencia_indisponivel
+GET  /api/v1/fila                        → ocupação da fila (backpressure)
 POST /api/v1/eventos/dispenser           → recebe eventos (dispenser-adapter)
 POST /api/v1/eventos/cnc                 → recebe eventos (cnc-adapter)
 POST /api/v1/eventos/visao               → recebe resultados de CV (vision-adapter)
@@ -248,8 +277,9 @@ PUT  /manutencao/alarmes/{id}/resolver   → resolve alarme
 GET  /manutencao/log                     → log de manutenção
 POST /api/v1/admin/liberar-trava         → libera trava de erro (admin/supervisor)
 GET  /api/v1/visao/historico             → histórico de leituras de CV
-GET  /relatorio/{os_id}/csv              → relatório CSV da OS
-GET  /relatorio/{os_id}/xlsx             → relatório Excel da OS
+GET  /api/v1/relatorio/os/{os_id}?formato=csv|xlsx
+                                         → relatório da OS (só header Authorization;
+                                           a IHM baixa server-side e entrega ao navegador)
 ```
 
 ---
@@ -277,10 +307,19 @@ valoryapsen/
 ├── order-generator/        # Gera OS aleatórias por categoria (sem porta)
 ├── dashboard/              # Plotly Dash read-only :8050
 ├── ihm_web/                # Plotly Dash IHM manutenção :8051
-├── mysql/init.sql          # Schema MySQL inicial
+├── ihm_esp32/              # ⚠️ firmware DEFASADO (ainda MQTT) — ver nota abaixo
+├── mysql/init.sql          # Só charset/collation; o schema vem do database.py
+├── tests/                  # pytest — sem Docker, sem MySQL (`make test`)
+├── .env.example            # Modelo do .env (segredos; o .env não é versionado)
 ├── docker-compose.yml
 └── .gitignore
 ```
+
+> **`ihm_esp32/` está defasado.** O firmware fala MQTT (`PubSubClient`, tópicos
+> `apsen/*`), de antes da migração para REST/HTTP: não há broker no compose e
+> nenhum serviço publica tópico, então ele não conversa com o sistema atual.
+> Migrá-lo para `GET /estado` + `WS /ws` é trabalho pendente; o código segue
+> aqui como referência de layout de tela e pinagem.
 
 ---
 
@@ -288,7 +327,10 @@ valoryapsen/
 
 | Variável                        | Padrão                          | Serviço            |
 |---------------------------------|---------------------------------|--------------------|
-| `SECRET_KEY`                    | (definido no docker-compose)    | central-computer   |
+| `SECRET_KEY`                    | (obrigatória, vem do `.env`)    | central-computer   |
+| `APSEN_ENV`                     | `prod` (`dev` afrouxa o segredo) | central-computer  |
+| `CORS_ORIGINS`                  | `http://localhost:8050,http://localhost:8051` | central-computer |
+| `AUTH_CACHE_TTL_S`              | `30`s de cache da revalidação   | central-computer   |
 | `DISPENSER_ADAPTER_URL`         | `http://dispenser-adapter:8100` | central-computer   |
 | `CNC_ADAPTER_URL`               | `http://cnc-adapter:8101`       | central-computer   |
 | `VISION_ADAPTER_URL`            | `http://vision-adapter:8102`    | central-computer   |
@@ -299,6 +341,11 @@ valoryapsen/
 | `TIMEOUT_VISAO_DISPENSER`       | `30`s                           | central-computer   |
 | `TIMEOUT_VISAO_MESA`            | `30`s                           | central-computer   |
 | `TIMEOUT_PESO`                  | `15`s                           | central-computer   |
+| `MAX_FILA_OS`                   | `5` OS esperando (faixa 1–1000) | central-computer   |
+| `BROADCAST_MIN_INTERVALO_MS`    | `500`ms entre broadcasts periódicos | central-computer |
+| `CNC_AMOSTRAGEM_MOVENDO`        | `0` (não grava trajetória; N = 1 em N) | central-computer |
+| `RETENCAO_DIAS`                 | `30` dias de histórico          | central-computer   |
+| `EXPURGO_INTERVALO_HORAS`       | `24`h entre expurgos            | central-computer   |
 | `T_CARGA_UNID`                  | `0.3`s por unidade              | dispenser-sim      |
 | `T_DISPENSA_UNID`               | `0.5`s por unidade              | dispenser-sim      |
 | `PROB_ERRO_MECANICO`            | `0.01` (1% falha mecânica)      | dispenser-sim      |
@@ -314,6 +361,8 @@ valoryapsen/
 | `RUIDO_G`                       | `2.0`g (ruído gaussiano)        | weight-sim         |
 | `VEL_MM_S`                      | `80` mm/s                       | cnc-sim            |
 | `INTERVALO_OS`                  | `90`s entre OS                  | order-generator    |
+| `ESPERA_FILA_CHEIA`             | `20`s entre consultas à fila    | order-generator    |
+| `MAX_ESPERAS_FILA`              | `15` esperas antes de pular o ciclo | order-generator |
 | `MIN_MEDS_POR_OS`               | `2`                             | order-generator    |
 | `MAX_MEDS_POR_OS`               | `6`                             | order-generator    |
 
@@ -328,5 +377,15 @@ valoryapsen/
 - `threading.Lock` atômico no cnc-simulator para `_em_movimento` (race condition eliminada)
 - `threading.Lock` + `_peso_anterior_g` no weight-simulator para leitura delta thread-safe
 - Pré-registro de eventos antes de enviar comandos (resposta rápida nunca perdida)
+- `copy.deepcopy` sob o lock em todo snapshot de estado — a cópia rasa deixava
+  os dicionários aninhados vivos durante a serialização, fora do lock
 - JWT + bcrypt para autenticação da IHM
+- **Revalidação a cada requisição autenticada**: o token não é a palavra final;
+  usuário desativado perde acesso na hora e a `role` vale a do banco, não a do
+  token (cache de `AUTH_CACHE_TTL_S`)
+- Segredos só no `.env` (não versionado); o central **recusa subir** com
+  `SECRET_KEY` default fora de `APSEN_ENV=dev`
+- CORS restrito ao dashboard e à IHM (`CORS_ORIGINS`), não `*`
+- Healthcheck em todos os serviços de aplicação e `depends_on` por
+  `condition: service_healthy` — ordem de start não é prontidão
 - Triple Check com trava de erro garante intervenção humana em qualquer divergência (limiar 1, ajustável por `TRIPLE_CHECK_MIN_DIVERGENCIAS`)

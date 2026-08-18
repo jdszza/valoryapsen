@@ -32,6 +32,7 @@ import collections
 import copy
 import csv
 import io
+import itertools
 import json
 import logging
 import threading
@@ -42,19 +43,19 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 import orchestrator as orch
 from auth import criar_token, decodificar_token, verificar_senha
-from config import settings
+from config import settings, validar_secret_key
 from database import (
-    atribuir_dispenser_item, atualizar_item_os, atualizar_status_ordem,
+    atualizar_item_os, atualizar_status_ordem,
     get_historico_visao, salvar_leitura_visao,
-    atualizar_usuario, criar_usuario,
+    atualizar_usuario, criar_usuario, expurgar_dados_antigos,
     get_alarmes, get_alarmes_por_os, get_cnc_recentes, get_dispensas, get_dispensas_recentes,
-    get_dispenser_estado, get_dispensers_estado,
+    get_dispensers_estado,
     get_historico_ordens, get_historico_sensor, get_log_manutencao,
     get_ordem_ativa, get_ordem_por_id, get_total_alarmes_ativos, get_ultimas_leituras,
     get_usuario, get_usuarios,
@@ -97,6 +98,9 @@ _estado = {
     },
     "fila_os":       [],
     "fila_tamanho":  0,
+    # Teto de OS esperando (MAX_FILA_OS). Vai no payload para o dashboard poder
+    # mostrar "3/5" em vez de um número sem escala.
+    "fila_capacidade": settings.MAX_FILA_OS,
     "atribuicao_ia": [],
     # Derivado do banco por _contar_alarmes_ativos() — nunca incrementado à mão.
     "alarmes_ativos": 0,
@@ -188,10 +192,66 @@ def _enfileirar_broadcast(data: dict):
         _loop.call_soon_threadsafe(_broadcast_q.put_nowait, data)
 
 
-def _broadcast_estado():
+# ── Throttle do broadcast ─────────────────────────────────────────────────────
+# Cada broadcast custa um `copy.deepcopy` do estado inteiro + serialização JSON
+# + envio para todo cliente conectado. O `movendo` da CNC chega a cada 0.5s
+# durante todo o movimento, e a telemetria são 12 eventos a cada 15s só do
+# dispenser: pagar o preço completo por evento desses é desperdício puro, já
+# que o conteúdo muda pouco e ninguém perde informação vendo 2 quadros por
+# segundo em vez de 30.
+#
+# Eventos de alta frequência passam por `prioritario=False`: se o último envio
+# foi há menos de BROADCAST_MIN_INTERVALO_MS, só marcam pendência e o
+# `_broadcast_flusher` manda o snapshot corrente no próximo tique. Transição de
+# verdade — trava, fim de OS, alarme, carga, dispensa — sai na hora, sem
+# throttle, porque atraso ali é atraso de decisão do operador.
+_BROADCAST_MIN_INTERVALO_S = settings.BROADCAST_MIN_INTERVALO_MS / 1000.0
+_throttle_lock = threading.Lock()
+_ultimo_broadcast: float = 0.0
+_broadcast_pendente: bool = False
+
+# Tipos periódicos, emitidos pelo equipamento independentemente de qualquer OS.
+_TIPOS_ALTA_FREQUENCIA = frozenset({"movendo", "telemetria", "status"})
+
+# Amostragem de trajetória: 1 em N "movendo" vira linha em `cnc_eventos`.
+_contador_movendo = itertools.count(1)
+
+
+def _amostrar_movendo() -> bool:
+    """True quando este "movendo" é o escolhido da amostra (0 = nunca)."""
+    n = settings.CNC_AMOSTRAGEM_MOVENDO
+    return n > 0 and next(_contador_movendo) % n == 0
+
+
+def _broadcast_estado(prioritario: bool = True):
+    """Publica o estado. `prioritario=False` respeita o throttle."""
+    global _ultimo_broadcast, _broadcast_pendente
+
+    with _throttle_lock:
+        agora = time.monotonic()
+        if not prioritario and (agora - _ultimo_broadcast) < _BROADCAST_MIN_INTERVALO_S:
+            _broadcast_pendente = True
+            return
+        _ultimo_broadcast = agora
+        _broadcast_pendente = False
+
     with _lock:
         snap = copy.deepcopy(_estado)
     _enfileirar_broadcast({"tipo": "estado", **snap})
+
+
+async def _broadcast_flusher():
+    """Envia o snapshot que o throttle segurou — no máximo um por intervalo.
+
+    Sem isso, a última posição antes de uma pausa ficaria retida até o próximo
+    evento: o dashboard mostraria a CNC parada onde ela não está mais.
+    """
+    while True:
+        await asyncio.sleep(_BROADCAST_MIN_INTERVALO_S)
+        with _throttle_lock:
+            pendente = _broadcast_pendente
+        if pendente:
+            _broadcast_estado()
 
 
 # ── Helpers DB async ──────────────────────────────────────────────────────────
@@ -433,7 +493,9 @@ async def _handle_evento_dispenser(payload: dict):
         orch.notificar_evento(f"limpeza:{disp_id}", {**payload, "tipo": "erro"})
 
     _log(f"disp_{tipo}", f"D{disp_id}: {tipo}", payload)
-    _broadcast_estado()
+    # "status" e "telemetria" são os 12 eventos periódicos a cada 15s; as
+    # transições (carregado, dispensado, erro, limpeza_ok) saem na hora.
+    _broadcast_estado(prioritario=tipo not in _TIPOS_ALTA_FREQUENCIA)
 
 
 async def _handle_evento_cnc(payload: dict):
@@ -465,7 +527,14 @@ async def _handle_evento_cnc(payload: dict):
             if _estado["os_ativa"].get("os_id") == os_id and tipo == "concluido":
                 _estado["os_ativa"]["status"] = "concluida"
 
-        if tipo in ("posicionado", "concluido", "erro", "movendo"):
+        # Só TRANSIÇÃO vira linha. "movendo" chega a cada 0.5s durante todo o
+        # movimento — eram centenas de linhas por OS para descrever uma
+        # trajetória que o dashboard já mostra ao vivo e que ninguém consulta
+        # depois. Quem quiser rastro grava amostrado (CNC_AMOSTRAGEM_MOVENDO).
+        if tipo in ("posicionado", "concluido", "erro"):
+            db_tasks.append((salvar_cnc_evento,
+                             (os_id, tipo, disp_alvo, pos_x, pos_y, ciclo, total)))
+        elif tipo == "movendo" and _amostrar_movendo():
             db_tasks.append((salvar_cnc_evento,
                              (os_id, tipo, disp_alvo, pos_x, pos_y, ciclo, total)))
 
@@ -498,7 +567,7 @@ async def _handle_evento_cnc(payload: dict):
                                   {**payload, "tipo": "erro"})
 
     _log(f"cnc_{tipo}", f"CNC {tipo} | D{disp_alvo} | ({pos_x:.1f},{pos_y:.1f})")
-    _broadcast_estado()
+    _broadcast_estado(prioritario=tipo not in _TIPOS_ALTA_FREQUENCIA)
 
 
 async def _handle_evento_visao(payload: dict):
@@ -625,7 +694,7 @@ async def _handle_evento_visao(payload: dict):
             orch.notificar_evento(f"{os_id}:visao_mesa:{slot_id}", payload)
 
     _log(f"visao_{tipo}", f"cam={camera} slot={slot_id}", payload)
-    _broadcast_estado()
+    _broadcast_estado(prioritario=tipo not in _TIPOS_ALTA_FREQUENCIA)
 
 
 async def _handle_evento_peso(payload: dict):
@@ -683,7 +752,30 @@ async def _handle_evento_peso(payload: dict):
             orch.notificar_evento(f"{os_id}:peso:{slot_id}", payload)
 
     _log(f"peso_{tipo}", f"slot={slot_id}", payload)
-    _broadcast_estado()
+    _broadcast_estado(prioritario=tipo not in _TIPOS_ALTA_FREQUENCIA)
+
+
+# ── Expurgo periódico do histórico ────────────────────────────────────────────
+
+async def _loop_expurgo():
+    """Apaga `cnc_eventos` e `leituras_sensores` além da retenção.
+
+    Roda no startup (banco herdado de versão sem expurgo pode chegar grande) e
+    depois a cada `EXPURGO_INTERVALO_HORAS`. Falha de expurgo é registrada e
+    ignorada: é manutenção, não pode derrubar a operação.
+    """
+    intervalo = max(settings.EXPURGO_INTERVALO_HORAS, 0.01) * 3600
+    while True:
+        try:
+            removidos = await asyncio.to_thread(
+                expurgar_dados_antigos, settings.RETENCAO_DIAS
+            )
+            if any(removidos.values()):
+                _log("expurgo", f"Histórico expurgado (> {settings.RETENCAO_DIAS}d): "
+                                + ", ".join(f"{t}={n}" for t, n in removidos.items()))
+        except Exception as exc:
+            logger.warning("[DB] Expurgo falhou: %s", exc)
+        await asyncio.sleep(intervalo)
 
 
 # ── FastAPI Lifespan ───────────────────────────────────────────────────────────
@@ -702,31 +794,72 @@ async def lifespan(app: FastAPI):
     # Injeta loop no orquestrador para notificar_evento thread-safe
     orch.inicializar(_estado, _lock, _broadcast_estado, _loop)
 
-    # Aviso de segurança: SECRET_KEY padrão
-    from config import _DEFAULT_SECRET_KEY
-    if settings.SECRET_KEY == _DEFAULT_SECRET_KEY:
-        logger.warning(
-            "⚠️  SECRET_KEY está com valor padrão! "
-            "Defina a variável de ambiente SECRET_KEY antes de ir para produção. "
-            "Gere com: python -c \"import secrets; print(secrets.token_hex(32))\""
-        )
+    # Segredo fraco derruba o boot (fora de APSEN_ENV=dev). O valor default é
+    # público neste repositório: com ele qualquer um forja um JWT role=admin.
+    validar_secret_key(settings.SECRET_KEY, settings.APSEN_ENV)
 
     task_broadcast = asyncio.create_task(_broadcast_worker())
+    task_flusher   = asyncio.create_task(_broadcast_flusher())
     task_orch      = asyncio.create_task(orch.loop_orquestrador())
+    task_expurgo   = asyncio.create_task(_loop_expurgo())
 
     logger.info("Computador Central APSEN v3.1 iniciado.")
     yield
 
-    task_broadcast.cancel()
-    task_orch.cancel()
+    for tarefa in (task_broadcast, task_flusher, task_orch, task_expurgo):
+        tarefa.cancel()
     await orch.encerrar()
 
 
 app = FastAPI(title="APSEN Computador Central v3.1", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
+# Só dashboard e IHM falam com o central pelo navegador. `*` num serviço
+# autenticado deixa qualquer página aberta no browser do técnico disparar
+# requisição em nome dele.
+app.add_middleware(CORSMiddleware, allow_origins=settings.CORS_ORIGINS,
+                   allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
 _bearer = HTTPBearer(auto_error=False)
+
+
+# ── Revalidação do usuário a cada requisição ──────────────────────────────────
+# O JWT era a palavra final: `_get_tecnico` decodificava e pronto. Um técnico
+# desativado seguia com acesso total até o token expirar — 8 horas —, e uma
+# role rebaixada continuava valendo pelo mesmo tempo. Como o token é assinado,
+# nem dá para "editar" o que já foi emitido: a fonte de verdade tem que ser o
+# banco, consultado a cada requisição.
+#
+# Cache de AUTH_CACHE_TTL_S (30s) para não virar uma query por request: é o
+# atraso máximo entre desativar alguém e o acesso cair. As mutações que o
+# próprio central conhece (desativar, ativar, trocar role) invalidam a entrada
+# na hora, então na prática o atraso só existe para mudança feita fora da API.
+_cache_usuarios: dict[str, tuple[float, dict]] = {}
+_cache_usuarios_lock = threading.Lock()
+
+
+def _invalidar_cache_usuario(username: str) -> None:
+    with _cache_usuarios_lock:
+        _cache_usuarios.pop(username, None)
+
+
+def _usuario_valido(username: str) -> Optional[dict]:
+    """Usuário ATIVO do banco, ou None. `get_usuario` já filtra `ativo=1`."""
+    agora = time.monotonic()
+    with _cache_usuarios_lock:
+        entrada = _cache_usuarios.get(username)
+        if entrada and (agora - entrada[0]) < settings.AUTH_CACHE_TTL_S:
+            return entrada[1]
+
+    try:
+        usuario = get_usuario(username)
+    except Exception as exc:
+        # Banco fora do ar não pode virar acesso liberado.
+        logger.error("[AUTH] Falha ao revalidar '%s': %s", username, exc)
+        return None
+
+    with _cache_usuarios_lock:
+        _cache_usuarios[username] = (time.monotonic(), usuario)
+    return usuario
 
 
 def _get_tecnico(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)):
@@ -735,7 +868,14 @@ def _get_tecnico(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer
     payload = decodificar_token(creds.credentials)
     if not payload:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token inválido")
-    return payload
+
+    usuario = _usuario_valido(payload.get("sub", ""))
+    if not usuario:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED,
+                            "Usuário inativo ou inexistente")
+    # A role vem do BANCO, não do token: ela pode ter mudado desde a emissão,
+    # e um token forjado traria a role que o portador quisesse.
+    return {**payload, "role": usuario.get("role", "manutencao")}
 
 
 def _get_admin(user=Depends(_get_tecnico)):
@@ -819,24 +959,99 @@ class EventoPesoReq(BaseModel):
 
 @app.post("/api/v1/ordens")
 async def receber_ordem(req: NovaOSReq):
-    """Recebe nova OS do order-generator."""
+    """Recebe nova OS do order-generator.
+
+    **Nenhuma OS é enfileirada sem linha no banco.** A fila é o que dispensa
+    medicamento; o banco é o que registra o que foi dispensado. Aceitar uma
+    sem a outra produz os dois piores resultados do sistema:
+
+      - `salvar_ordem` devolvendo False (INSERT IGNORE não inseriu) significa
+        OS já registrada. Enfileirar de novo processa a MESMA OS duas vezes —
+        dose dobrada no leito. Vira 409 `os_duplicada`, o contrato da
+        ANALISE_ARQUITETURAL §4.1.
+      - `salvar_ordem` levantando significa banco fora do ar. Antes isso só era
+        logado e a OS seguia para a fila: os medicamentos sairiam do dispenser
+        sem linha em `ordens`/`os_itens`, então `atualizar_item_os` e
+        `atualizar_status_ordem` não achariam o que atualizar e o relatório
+        (`GET /os/{os_id}`, CSV/XLSX) sairia vazio — dispensa sem rastro, que é
+        justamente o que um sistema de medicação não pode fazer. Vira 503, e a
+        OS não entra na fila.
+
+    Os corpos seguem a forma `{"erro": ..., "os_id": ...}` do contrato, e por
+    isso são `JSONResponse` — `HTTPException` embrulharia tudo em `detail`.
+    Em todos os casos o order-generator apenas loga e segue para a próxima OS
+    no ciclo seguinte (`_enviar_os` devolve False e ninguém retenta), então não
+    há laço de reenvio nem processo derrubado.
+
+    A terceira recusa é de fila cheia (429): o gerador posta mais rápido do que
+    a planta processa, e sob trava do Triple Check o orquestrador para até um
+    humano liberar. Ela vem ANTES de `salvar_ordem` — OS recusada não gera
+    linha no banco, senão o "aguardando" órfão viraria a OS ativa aos olhos de
+    `get_ordem_ativa`.
+    """
     os_id        = req.os_id
     medicamentos = req.medicamentos
 
     if not os_id or not medicamentos:
         raise HTTPException(400, "os_id e medicamentos são obrigatórios")
 
+    if not orch.ha_vaga_na_fila():
+        fila = orch.fila_status()
+        logger.warning("[API] OS %s recusada — fila cheia (%d/%d).",
+                       os_id, fila["tamanho"], fila["capacidade"])
+        _log("os_recusada", f"OS {os_id} recusada: fila cheia "
+                            f"({fila['tamanho']}/{fila['capacidade']})")
+        return JSONResponse(
+            status_code=429,
+            content={
+                "erro":        "fila_cheia",
+                "os_id":       os_id,
+                "fila":        fila,
+                "mensagem":    (f"Fila de OS no limite ({fila['tamanho']}/"
+                                f"{fila['capacidade']}). Tente novamente mais tarde."),
+            },
+            headers={"Retry-After": str(int(settings.TIMEOUT_DISPENSA))},
+        )
+
     try:
-        await asyncio.to_thread(
+        inserida = await asyncio.to_thread(
             salvar_ordem, os_id, req.descricao, medicamentos, req.model_dump()
         )
     except Exception as exc:
-        logger.error("[DB] Erro ao salvar OS %s: %s", os_id, exc)
+        logger.error("[DB] Erro ao salvar OS %s: %s — OS recusada.", os_id, exc)
+        _log("os_recusada", f"OS {os_id} recusada: persistência indisponível")
+        return JSONResponse(
+            status_code=503,
+            content={"erro": "persistencia_indisponivel", "os_id": os_id},
+        )
+
+    if not inserida:
+        logger.warning("[API] OS %s já registrada — recusada (duplicada).", os_id)
+        _log("os_duplicada", f"OS {os_id} recusada: já registrada")
+        return JSONResponse(
+            status_code=409,
+            content={"erro": "os_duplicada", "os_id": os_id},
+        )
 
     with _lock:
         posicao_fila = len(_estado["fila_os"]) + (1 if _estado["os_ativa"] else 0)
 
-    await orch.enfileirar_os(req.model_dump())
+    if not await orch.enfileirar_os(req.model_dump()):
+        # Corrida perdida: a vaga conferida acima sumiu entre a checagem e o
+        # enfileiramento. A OS já foi persistida, e uma linha "aguardando" que
+        # ninguém vai processar seria devolvida por `get_ordem_ativa` como a OS
+        # ativa — daí o fechamento em "cancelada".
+        try:
+            await asyncio.to_thread(atualizar_status_ordem, os_id, "cancelada")
+        except Exception as exc:
+            logger.error("[DB] cancelar OS %s não enfileirada: %s", os_id, exc)
+        fila = orch.fila_status()
+        return JSONResponse(
+            status_code=429,
+            content={"erro": "fila_cheia", "os_id": os_id, "fila": fila,
+                     "mensagem": "Fila de OS ficou cheia durante o registro."},
+            headers={"Retry-After": str(int(settings.TIMEOUT_DISPENSA))},
+        )
 
     _log("os_nova", f"OS {os_id} recebida — {len(medicamentos)} medicamento(s)")
     logger.info("[API] OS %s recebida.", os_id)
@@ -889,7 +1104,26 @@ def get_estado():
     # query por request.
     _contar_alarmes_ativos()
     with _lock:
-        return dict(_estado)
+        # deepcopy, não dict(): a cópia rasa devolve os MESMOS dicionários
+        # aninhados (dispensers, cnc, visao, peso, trava). A serialização
+        # acontece depois do `with`, já sem o lock, e um evento chegando nesse
+        # intervalo muda o dicionário durante a iteração do serializador
+        # ("dictionary changed size during iteration"). O mesmo padrão de
+        # `_broadcast_estado`.
+        return copy.deepcopy(_estado)
+
+
+@app.get("/api/v1/fila")
+def get_fila():
+    """Ocupação da fila de OS — endpoint de backpressure do order-generator.
+
+    O `/estado` já traz `fila_tamanho`, mas serve o snapshot inteiro (6 slots,
+    CNC, visão, peso, trava) e ainda passa pelo contador de alarmes. Quem só
+    precisa saber se cabe mais uma OS não deveria pagar por isso a cada ciclo —
+    daí este endpoint de dois números. `fila_capacidade` continua no `/estado`
+    para o dashboard mostrar a escala junto do resto.
+    """
+    return orch.fila_status()
 
 
 @app.get("/os/ativa")
@@ -917,16 +1151,19 @@ def os_detalhe(os_id: str):
 async def relatorio_os(
     os_id: str,
     formato: str = "csv",
-    token: Optional[str] = None,
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ):
     """
     Exporta relatório completo de uma OS em CSV ou XLSX.
-    Aceita token via Header Authorization Bearer OU via query param ?token=
-    para facilitar download direto pelo browser.
+
+    Autenticação **só** por `Authorization: Bearer <jwt>`. O `?token=` que
+    existia aqui servia para o navegador baixar direto de uma âncora da IHM, o
+    que punha o JWT no histórico do navegador, no `Referer` e no log de acesso
+    deste serviço. Hoje quem baixa é o processo da IHM (server-side, dentro da
+    rede Docker) e devolve os bytes ao operador pelo `dcc.Download` — nenhum
+    cliente precisa mais de token na URL.
     """
-    # Aceita token via query param (para links de download direto)
-    raw_token = (creds.credentials if creds else None) or token
+    raw_token = creds.credentials if creds else None
     if not raw_token or not decodificar_token(raw_token):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token ausente ou inválido")
     # Buscar dados em paralelo
@@ -1292,6 +1529,8 @@ def editar_usuario(username: str, req: UsuarioUpdateReq, user=Depends(_get_admin
     resultado = atualizar_usuario(username, req.nome_completo, req.role, req.nova_senha)
     if not resultado.get("ok"):
         raise HTTPException(400, resultado.get("erro", "Erro ao atualizar"))
+    # Role nova precisa valer AGORA, não daqui a AUTH_CACHE_TTL_S.
+    _invalidar_cache_usuario(username)
     return resultado
 
 
@@ -1299,12 +1538,18 @@ def editar_usuario(username: str, req: UsuarioUpdateReq, user=Depends(_get_admin
 def desativar_usuario(username: str, user=Depends(_get_admin)):
     if username == user["sub"]:
         raise HTTPException(400, "Não pode desativar a própria conta")
-    return toggle_usuario_ativo(username, False)
+    resultado = toggle_usuario_ativo(username, False)
+    # Desativação é a operação em que o atraso do cache mais custa: é o botão
+    # que o supervisor aperta quando quer alguém FORA agora.
+    _invalidar_cache_usuario(username)
+    return resultado
 
 
 @app.put("/manutencao/usuarios/{username}/ativar")
 def ativar_usuario(username: str, user=Depends(_get_admin)):
-    return toggle_usuario_ativo(username, True)
+    resultado = toggle_usuario_ativo(username, True)
+    _invalidar_cache_usuario(username)
+    return resultado
 
 
 # ── WebSocket ──────────────────────────────────────────────────────────────────
@@ -1312,7 +1557,9 @@ def ativar_usuario(username: str, user=Depends(_get_admin)):
 async def ws_endpoint(ws: WebSocket):
     await _ws_manager.connect(ws)
     with _lock:
-        snap = dict(_estado)
+        # deepcopy pelo mesmo motivo de `get_estado`: o json.dumps abaixo roda
+        # fora do lock e percorreria os dicionários vivos.
+        snap = copy.deepcopy(_estado)
     await ws.send_text(json.dumps({"tipo": "estado", **snap}, default=str))
     try:
         while True:

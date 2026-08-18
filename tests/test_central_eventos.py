@@ -348,3 +348,123 @@ def test_reinicio_carrega_o_contador_do_banco(carregar_central, monkeypatch):
 
     asyncio.run(_subir_e_descer())
     assert contador.leituras == 1
+
+
+# ── Volume de escrita e de broadcast ──────────────────────────────────────────
+#
+# O cnc_simulator emite "movendo" a cada 0.5s durante TODO o movimento: eram
+# centenas de linhas em `cnc_eventos` por OS para descrever uma trajetória que
+# o dashboard já mostra ao vivo e que ninguém consulta depois. Cada evento
+# ainda disparava `copy.deepcopy` do estado inteiro + JSON + envio a todos os
+# clientes. Persistir só transição e segurar o broadcast dos periódicos é o que
+# estes testes prendem.
+
+def _evento_cnc(central, tipo: str, **extra) -> None:
+    asyncio.run(central.modulo._handle_evento_cnc({
+        "tipo": tipo, "os_id": "OS-42", "dispenser_alvo": 3,
+        "posicao_x": 120.0, "posicao_y": 0.0, **extra,
+    }))
+
+
+def test_movendo_nao_vira_linha_no_banco(carregar_central):
+    central = carregar_central()
+
+    for _ in range(20):
+        _evento_cnc(central, "movendo")
+
+    assert central.banco.chamadas_de("salvar_cnc_evento") == []
+    # ...mas o dashboard continua vendo a CNC andar.
+    assert central.modulo._estado["cnc"]["status"] == "movendo"
+    assert central.modulo._estado["cnc"]["posicao_x"] == 120.0
+
+
+@pytest.mark.parametrize("tipo", ["posicionado", "concluido", "erro"])
+def test_transicoes_de_cnc_continuam_sendo_gravadas(carregar_central, tipo):
+    central = carregar_central()
+
+    _evento_cnc(central, tipo)
+
+    (chamada,) = central.banco.chamadas_de("salvar_cnc_evento")
+    assert chamada["args"][1] == tipo
+
+
+def test_amostragem_de_trajetoria_grava_1_em_n(carregar_central, monkeypatch):
+    """Rastro de trajetória é opcional e sai caro — por isso vem desligado."""
+    central = carregar_central()
+    monkeypatch.setattr(central.modulo.settings, "CNC_AMOSTRAGEM_MOVENDO", 5)
+
+    for _ in range(20):
+        _evento_cnc(central, "movendo")
+
+    assert len(central.banco.chamadas_de("salvar_cnc_evento")) == 4
+
+
+# ── Throttle do broadcast ─────────────────────────────────────────────────────
+
+def _contar_broadcasts(central, monkeypatch) -> list:
+    """Intercepta o envio no ponto em que o payload já foi montado."""
+    enviados = []
+    monkeypatch.setattr(central.modulo, "_enfileirar_broadcast", enviados.append)
+    return enviados
+
+
+def test_rajada_de_movendo_gera_no_maximo_um_broadcast(carregar_central, monkeypatch):
+    """30 eventos (15s de movimento real) em rajada: um envio, não trinta."""
+    central = carregar_central()
+    enviados = _contar_broadcasts(central, monkeypatch)
+
+    for _ in range(30):
+        _evento_cnc(central, "movendo")
+
+    assert len(enviados) == 1
+
+
+def test_telemetria_de_dispenser_tambem_e_segurada(carregar_central, monkeypatch):
+    """12 eventos periódicos a cada 15s — o outro emissor de alta frequência."""
+    central = carregar_central()
+    enviados = _contar_broadcasts(central, monkeypatch)
+
+    for slot in range(1, 7):
+        _evento(central, {"tipo": "status", "dispenser_id": slot, "quantidade": 5})
+        _evento(central, {"tipo": "telemetria", "dispenser_id": slot, "valor_c": 30.0})
+
+    assert len(enviados) == 1
+
+
+@pytest.mark.parametrize("evento", [
+    {"tipo": "carregado",  "dispenser_id": 1, "os_id": "OS-42", "quantidade_total": 10},
+    {"tipo": "erro",       "dispenser_id": 1, "descricao": "Motor travado"},
+    {"tipo": "limpeza_ok", "dispenser_id": 1},
+])
+def test_transicao_importante_ignora_o_throttle(carregar_central, monkeypatch, evento):
+    """Alarme e fim de etapa não podem esperar meio segundo na fila."""
+    central = carregar_central()
+    _evento_cnc(central, "movendo")          # consome a janela do throttle
+    enviados = _contar_broadcasts(central, monkeypatch)
+
+    _evento(central, evento)
+
+    assert len(enviados) == 1
+
+
+def test_estado_segurado_pelo_throttle_e_enviado_pelo_flusher(carregar_central,
+                                                              monkeypatch):
+    """O que o throttle segura não pode se perder: a CNC pararia na tela."""
+    central = carregar_central()
+    monkeypatch.setattr(central.modulo, "_BROADCAST_MIN_INTERVALO_S", 0.05)
+    enviados = _contar_broadcasts(central, monkeypatch)
+
+    _evento_cnc(central, "movendo")                       # 1º: passa
+    _evento_cnc(central, "movendo", posicao_x=240.0)      # 2º: segurado
+    assert len(enviados) == 1
+    assert central.modulo._broadcast_pendente is True
+
+    async def _um_tique():
+        tarefa = asyncio.create_task(central.modulo._broadcast_flusher())
+        await asyncio.sleep(0.15)
+        tarefa.cancel()
+
+    asyncio.run(_um_tique())
+
+    assert len(enviados) == 2
+    assert enviados[-1]["cnc"]["posicao_x"] == 240.0      # a posição mais recente

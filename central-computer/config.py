@@ -1,10 +1,61 @@
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 _cfg_logger = logging.getLogger(__name__)
 
 _DEFAULT_SECRET_KEY = "apsen-mude-esta-chave-em-producao-2024"
+_TAMANHO_MINIMO_SECRET = 32
+
+
+class ConfiguracaoInsegura(RuntimeError):
+    """Configuração que não pode ir para produção — o central recusa subir."""
+
+
+def validar_secret_key(chave: str, ambiente: str) -> None:
+    """Recusa subir com segredo default, vazio ou curto demais.
+
+    O valor default está VERSIONADO neste repositório: quem o tem consegue
+    forjar um JWT com `role=admin`, liberar a trava do Triple Check e mexer em
+    usuários. Um warning no startup não resolve isso — em produção ninguém lê
+    log de boot, e o sistema segue funcionando como se estivesse protegido.
+
+    `APSEN_ENV=dev` mantém o boot permissivo (com warning) para quem só quer
+    subir a stack de simulação. Qualquer outro valor — inclusive o default,
+    `prod` — trata segredo fraco como erro de configuração.
+    """
+    problema = None
+    if not chave or chave == _DEFAULT_SECRET_KEY:
+        problema = "SECRET_KEY está com o valor default, que é público no repositório"
+    elif len(chave) < _TAMANHO_MINIMO_SECRET:
+        problema = (f"SECRET_KEY tem {len(chave)} caracteres — "
+                    f"mínimo {_TAMANHO_MINIMO_SECRET}")
+
+    if not problema:
+        return
+
+    receita = 'python -c "import secrets; print(secrets.token_hex(32))"'
+    if ambiente == "dev":
+        _cfg_logger.warning(
+            "⚠️  %s. Tolerado porque APSEN_ENV=dev — NÃO suba assim em produção. "
+            "Gere uma chave com: %s", problema, receita,
+        )
+        return
+    raise ConfiguracaoInsegura(
+        f"{problema}. Defina SECRET_KEY no .env (gere com: {receita}) "
+        f"ou rode com APSEN_ENV=dev se isto for um ambiente de simulação."
+    )
+
+
+def _origens_cors() -> list[str]:
+    """Origens de browser autorizadas a chamar o central.
+
+    Só o dashboard e a IHM falam com o central pelo navegador. `*` num serviço
+    autenticado deixa qualquer página aberta no mesmo browser do técnico
+    disparar requisições em nome dele.
+    """
+    bruto = os.getenv("CORS_ORIGINS", "http://localhost:8050,http://localhost:8051")
+    return [origem.strip() for origem in bruto.split(",") if origem.strip()]
 
 
 def _limiar_triple_check() -> int:
@@ -32,6 +83,30 @@ def _limiar_triple_check() -> int:
     return valor
 
 
+def _max_fila_os() -> int:
+    """Quantas OS podem ESPERAR na fila do orquestrador. Faixa válida: 1..1000.
+
+    O gerador posta uma OS a cada `INTERVALO_OS` (90s por padrão) e uma OS de 6
+    slots leva de 90 a 140s — o sistema recebe mais rápido do que processa. Com
+    a trava do Triple Check ativa, o loop único para por tempo indeterminado
+    esperando o supervisor, e aí a fila cresce sem teto: memória do processo e
+    linhas "aguardando" no banco. O limite transforma isso numa recusa
+    explícita (429), que o gerador sabe tratar.
+
+    O default de 5 é ~7 minutos de trabalho enfileirado: absorve rajada sem
+    esconder que a planta está mais lenta que a demanda.
+    """
+    bruto = os.getenv("MAX_FILA_OS", "5")
+    try:
+        valor = int(bruto)
+    except ValueError:
+        valor = 0
+    if not 1 <= valor <= 1000:
+        _cfg_logger.warning("MAX_FILA_OS=%r fora da faixa 1..1000 — usando 5.", bruto)
+        return 5
+    return valor
+
+
 @dataclass
 class Settings:
     # ── MySQL ─────────────────────────────────────────────────────────────────
@@ -41,10 +116,22 @@ class Settings:
     MYSQL_USER: str = os.getenv("MYSQL_USER", "apsen")
     MYSQL_PASS: str = os.getenv("MYSQL_PASS", "apsen_pass_2024")
 
+    # ── Ambiente ──────────────────────────────────────────────────────────────
+    # "dev" afrouxa a validação de segredo (ver `validar_secret_key`). Qualquer
+    # outro valor é tratado como produção.
+    APSEN_ENV: str = os.getenv("APSEN_ENV", "prod").strip().lower()
+
     # ── JWT ───────────────────────────────────────────────────────────────────
     # OBRIGATÓRIO em produção: defina SECRET_KEY no ambiente com ≥32 caracteres aleatórios.
     # Gere com: python -c "import secrets; print(secrets.token_hex(32))"
+    # O central RECUSA subir com o valor default fora de APSEN_ENV=dev.
     SECRET_KEY: str = os.getenv("SECRET_KEY", _DEFAULT_SECRET_KEY)
+    # Janela em que a revalidação de usuário fica em cache. Curta de propósito:
+    # é o atraso máximo entre desativar um técnico e ele perder o acesso.
+    AUTH_CACHE_TTL_S: float = float(os.getenv("AUTH_CACHE_TTL_S", "30"))
+
+    # ── CORS ──────────────────────────────────────────────────────────────────
+    CORS_ORIGINS: list = field(default_factory=_origens_cors)
 
     # ── Seed de usuários (lidos apenas na primeira inicialização do DB) ────────
     # Altere via env vars antes do primeiro `docker compose up`.
@@ -68,6 +155,22 @@ class Settings:
 
     # ── Triple Check ──────────────────────────────────────────────────────────
     TRIPLE_CHECK_MIN_DIVERGENCIAS: int = _limiar_triple_check()
+
+    # ── Backpressure da fila de OS ────────────────────────────────────────────
+    MAX_FILA_OS: int = _max_fila_os()
+
+    # ── Volume de escrita e de broadcast ──────────────────────────────────────
+    # Intervalo mínimo entre broadcasts de eventos de ALTA FREQUÊNCIA (posição
+    # da CNC a cada 0.5s, telemetria dos 6 slots a cada 15s). Transição de
+    # verdade — trava, fim de OS, alarme — ignora o throttle e sai na hora.
+    BROADCAST_MIN_INTERVALO_MS: int = int(os.getenv("BROADCAST_MIN_INTERVALO_MS", "500"))
+    # 1 em N eventos "movendo" vira linha em `cnc_eventos`. 0 = nenhum (default):
+    # a trajetória já está no estado em memória e no dashboard; o banco só
+    # precisa das transições. Suba para amostrar rastro (20 ≈ 1 linha/10s).
+    CNC_AMOSTRAGEM_MOVENDO: int = int(os.getenv("CNC_AMOSTRAGEM_MOVENDO", "0"))
+    # Retenção das tabelas de histórico de alta cardinalidade.
+    RETENCAO_DIAS: int = int(os.getenv("RETENCAO_DIAS", "30"))
+    EXPURGO_INTERVALO_HORAS: float = float(os.getenv("EXPURGO_INTERVALO_HORAS", "24"))
 
 
 settings = Settings()

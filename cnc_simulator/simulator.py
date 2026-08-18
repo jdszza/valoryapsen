@@ -23,7 +23,6 @@ import random
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Optional
 
 import requests
 from fastapi import FastAPI, HTTPException

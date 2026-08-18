@@ -30,14 +30,9 @@ import httpx
 from config import settings
 from database import (
     atribuir_dispenser_item,
-    atualizar_item_os,
     atualizar_status_ordem,
     get_peso_medicamento,
     salvar_alarme,
-    salvar_cnc_evento,
-    salvar_dispensa,
-    salvar_dispenser_estado,
-    limpar_dispenser_estado,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +49,10 @@ POSICOES: dict[int, tuple[float, float]] = {
 HOME: tuple[float, float] = (0.0, -50.0)
 NUM_SLOTS = 6
 
+# Peso usado quando o catálogo não responde. É o mesmo default de
+# `database.get_peso_medicamento` para medicamento sem peso cadastrado.
+PESO_UNITARIO_PADRAO_G = 50.0
+
 # ── Estado compartilhado (referência injetada pelo main.py) ───────────────────
 _estado: dict = {}
 _lock: object = None          # threading.Lock injetado pelo main
@@ -61,7 +60,12 @@ _broadcast_fn = None          # função de broadcast injetada pelo main
 _loop: Optional[asyncio.AbstractEventLoop] = None  # event loop (para call_soon_threadsafe)
 
 # ── Fila e eventos de orquestração ────────────────────────────────────────────
-_os_queue: asyncio.Queue = asyncio.Queue()
+# Fila LIMITADA: o gerador posta a cada 90s, uma OS de 6 slots leva de 90 a
+# 140s, e com a trava do Triple Check ativa o loop para até um humano liberar.
+# Sem teto, a fila cresce indefinidamente em memória e no banco. O limite é o
+# próprio `maxsize` — a estrutura recusa, em vez de cada chamador ter que
+# lembrar de conferir (ver `enfileirar_os` e `ha_vaga_na_fila`).
+_os_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.MAX_FILA_OS)
 _pending_events: dict[str, asyncio.Event] = {}
 _pending_data: dict[str, dict] = {}
 
@@ -94,7 +98,6 @@ def inicializar(estado: dict, lock, broadcast_fn, loop: asyncio.AbstractEventLoo
 
 async def encerrar():
     """Chamado pelo main.py no shutdown para fechar o cliente HTTP."""
-    global _client
     if _client:
         await _client.aclose()
         logger.info("[ORCH] httpx.AsyncClient encerrado")
@@ -118,7 +121,7 @@ def liberar_trava(liberado_por: str) -> bool:
     Thread-safe: usa call_soon_threadsafe para setar o evento no loop correto.
     Retorna False se não há trava ativa.
     """
-    global _trava_ativa, _trava_evento, _trava_motivo, _trava_slot_id, _trava_os_id
+    global _trava_ativa, _trava_motivo, _trava_slot_id, _trava_os_id
     if not _trava_ativa or _trava_evento is None:
         return False
     logger.warning("[TRAVA] Trava liberada por '%s'.", liberado_por)
@@ -140,6 +143,11 @@ async def _ativar_trava(os_id: str, slot_id: Optional[int], motivo: str) -> asyn
     Deve ser chamado DENTRO do event loop (é async).
     """
     global _trava_ativa, _trava_evento, _trava_motivo, _trava_slot_id, _trava_os_id
+    # PRIMEIRO o estado interno, DEPOIS a publicação. `liberar_trava` responde
+    # a partir de `_trava_ativa`; se o dashboard mostrasse a trava antes dessa
+    # linha, um clique em "Liberar" nesse intervalo cairia em
+    # `if not _trava_ativa: return False` e a API responderia 409 "nenhuma
+    # trava ativa" com a trava bem visível na tela do supervisor.
     _trava_ativa   = True
     _trava_motivo  = motivo
     _trava_slot_id = slot_id
@@ -149,6 +157,16 @@ async def _ativar_trava(os_id: str, slot_id: Optional[int], motivo: str) -> asyn
         "[TRAVA] ⛔ TRAVA ATIVADA — OS=%s slot=%s motivo=%s",
         os_id, slot_id, motivo,
     )
+    # A publicação em `_estado["trava"]` mora aqui, e não em cada chamador,
+    # justamente para que a ordem acima não dependa de ninguém lembrar dela.
+    if _lock:
+        with _lock:
+            _estado["trava"] = {
+                "ativa":   True,
+                "os_id":   os_id,
+                "slot_id": slot_id,
+                "motivo":  motivo,
+            }
     # Avisa todos os clientes conectados (dashboard, IHM) via WebSocket
     if _broadcast_fn:
         _broadcast_fn()
@@ -680,12 +698,23 @@ async def _processar_os(os_payload: dict):
     if _broadcast_fn:
         _broadcast_fn()
 
-    # Enriquece atribuições com peso unitário (lookup paralelo no DB)
+    # Enriquece atribuições com peso unitário (lookup paralelo no DB).
+    # `return_exceptions=True`: sem ele, uma falha de banco em UM medicamento
+    # propaga pelo gather e derruba a OS inteira — sendo que o peso unitário já
+    # tem fallback (`get_peso_medicamento` devolve 50 g para medicamento sem
+    # peso cadastrado). Perder a precisão da balança em um item é aceitável;
+    # perder a OS por causa disso, não. O erro é tratado item a item.
     pesos = await asyncio.gather(*[
         asyncio.to_thread(get_peso_medicamento, a["medicamento"])
         for a in atribuicoes
-    ])
+    ], return_exceptions=True)
     for a, peso in zip(atribuicoes, pesos):
+        if isinstance(peso, BaseException):
+            logger.warning(
+                "[DB] get_peso_medicamento(%s): %s — usando %.0f g.",
+                a["medicamento"], peso, PESO_UNITARIO_PADRAO_G,
+            )
+            peso = PESO_UNITARIO_PADRAO_G
         a["peso_unitario_g"] = peso
 
     # ── 2. Planejamento de rota ──────────────────────────────────────────────
@@ -789,16 +818,9 @@ async def _processar_os(os_payload: dict):
         )
         logger.error("[ORCH] ⛔ %s", motivo)
 
-        with _lock:
-            _estado["trava"] = {
-                "ativa":   True,
-                "os_id":   os_id,
-                "slot_id": a_err["dispenser_id"],
-                "motivo":  motivo,
-            }
-        if _broadcast_fn:
-            _broadcast_fn()
-
+        # `_ativar_trava` arma o estado interno e só então publica em
+        # `_estado["trava"]` — publicar aqui antes reabriria a janela em que a
+        # tela mostra trava que `liberar_trava` ainda não reconhece.
         evento_lib = await _ativar_trava(os_id, a_err["dispenser_id"], motivo)
         logger.warning(
             "[ORCH] Aguardando operador corrigir dispenser D%d (OS %s)…",
@@ -953,7 +975,7 @@ async def _processar_os(os_payload: dict):
         # 4d. Pesagem HX711 (bloqueante se Triple Check divergir)
         chave_peso = f"{os_id}:peso:{disp_id}"
         registrar_evento(chave_peso)
-        peso_unit = a.get("peso_unitario_g", 50.0)
+        peso_unit = a.get("peso_unitario_g") or PESO_UNITARIO_PADRAO_G
         resultado_peso: Optional[dict] = None
         ok_p = await cmd_pesar(disp_id, os_id, qtd_esperada, peso_unit, qtd_dispensada)
         if ok_p:
@@ -1005,16 +1027,9 @@ async def _processar_os(os_payload: dict):
                 f"limiar={veredito.limiar}) — D{disp_id}: " + "; ".join(causas)
             )
             logger.error("[ORCH] ⛔ %s", motivo_trava)
-            with _lock:
-                _estado["trava"] = {
-                    "ativa": True,
-                    "os_id": os_id,
-                    "slot_id": disp_id,
-                    "motivo": motivo_trava,
-                }
-            if _broadcast_fn:
-                _broadcast_fn()
-            # Aguarda liberação manual por supervisor/admin — bloqueia aqui
+            # Mesma ordem do bloco de SKU errado: `_ativar_trava` arma o estado
+            # interno antes de publicar. Aguarda liberação manual por
+            # supervisor/admin — bloqueia aqui.
             evento_liberacao = await _ativar_trava(os_id, disp_id, motivo_trava)
             logger.warning("[ORCH] Aguardando liberação da trava (OS %s, D%d)…", os_id, disp_id)
             await evento_liberacao.wait()
@@ -1128,15 +1143,60 @@ async def _abortar_os(os_id: str, motivo: str, atribuicoes: Optional[list] = Non
 
 # ── Loop principal do orquestrador ────────────────────────────────────────────
 
-async def enfileirar_os(os_payload: dict):
-    """Chamado pelo endpoint POST /api/v1/ordens."""
-    await _os_queue.put(os_payload)
+def fila_status() -> dict:
+    """Ocupação da fila — o que o order-generator consulta antes de gerar OS.
+
+    `tamanho` conta apenas quem ESPERA: a OS em execução já saiu da fila. Por
+    isso `os_ativa` e `trava_ativa` vão junto — fila vazia com trava ativa não
+    significa planta ociosa, significa planta parada esperando um humano.
+    """
+    tamanho = _os_queue.qsize()
+    capacidade = _os_queue.maxsize or 0
+    if _lock:                      # None até o `inicializar` do main
+        with _lock:
+            os_ativa = bool(_estado.get("os_ativa"))
+    else:
+        os_ativa = False
+    return {
+        "tamanho":     tamanho,
+        "capacidade":  capacidade,
+        "disponivel":  max(capacidade - tamanho, 0),
+        "cheia":       tamanho >= capacidade,
+        "os_ativa":    os_ativa,
+        "trava_ativa": _trava_ativa,
+    }
+
+
+def ha_vaga_na_fila() -> bool:
+    """Checagem barata para o endpoint recusar ANTES de persistir a OS."""
+    return _os_queue.qsize() < _os_queue.maxsize
+
+
+async def enfileirar_os(os_payload: dict) -> bool:
+    """Chamado pelo endpoint POST /api/v1/ordens. False = fila cheia.
+
+    `put_nowait` em vez de `await put`: com a fila cheia, o `await` deixaria o
+    request do gerador pendurado até abrir vaga — que, sob trava, pode ser
+    "quando alguém aparecer". Recusar na hora é o que dá ao gerador a chance de
+    esperar do lado dele.
+    """
+    try:
+        _os_queue.put_nowait(os_payload)
+    except asyncio.QueueFull:
+        logger.warning(
+            "[ORCH] Fila cheia (%d/%d) — OS %s recusada.",
+            _os_queue.qsize(), _os_queue.maxsize, os_payload.get("os_id", "?"),
+        )
+        return False
     pos = _os_queue.qsize()
     with _lock:
         _estado["fila_tamanho"] = pos
+        _estado["fila_capacidade"] = _os_queue.maxsize
         if os_payload["os_id"] not in _estado["fila_os"]:
             _estado["fila_os"].append(os_payload["os_id"])
-    logger.info("[ORCH] OS %s enfileirada (posição %d).", os_payload["os_id"], pos)
+    logger.info("[ORCH] OS %s enfileirada (posição %d/%d).",
+                os_payload["os_id"], pos, _os_queue.maxsize)
+    return True
 
 
 async def loop_orquestrador():
@@ -1149,6 +1209,7 @@ async def loop_orquestrador():
             if os_id in _estado["fila_os"]:
                 _estado["fila_os"].remove(os_id)
             _estado["fila_tamanho"] = _os_queue.qsize()
+            _estado["fila_capacidade"] = _os_queue.maxsize
         try:
             await _processar_os(os_payload)
         except Exception as exc:

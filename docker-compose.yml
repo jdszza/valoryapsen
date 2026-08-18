@@ -1,4 +1,3 @@
-version: "3.9"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # APSEN - Sistema de Contagem de Medicamentos v3.2 (Arquitetura REST/HTTP)
@@ -22,6 +21,21 @@ version: "3.9"
 #   docker compose down -v && docker compose build --no-cache && docker compose up -d
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Healthcheck: as imagens são python:slim e não têm curl nem wget. O urllib da
+# stdlib resolve, e é o mesmo interpretador que já roda o serviço.
+#
+# Nos ADAPTERS o teste é /ping (só o processo), não /health. Duas razões: (a)
+# /health devolve 200 mesmo "degradado", então nem serviria de portão sem
+# interpretar o corpo; (b) e se servisse, seria pior — atrelar a saúde do
+# adapter à do central faria uma reinicialização do central marcar os quatro
+# adapters como unhealthy em cascata, sendo que eles toleram central fora do ar
+# (o _post retenta). /health continua sendo o endpoint de diagnóstico.
+x-healthcheck: &healthcheck-padrao
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 20s
+
 x-logging: &default-logging
   driver: "json-file"
   options:
@@ -40,18 +54,21 @@ services:
     ports:
       - "3306:3306"
     environment:
-      MYSQL_ROOT_PASSWORD: apsen_root_2024
-      MYSQL_DATABASE:      apsen_db
-      MYSQL_USER:          apsen
-      MYSQL_PASSWORD:      apsen_pass_2024
+      # Credenciais vêm do .env (não versionado). Ver .env.example e README.
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASS:?defina MYSQL_ROOT_PASS no .env}
+      MYSQL_DATABASE:      ${MYSQL_DB:-apsen_db}
+      MYSQL_USER:          ${MYSQL_USER:-apsen}
+      MYSQL_PASSWORD:      ${MYSQL_PASS:?defina MYSQL_PASS no .env}
     volumes:
       - mysql_data:/var/lib/mysql
       # Só charset/collation do banco. O schema (tabelas, colunas, seeds) é
       # criado pelo central-computer a cada startup — ver CLAUDE.md.
       - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
+      # Nomes do .env, não os do container: em `test` na forma exec não há
+      # shell, quem interpola é o próprio Compose, antes de subir.
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
-             "-u", "apsen", "-papsen_pass_2024"]
+             "-u", "${MYSQL_USER:-apsen}", "-p${MYSQL_PASS:?defina MYSQL_PASS no .env}"]
       interval: 5s
       timeout: 10s
       retries: 15
@@ -71,11 +88,16 @@ services:
       MYSQL_HOST:             mysql
       MYSQL_PORT:             3306
       MYSQL_DB:               apsen_db
-      MYSQL_USER:             apsen
-      MYSQL_PASS:             apsen_pass_2024
-      SECRET_KEY:             apsen-mude-esta-chave-em-producao-2024  # ALTERE EM PRODUÇÃO!
-      SEED_ADMIN_SENHA:       "Apsen@Admin#2024!"   # senha do usuário admin (seed inicial)
-      SEED_MANUT_SENHA:       "Apsen@Manut#2024!"   # senha do usuário manut1 (seed inicial)
+      MYSQL_USER:             ${MYSQL_USER:-apsen}
+      MYSQL_PASS:             ${MYSQL_PASS:?defina MYSQL_PASS no .env}
+      # Segredos: todos do .env, nenhum versionado. O central RECUSA subir com
+      # SECRET_KEY default fora de APSEN_ENV=dev — ver README.
+      APSEN_ENV:              ${APSEN_ENV:-prod}
+      SECRET_KEY:             ${SECRET_KEY:?gere com python -c "import secrets; print(secrets.token_hex(32))"}
+      SEED_ADMIN_SENHA:       ${SEED_ADMIN_SENHA:?defina SEED_ADMIN_SENHA no .env}
+      SEED_MANUT_SENHA:       ${SEED_MANUT_SENHA:?defina SEED_MANUT_SENHA no .env}
+      # Origens de browser autorizadas (dashboard e IHM).
+      CORS_ORIGINS:           ${CORS_ORIGINS:-http://localhost:8050,http://localhost:8051}
       DISPENSER_ADAPTER_URL:  http://dispenser-adapter:8100
       CNC_ADAPTER_URL:        http://cnc-adapter:8101
       VISION_ADAPTER_URL:     http://vision-adapter:8102
@@ -89,9 +111,24 @@ services:
       # Nº de fontes do Triple Check que precisam divergir para travar a OS.
       # 1 = regra conservadora (default). Faixa 1..3 — ver README.
       TRIPLE_CHECK_MIN_DIVERGENCIAS: 1
+      # Teto de OS ESPERANDO na fila (a em execução já saiu dela). Atingido o
+      # teto, POST /api/v1/ordens responde 429 sem persistir. Faixa 1..1000.
+      MAX_FILA_OS: 5
+      # Volume de escrita/broadcast: throttle dos eventos periódicos, amostragem
+      # da trajetória da CNC (0 = não grava) e retenção do histórico.
+      BROADCAST_MIN_INTERVALO_MS: 500
+      CNC_AMOSTRAGEM_MOVENDO:     0
+      RETENCAO_DIAS:              30
+      EXPURGO_INTERVALO_HORAS:    24
     depends_on:
       mysql:
         condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-padrao
+      # init_db + seeds do catálogo depois do MySQL ficar pronto.
+      start_period: 45s
+      retries: 10
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ping', timeout=3)"]
     networks:
       - apsen-net
 
@@ -109,8 +146,19 @@ services:
       TIMEOUT_CMD:       15
       TIMEOUT_EVENT:     5
     depends_on:
-      - central-computer
-      - dispenser-simulator
+      # `service_healthy`, não só `service_started`: o adapter fala com o
+      # simulador no lifespan e com o central no primeiro evento. O central NÃO
+      # depende dos adapters no compose — seria ciclo, e ele tolera adapter
+      # fora do ar (o _post retenta).
+      central-computer:
+        condition: service_healthy
+      dispenser-simulator:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-padrao
+      # o lifespan espera o simulador por até 60s antes de servir.
+      start_period: 70s
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/ping', timeout=3)"]
     networks:
       - apsen-net
 
@@ -128,8 +176,15 @@ services:
       TIMEOUT_CMD:  15
       TIMEOUT_EVENT: 5
     depends_on:
-      - central-computer
-      - cnc-simulator
+      central-computer:
+        condition: service_healthy
+      cnc-simulator:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-padrao
+      # o lifespan espera o simulador por até 60s antes de servir.
+      start_period: 70s
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8101/ping', timeout=3)"]
     networks:
       - apsen-net
 
@@ -147,8 +202,15 @@ services:
       TIMEOUT_CMD:    20
       TIMEOUT_EVENT:  5
     depends_on:
-      - central-computer
-      - vision-simulator
+      central-computer:
+        condition: service_healthy
+      vision-simulator:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-padrao
+      # o lifespan espera o simulador por até 60s antes de servir.
+      start_period: 70s
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8102/ping', timeout=3)"]
     networks:
       - apsen-net
 
@@ -166,8 +228,15 @@ services:
       TIMEOUT_CMD:    10
       TIMEOUT_EVENT:  5
     depends_on:
-      - central-computer
-      - weight-simulator
+      central-computer:
+        condition: service_healthy
+      weight-simulator:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-padrao
+      # o lifespan espera o simulador por até 60s antes de servir.
+      start_period: 70s
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8103/ping', timeout=3)"]
     networks:
       - apsen-net
 
@@ -185,6 +254,9 @@ services:
       PROB_ERRO_SENSOR:  0.01   # probabilidade de falha do sensor HX711
       T_LEITURA:         1.5    # tempo de estabilização da leitura (s)
       RUIDO_G:           2.0    # ruído gaussiano simulado (g)
+    healthcheck:
+      <<: *healthcheck-padrao
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8203/ping', timeout=3)"]
     networks:
       - apsen-net
 
@@ -204,6 +276,9 @@ services:
       PROB_DIVERGENCIA_MESA:         0.02   # 2% contagem errada na mesa
       T_SCAN_DISPENSER:              1.5    # segundos processamento scan dispenser
       T_SCAN_MESA:                   2.0    # segundos processamento scan mesa
+    healthcheck:
+      <<: *healthcheck-padrao
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8202/ping', timeout=3)"]
     networks:
       - apsen-net
 
@@ -220,6 +295,9 @@ services:
       T_CARGA_UNID:       0.3
       T_DISPENSA_UNID:    0.5
       PROB_ERRO_MECANICO: 0.01   # falha mecânica (atolamento) — CV movido para vision-adapter
+    healthcheck:
+      <<: *healthcheck-padrao
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8201/ping', timeout=3)"]
     networks:
       - apsen-net
 
@@ -235,10 +313,17 @@ services:
       ADAPTER_URL: http://cnc-adapter:8101
       VEL_MM_S:    80
       INTERVALO:   0.5
+    healthcheck:
+      <<: *healthcheck-padrao
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8200/ping', timeout=3)"]
     networks:
       - apsen-net
 
   # ── Order Generator ───────────────────────────────────────────────────────────
+  # Sem healthcheck de propósito: é um worker de laço, não expõe porta nem
+  # endpoint, e nenhum serviço depende dele. Um teste artificial (pgrep) só
+  # diria que o processo existe, que é o que o `restart: unless-stopped` já
+  # cobre. Ver tests/test_compose.py, que registra a exceção.
   order-generator:
     build: ./order-generator
     container_name: apsen-order-gen
@@ -248,12 +333,30 @@ services:
       CENTRAL_URL:         http://central-computer:8000
       INTERVALO_OS:        90
       RELOAD_CATALOGO_MIN: 30
+      # Backpressure: espera entre consultas quando a fila do central está
+      # cheia, e quantas esperas antes de pular o ciclo. Ver README.
+      ESPERA_FILA_CHEIA:   20
+      MAX_ESPERAS_FILA:    15
       MIN_MEDS_POR_OS:     2
       MAX_MEDS_POR_OS:     6
       QTD_MIN:             2
       QTD_MAX:             15
     depends_on:
-      - central-computer
+      # Não basta o central: quem EXECUTA a OS são os adapters, e eles só
+      # sobem depois que o central fica healthy — ou seja, em paralelo com
+      # este gerador. Sem esperá-los, a primeira OS do boot saía antes de o
+      # dispenser-adapter estar ouvindo, tomava `connection refused` e morria
+      # em timeout de carregamento. Aciclico: gerador → adapters → central.
+      central-computer:
+        condition: service_healthy
+      dispenser-adapter:
+        condition: service_healthy
+      cnc-adapter:
+        condition: service_healthy
+      vision-adapter:
+        condition: service_healthy
+      weight-adapter:
+        condition: service_healthy
     networks:
       - apsen-net
 
@@ -269,7 +372,11 @@ services:
       BACKEND_URL: http://central-computer:8000
       POLL_MS:     2000
     depends_on:
-      - central-computer
+      central-computer:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-padrao
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8050/', timeout=3)"]
     networks:
       - apsen-net
 
@@ -285,7 +392,11 @@ services:
       BACKEND_URL: http://central-computer:8000
       POLL_MS:     5000
     depends_on:
-      - central-computer
+      central-computer:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-padrao
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8051/', timeout=3)"]
     networks:
       - apsen-net
 

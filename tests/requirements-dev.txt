@@ -17,3 +17,12 @@ httpx==0.27.0
 pymysql==1.1.1
 python-jose[cryptography]==3.3.0
 bcrypt==4.1.3
+
+# test_ihm_relatorio.py importa ihm_web/app.py de verdade — o layout e o
+# registro dos callbacks acontecem no import. Só `requests` é duplado.
+# Versões espelhadas de ihm_web/requirements.txt.
+dash==2.17.0
+dash-bootstrap-components==1.6.0
+
+# test_compose.py lê o docker-compose.yml (healthchecks, ciclos, portas).
+PyYAML==6.0.1

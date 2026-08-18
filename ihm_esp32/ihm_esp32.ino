@@ -1,4 +1,15 @@
 /*
+  ⚠️  FIRMWARE DEFASADO — NÃO REFLETE A ARQUITETURA ATUAL DO SISTEMA
+  ==================================================================
+  Este sketch fala MQTT (PubSubClient, tópicos `apsen/*`), e o APSEN migrou
+  inteiramente para REST/HTTP + WebSocket: não existe mais broker no
+  docker-compose.yml, e nenhum serviço publica ou assina tópico algum. Ou seja,
+  compilado e gravado hoje, este firmware não conversa com coisa nenhuma.
+
+  Migrar para `GET /estado` + `WS /ws` do central-computer é trabalho
+  PENDENTE — ver a nota no CLAUDE.md. O arquivo segue no repositório como
+  referência do layout de tela e do mapeamento de pinos do hardware.
+
   APSEN - IHM ESP32-8048S070
   ===========================
   Hardware: Sunton ESP32-8048S070C

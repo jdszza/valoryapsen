@@ -9,7 +9,7 @@ import json
 import logging
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pymysql
 import pymysql.cursors
@@ -551,7 +551,19 @@ def _seed_usuarios():
 
 # ── Ordens ─────────────────────────────────────────────────────────────────────
 
-def salvar_ordem(os_id: str, descricao: str, medicamentos: list, payload_raw: dict):
+def salvar_ordem(os_id: str, descricao: str, medicamentos: list, payload_raw: dict) -> bool:
+    """Grava a OS e seus itens. Devolve False se a OS JÁ EXISTIA.
+
+    `ordens.os_id` é UNIQUE e o INSERT IGNORE é a trava de idempotência: no
+    reenvio da mesma OS o insert não afeta linha nenhuma (`rowcount == 0`) e a
+    função sai sem tocar em `os_itens` — do contrário os itens duplicariam sob
+    a ordem original.
+
+    Quem chama PRECISA olhar o retorno. Enfileirar uma OS que não foi inserida
+    é processá-la duas vezes; era o que `receber_ordem` fazia, respondendo
+    `{"aceita": true}` para um reenvio. O contrato manda 409 (ANALISE
+    ARQUITETURAL §4.1).
+    """
     ts = _ts()
     categoria = payload_raw.get("categoria", "")
     with _conn(autocommit=False) as conn:
@@ -565,7 +577,8 @@ def salvar_ordem(os_id: str, descricao: str, medicamentos: list, payload_raw: di
                 )
                 if cur.rowcount == 0:
                     conn.rollback()
-                    return
+                    logger.info(f"[DB] OS {os_id} já registrada — nada inserido.")
+                    return False
                 for item in medicamentos:
                     cur.execute(
                         "INSERT INTO os_itens "
@@ -582,6 +595,7 @@ def salvar_ordem(os_id: str, descricao: str, medicamentos: list, payload_raw: di
                     )
             conn.commit()
             logger.info(f"[DB] OS {os_id} salva com {len(medicamentos)} item(ns).")
+            return True
         except Exception:
             conn.rollback()
             raise
@@ -731,6 +745,46 @@ def salvar_leitura_sensor(componente: str, tipo: str, valor: float, unidade: str
                 "INSERT INTO leituras_sensores (componente, tipo, valor, unidade, ts) VALUES (%s,%s,%s,%s,%s)",
                 (componente, tipo, valor, unidade, _ts()),
             )
+
+
+_LOTE_EXPURGO = 5000
+# SQL literal por tabela, em vez de interpolar o nome: é o que mantém o
+# `tests/test_schema.py` capaz de conferir tabela e coluna por AST.
+_SQL_EXPURGO = {
+    "cnc_eventos":
+        f"DELETE FROM cnc_eventos WHERE ts < %s LIMIT {_LOTE_EXPURGO}",
+    "leituras_sensores":
+        f"DELETE FROM leituras_sensores WHERE ts < %s LIMIT {_LOTE_EXPURGO}",
+}
+
+
+def expurgar_dados_antigos(dias: int) -> dict:
+    """Apaga histórico de alta cardinalidade mais velho que `dias`.
+
+    `cnc_eventos` e `leituras_sensores` são as duas tabelas que crescem por
+    tempo, não por operação: telemetria de 6 slots a cada 15s, da CNC a cada
+    30s, de câmeras e balança a cada 60s. Sem expurgo, o volume só sobe — e o
+    banco é um MySQL de container, sem DBA por perto.
+
+    Apaga em lotes de `_LOTE_EXPURGO`: um DELETE único de milhões de linhas
+    segura lock e enche o binlog. Devolve o total removido por tabela.
+    """
+    corte = (datetime.now(timezone.utc) - timedelta(days=dias)).strftime("%Y-%m-%d %H:%M:%S")
+    removidos = {}
+    for tabela, sql in _SQL_EXPURGO.items():
+        total = 0
+        while True:
+            with _conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (corte,))
+                    apagadas = cur.rowcount
+            total += apagadas
+            if apagadas < _LOTE_EXPURGO:
+                break
+        removidos[tabela] = total
+    if any(removidos.values()):
+        logger.info("[DB] Expurgo (> %d dias): %s", dias, removidos)
+    return removidos
 
 
 def get_ultimas_leituras() -> list:

@@ -23,7 +23,7 @@ import requests
 from dash import Input, Output, callback, dcc, html
 import dash_bootstrap_components as dbc
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://central-computer:8000")
 POLL_MS     = int(os.getenv("POLL_MS", "2000"))
 
 app = dash.Dash(
@@ -84,6 +84,7 @@ app.layout = dbc.Container(
         dcc.Store(id="store-estado"),
         dcc.Store(id="store-eventos"),
         dcc.Store(id="store-os"),
+        dcc.Store(id="store-alarmes"),
 
         # ── Header ────────────────────────────────────────────────────────────
         dbc.Row(
@@ -179,13 +180,22 @@ app.layout = dbc.Container(
     Output("store-estado",  "data"),
     Output("store-eventos", "data"),
     Output("store-os",      "data"),
+    Output("store-alarmes", "data"),
     Input("poll", "n_intervals"),
 )
 def _fetch(_):
+    """Único ponto de I/O do dashboard.
+
+    Os alarmes eram buscados DENTRO do `_render`, o que fazia uma quarta
+    requisição a cada 2s por cliente conectado — fora do lugar onde as outras
+    três estão, e num callback que deveria ser função pura do que já veio nos
+    stores.
+    """
     estado  = _get("/estado")
     eventos = _get("/log/eventos?limite=30")
     os_hist = _get("/os/historico?limite=10")
-    return estado, eventos, os_hist
+    alarmes = _get("/alarmes?resolvido=false&limite=20")
+    return estado, eventos, os_hist, alarmes
 
 
 # ── Callbacks: render ──────────────────────────────────────────────────────────
@@ -205,8 +215,9 @@ def _fetch(_):
     Input("store-estado",  "data"),
     Input("store-eventos", "data"),
     Input("store-os",      "data"),
+    Input("store-alarmes", "data"),
 )
-def _render(estado: dict, eventos: list, os_hist: list):
+def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
     if not estado:
         vazio = html.P("Aguardando backend...", className="text-muted")
         return (vazio,) * 11
@@ -377,7 +388,6 @@ def _render(estado: dict, eventos: list, os_hist: list):
     card_dispensers = dbc.Row(disp_cards)
 
     # ── Alarmes ───────────────────────────────────────────────────────────────
-    alarmes_data = _get("/alarmes?resolvido=false&limite=20")
     if alarmes_data and isinstance(alarmes_data, list):
         card_alarmes_content = html.Div([
             dbc.Alert([

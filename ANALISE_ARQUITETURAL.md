@@ -1,4 +1,12 @@
 # Análise Arquitetural — APSEN Sistema de Contagem
+
+> **📜 REGISTRO HISTÓRICO.** Este documento propôs a migração de MQTT para
+> REST/HTTP — migração que **já foi executada**. Ele é útil para entender *por
+> que* o sistema é como é, mas não descreve o estado atual: nomes de serviço,
+> contratos e decisões posteriores estão no [CLAUDE.md](CLAUDE.md) (decisões e
+> armadilhas) e no [README.md](README.md) (visão geral, endpoints, variáveis de
+> ambiente). Em caso de divergência, **o CLAUDE.md vence**.
+
 **Data:** 2026-06-24  
 **Base:** Código atual + documento SISTEMA APSEN.pdf + fluxograma operacional
 
@@ -158,7 +166,20 @@ Response 200:
 
 Response 409 (OS já existe):
 {"erro": "os_duplicada", "os_id": "OS-2024-001"}
+
+Response 503 (central não conseguiu persistir a OS):
+{"erro": "persistencia_indisponivel", "os_id": "OS-2024-001"}
 ```
+
+**Nenhuma OS entra na fila sem linha no banco.** A fila é o que dispensa
+medicamento; `ordens`/`os_itens` é o que registra o que foi dispensado. Aceitar
+uma sem a outra é dispensa em dobro (409) ou dispensa sem rastro (503) — em
+ambos os casos o central recusa e não enfileira.
+
+O order-generator trata as duas recusas do mesmo jeito: loga e segue para a
+próxima OS no ciclo seguinte, sem reenviar. Como cada OS nasce com `os_id`
+próprio, reenviar a recusada só produziria 409 eterno (na duplicada) ou log
+empilhado enquanto o banco está fora (na 503).
 
 ### 4.2 Eventos: dispenser-adapter → central-computer
 

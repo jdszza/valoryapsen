@@ -2,7 +2,8 @@
 APSEN - IHM de Manutenção v2.1 (porta 8051)
 =============================================
 Requer autenticação JWT. Usuários padrão: admin / manut1
-(Senhas configuradas via SEED_ADMIN_SENHA e SEED_MANUT_SENHA no docker-compose.yml)
+(Senhas iniciais em SEED_ADMIN_SENHA e SEED_MANUT_SENHA no .env — troque ambas
+após o primeiro login, pela aba 👥 Usuários. Ver README.)
 
 Funcionalidades:
   • Login / Logout com JWT (role: admin | manutencao)
@@ -18,13 +19,14 @@ Funcionalidades:
 
 import json
 import os
+import re
 
 import dash
 import requests
 from dash import ALL, Input, Output, State, callback, ctx, dcc, html, no_update
 import dash_bootstrap_components as dbc
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://central-computer:8000")
 POLL_MS     = int(os.getenv("POLL_MS", "5000"))
 
 app = dash.Dash(
@@ -97,6 +99,9 @@ app.layout = dbc.Container(
         dcc.Store(id="user-role",  storage_type="session"),
         dcc.Store(id="active-tab", data="temp"),
         dcc.Store(id="os-modal-id", data=None),  # OS selecionada para modal
+        # Alvo do download de relatório: o arquivo chega por aqui, em memória,
+        # sem o navegador precisar falar com o backend (ver _buscar_relatorio).
+        dcc.Download(id="download-relatorio"),
 
         # ── Modal: detalhe JSON da OS ──────────────────────────────────────────
         dbc.Modal(
@@ -701,10 +706,18 @@ def _render_ordens(token):
             dbc.Col(dbc.Badge(sts, color=cor, className="small"), md=2),
             dbc.Col(html.Small(criado, className="text-muted"), md=1),
             dbc.Col(
-                html.Div(
-                    id={"type": "div-relatorio", "index": os_id},
-                    children=[html.Small("…", className="text-muted")],
-                ),
+                dbc.ButtonGroup([
+                    dbc.Button(
+                        "CSV",
+                        id={"type": "btn-relatorio", "index": os_id, "formato": "csv"},
+                        color="outline-success", size="sm", n_clicks=0,
+                    ),
+                    dbc.Button(
+                        "XLSX",
+                        id={"type": "btn-relatorio", "index": os_id, "formato": "xlsx"},
+                        color="outline-primary", size="sm", n_clicks=0,
+                    ),
+                ], size="sm"),
                 md=1,
             ),
             dbc.Col(
@@ -737,6 +750,7 @@ def _render_ordens(token):
                className="text-muted small mb-3"),
         header,
         html.Div(rows_com_download) if rows_com_download else html.P("Sem ordens registradas.", className="text-muted small"),
+        html.Div(id="msg-relatorio", className="mt-2"),
         html.Div(id="msg-alterar-status", className="mt-2"),
     ])
 
@@ -899,36 +913,110 @@ def _limpar_dispenser(n_clicks_list, token):
     return dbc.Alert(f"Erro: {data.get('detail','?')}", color="danger", dismissable=True)
 
 
-# ── Links de download de relatório (injeta token na URL) ─────────────────────
+# ── Download de relatório (server-side) ───────────────────────────────────────
+#
+# Os botões já foram âncoras para
+# `{BACKEND_URL}/api/v1/relatorio/...?formato=csv&token={jwt}`. Duas coisas
+# erradas em uma linha:
+#
+#   1. `BACKEND_URL` é `http://central-computer:8000` — nome DNS da rede Docker
+#      `apsen-net`. Quem resolve esse nome é o container; o navegador do
+#      operador, não. O link simplesmente não baixava nada.
+#   2. o JWT ia na query string, ou seja, no histórico do navegador, no header
+#      `Referer` e no log de acesso do central.
+#
+# Agora quem busca o arquivo é o processo da IHM, que está DENTRO da rede
+# Docker (o hostname resolve) e manda o token no header `Authorization` (fora
+# da URL). Os bytes voltam ao navegador pelo `dcc.Download`, pela conexão que
+# o operador já tem aberta com a IHM.
+#
+# A alternativa era publicar uma `PUBLIC_BACKEND_URL` (ex.: localhost:8000) só
+# para os links; ela exigiria expor o central ao navegador e manter mais uma
+# variável em sincronia com o compose — e ainda deixaria o token na URL.
 
-@callback(
-    Output({"type": "div-relatorio", "index": ALL}, "children"),
-    Input("poll", "n_intervals"),
+_TIPOS_RELATORIO = {
+    "csv":  "text/csv",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+_RE_FILENAME = re.compile(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', re.I)
+
+
+def _nome_do_arquivo(resp, os_id: str, formato: str) -> str:
+    """Nome vem do `Content-Disposition` do backend; o fallback repete o padrão."""
+    achado = _RE_FILENAME.search(resp.headers.get("Content-Disposition", "") or "")
+    return achado.group(1).strip() if achado else f"relatorio_{os_id}.{formato}"
+
+
+def _erro_relatorio(resp, os_id: str) -> str:
+    if resp.status_code == 401:
+        return "Sessão expirada. Faça login novamente."
+    if resp.status_code == 404:
+        return f"OS {os_id} não encontrada."
+    try:
+        detalhe = (resp.json() or {}).get("detail", "")
+    except Exception:
+        detalhe = ""
+    return f"Erro {resp.status_code} ao gerar o relatório{': ' + detalhe if detalhe else '.'}"
+
+
+def _buscar_relatorio(os_id: str, formato: str, token: str) -> tuple[dict, str]:
+    """Baixa o relatório da OS e devolve `(payload_do_dcc_download, erro)`.
+
+    Chamada SERVER-SIDE: roda no container da IHM, onde `BACKEND_URL` resolve.
+    O token vai no header — nunca em `params`, nunca na URL.
+    """
+    if formato not in _TIPOS_RELATORIO:
+        return None, f"Formato de relatório inválido: {formato}"
+
+    try:
+        resp = requests.get(
+            f"{BACKEND_URL}/api/v1/relatorio/os/{os_id}",
+            params={"formato": formato},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+    except Exception as exc:
+        return None, f"Falha ao contatar o servidor: {exc}"
+
+    if resp.status_code != 200:
+        return None, _erro_relatorio(resp, os_id)
+
+    return dcc.send_bytes(
+        resp.content,
+        _nome_do_arquivo(resp, os_id, formato),
+        type=_TIPOS_RELATORIO[formato],
+    ), ""
+
+
+def _baixar_relatorio(n_clicks_list, token):
+    """Corpo do callback dos botões CSV/XLSX. Registrado logo abaixo."""
+    if not any(n for n in (n_clicks_list or []) if n):
+        return no_update, no_update
+    if not token:
+        return no_update, dbc.Alert("Sessão expirada.", color="danger")
+
+    alvo = ctx.triggered_id
+    if not (alvo and isinstance(alvo, dict)):
+        return no_update, no_update
+
+    dados, erro = _buscar_relatorio(alvo["index"], alvo["formato"], token)
+    if erro:
+        return no_update, dbc.Alert(erro, color="danger", dismissable=True)
+    return dados, None
+
+
+# Registro explícito, em vez de `@callback` em cima da função: o decorador
+# devolve o wrapper do Dash, que só roda dentro de um callback context. Assim
+# `_baixar_relatorio` continua sendo função Python comum, testável direto
+# (tests/test_ihm_relatorio.py) sem subir servidor nem navegador.
+_cb_baixar_relatorio = callback(
+    Output("download-relatorio", "data"),
+    Output("msg-relatorio", "children"),
+    Input({"type": "btn-relatorio", "index": ALL, "formato": ALL}, "n_clicks"),
     State("jwt-token", "data"),
-    State({"type": "div-relatorio", "index": ALL}, "id"),
     prevent_initial_call=True,
-)
-def _cb_links_relatorio(_, token, ids):
-    if not token or not ids:
-        return [no_update] * len(ids)
-    links = []
-    for id_dict in ids:
-        os_id = id_dict.get("index", "")
-        links.append(dbc.ButtonGroup([
-            dbc.Button(
-                "CSV",
-                href=f"{BACKEND_URL}/api/v1/relatorio/os/{os_id}?formato=csv&token={token}",
-                external_link=True, target="_blank",
-                color="outline-success", size="sm",
-            ),
-            dbc.Button(
-                "XLSX",
-                href=f"{BACKEND_URL}/api/v1/relatorio/os/{os_id}?formato=xlsx&token={token}",
-                external_link=True, target="_blank",
-                color="outline-primary", size="sm",
-            ),
-        ], size="sm"))
-    return links
+)(_baixar_relatorio)
 
 
 # ── Alterar status da OS ───────────────────────────────────────────────────────
@@ -1096,29 +1184,39 @@ def _salvar_role(n_clicks_list, role_values, ids, token):
     Output("active-tab", "data", allow_duplicate=True),
     Input({"type":"btn-toggle-ativo","index":ALL}, "n_clicks"),
     State({"type":"btn-toggle-ativo","index":ALL}, "children"),
+    State({"type":"btn-toggle-ativo","index":ALL}, "id"),
     State("jwt-token", "data"),
     prevent_initial_call=True,
 )
-def _toggle_ativo(n_clicks_list, labels, token):
+def _toggle_ativo(n_clicks_list, labels, ids, token):
+    """Ativa/desativa o usuário do botão CLICADO.
+
+    O label ("Ativar"/"Desativar") é que decide a ação, e ele era lido pelo
+    "primeiro botão com n_clicks". `n_clicks` é cumulativo por componente:
+    depois de qualquer clique anterior, aquele botão continua com n_clicks > 0
+    e era ele o encontrado — o `username` vinha certo do `ctx.triggered_id`,
+    mas o VERBO saía do usuário errado. Clicar em "Ativar" de um técnico podia
+    desativá-lo, porque outra linha da tabela dizia "Desativar".
+
+    Agora a posição sai do casamento com o id disparado, como em
+    `_salvar_role`. (O `idx` que existia aqui era uma versão inacabada desse
+    mesmo casamento, sem efeito nenhum.)
+    """
     if not any(n for n in (n_clicks_list or []) if n):
         return no_update
     triggered = ctx.triggered_id
-    if not (triggered and isinstance(triggered, dict)):
+    if not (triggered and isinstance(triggered, dict)) or not token:
         return no_update
     username = triggered["index"]
-    idx = next((i for i, id_ in enumerate(
-        [{"index": u} for u in [username]]
-    ) if id_["index"] == username), None)
-    # Determina label clicado
-    triggered_idx = next(
-        (i for i, nc in enumerate(n_clicks_list or []) if nc), None
-    )
-    if triggered_idx is not None and token:
-        label = (labels or [])[triggered_idx] if labels else "Desativar"
-        if label == "Desativar":
-            _api("put", f"/manutencao/usuarios/{username}/desativar", token=token)
-        else:
-            _api("put", f"/manutencao/usuarios/{username}/ativar", token=token)
+
+    posicao = next((i for i, id_ in enumerate(ids or [])
+                    if id_.get("index") == username), None)
+    if posicao is None:
+        return no_update
+
+    label = (labels or [None] * (posicao + 1))[posicao] or "Desativar"
+    acao  = "desativar" if label == "Desativar" else "ativar"
+    _api("put", f"/manutencao/usuarios/{username}/{acao}", token=token)
     return "usuarios"
 
 

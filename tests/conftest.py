@@ -6,7 +6,7 @@ diretórios têm hífen no nome (`weight-simulator`, `central-computer`) e os
 módulos sobem o uvicorn no bloco `__main__`. Por isso o carregamento é feito
 por CAMINHO, via `importlib.util.spec_from_file_location`.
 
-Três fábricas são oferecidas:
+Quatro fábricas são oferecidas:
 
   `carregar_simulador` — importa um simulador com `requests` substituído por um
   duplo que grava as chamadas em memória em vez de fazer HTTP. É assim que os
@@ -25,6 +25,14 @@ Três fábricas são oferecidas:
           asyncio.run(central.modulo._handle_evento_dispenser({...}))
           assert central.banco.chamadas_de("salvar_dispenser_estado")
 
+  `carregar_ihm` — importa `ihm_web/app.py` (Dash) com `requests` duplado, para
+  testar callback sem subir servidor nem navegador.
+
+      def test_download(carregar_ihm):
+          ihm = carregar_ihm()
+          ihm.requests.content = b"csv..."
+          dados, erro = ihm.modulo._buscar_relatorio("OS-1", "csv", "jwt")
+
   `carregar_orquestrador` — importa `central-computer/orchestrator.py` sozinho,
   com banco duplado e `_post` trocado por um adapter fake que grava os comandos
   e responde no lugar do equipamento.
@@ -36,6 +44,7 @@ Três fábricas são oferecidas:
 """
 import importlib.util
 import inspect
+import os
 import sys
 import threading
 from pathlib import Path
@@ -43,6 +52,14 @@ from pathlib import Path
 import pytest
 
 RAIZ_REPO = Path(__file__).resolve().parent.parent
+
+# O central RECUSA subir com a SECRET_KEY default (ver `validar_secret_key`).
+# Definido aqui, no import do conftest, porque `config` é importado uma única
+# vez por sessão — a partir do primeiro teste que toque em `auth` ou `main` — e
+# lê o ambiente nesse momento. Os testes rodam, portanto, como uma instalação
+# bem configurada; a validação em si é testada em `test_seguranca.py`, que
+# chama a função direto.
+os.environ.setdefault("SECRET_KEY", "t" * 64)
 
 # Caminho de cada simulador, relativo à raiz do repositório.
 SIMULADORES = {
@@ -56,12 +73,19 @@ SIMULADORES = {
 # ── Duplo de `requests` ────────────────────────────────────────────────────────
 
 class RespostaFake:
-    """Resposta mínima com a superfície que os simuladores realmente usam."""
+    """Resposta mínima com a superfície que os simuladores realmente usam.
 
-    def __init__(self, status_code: int = 200, payload: dict | None = None):
+    `content` e `headers` existem para o download de relatório da IHM, que lê
+    os bytes e o `Content-Disposition` em vez do JSON.
+    """
+
+    def __init__(self, status_code: int = 200, payload: dict | None = None,
+                 content: bytes = b"", headers: dict | None = None):
         self.status_code = status_code
         self._payload = payload if payload is not None else {}
         self.text = ""
+        self.content = content
+        self.headers = headers if headers is not None else {}
 
     def json(self) -> dict:
         return self._payload
@@ -70,14 +94,17 @@ class RespostaFake:
 class RequestsFake:
     """Stand-in para o módulo `requests`: grava as chamadas em vez de fazer HTTP.
 
-    `status_code` e `payload` são atributos mutáveis para que um teste possa
-    simular adapter fora do ar (ex.: `sim.requests.status_code = 500`).
+    `status_code`, `payload`, `content` e `headers` são atributos mutáveis para
+    que um teste possa simular adapter fora do ar (ex.:
+    `sim.requests.status_code = 500`) ou devolver um arquivo.
     """
 
     def __init__(self):
         self.chamadas: list[dict] = []
         self.status_code = 200
         self.payload: dict = {}
+        self.content: bytes = b""
+        self.headers: dict = {}
 
     # A API real expõe `requests.exceptions.*`; alguns handlers capturam por nome.
     class exceptions:  # noqa: N801 — espelha o nome do módulo real
@@ -95,15 +122,22 @@ class RequestsFake:
             "metodo":  metodo,
             "url":     url,
             "json":    json,
+            "params":  kwargs.get("params"),
+            "headers": kwargs.get("headers"),
             "timeout": kwargs.get("timeout"),
         })
-        return RespostaFake(self.status_code, self.payload)
+        return RespostaFake(self.status_code, self.payload,
+                            self.content, self.headers)
 
     def post(self, url, json=None, **kwargs) -> RespostaFake:
         return self._registrar("POST", url, json, **kwargs)
 
-    def get(self, url, **kwargs) -> RespostaFake:
-        return self._registrar("GET", url, None, **kwargs)
+    def get(self, url, json=None, **kwargs) -> RespostaFake:
+        # `json=` explícito: o helper `_api` da IHM manda `json=None` em TODO
+        # método, inclusive GET. Deixá-lo cair no **kwargs colidia com o
+        # posicional de `_registrar` e virava TypeError engolido pelo try/except
+        # do chamador — a tela renderizava vazia sem dizer por quê.
+        return self._registrar("GET", url, json, **kwargs)
 
 
 # ── Handle devolvido ao teste ──────────────────────────────────────────────────
@@ -164,6 +198,54 @@ def carregar_simulador(monkeypatch):
         spec.loader.exec_module(modulo)
 
         return SimuladorCarregado(modulo, requests_fake)
+
+    return _carregar
+
+
+# ── IHM de manutenção (Dash) ───────────────────────────────────────────────────
+
+IHM_APP = RAIZ_REPO / "ihm_web" / "app.py"
+
+
+class IHMCarregada:
+    """Módulo `ihm_web/app.py` + as chamadas HTTP que ele tentou fazer."""
+
+    def __init__(self, modulo, requests_fake: RequestsFake):
+        self.modulo = modulo
+        self.requests = requests_fake
+
+    @property
+    def chamadas(self) -> list[dict]:
+        return self.requests.chamadas
+
+
+@pytest.fixture
+def carregar_ihm(monkeypatch):
+    """Importa `ihm_web/app.py` com `requests` duplado.
+
+    O import monta o layout e registra os callbacks; nada sobe servidor nem
+    navegador. `dash` e `dash_bootstrap_components` são importados DE VERDADE
+    (constam de `requirements-dev.txt`) — duplá-los custaria mais do que
+    instalá-los, e o layout deixaria de ser exercitado de fato.
+
+    `BACKEND_URL` é lido do ambiente numa constante de módulo, então `env` só
+    tem efeito antes do import — igual aos simuladores.
+    """
+
+    def _carregar(env: dict[str, str] | None = None) -> IHMCarregada:
+        for chave, valor in (env or {}).items():
+            monkeypatch.setenv(chave, valor)
+
+        requests_fake = RequestsFake()
+        monkeypatch.setitem(sys.modules, "requests", requests_fake)
+
+        nome_modulo = "apsen_ihm_web"
+        spec = importlib.util.spec_from_file_location(nome_modulo, IHM_APP)
+        modulo = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, nome_modulo, modulo)
+        spec.loader.exec_module(modulo)
+
+        return IHMCarregada(modulo, requests_fake)
 
     return _carregar
 
@@ -303,8 +385,10 @@ class AdapterFake:
     pré-registradas com `registrar_evento` ANTES do comando sair.
 
     Atributos mutáveis para encenar falha: `aceita=False` (adapter fora do ar),
-    `confirma_limpeza=False` (equipamento mudo → timeout) e
-    `quantidade_dispensada` (falha mecânica: solta menos que o alvo).
+    `confirma_limpeza=False` (equipamento mudo → timeout),
+    `quantidade_dispensada` (falha mecânica: solta menos que o alvo) e
+    `capturas_divergentes` (as N primeiras leituras da câmera do dispenser
+    voltam com SKU errado, que é o que ativa a trava de bloqueio).
     """
 
     def __init__(self, modulo):
@@ -313,6 +397,7 @@ class AdapterFake:
         self.aceita = True
         self.confirma_limpeza = True
         self.quantidade_dispensada: int | None = None   # None = dispensa o alvo
+        self.capturas_divergentes = 0                   # scans com SKU errado
         self._carga: dict[int, int] = {}                # slot → quantidade carregada
 
     async def post(self, url: str, payload: dict, timeout: float = 10.0) -> bool:
@@ -340,9 +425,18 @@ class AdapterFake:
 
         elif url.endswith("/comandos/capturar/dispenser"):
             slot = payload["slot_id"]
-            self._evento(f"{os_id}:visao_dispenser:{slot}",
-                         tipo="leitura_dispenser_ok",
-                         sku_lido=payload.get("sku_esperado", ""), confianca=0.99)
+            if self.capturas_divergentes > 0:
+                # Slot carregado com o medicamento errado: o orquestrador trava
+                # e só re-escaneia depois que o operador liberar.
+                self.capturas_divergentes -= 1
+                self._evento(f"{os_id}:visao_dispenser:{slot}",
+                             tipo="leitura_dispenser_divergencia",
+                             sku_esperado=payload.get("sku_esperado", ""),
+                             sku_lido="SKU-ERRADO", confianca=0.99)
+            else:
+                self._evento(f"{os_id}:visao_dispenser:{slot}",
+                             tipo="leitura_dispenser_ok",
+                             sku_lido=payload.get("sku_esperado", ""), confianca=0.99)
 
         elif url.endswith("/comandos/tara"):
             self._evento(f"{os_id}:tara", tipo="tara_ok", peso_tara_g=0.0)

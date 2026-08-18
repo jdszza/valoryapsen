@@ -476,3 +476,147 @@ def test_avaliar_triple_check_e_pura(carregar_orquestrador):
     assert mesa == MESA_DIVERGENTE
     assert peso == PESO_DIVERGENTE
     assert orq.adapter.chamadas == []
+
+
+# ── Robustez: banco fora do ar não pode derrubar a OS ─────────────────────────
+
+def test_falha_no_peso_unitario_nao_derruba_a_os(carregar_orquestrador, monkeypatch):
+    """O lookup de peso é paralelo, e `gather` propaga a primeira exceção.
+
+    Sem `return_exceptions=True`, um erro de banco em UM medicamento matava a
+    OS inteira — sendo que o peso unitário já tem fallback (50 g). Perder
+    precisão da balança em um item é aceitável; perder a OS por isso, não.
+    """
+    orq = carregar_orquestrador()
+
+    def _explode(nome):
+        raise RuntimeError(f"MySQL fora do ar ao buscar {nome}")
+
+    monkeypatch.setattr(orq.modulo, "get_peso_medicamento", _explode)
+
+    asyncio.run(orq.modulo._processar_os(
+        _payload_os("OS-9", _item("Dipirona"), _item("Paracetamol"))
+    ))
+
+    assert _status_gravados(orq) == [("OS-9", "em_andamento"), ("OS-9", "concluida")]
+    pesagens = orq.adapter.comandos("/comandos/pesar")
+    assert len(pesagens) == 2
+    assert all(p["peso_unitario_g"] == orq.modulo.PESO_UNITARIO_PADRAO_G
+               for p in pesagens)
+
+
+def test_peso_do_catalogo_e_usado_quando_o_banco_responde(carregar_orquestrador,
+                                                          monkeypatch):
+    """Guarda do caminho feliz: o fallback não pode virar o padrão."""
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.modulo, "get_peso_medicamento", lambda nome: 12.5)
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-9")))
+
+    (pesagem,) = orq.adapter.comandos("/comandos/pesar")
+    assert pesagem["peso_unitario_g"] == 12.5
+
+
+# ── Trava: estado interno antes da publicação ─────────────────────────────────
+
+def test_trava_ja_e_liberavel_quando_aparece_no_dashboard(carregar_orquestrador,
+                                                          monkeypatch):
+    """A janela de corrida: `_estado["trava"]` publicado antes de `_trava_ativa`.
+
+    O supervisor via a trava na tela e clicava em "Liberar"; `liberar_trava`
+    caía no `if not _trava_ativa: return False` e a API respondia 409 "nenhuma
+    trava ativa" com a trava bem visível. Aqui o clique acontece no instante
+    exato do broadcast — o pior momento possível.
+    """
+    liberacoes = []
+
+    orq = carregar_orquestrador()
+
+    def _broadcast_e_clicar():
+        if orq.estado["trava"]["ativa"]:
+            liberacoes.append(orq.modulo.liberar_trava("supervisor"))
+
+    monkeypatch.setattr(orq.modulo, "_broadcast_fn", _broadcast_e_clicar)
+
+    asyncio.run(orq.modulo._ativar_trava("OS-1", 3, "SKU errado em D3"))
+
+    assert liberacoes == [True], "trava apareceu na tela antes de ser liberável"
+
+
+def test_trava_de_sku_errado_e_liberavel_no_instante_do_broadcast(carregar_orquestrador,
+                                                                  monkeypatch):
+    """O cenário completo, pelo caminho onde a corrida vivia.
+
+    O bloco de SKU errado publicava `_estado["trava"]` e chamava o broadcast
+    ANTES de `_ativar_trava`. O clique em "Liberar" que chegasse nesse intervalo
+    era recusado com 409 e a OS ficava parada esperando um evento que já tinha
+    sido pedido.
+    """
+    orq = carregar_orquestrador()
+    orq.adapter.capturas_divergentes = 1      # o 1º scan volta com SKU errado
+    liberacoes = []
+
+    def _broadcast_e_clicar():
+        if orq.estado["trava"]["ativa"] and not liberacoes:
+            liberacoes.append(orq.modulo.liberar_trava("supervisor"))
+
+    monkeypatch.setattr(orq.modulo, "_broadcast_fn", _broadcast_e_clicar)
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-10")))
+
+    assert liberacoes == [True], "trava visível na tela mas ainda não liberável"
+    assert _status_gravados(orq)[-1] == ("OS-10", "concluida")
+    assert orq.estado["trava"]["ativa"] is False
+
+
+def test_ativar_trava_publica_o_motivo_para_a_ihm(carregar_orquestrador):
+    """A publicação mudou de lugar (foi para dentro de `_ativar_trava`), não sumiu."""
+    orq = carregar_orquestrador()
+
+    asyncio.run(orq.modulo._ativar_trava("OS-1", 3, "SKU errado em D3"))
+
+    assert orq.estado["trava"] == {
+        "ativa": True, "os_id": "OS-1", "slot_id": 3, "motivo": "SKU errado em D3",
+    }
+    assert orq.modulo.get_trava_estado()["ativa"] is True
+
+
+# ── Nenhuma query síncrona dentro do event loop ───────────────────────────────
+
+def test_orquestrador_nao_chama_o_banco_no_event_loop():
+    """Toda função de `database` tem que passar por `asyncio.to_thread`.
+
+    Uma query síncrona no event loop congela o central INTEIRO enquanto o MySQL
+    responde: WebSocket, endpoints e o próprio orquestrador. Varredura por AST
+    em vez de lista manual — chamada nova entra na conta sozinha.
+    """
+    import ast
+    from pathlib import Path
+
+    arquivo = Path(__file__).resolve().parent.parent / "central-computer" / "orchestrator.py"
+    arvore = ast.parse(arquivo.read_text(encoding="utf-8"))
+
+    do_banco = {
+        alias.name
+        for no in ast.walk(arvore)
+        if isinstance(no, ast.ImportFrom) and no.module == "database"
+        for alias in no.names
+    }
+    assert do_banco, "nenhum import de `database` encontrado — teste desatualizado"
+
+    em_thread, diretas = set(), []
+    for no in ast.walk(arvore):
+        if not isinstance(no, ast.Call):
+            continue
+        nome = getattr(no.func, "attr", None) or getattr(no.func, "id", None)
+        if nome == "to_thread":
+            em_thread |= {a.lineno for a in no.args if isinstance(a, ast.Name)}
+        if isinstance(no.func, ast.Name) and no.func.id in do_banco:
+            diretas.append((no.func.id, no.lineno))
+
+    sincronas = [f"{nome}() na linha {linha}"
+                 for nome, linha in diretas if linha not in em_thread]
+    assert not sincronas, (
+        "chamadas de banco fora de asyncio.to_thread (bloqueiam o event loop): "
+        + "; ".join(sincronas)
+    )
