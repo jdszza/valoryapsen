@@ -54,7 +54,8 @@ services:
     ports:
       - "3306:3306"
     environment:
-      # Credenciais vêm do .env (não versionado). Ver .env.example e README.
+      # Credenciais vêm do .env (não versionado). O modelo do arquivo está no
+      # README, em "Como rodar" — não há .env.example no repositório.
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASS:?defina MYSQL_ROOT_PASS no .env}
       MYSQL_DATABASE:      ${MYSQL_DB:-apsen_db}
       MYSQL_USER:          ${MYSQL_USER:-apsen}

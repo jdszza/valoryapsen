@@ -811,7 +811,48 @@ async def lifespan(app: FastAPI):
     await orch.encerrar()
 
 
-app = FastAPI(title="APSEN Computador Central v3.1", lifespan=lifespan)
+_TAGS_META = [
+    {"name": "Saúde",
+     "description": "Liveness. É o alvo do healthcheck do compose."},
+    {"name": "Ordens de Serviço",
+     "description": "Ciclo de vida da OS: entrada, fila, consulta e relatório. A entrada tem três recusas de contrato (409/429/503) e nenhuma é retentada pelo gerador."},
+    {"name": "Eventos dos Adapters",
+     "description": "Telemetria e transições vindas dos 4 adapters. Não é API de operador: quem chama são os adapters, sem autenticação."},
+    {"name": "Estado e Telemetria",
+     "description": "Estado corrente e históricos. `GET /estado` devolve o mesmo snapshot que o WebSocket `/ws` publica."},
+    {"name": "Catálogo",
+     "description": "Medicamentos e categorias disponíveis."},
+    {"name": "Autenticação",
+     "description": "Login e identidade. O token vale 8h."},
+    {"name": "Manutenção",
+     "description": "Sensores, log, alarmes e limpeza de dispenser. Exige JWT de técnico."},
+    {"name": "Triple Check",
+     "description": "Trava de emergência. 1 fonte divergente já trava (`TRIPLE_CHECK_MIN_DIVERGENCIAS`); liberar exige role admin."},
+    {"name": "Usuários",
+     "description": "Gestão de técnicos. Exige role admin."},
+]
+
+app = FastAPI(
+    title="APSEN Computador Central",
+    version="3.1.0",
+    lifespan=lifespan,
+    openapi_tags=_TAGS_META,
+    description="""Orquestrador do sistema APSEN de contagem e dispensação de medicamentos.
+
+**Autenticação** — as rotas de Manutenção, Usuários e Triple Check usam
+`Authorization: Bearer <jwt>`, obtido em `POST /auth/login`. Use o botão
+**Authorize** acima. A role vem do BANCO a cada requisição, não do token:
+técnico desativado perde acesso na hora, sem esperar as 8h de expiração.
+
+**O que NÃO está nesta página** — o endpoint `WS /ws`, que publica o
+snapshot de estado a cada transição. OpenAPI não descreve WebSocket; o
+payload é o mesmo de `GET /estado`.
+
+**Corpos de resposta** — a maioria das rotas ainda não declara
+`response_model`, então o *Example Value* aparece vazio. Os códigos de erro
+documentados, esses, correspondem ao que o código realmente levanta.
+""",
+)
 # Só dashboard e IHM falam com o central pelo navegador. `*` num serviço
 # autenticado deixa qualquer página aberta no browser do técnico disparar
 # requisição em nome dele.
@@ -957,7 +998,12 @@ class EventoPesoReq(BaseModel):
 # ENDPOINTS — RECEBIMENTO (adapters e order-generator)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/api/v1/ordens")
+@app.post("/api/v1/ordens", tags=["Ordens de Serviço"],
+    responses={
+        409: {"description": "OS já registrada (`os_duplicada`). O reenvio NÃO é reprocessado."},
+        429: {"description": "Fila cheia (`fila_cheia`). Nada é persistido — a recusa vem ANTES do INSERT."},
+        503: {"description": "Banco indisponível (`persistencia_indisponivel`). A OS não entra na fila."},
+    })
 async def receber_ordem(req: NovaOSReq):
     """Recebe nova OS do order-generator.
 
@@ -1060,28 +1106,28 @@ async def receber_ordem(req: NovaOSReq):
     return {"aceita": True, "os_id": os_id, "posicao_fila": posicao_fila + 1}
 
 
-@app.post("/api/v1/eventos/dispenser")
+@app.post("/api/v1/eventos/dispenser", tags=["Eventos dos Adapters"])
 async def evento_dispenser(req: EventoDispenserReq):
     """Recebe eventos normalizados do dispenser-adapter."""
     await _handle_evento_dispenser(req.model_dump())
     return {"ok": True}
 
 
-@app.post("/api/v1/eventos/cnc")
+@app.post("/api/v1/eventos/cnc", tags=["Eventos dos Adapters"])
 async def evento_cnc(req: EventoCNCReq):
     """Recebe eventos normalizados do cnc-adapter."""
     await _handle_evento_cnc(req.model_dump())
     return {"ok": True}
 
 
-@app.post("/api/v1/eventos/visao")
+@app.post("/api/v1/eventos/visao", tags=["Eventos dos Adapters"])
 async def evento_visao(req: EventoVisionReq):
     """Recebe resultados de captura do vision-adapter (câmera dispenser e câmera mesa)."""
     await _handle_evento_visao(req.model_dump())
     return {"ok": True}
 
 
-@app.post("/api/v1/eventos/peso")
+@app.post("/api/v1/eventos/peso", tags=["Eventos dos Adapters"])
 async def evento_peso(req: EventoPesoReq):
     """Recebe leituras de pesagem do weight-adapter (balança HX711)."""
     await _handle_evento_peso(req.model_dump())
@@ -1092,12 +1138,12 @@ async def evento_peso(req: EventoPesoReq):
 # ENDPOINTS — DASHBOARD (sem autenticação, read-only)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.get("/ping")
+@app.get("/ping", tags=["Saúde"])
 def ping():
     return {"status": "ok", "service": "apsen-central-computer"}
 
 
-@app.get("/estado")
+@app.get("/estado", tags=["Estado e Telemetria"])
 def get_estado():
     # Endpoint síncrono (roda em threadpool), então a releitura pode bloquear.
     # Sujeita ao mesmo cache dos handlers: o polling do dashboard não vira uma
@@ -1113,7 +1159,7 @@ def get_estado():
         return copy.deepcopy(_estado)
 
 
-@app.get("/api/v1/fila")
+@app.get("/api/v1/fila", tags=["Ordens de Serviço"])
 def get_fila():
     """Ocupação da fila de OS — endpoint de backpressure do order-generator.
 
@@ -1126,7 +1172,7 @@ def get_fila():
     return orch.fila_status()
 
 
-@app.get("/os/ativa")
+@app.get("/os/ativa", tags=["Ordens de Serviço"])
 def os_ativa():
     ordem = get_ordem_ativa()
     if not ordem:
@@ -1134,12 +1180,15 @@ def os_ativa():
     return {"os_ativa": ordem}
 
 
-@app.get("/os/historico")
+@app.get("/os/historico", tags=["Ordens de Serviço"])
 def os_historico(limite: int = 50):
     return get_historico_ordens(limite)
 
 
-@app.get("/os/{os_id}")
+@app.get("/os/{os_id}", tags=["Ordens de Serviço"],
+    responses={
+        404: {"description": "OS não encontrada."},
+    })
 def os_detalhe(os_id: str):
     ordem = get_ordem_por_id(os_id)
     if not ordem:
@@ -1147,7 +1196,17 @@ def os_detalhe(os_id: str):
     return ordem
 
 
-@app.get("/api/v1/relatorio/os/{os_id}")
+@app.get("/api/v1/relatorio/os/{os_id}", tags=["Ordens de Serviço"],
+    # Devolve BYTES DE ARQUIVO, não JSON — o spec dizia `application/json`.
+    # E não existe 400 aqui: qualquer `formato` diferente de `xlsx` cai no
+    # CSV, inclusive valor inválido (`formato=pdf` responde 200 text/csv).
+    response_class=StreamingResponse,
+    responses={
+        200: {"description": "CSV (default) ou XLSX, conforme `formato`.",
+              "content": {"text/csv": {}, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}}},
+        401: {"description": "Token ausente ou inválido."},
+        404: {"description": "OS não encontrada."},
+    })
 async def relatorio_os(
     os_id: str,
     formato: str = "csv",
@@ -1321,7 +1380,7 @@ async def _gerar_xlsx(os_id, os_data, dispensas_data, visao_data, alarmes_data) 
     )
 
 
-@app.get("/api/v1/visao/historico")
+@app.get("/api/v1/visao/historico", tags=["Estado e Telemetria"])
 async def visao_historico(os_id: str = None, limite: int = 100):
     """Retorna histórico de leituras de visão computacional. Filtra por os_id se fornecido."""
     if limite > 500:
@@ -1330,39 +1389,39 @@ async def visao_historico(os_id: str = None, limite: int = 100):
     return {"leituras": rows, "total": len(rows)}
 
 
-@app.get("/medicamentos")
+@app.get("/medicamentos", tags=["Catálogo"])
 def get_medicamentos(categoria: str = None):
     return listar_medicamentos(categoria)
 
 
-@app.get("/medicamentos/categorias")
+@app.get("/medicamentos/categorias", tags=["Catálogo"])
 def get_categorias():
     return listar_categorias()
 
 
-@app.get("/dispensas")
+@app.get("/dispensas", tags=["Estado e Telemetria"])
 def dispensas(os_id: str = None, limite: int = 100):
     if os_id:
         return get_dispensas(os_id, limite)
     return get_dispensas_recentes(limite)
 
 
-@app.get("/dispensers/estado")
+@app.get("/dispensers/estado", tags=["Estado e Telemetria"])
 def dispensers_estado():
     return get_dispensers_estado()
 
 
-@app.get("/cnc/historico")
+@app.get("/cnc/historico", tags=["Estado e Telemetria"])
 def cnc_historico(limite: int = 50):
     return get_cnc_recentes(limite)
 
 
-@app.get("/alarmes")
+@app.get("/alarmes", tags=["Estado e Telemetria"])
 def alarmes(resolvido: bool = False, limite: int = 50):
     return get_alarmes(resolvido=resolvido, limite=limite)
 
 
-@app.get("/log/eventos")
+@app.get("/log/eventos", tags=["Estado e Telemetria"])
 def log_eventos(limite: int = 50):
     return list(_log_eventos)[:limite]
 
@@ -1371,7 +1430,10 @@ def log_eventos(limite: int = 50):
 # ENDPOINTS — IHM MANUTENÇÃO (requer JWT)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/auth/login")
+@app.post("/auth/login", tags=["Autenticação"],
+    responses={
+        401: {"description": "Credenciais inválidas."},
+    })
 def login(req: LoginReq):
     user = get_usuario(req.username)
     if not user or not verificar_senha(req.senha, user["senha_hash"]):
@@ -1386,12 +1448,12 @@ def login(req: LoginReq):
     }
 
 
-@app.get("/auth/me")
+@app.get("/auth/me", tags=["Autenticação"])
 def me(user=Depends(_get_tecnico)):
     return {"username": user["sub"], "nome": user["nome"], "role": user.get("role")}
 
 
-@app.put("/ordens/{os_id}/status")
+@app.put("/ordens/{os_id}/status", tags=["Ordens de Serviço"])
 def alterar_status_os(os_id: str, req: StatusOSReq, user=Depends(_get_tecnico)):
     validos = {"aguardando", "em_andamento", "concluida", "erro", "cancelada"}
     if req.status not in validos:
@@ -1401,33 +1463,33 @@ def alterar_status_os(os_id: str, req: StatusOSReq, user=Depends(_get_tecnico)):
     return {"ok": True, "os_id": os_id, "status": req.status}
 
 
-@app.get("/manutencao/sensores")
+@app.get("/manutencao/sensores", tags=["Manutenção"])
 def manut_sensores(user=Depends(_get_tecnico)):
     return get_ultimas_leituras()
 
 
-@app.get("/manutencao/sensores/{componente}")
+@app.get("/manutencao/sensores/{componente}", tags=["Manutenção"])
 def manut_sensor_hist(componente: str, tipo: str = "temperatura", limite: int = 60,
                       user=Depends(_get_tecnico)):
     return get_historico_sensor(componente, tipo, limite)
 
 
-@app.get("/manutencao/log")
+@app.get("/manutencao/log", tags=["Manutenção"])
 def manut_log(limite: int = 100, user=Depends(_get_tecnico)):
     return get_log_manutencao(limite)
 
 
-@app.post("/manutencao/log")
+@app.post("/manutencao/log", tags=["Manutenção"])
 def manut_registrar(req: ManutencaoReq, user=Depends(_get_tecnico)):
     return salvar_manutencao(req.tipo, req.componente, req.descricao, user["sub"])
 
 
-@app.get("/manutencao/alarmes")
+@app.get("/manutencao/alarmes", tags=["Manutenção"])
 def manut_alarmes(resolvido: bool = False, limite: int = 100, user=Depends(_get_tecnico)):
     return get_alarmes(resolvido=resolvido, limite=limite)
 
 
-@app.put("/manutencao/alarmes/{alarme_id}/resolver")
+@app.put("/manutencao/alarmes/{alarme_id}/resolver", tags=["Manutenção"])
 def manut_resolver_alarme(alarme_id: int, user=Depends(_get_tecnico)):
     resolver_alarme(alarme_id)
     # Único caminho que ABAIXA o total — o que o contador manual nunca fez.
@@ -1441,13 +1503,18 @@ def manut_resolver_alarme(alarme_id: int, user=Depends(_get_tecnico)):
 
 # ── Triple Check — trava de emergência ────────────────────────────────────────
 
-@app.get("/api/v1/trava")
+@app.get("/api/v1/trava", tags=["Triple Check"])
 def get_trava():
     """Retorna estado atual da trava de Triple Check."""
     return orch.get_trava_estado()
 
 
-@app.post("/api/v1/admin/liberar-trava")
+@app.post("/api/v1/admin/liberar-trava", tags=["Triple Check"],
+    responses={
+        401: {"description": "Token ausente, inválido, ou usuário desativado no banco."},
+        403: {"description": "Requer role admin (a role vem do banco, não do token)."},
+        409: {"description": "Nenhuma trava ativa no momento."},
+    })
 async def liberar_trava(user=Depends(_get_admin)):
     """
     Libera a trava de Triple Check. Exige role admin ou supervisor.
@@ -1463,7 +1530,13 @@ async def liberar_trava(user=Depends(_get_admin)):
     return {"ok": True, "liberado_por": user["sub"]}
 
 
-@app.post("/manutencao/dispensers/{dispenser_id}/limpar")
+@app.post("/manutencao/dispensers/{dispenser_id}/limpar", tags=["Manutenção"],
+    responses={
+        400: {"description": "`dispenser_id` fora da faixa 1..6."},
+        401: {"description": "Token ausente, inválido, ou usuário desativado no banco."},
+        409: {"description": "OS em andamento, ou slot em operação física (`carregando`/`dispensando`)."},
+        503: {"description": "Dispenser-adapter indisponível."},
+    })
 async def manut_limpar_dispenser(dispenser_id: int, user=Depends(_get_tecnico)):
     """Envia comando de limpeza ao dispenser-adapter. Bloqueado se slot está em operação."""
     if dispenser_id not in range(1, 7):
@@ -1511,12 +1584,12 @@ async def manut_limpar_dispenser(dispenser_id: int, user=Depends(_get_tecnico)):
             "msg": "Comando enviado. Aguardando confirmação do dispenser."}
 
 
-@app.get("/manutencao/usuarios")
+@app.get("/manutencao/usuarios", tags=["Usuários"])
 def listar_usuarios(user=Depends(_get_admin)):
     return get_usuarios()
 
 
-@app.post("/manutencao/usuarios")
+@app.post("/manutencao/usuarios", tags=["Usuários"])
 def criar_novo_usuario(req: UsuarioReq, user=Depends(_get_admin)):
     resultado = criar_usuario(req.username, req.senha, req.nome_completo, req.role)
     if not resultado.get("ok"):
@@ -1524,7 +1597,7 @@ def criar_novo_usuario(req: UsuarioReq, user=Depends(_get_admin)):
     return resultado
 
 
-@app.put("/manutencao/usuarios/{username}")
+@app.put("/manutencao/usuarios/{username}", tags=["Usuários"])
 def editar_usuario(username: str, req: UsuarioUpdateReq, user=Depends(_get_admin)):
     resultado = atualizar_usuario(username, req.nome_completo, req.role, req.nova_senha)
     if not resultado.get("ok"):
@@ -1534,7 +1607,7 @@ def editar_usuario(username: str, req: UsuarioUpdateReq, user=Depends(_get_admin
     return resultado
 
 
-@app.put("/manutencao/usuarios/{username}/desativar")
+@app.put("/manutencao/usuarios/{username}/desativar", tags=["Usuários"])
 def desativar_usuario(username: str, user=Depends(_get_admin)):
     if username == user["sub"]:
         raise HTTPException(400, "Não pode desativar a própria conta")
@@ -1545,7 +1618,7 @@ def desativar_usuario(username: str, user=Depends(_get_admin)):
     return resultado
 
 
-@app.put("/manutencao/usuarios/{username}/ativar")
+@app.put("/manutencao/usuarios/{username}/ativar", tags=["Usuários"])
 def ativar_usuario(username: str, user=Depends(_get_admin)):
     resultado = toggle_usuario_ativo(username, True)
     _invalidar_cache_usuario(username)

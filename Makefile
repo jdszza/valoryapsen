@@ -31,7 +31,7 @@ LOG_LINES ?= 100
 
 up:
 	@printf "$(GREEN)$(BOLD)▶ Subindo todos os serviços APSEN...$(RESET)\n"
-	@test -f .env || (printf "$(RED)Falta o .env — rode: cp .env.example .env$(RESET)\n" && exit 1)
+	@test -f .env || (printf "$(RED)Falta o .env — veja o bloco do passo 2 em 'Como rodar', no README$(RESET)\n" && exit 1)
 	docker compose up -d
 	@printf "$(GREEN)✅ Serviços ativos. Dashboard: http://localhost:8050 | IHM: http://localhost:8051$(RESET)\n"
 

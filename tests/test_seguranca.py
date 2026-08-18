@@ -215,12 +215,12 @@ def test_compose_nao_versiona_segredos():
         assert segredo not in compose, f"segredo ainda versionado no compose: {segredo}"
 
 
-def test_env_de_exemplo_nao_traz_valores_reais():
-    exemplo = (CENTRAL_DIR.parent / ".env.example").read_text(encoding="utf-8")
-
-    for chave in ("SECRET_KEY", "MYSQL_ROOT_PASS", "MYSQL_PASS",
-                  "SEED_ADMIN_SENHA", "SEED_MANUT_SENHA"):
-        assert f"{chave}=\n" in exemplo, f"{chave} deveria estar vazia no .env.example"
+# Havia aqui um `test_env_de_exemplo_nao_traz_valores_reais`, que exigia as 5
+# chaves de segredo VAZIAS num `.env.example` versionado. O arquivo foi removido
+# do repositório: sem template commitado, não existe o risco de alguém preencher
+# o exemplo com valores reais e commitar — o teste perdeu o objeto. O modelo do
+# `.env` passou a viver no README ("Como rodar", passo 2), que não é lido por
+# nenhum teste.
 
 
 def test_env_real_esta_ignorado_pelo_git():

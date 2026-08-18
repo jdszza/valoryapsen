@@ -189,10 +189,41 @@ Probabilidades configuráveis por env var (padrão 2% cada):
 git clone https://github.com/seu-usuario/valoryapsen.git
 cd valoryapsen
 
-# 2. Configure os segredos (OBRIGATÓRIO — nada sobe sem isto)
-cp .env.example .env
-python -c "import secrets; print(secrets.token_hex(32))"   # cole em SECRET_KEY
-#   preencha também MYSQL_ROOT_PASS, MYSQL_PASS, SEED_ADMIN_SENHA e SEED_MANUT_SENHA
+# 2. Crie o .env (OBRIGATÓRIO — nada sobe sem isto). Ele NÃO é versionado.
+cat > .env <<'FIM'
+# ── Assinatura dos JWT ───────────────────────────────────────────────────────
+# OBRIGATÓRIO. Gere com:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+SECRET_KEY=
+
+# "dev" tolera SECRET_KEY fraca, só com aviso no log. Qualquer outro valor
+# (inclusive vazio → prod) trata segredo fraco como erro e IMPEDE o boot.
+APSEN_ENV=prod
+
+# ── MySQL ────────────────────────────────────────────────────────────────────
+# OBRIGATÓRIOS: MYSQL_ROOT_PASS e MYSQL_PASS. Lidos na PRIMEIRA subida (criação
+# do volume mysql_data); trocar depois exige `docker compose down -v`, que
+# apaga os dados.
+MYSQL_ROOT_PASS=
+MYSQL_USER=apsen
+MYSQL_PASS=
+MYSQL_DB=apsen_db
+
+# ── Usuários seed da IHM de manutenção ───────────────────────────────────────
+# OBRIGATÓRIAS. Criadas só na primeira inicialização do banco. TROQUE AMBAS
+# após o primeiro login, pela própria IHM (aba Usuários) — ficam em claro aqui.
+SEED_ADMIN_SENHA=
+SEED_MANUT_SENHA=
+
+# ── Origens de browser autorizadas a chamar o central ────────────────────────
+# Ajuste ao publicar fora da máquina local. `*` não é aceito no central.
+CORS_ORIGINS=http://localhost:8050,http://localhost:8051
+FIM
+
+# Preencha as CINCO obrigatórias antes de seguir:
+#   SECRET_KEY  MYSQL_ROOT_PASS  MYSQL_PASS  SEED_ADMIN_SENHA  SEED_MANUT_SENHA
+# As demais já têm default utilizável. O compose recusa subir com qualquer
+# obrigatória vazia, citando o nome da variável que falta.
 
 # 3. Build e start
 docker compose down -v
@@ -310,7 +341,6 @@ valoryapsen/
 ├── ihm_esp32/              # ⚠️ firmware DEFASADO (ainda MQTT) — ver nota abaixo
 ├── mysql/init.sql          # Só charset/collation; o schema vem do database.py
 ├── tests/                  # pytest — sem Docker, sem MySQL (`make test`)
-├── .env.example            # Modelo do .env (segredos; o .env não é versionado)
 ├── docker-compose.yml
 └── .gitignore
 ```
