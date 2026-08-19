@@ -48,6 +48,48 @@ def _badge(label: str, color: str = "secondary") -> dbc.Badge:
     return dbc.Badge(label, color=color, className="ms-1")
 
 
+def _kpi(label: str, valor, unidade: str = "", tom: str = "",
+         dica: str = "") -> html.Div:
+    """Bloco da faixa de indicadores no topo.
+
+    `tom` é uma das classes de severidade do tema (`is-gold`, `is-blue`,
+    `is-ok`, `is-warn`, `is-err`) e pinta só o filete lateral — o valor fica
+    legível em qualquer caso. `dica` vira `title`, para o valor que aparece
+    abreviado ainda poder ser lido por inteiro.
+    """
+    return html.Div(
+        [
+            html.Span(label, className="ap-kpi-label"),
+            html.Div(
+                [str(valor), html.Span(unidade, className="unit") if unidade else ""],
+                className="ap-kpi-value",
+            ),
+        ],
+        className=f"ap-kpi {tom}".strip(),
+        title=dica or None,
+    )
+
+
+def _vazio(icone: str, texto: str) -> html.Div:
+    """Estado vazio: um "sem dados" que ocupa o cartão em vez de uma linha solta."""
+    return html.Div(
+        [html.Span(icone, className="ico"), html.Span(texto)],
+        className="ap-empty",
+    )
+
+
+def _hora(ts, com_data: bool = False) -> str:
+    """`2026-08-18T14:03:07` → `14:03:07` (ou `08-18 14:03` com data).
+
+    O log mostra dezenas de linhas por tela e a data se repete em todas; ela só
+    aparece onde a linha pode ser de outro dia (histórico de OS).
+    """
+    s = str(ts or "").replace("T", " ")
+    if len(s) < 19:
+        return s[:16]
+    return f"{s[5:10]} {s[11:16]}" if com_data else s[11:19]
+
+
 STATUS_COR = {
     "idle":                     "secondary",
     "aguardando_atribuicao":    "info",
@@ -87,19 +129,23 @@ app.layout = dbc.Container(
         dcc.Store(id="store-alarmes"),
 
         # ── Header ────────────────────────────────────────────────────────────
-        dbc.Row(
-            dbc.Col(
+        html.Div(
+            [
+                html.Div("AP", className="ap-logo"),
                 html.Div([
-                    html.H1("APSEN", className="d-inline me-3 fw-bold text-primary"),
-                    html.Span(
-                        "Sistema de Contagem de Medicamentos",
-                        className="text-muted fs-5",
-                    ),
-                    html.Span(id="badge-alarmes", className="float-end mt-1"),
+                    html.H1("APSEN", className="ap-title"),
+                    html.Span("Sistema de Contagem de Medicamentos",
+                              className="ap-subtitle"),
                 ]),
-                className="py-3 border-bottom",
-            )
+                # `ms-auto` empurra o bloco de status para a direita — a marca
+                # fica à esquerda em qualquer largura, sem `float`.
+                html.Span(id="badge-alarmes", className="ms-auto"),
+            ],
+            className="ap-header",
         ),
+
+        # ── Faixa de indicadores ──────────────────────────────────────────────
+        html.Div(id="kpi-strip", className="ap-kpis"),
 
         # ── Row 1: OS ativa + CNC ─────────────────────────────────────────────
         dbc.Row([
@@ -131,6 +177,7 @@ app.layout = dbc.Container(
                 dbc.CardHeader("🚨 Alarmes Ativos"),
                 dbc.CardBody(
                     id="card-alarmes",
+                    className="ap-scroll",
                     style={"maxHeight": "220px", "overflowY": "auto"},
                 ),
             ]), md=5, className="mb-3"),
@@ -139,13 +186,14 @@ app.layout = dbc.Container(
                 dbc.CardHeader("📡 Log de Eventos"),
                 dbc.CardBody(
                     id="card-log",
+                    className="ap-scroll",
                     style={"maxHeight": "220px", "overflowY": "auto"},
                 ),
             ]), md=7, className="mb-3"),
         ]),
 
         # ── BANNER: Trava de Emergência (Triple Check) ────────────────────────
-        html.Div(id="banner-trava"),
+        html.Div(id="banner-trava", className="ap-trava"),
 
         # ── Row 4: Visão Computacional + Balança ─────────────────────────────
         dbc.Row([
@@ -166,6 +214,7 @@ app.layout = dbc.Container(
                 dbc.CardHeader("📂 Histórico de Ordens"),
                 dbc.CardBody(
                     id="card-historico",
+                    className="ap-scroll",
                     style={"maxHeight": "250px", "overflowY": "auto"},
                 ),
             ]), className="mb-3")
@@ -201,6 +250,7 @@ def _fetch(_):
 # ── Callbacks: render ──────────────────────────────────────────────────────────
 
 @callback(
+    Output("kpi-strip",       "children"),
     Output("badge-alarmes",   "children"),
     Output("badge-os-status", "children"),
     Output("card-os",         "children"),
@@ -219,8 +269,13 @@ def _fetch(_):
 )
 def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
     if not estado:
-        vazio = html.P("Aguardando backend...", className="text-muted")
-        return (vazio,) * 11
+        # Defensivo, não um monitor de conexão: medido nesta versão do Dash, com
+        # o central fora do ar o `_fetch` roda a cada tique mas o `_render` NÃO é
+        # chamado — os stores ficam com o último valor bom e a tela congela com
+        # dado velho, sem avisar. Um indicador de "sem conexão" honesto precisa
+        # de outro caminho (o `WS /ws` do central), não do diff dos stores.
+        vazio = _vazio("🔌", "Sem resposta do central-computer.")
+        return ([], "", "") + (vazio,) * 9
 
     estado    = estado or {}
     eventos   = eventos or []
@@ -230,7 +285,7 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
     disp_map  = estado.get("dispensers", {})
     n_alarmes = estado.get("alarmes_ativos", 0)
 
-    # ── Badge alarmes ─────────────────────────────────────────────────────────
+    # ── Badge de alarmes ──────────────────────────────────────────────────────
     badge_alarmes = dbc.Badge(
         f"⚠ {n_alarmes} alarme(s)" if n_alarmes else "✓ Sem alarmes",
         color="danger" if n_alarmes else "success",
@@ -286,7 +341,7 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
                 className="text-warning",
             )
         else:
-            card_os = html.P("Nenhuma OS em andamento.", className="text-muted")
+            card_os = _vazio("💤", "Nenhuma OS em andamento.")
 
     # ── CNC ───────────────────────────────────────────────────────────────────
     cnc_status   = cnc.get("status", "idle")
@@ -381,7 +436,12 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
                         ) if qtd_a > 0 else html.Div(),
                     ], className="py-1 px-2"),
                 ], className="h-100"),
-                md=2, sm=4, xs=6, className="mb-2",
+                md=2, sm=4, xs=6,
+                # `is-active` acende a borda dourada do slot que está em
+                # operação — num painel de 6 cartões iguais, é o que faz o
+                # operador achar o slot certo sem ler cada um.
+                className=("ap-slot mb-2 is-active"
+                           if d_sts not in ("idle", None) else "ap-slot mb-2"),
             )
         )
 
@@ -394,14 +454,14 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
                 html.Strong(f"[{a.get('tipo', '?').upper()}] "),
                 html.Span(a.get("descricao", "")),
                 html.Small(
-                    f" — {str(a.get('ts', ''))[:16].replace('T', ' ')}",
+                    f" — {_hora(a.get('ts'))}",
                     className="text-muted ms-2",
                 ),
             ], color="danger", className="py-1 px-2 mb-1 small")
             for a in alarmes_data
         ])
     else:
-        card_alarmes_content = html.P("Nenhum alarme ativo.", className="text-muted small")
+        card_alarmes_content = _vazio("✓", "Nenhum alarme ativo.")
 
     # ── Log eventos ───────────────────────────────────────────────────────────
     ICONE = {
@@ -414,29 +474,31 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
         "alarme":           "🚨",
         "cnc_concluido":    "🏁",
     }
+    # Ícone, hora e mensagem em colunas próprias: a hora vira uma coluna fixa e
+    # as mensagens alinham à esquerda, em vez de começarem em posições
+    # diferentes conforme o tamanho do carimbo de tempo.
     log_items = [
         html.Div(
-            html.Small(
-                f"{ICONE.get(e.get('tipo', ''), '•')} "
-                f"[{str(e.get('ts', ''))[:19].replace('T', ' ')}] "
-                f"{e.get('msg', '')}",
-                className="d-block text-muted",
-            ),
-            className="mb-1",
+            [
+                html.Span(ICONE.get(e.get("tipo", ""), "•"), className="ico"),
+                html.Span(_hora(e.get("ts")), className="ts"),
+                html.Span(e.get("msg", ""), className="msg"),
+            ],
+            className="ap-log-line",
         )
         for e in (eventos or [])
     ]
     card_log_content = (
         html.Div(log_items)
         if log_items
-        else html.P("Sem eventos.", className="text-muted small")
+        else _vazio("📡", "Nenhum evento registrado ainda.")
     )
 
     # ── Histórico OS ──────────────────────────────────────────────────────────
     if os_hist and isinstance(os_hist, list):
         hist_rows = []
         for h in os_hist:
-            criado = str(h.get("criado_em", ""))[:16].replace("T", " ")
+            criado = _hora(h.get("criado_em"), com_data=True)
             hist_rows.append(
                 dbc.Row([
                     dbc.Col(
@@ -454,11 +516,11 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
                         _badge(h.get("status", "?"), _cor(h.get("status", ""))),
                         md=3,
                     ),
-                ], className="mb-1 border-bottom pb-1")
+                ], className="ap-row mb-1")
             )
         card_historico_content = html.Div(hist_rows)
     else:
-        card_historico_content = html.P("Sem histórico de OS.", className="text-muted small")
+        card_historico_content = _vazio("📂", "Nenhuma OS concluída ainda.")
 
     # ── Banner de Trava (Triple Check) ───────────────────────────────────────
     trava = estado.get("trava", {})
@@ -561,7 +623,37 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
         ),
     ])
 
+    # ── Faixa de indicadores ──────────────────────────────────────────────────
+    # Os seis números que respondem "o sistema está indo bem?" sem precisar ler
+    # cartão nenhum. Todos saem do mesmo `estado` que os cartões já usam — a
+    # faixa não custa requisição extra.
+    fila_cap   = estado.get("fila_capacidade", 5)
+    slots_uso  = sum(
+        1 for d in disp_map.values()
+        if d.get("status") not in (None, "idle") or d.get("quantidade", 0) > 0
+    )
+    # `OS-20260818-000412` não cabe na coluna do KPI, e cortar pelo meio some
+    # justamente com o número que distingue uma OS da outra. Mostra-se o
+    # sufixo (`#000412`) e o id inteiro vai no `title`; o cartão da OS ativa,
+    # logo abaixo, continua exibindo a forma completa.
+    os_id_full  = (os_ativa or {}).get("os_id", "") or ""
+    os_id_curto = ("#" + os_id_full.rsplit("-", 1)[-1]) if os_id_full else "—"
+
+    kpis = [
+        _kpi("OS em execução", os_id_curto, dica=os_id_full,
+             tom="is-gold" if os_ativa else ""),
+        _kpi("Progresso CNC", f"{pct_cnc:.0f}", "%", tom="is-blue" if total_ciclos else ""),
+        _kpi("Fila", f"{fila_tamanho}/{fila_cap}",
+             tom="is-err" if fila_tamanho >= fila_cap else ("is-warn" if fila_tamanho else "")),
+        _kpi("Slots em uso", f"{slots_uso}/6", tom="is-blue" if slots_uso else ""),
+        _kpi("Mesa CNC", cnc_status.replace("_", " "),
+             tom="is-text is-err" if cnc_status == "erro"
+                 else "is-text is-ok" if cnc_status != "idle" else "is-text"),
+        _kpi("Alarmes", n_alarmes, tom="is-err" if n_alarmes else "is-ok"),
+    ]
+
     return (
+        kpis,
         badge_alarmes,
         badge_os,
         card_os,

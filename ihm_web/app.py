@@ -66,6 +66,27 @@ def _cor_status_os(status: str) -> str:
     }.get(status, "secondary")
 
 
+def _vazio(icone: str, texto: str) -> html.Div:
+    """Estado vazio: ocupa o painel em vez de deixar uma linha de texto solta."""
+    return html.Div(
+        [html.Span(icone, className="ico"), html.Span(texto)],
+        className="ap-empty",
+    )
+
+
+def _hora(ts, com_data: bool = True) -> str:
+    """`2026-08-18T14:03:07` → `08-18 14:03` (ou só `14:03:07`)."""
+    s = str(ts or "").replace("T", " ")
+    if len(s) < 19:
+        return s[:16]
+    return f"{s[5:10]} {s[11:16]}" if com_data else s[11:19]
+
+
+def _titulo(icone: str, texto: str) -> html.H5:
+    """Cabeçalho de aba — o filete dourado sob ele vem do `h5::after` do tema."""
+    return html.H5(f"{icone} {texto}", className="mb-3")
+
+
 def _cor_disp(qty: int, cap: int = 100) -> str:
     pct = qty / cap * 100 if cap else 0
     if pct >= 60: return "success"
@@ -75,17 +96,20 @@ def _cor_disp(qty: int, cap: int = 100) -> str:
 
 # ── Sidebar links ──────────────────────────────────────────────────────────────
 
+# (ícone, rótulo, id da aba). O ícone é separado do rótulo para ganhar coluna
+# própria no CSS: com tudo numa string só, ícones de larguras diferentes
+# desalinham o texto de cada item da sidebar.
 _SIDEBAR_LINKS = [
-    ("🌡 Temperaturas",    "temp"),
-    ("⚙ Desgaste / Uso",  "uso"),
-    ("📋 Log Manutenção",  "log"),
-    ("🚨 Alarmes",         "alarmes"),
-    ("➕ Nova Manutenção", "nova"),
-    ("📦 Dispensers",      "dispensers"),
-    ("📷 Visão / Balança", "visao"),
-    ("⛔ Triple Check",    "trava"),
-    ("🗂 Ordens (OS)",     "ordens"),
-    ("👥 Usuários",        "usuarios"),
+    ("🌡", "Temperaturas",     "temp"),
+    ("⚙",  "Desgaste / Uso",   "uso"),
+    ("📋", "Log Manutenção",   "log"),
+    ("🚨", "Alarmes",          "alarmes"),
+    ("➕", "Nova Manutenção",  "nova"),
+    ("📦", "Dispensers",       "dispensers"),
+    ("📷", "Visão / Balança",  "visao"),
+    ("⛔", "Triple Check",     "trava"),
+    ("🗂", "Ordens (OS)",      "ordens"),
+    ("👥", "Usuários",         "usuarios"),
 ]
 
 # ── Layout ─────────────────────────────────────────────────────────────────────
@@ -121,33 +145,34 @@ app.layout = dbc.Container(
         # ── Tela de Login ─────────────────────────────────────────────────────
         html.Div(
             id="tela-login",
+            className="ap-login-wrap",
             children=[
-                dbc.Row(
-                    dbc.Col(
-                        dbc.Card([
-                            dbc.CardHeader(
-                                html.H4("APSEN — Manutenção", className="text-center mb-0")
-                            ),
-                            dbc.CardBody([
-                                dbc.Input(
-                                    id="inp-user", placeholder="Usuário",
-                                    type="text", className="mb-2",
-                                ),
-                                dbc.Input(
-                                    id="inp-senha", placeholder="Senha",
-                                    type="password", className="mb-3",
-                                    debounce=True,
-                                ),
-                                dbc.Button(
-                                    "Entrar", id="btn-login",
-                                    color="primary", className="w-100",
-                                ),
-                                html.Div(id="msg-login", className="mt-2 text-danger small"),
-                            ]),
-                        ]),
-                        md=4, lg=3, className="mx-auto mt-5",
-                    )
-                )
+                dbc.Card([
+                    dbc.CardHeader([
+                        html.Div("AP", className="ap-login-logo"),
+                        html.H4("APSEN", className="ap-login-title"),
+                        html.Span("Painel de Manutenção", className="ap-login-sub"),
+                    ]),
+                    dbc.CardBody([
+                        dbc.Label("Usuário", html_for="inp-user"),
+                        dbc.Input(
+                            id="inp-user", placeholder="seu.usuario",
+                            type="text", className="mb-3",
+                            autoFocus=True,
+                        ),
+                        dbc.Label("Senha", html_for="inp-senha"),
+                        dbc.Input(
+                            id="inp-senha", placeholder="••••••••",
+                            type="password", className="mb-3",
+                            debounce=True,
+                        ),
+                        dbc.Button(
+                            "Entrar", id="btn-login",
+                            color="primary", className="w-100",
+                        ),
+                        html.Div(id="msg-login", className="mt-3 text-danger small text-center"),
+                    ]),
+                ], className="ap-login"),
             ],
         ),
 
@@ -158,11 +183,15 @@ app.layout = dbc.Container(
             children=[
                 dbc.Navbar(
                     dbc.Container([
-                        dbc.NavbarBrand("APSEN Manutenção", className="fw-bold"),
-                        html.Span(id="span-username", className="text-muted me-auto ms-3 small"),
-                        dbc.Button("Sair", id="btn-logout", color="outline-secondary", size="sm"),
+                        dbc.NavbarBrand(
+                            [html.Span("AP", className="ap-brand-mark"), "APSEN Manutenção"],
+                            className="fw-bold",
+                        ),
+                        html.Span(id="span-username", className="me-auto ms-3"),
+                        dbc.Button("Sair", id="btn-logout",
+                                   color="outline-secondary", size="sm"),
                     ], fluid=True),
-                    dark=True, color="dark", className="mb-3",
+                    dark=True, color="dark", className="mb-0",
                 ),
                 dbc.Row([
                     # Sidebar
@@ -170,18 +199,18 @@ app.layout = dbc.Container(
                         dbc.Nav(
                             [
                                 dbc.NavLink(
-                                    label, id=f"nav-{tab_id}", href="#",
-                                    className="text-light border-bottom py-2",
+                                    [html.Span(icone, className="ico"), label],
+                                    id=f"nav-{tab_id}", href="#", active=(tab_id == "temp"),
                                 )
-                                for label, tab_id in _SIDEBAR_LINKS
+                                for icone, label, tab_id in _SIDEBAR_LINKS
                             ],
                             vertical=True, pills=True,
                         ),
-                        md=2, className="border-end pt-2",
+                        md=2, className="ap-sidebar pt-2",
                     ),
                     # Conteúdo
-                    dbc.Col(html.Div(id="conteudo-principal"), md=10),
-                ]),
+                    dbc.Col(html.Div(id="conteudo-principal", className="ap-content"), md=10),
+                ], className="g-0"),
             ],
         ),
     ],
@@ -189,6 +218,14 @@ app.layout = dbc.Container(
 
 
 # ── Login / Logout ─────────────────────────────────────────────────────────────
+
+# As duas telas alternam por `style`, e o estilo inline vence o da folha — então
+# cada uma precisa do SEU display, não de um "visível" genérico: a de login é
+# `grid` (é o que centraliza o card em `.ap-login-wrap`) e a principal é `block`.
+_OCULTO            = {"display": "none"}
+_LOGIN_VISIVEL     = {"display": "grid"}
+_PRINCIPAL_VISIVEL = {"display": "block"}
+
 
 @callback(
     Output("jwt-token",      "data"),
@@ -205,18 +242,27 @@ app.layout = dbc.Container(
     prevent_initial_call=True,
 )
 def _login(_, __, username, senha):
-    oculto  = {"display": "none"}
-    visivel = {"display": "block"}
     if not username or not senha:
-        return None, None, None, "Preencha usuário e senha.", visivel, oculto, ""
+        return (None, None, None, "Preencha usuário e senha.",
+                _LOGIN_VISIVEL, _OCULTO, "")
 
     code, data = _api("post", "/auth/login", json_body={"username": username, "senha": senha})
     if code == 200:
         token = data.get("token", "")
         nome  = data.get("nome", username)
         role  = data.get("role", "manutencao")
-        return token, nome, role, "", oculto, visivel, f"{nome} [{role}]"
-    return None, None, None, "Credenciais inválidas.", visivel, oculto, ""
+        chip = html.Span(
+            [nome, html.Span(role, className="role")],
+            className="ap-user-chip",
+        )
+        return token, nome, role, "", _OCULTO, _PRINCIPAL_VISIVEL, chip
+
+    # 0 é o código que `_api` devolve quando a requisição nem saiu (central fora
+    # do ar): dizer "credenciais inválidas" nesse caso manda o técnico conferir a
+    # senha por um problema que não é dele.
+    msg = ("Central indisponível — tente novamente em instantes."
+           if code == 0 else "Credenciais inválidas.")
+    return None, None, None, msg, _LOGIN_VISIVEL, _OCULTO, ""
 
 
 @callback(
@@ -227,19 +273,34 @@ def _login(_, __, username, senha):
     prevent_initial_call=True,
 )
 def _logout(_):
-    return None, {"display": "block"}, {"display": "none"}
+    return None, _LOGIN_VISIVEL, _OCULTO
 
 
 # ── Navegação ──────────────────────────────────────────────────────────────────
 
 @callback(
     Output("active-tab", "data"),
-    [Input(f"nav-{t}", "n_clicks") for _, t in _SIDEBAR_LINKS],
+    [Input(f"nav-{t}", "n_clicks") for _, _l, t in _SIDEBAR_LINKS],
     prevent_initial_call=True,
 )
 def _nav(*_):
     triggered = ctx.triggered_id or "nav-temp"
     return triggered.replace("nav-", "")
+
+
+@callback(
+    [Output(f"nav-{t}", "active") for _, _l, t in _SIDEBAR_LINKS],
+    Input("active-tab", "data"),
+)
+def _marcar_aba_ativa(tab):
+    """Sem isto a sidebar não mostra onde o usuário está.
+
+    `dbc.Nav(pills=True)` só estiliza o link que tem `active=True`; a propriedade
+    nunca era escrita, então os dez itens ficavam com a mesma aparência em todas
+    as telas — trocar de aba mudava o conteúdo e nada mais, e voltar exigia
+    lembrar em qual item se clicou.
+    """
+    return [t == (tab or "temp") for _, _l, t in _SIDEBAR_LINKS]
 
 
 # ── Conteúdo principal ────────────────────────────────────────────────────────
@@ -248,13 +309,16 @@ def _nav(*_):
     Output("conteudo-principal", "children"),
     Input("active-tab",  "data"),
     Input("poll",        "n_intervals"),
-    State("jwt-token",   "data"),
+    # O token é Input, não State: era State, e como o login não muda `active-tab`
+    # nem dispara o `poll`, o painel ficava em branco de 0 a POLL_MS (5s) depois
+    # de entrar — tempo suficiente para o técnico achar que o login falhou.
+    Input("jwt-token",   "data"),
     State("user-role",   "data"),
     prevent_initial_call=True,
 )
 def _render_conteudo(tab, _, token, role):
     if not token:
-        return html.P("Faça login para continuar.", className="text-muted")
+        return _vazio("🔒", "Faça login para continuar.")
 
     renderers = {
         "temp":       lambda: _render_temp(token),
@@ -292,15 +356,15 @@ def _render_temp(token):
         cards.append(dbc.Col(dbc.Card([
             dbc.CardHeader(html.Small(leit.get("componente","?"), className="fw-bold")),
             dbc.CardBody([
-                html.H3(f"{val}°C", className=f"text-{cor} text-center"),
+                html.Div(f"{val}°C", className=f"ap-metric-value text-{cor}"),
                 dbc.Progress(value=min(val/85*100,100), color=cor, style={"height":"8px"}),
-                html.Small(str(leit.get("ts",""))[:16], className="text-muted d-block text-end mt-1"),
+                html.Small(_hora(leit.get("ts")), className="text-muted d-block text-end mt-1"),
             ]),
-        ]), md=3, sm=6, xs=12, className="mb-3"))
+        ], className="ap-metric h-100"), md=3, sm=6, xs=12, className="mb-3"))
 
     return html.Div([
-        html.H5("🌡 Temperaturas dos Componentes", className="mb-3"),
-        dbc.Row(cards) if cards else html.P("Sem leituras.", className="text-muted small"),
+        _titulo("🌡", "Temperaturas dos Componentes"),
+        dbc.Row(cards) if cards else _vazio("🌡", "Nenhuma leitura de temperatura."),
     ])
 
 
@@ -325,11 +389,11 @@ def _render_uso(token):
                 dbc.Progress(value=min(val,100) if "%" in unid else 0, color=cor,
                              style={"height":"5px","marginTop":"4px"}) if "%" in unid else html.Div(),
             ], md=5),
-        ], className="mb-2 border-bottom pb-1"))
+        ], className="ap-row mb-1"))
 
     return html.Div([
-        html.H5("⚙ Desgaste e Horas de Uso", className="mb-3"),
-        html.Div(rows) if rows else html.P("Sem leituras.", className="text-muted small"),
+        _titulo("⚙", "Desgaste e Horas de Uso"),
+        html.Div(rows) if rows else _vazio("⚙", "Nenhuma leitura de desgaste."),
     ])
 
 
@@ -346,20 +410,20 @@ def _render_log(token):
         dbc.Col(html.Small("Tipo", className="text-muted fw-bold"), md=2),
         dbc.Col(html.Small("Descrição", className="text-muted fw-bold"), md=4),
         dbc.Col(html.Small("Técnico", className="text-muted fw-bold"), md=1),
-    ], className="mb-2")
+    ], className="ap-thead")
 
     rows = [dbc.Row([
-        dbc.Col(html.Small(str(l.get("ts",""))[:16], className="text-muted"), md=2),
+        dbc.Col(html.Small(_hora(l.get("ts")), className="ap-mono text-muted"), md=2),
         dbc.Col(html.Small(l.get("componente","?"), className="fw-bold"), md=3),
         dbc.Col(html.Small(l.get("tipo","?"), className="text-info"), md=2),
         dbc.Col(html.Small(l.get("descricao",""), className="text-light"), md=4),
         dbc.Col(html.Small(l.get("tecnico","?"), className="text-muted"), md=1),
-    ], className="mb-1 border-bottom pb-1") for l in logs]
+    ], className="ap-row") for l in logs]
 
     return html.Div([
-        html.H5("📋 Log de Manutenções", className="mb-3"),
+        _titulo("📋", "Log de Manutenções"),
         header,
-        html.Div(rows) if rows else html.P("Nenhuma manutenção registrada.", className="text-muted small"),
+        html.Div(rows) if rows else _vazio("📋", "Nenhuma manutenção registrada."),
     ])
 
 
@@ -371,7 +435,7 @@ def _render_alarmes(token):
         return html.P("Erro ao carregar alarmes.", className="text-danger small")
 
     if not alarmes:
-        return html.Div([html.H5("🚨 Alarmes", className="mb-3"),
+        return html.Div([_titulo("🚨", "Alarmes"),
                          dbc.Alert("Nenhum alarme ativo.", color="success")])
 
     items = [dbc.ListGroupItem([
@@ -380,7 +444,7 @@ def _render_alarmes(token):
                 html.Strong(f"[{a.get('tipo','').upper()}] "),
                 html.Span(a.get("descricao","")),
                 html.Br(),
-                html.Small(f"Fonte: {a.get('fonte','?')} | {str(a.get('ts',''))[:16]}",
+                html.Small(f"Fonte: {a.get('fonte','?')} | {_hora(a.get('ts'))}",
                            className="text-muted"),
             ], md=9),
             dbc.Col(dbc.Button("Resolver",
@@ -390,14 +454,14 @@ def _render_alarmes(token):
         ])
     ], color="danger", className="mb-1") for a in alarmes]
 
-    return html.Div([html.H5("🚨 Alarmes Ativos", className="mb-3"), dbc.ListGroup(items)])
+    return html.Div([_titulo("🚨", "Alarmes Ativos"), dbc.ListGroup(items)])
 
 
 # ── Nova Manutenção ────────────────────────────────────────────────────────────
 
 def _render_nova_manut():
     return html.Div([
-        html.H5("➕ Registrar Manutenção", className="mb-3"),
+        _titulo("➕", "Registrar Manutenção"),
         dbc.Form([
             dbc.Row([
                 dbc.Col([

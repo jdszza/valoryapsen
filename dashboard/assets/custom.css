@@ -1,4 +1,0 @@
-.dash-content { padding: 16px 12px; }
-@media (min-width: 768px) { .dash-content { padding: 28px 32px; } }
-@media (max-width: 480px)  { .dash-header-sub { display: none !important; } }
-@media (max-width: 575px)  { .dash-graph { height: 220px !important; } }

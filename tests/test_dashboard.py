@@ -74,3 +74,39 @@ def test_render_usa_os_alarmes_recebidos_pelo_store(dashboard):
 def test_backend_url_padrao_aponta_para_servico_existente(dashboard):
     """`http://backend:8000` era resíduo da migração: esse serviço não existe."""
     assert dashboard.modulo.BACKEND_URL == "http://central-computer:8000"
+
+
+def _n_outputs(modulo) -> int:
+    """Quantos Outputs o callback de `_render` declara.
+
+    O registro fica em `dash._callback.GLOBAL_CALLBACK_MAP` (e não no
+    `app.callback_map`) porque o dashboard usa o decorador de módulo
+    `@callback`, não `@app.callback`.
+    """
+    from dash._callback import GLOBAL_CALLBACK_MAP
+
+    for spec in GLOBAL_CALLBACK_MAP.values():
+        if getattr(spec["callback"], "__wrapped__", None) is modulo._render:
+            return len(spec["outputs_indices"])
+    raise AssertionError("callback de _render não encontrado no registro do Dash")
+
+
+@pytest.mark.parametrize(
+    "caminho, estado",
+    [("com dados", _estado_minimo()), ("sem dados", {})],
+)
+def test_render_devolve_um_item_por_output(dashboard, caminho, estado):
+    """Aridade: os dois caminhos de `_render` têm que casar com os Outputs.
+
+    Não é hipótese: mexendo no cabeçalho eu tirei um `Output` e esqueci o item
+    correspondente no `return` do caminho com dados. O Dash rejeita a resposta
+    inteira, a tela fica vazia — e o teste não pegou, porque chamar `_render`
+    como função Python comum não passa pela checagem de aridade do Dash.
+    """
+    esperado = _n_outputs(dashboard.modulo)
+    saida = dashboard.modulo._render(estado, [], [], [])
+
+    assert isinstance(saida, tuple), f"{caminho}: _render deve devolver tupla"
+    assert len(saida) == esperado, (
+        f"{caminho}: _render devolveu {len(saida)} itens para {esperado} Outputs"
+    )
