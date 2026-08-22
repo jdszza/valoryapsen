@@ -1,5 +1,5 @@
 """
-Testes do dispenser-simulator (6 dispensers físicos).
+Testes do dispenser-simulator (os dispensers físicos da célula).
 
 Regressão principal: o botão "Limpar Dispenser" da IHM parava de funcionar depois
 da primeira OS. _do_dispensar() encerrava o slot com status="concluido" e deixava
@@ -11,6 +11,8 @@ bloqueado.
 import threading
 
 import pytest
+
+from conftest import NUM_SLOTS
 
 # Import determinístico: sem tempo de carga/dispensa e sem falha mecânica.
 ENV_DETERMINISTICO = {
@@ -190,7 +192,8 @@ def test_get_status_responde_sem_travar(disp):
     terminou, resposta = _chamar_com_prazo(disp.modulo.status)
 
     assert terminou, "GET /status travou (deadlock: _lock adquirido duas vezes)"
-    assert [s["dispenser_id"] for s in resposta["slots"]] == [1, 2, 3, 4, 5, 6]
+    assert ([s["dispenser_id"] for s in resposta["slots"]]
+            == list(range(1, NUM_SLOTS + 1)))
 
     slot = resposta["slots"][SLOT - 1]
     assert slot["medicamento"] == MED

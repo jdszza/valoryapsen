@@ -107,6 +107,31 @@ def _max_fila_os() -> int:
     return valor
 
 
+def _num_slots() -> int:
+    """Quantos dispensers a célula tem. Faixa válida: 2..64, e PAR.
+
+    O arranjo físico é de DUAS FILEIRAS frente a frente, com a mesa CNC
+    percorrendo o corredor entre elas (ver `orchestrator.POSICOES`). Um número
+    ímpar deixaria uma fileira mais longa que a outra — geometria que o resto
+    do código não modela — então ímpar cai no default em vez de virar uma
+    fileira torta silenciosa.
+
+    O valor precisa ser o MESMO em todos os serviços: o central deriva dele o
+    mapa de posições e a validação de slot, e cada simulador valida a faixa que
+    aceita. É por isso que ele mora numa env var comum (`NUM_SLOTS`), declarada
+    uma vez no compose, e não numa constante por arquivo.
+    """
+    bruto = os.getenv("NUM_SLOTS", "8")
+    try:
+        valor = int(bruto)
+    except ValueError:
+        valor = 0
+    if not 2 <= valor <= 64 or valor % 2 != 0:
+        _cfg_logger.warning("NUM_SLOTS=%r inválido (par, 2..64) — usando 8.", bruto)
+        return 8
+    return valor
+
+
 @dataclass
 class Settings:
     # ── MySQL ─────────────────────────────────────────────────────────────────
@@ -159,9 +184,15 @@ class Settings:
     # ── Backpressure da fila de OS ────────────────────────────────────────────
     MAX_FILA_OS: int = _max_fila_os()
 
+    # ── Geometria da célula ───────────────────────────────────────────────────
+    # Nº de dispensers, em duas fileiras frente a frente. Fonte única para o
+    # mapa de posições (orchestrator), a validação de slot (main) e o seed de
+    # `dispenser_estado` (database).
+    NUM_SLOTS: int = _num_slots()
+
     # ── Volume de escrita e de broadcast ──────────────────────────────────────
     # Intervalo mínimo entre broadcasts de eventos de ALTA FREQUÊNCIA (posição
-    # da CNC a cada 0.5s, telemetria dos 6 slots a cada 15s). Transição de
+    # da CNC a cada 0.5s, telemetria de todos os slots a cada 15s). Transição de
     # verdade — trava, fim de OS, alarme — ignora o throttle e sai na hora.
     BROADCAST_MIN_INTERVALO_MS: int = int(os.getenv("BROADCAST_MIN_INTERVALO_MS", "500"))
     # 1 em N eventos "movendo" vira linha em `cnc_eventos`. 0 = nenhum (default):

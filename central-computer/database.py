@@ -301,7 +301,10 @@ _COLUNAS_EVOLUTIVAS: dict[str, dict[str, str]] = {
     },
 }
 
-_SLOTS_DISPENSER = 6
+# Nº de slots físicos — o mesmo `NUM_SLOTS` que o orquestrador usa para o mapa
+# de posições e os simuladores para validar a faixa. Uma constante local aqui
+# faria o seed e a célula divergirem no dia em que a célula crescesse.
+_SLOTS_DISPENSER = settings.NUM_SLOTS
 _CAPACIDADE_SLOT = 100
 
 
@@ -342,17 +345,30 @@ def _aplicar_colunas_faltantes(cur) -> None:
 
 
 def _seed_dispenser_estado(cur) -> None:
-    """Garante as 6 linhas de slot, todas VAZIAS.
+    """Garante uma linha VAZIA para cada slot de 1 a `_SLOTS_DISPENSER`.
 
     Nenhum slot é fixo para um medicamento: o orquestrador atribui conforme as
     OS chegam. Só as linhas precisam existir de antemão, porque
-    `salvar_dispenser_estado` faz UPDATE, não upsert.
+    `salvar_dispenser_estado` faz UPDATE, não upsert — slot sem linha é slot
+    cujo estoque o banco nunca registra.
+
+    Insere o que FALTA, um id de cada vez, em vez de decidir por `COUNT(*)`.
+    A contagem servia enquanto o número de slots era fixo; quando a célula
+    cresceu de 6 para 8, um banco existente com 6 linhas já satisfazia
+    "count >= 6" pelo critério antigo e D7/D8 nunca ganhariam linha — o mesmo
+    tipo de drift que o `_aplicar_colunas_faltantes` resolve para colunas.
+    Comparar por id também torna o seed idempotente e tolerante a buraco no
+    meio (uma linha apagada à mão volta na subida seguinte).
     """
-    cur.execute("SELECT COUNT(*) AS n FROM dispenser_estado")
-    if cur.fetchone()["n"] >= _SLOTS_DISPENSER:
+    cur.execute("SELECT dispenser_id FROM dispenser_estado")
+    existentes = {linha["dispenser_id"] for linha in cur.fetchall()}
+    faltantes = [s for s in range(1, _SLOTS_DISPENSER + 1) if s not in existentes]
+    if not faltantes:
         return
+
+    logger.info("[DB] Criando linha de dispenser_estado para os slots %s.", faltantes)
     ts = _ts()
-    for slot in range(1, _SLOTS_DISPENSER + 1):
+    for slot in faltantes:
         cur.execute(
             "INSERT IGNORE INTO dispenser_estado "
             "(dispenser_id, medicamento, categoria, quantidade_atual, capacidade, atualizado_em) "
@@ -762,7 +778,7 @@ def expurgar_dados_antigos(dias: int) -> dict:
     """Apaga histórico de alta cardinalidade mais velho que `dias`.
 
     `cnc_eventos` e `leituras_sensores` são as duas tabelas que crescem por
-    tempo, não por operação: telemetria de 6 slots a cada 15s, da CNC a cada
+    tempo, não por operação: telemetria de todos os slots a cada 15s, da CNC a cada
     30s, de câmeras e balança a cada 60s. Sem expurgo, o volume só sobe — e o
     banco é um MySQL de container, sem DBA por perto.
 

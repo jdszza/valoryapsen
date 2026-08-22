@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import NUM_SLOTS
+
 RAIZ_REPO   = Path(__file__).resolve().parent.parent
 CENTRAL_DIR = RAIZ_REPO / "central-computer"
 DATABASE_PY = CENTRAL_DIR / "database.py"
@@ -231,20 +233,25 @@ def database():
 
 
 class CursorFake:
-    """Cursor mínimo: grava os SQLs e responde ao que `_create_tables` pergunta."""
+    """Cursor mínimo: grava os SQLs e responde ao que `_create_tables` pergunta.
 
-    def __init__(self, colunas: list[dict], slots: int = 6):
+    `slots` é a lista de ids que a tabela `dispenser_estado` JÁ tem — não uma
+    contagem. O seed passou a comparar por id justamente porque a contagem não
+    distingue "6 linhas numa célula de 6" de "6 linhas numa célula de 8".
+    """
+
+    def __init__(self, colunas: list[dict], slots: list[int] | None = None):
         self.executados: list[str] = []
         self._colunas = colunas
-        self._slots = slots
+        self._slots = list(slots or [])
         self._resultado: list[dict] = []
 
     def execute(self, sql, args=None):
         self.executados.append(" ".join(sql.split()))
         if "information_schema" in sql:
             self._resultado = list(self._colunas)
-        elif "COUNT(*)" in sql:
-            self._resultado = [{"n": self._slots}]
+        elif "FROM dispenser_estado" in sql:
+            self._resultado = [{"dispenser_id": s} for s in self._slots]
         else:
             self._resultado = []
 
@@ -292,18 +299,40 @@ def test_dispenser_id_not_null_e_relaxado(database):
     ]
 
 
-def test_seed_cria_os_seis_slots(database):
-    cur = CursorFake([], slots=0)
+def test_seed_cria_uma_linha_por_slot_da_celula(database):
+    """Banco vazio: uma linha para cada slot, nem mais nem menos."""
+    cur = CursorFake([], slots=[])
     database._seed_dispenser_estado(cur)
     inserts = cur.sqls("INSERT")
-    assert len(inserts) == 6
+    assert len(inserts) == NUM_SLOTS == database._SLOTS_DISPENSER
     assert all("dispenser_estado" in s for s in inserts)
 
 
 def test_seed_e_idempotente(database):
-    cur = CursorFake([], slots=6)
+    cur = CursorFake([], slots=list(range(1, NUM_SLOTS + 1)))
     database._seed_dispenser_estado(cur)
     assert cur.sqls("INSERT") == []
+
+
+def test_seed_completa_banco_de_celula_menor(database):
+    """A célula cresceu de 6 para 8: o banco de 6 linhas ganha D7 e D8.
+
+    `CREATE TABLE IF NOT EXISTS` não repara tabela existente, e o critério
+    antigo (`COUNT(*) >= _SLOTS_DISPENSER`) também não repararia esta: 6 linhas
+    já bastavam para ele desistir. Só o INSERT do que falta acerta o banco
+    antigo — o mesmo raciocínio de `_aplicar_colunas_faltantes`.
+    """
+    cur = CursorFake([], slots=[1, 2, 3, 4, 5, 6])
+    database._seed_dispenser_estado(cur)
+    assert len(cur.sqls("INSERT")) == max(0, NUM_SLOTS - 6)
+
+
+def test_seed_repoe_linha_apagada_no_meio(database):
+    """Buraco no meio volta na subida seguinte — slot sem linha não é gravado."""
+    ids = [s for s in range(1, NUM_SLOTS + 1) if s != 2]
+    cur = CursorFake([], slots=ids)
+    database._seed_dispenser_estado(cur)
+    assert len(cur.sqls("INSERT")) == 1
 
 
 # ── init_db distingue indisponibilidade de erro de schema ──────────────────────

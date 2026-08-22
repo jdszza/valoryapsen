@@ -6,7 +6,7 @@ O contrato em teste é a divisão de fontes de verdade:
   - o simulador manda no HARDWARE/ESTOQUE (medicamento, sku, categoria,
     quantidade) e o central aceita esses campos de qualquer evento;
   - o orquestrador manda no FLUXO (status da etapa, os_id em execução) e a
-    telemetria periódica — o evento "status", emitido a cada 15s para os 6
+    telemetria periódica — o evento "status", emitido a cada 15s para todos os
     slots — não pode encostar nele.
 
 Quando a telemetria invadia o fluxo, o reset de fim de OS era desfeito no
@@ -17,6 +17,8 @@ import asyncio
 
 import pytest
 from fastapi import HTTPException
+
+from conftest import NUM_SLOTS
 
 
 def _evento(central, payload: dict) -> None:
@@ -424,7 +426,7 @@ def test_telemetria_de_dispenser_tambem_e_segurada(carregar_central, monkeypatch
     central = carregar_central()
     enviados = _contar_broadcasts(central, monkeypatch)
 
-    for slot in range(1, 7):
+    for slot in range(1, NUM_SLOTS + 1):
         _evento(central, {"tipo": "status", "dispenser_id": slot, "quantidade": 5})
         _evento(central, {"tipo": "telemetria", "dispenser_id": slot, "valor_c": 30.0})
 
@@ -468,3 +470,190 @@ def test_estado_segurado_pelo_throttle_e_enviado_pelo_flusher(carregar_central,
 
     assert len(enviados) == 2
     assert enviados[-1]["cnc"]["posicao_x"] == 240.0      # a posição mais recente
+
+
+# ── Visão: as três câmeras ────────────────────────────────────────────────────
+#
+# A célula tem uma câmera por fileira de dispensers e uma sobre a mesa
+# (a da balança). O TIPO do evento é o mesmo nas duas câmeras de dispenser —
+# quem separa esquerda de direita é o campo `camera`.
+#
+# Duas coisas precisam ser verdade ao mesmo tempo, e é fácil quebrar uma
+# consertando a outra: cada leitura tem que pousar na chave da SUA câmera (sem
+# apagar a última leitura das outras duas, que é o que faria "a câmera da
+# direita parou" sumir do painel), e o orquestrador tem que continuar sendo
+# avisado pela chave do SLOT — ele espera por um slot, não por uma lente.
+
+SLOT_ESQ = 1
+SLOT_DIR = NUM_SLOTS
+CHAVES_VISAO = ("camera_dispenser_esq", "camera_dispenser_dir", "camera_mesa")
+
+
+def _evento_visao(central, payload: dict) -> None:
+    asyncio.run(central.modulo._handle_evento_visao(payload))
+
+
+def _notificacoes(central, monkeypatch) -> list:
+    """Grava as chaves com que o orquestrador foi acordado."""
+    registradas = []
+    monkeypatch.setattr(central.modulo.orch, "notificar_evento",
+                        lambda chave, dados: registradas.append((chave, dados)))
+    return registradas
+
+
+def _leitura_dispenser(slot_id: int, camera: str, tipo: str, **extra) -> dict:
+    payload = {
+        "tipo":         tipo,
+        "camera":       camera,
+        "slot_id":      slot_id,
+        "os_id":        "OS-CAM",
+        "sku_esperado": "SKU-1",
+        "confianca":    0.97,
+        "ts":           "2026-01-01T00:00:00Z",
+    }
+    payload.update(extra)
+    return payload
+
+
+@pytest.mark.parametrize("camera,slot_id,chave", [
+    ("dispenser_esq", SLOT_ESQ, "camera_dispenser_esq"),
+    ("dispenser_dir", SLOT_DIR, "camera_dispenser_dir"),
+])
+def test_leitura_de_dispenser_pousa_na_camera_que_leu(carregar_central, camera,
+                                                      slot_id, chave):
+    central = carregar_central()
+
+    _evento_visao(central, _leitura_dispenser(
+        slot_id, camera, "leitura_dispenser_ok", sku_lido="SKU-1", match_sku=True))
+
+    visao = central.modulo._estado["visao"]
+    assert visao[chave]["ultima_leitura"] == "leitura_dispenser_ok"
+    assert visao[chave]["slot_id"] == slot_id
+    assert visao[chave]["match_sku"] is True
+    # As outras duas seguem intocadas.
+    for outra in set(CHAVES_VISAO) - {chave}:
+        assert visao[outra]["ultima_leitura"] is None, (
+            f"{camera} contaminou {outra}"
+        )
+
+
+def test_leitura_de_mesa_pousa_na_camera_da_balanca(carregar_central):
+    central = carregar_central()
+
+    _evento_visao(central, {
+        "tipo":                 "leitura_mesa_ok",
+        "camera":               "mesa",
+        "slot_id":              3,
+        "os_id":                "OS-CAM",
+        "quantidade_esperada":  10,
+        "quantidade_detectada": 10,
+        "confianca":            0.95,
+        "ts":                   "2026-01-01T00:00:00Z",
+    })
+
+    visao = central.modulo._estado["visao"]
+    assert visao["camera_mesa"]["ultima_leitura"] == "leitura_mesa_ok"
+    assert visao["camera_mesa"]["quantidade_detectada"] == 10
+    assert visao["camera_dispenser_esq"]["ultima_leitura"] is None
+    assert visao["camera_dispenser_dir"]["ultima_leitura"] is None
+
+
+def test_as_duas_cameras_de_dispenser_convivem(carregar_central):
+    """A leitura de um lado não apaga a do outro — as duas ficam no painel."""
+    central = carregar_central()
+
+    _evento_visao(central, _leitura_dispenser(
+        SLOT_ESQ, "dispenser_esq", "leitura_dispenser_ok",
+        sku_lido="SKU-1", match_sku=True))
+    _evento_visao(central, _leitura_dispenser(
+        SLOT_DIR, "dispenser_dir", "leitura_dispenser_falha",
+        motivo="camera_obstruida"))
+
+    visao = central.modulo._estado["visao"]
+    assert visao["camera_dispenser_esq"]["ultima_leitura"] == "leitura_dispenser_ok"
+    assert visao["camera_dispenser_esq"]["slot_id"] == SLOT_ESQ
+    assert visao["camera_dispenser_dir"]["ultima_leitura"] == "leitura_dispenser_falha"
+    assert visao["camera_dispenser_dir"]["slot_id"] == SLOT_DIR
+
+
+@pytest.mark.parametrize("camera,slot_id", [
+    ("dispenser_esq", SLOT_ESQ),
+    ("dispenser_dir", SLOT_DIR),
+])
+def test_divergencia_de_sku_avisa_o_orquestrador_pelos_dois_lados(
+        carregar_central, monkeypatch, camera, slot_id):
+    """A chave de espera é do SLOT: trocar de câmera não pode mudá-la."""
+    central = carregar_central()
+    notificadas = _notificacoes(central, monkeypatch)
+
+    _evento_visao(central, _leitura_dispenser(
+        slot_id, camera, "leitura_dispenser_divergencia",
+        sku_lido="SKU-ERRADO", match_sku=False))
+
+    chaves = [chave for chave, _ in notificadas]
+    assert chaves == [f"OS-CAM:visao_dispenser:{slot_id}"]
+
+
+@pytest.mark.parametrize("camera,slot_id", [
+    ("dispenser_esq", SLOT_ESQ),
+    ("dispenser_dir", SLOT_DIR),
+])
+def test_divergencia_de_sku_abre_alarme_com_a_camera_na_fonte(
+        carregar_central, camera, slot_id):
+    """A fonte identifica a câmera física: é o que aponta a lente a inspecionar."""
+    central = carregar_central()
+
+    _evento_visao(central, _leitura_dispenser(
+        slot_id, camera, "leitura_dispenser_divergencia",
+        sku_lido="SKU-ERRADO", match_sku=False))
+
+    (alarme,) = central.banco.chamadas_de("salvar_alarme")
+    fonte, tipo, _ = alarme["args"]
+    assert fonte == f"camera_{camera}_{slot_id}"
+    assert tipo == "divergencia_sku"
+
+
+@pytest.mark.parametrize("camera,slot_id", [
+    ("dispenser_esq", SLOT_ESQ),
+    ("dispenser_dir", SLOT_DIR),
+])
+def test_historico_grava_qual_camera_leu(carregar_central, camera, slot_id):
+    """`visao_leituras.camera` é o que permite auditar uma câmera sozinha."""
+    central = carregar_central()
+
+    _evento_visao(central, _leitura_dispenser(
+        slot_id, camera, "leitura_dispenser_ok", sku_lido="SKU-1", match_sku=True))
+
+    (leitura,) = central.banco.chamadas_de("salvar_leitura_visao")
+    assert leitura["args"][1] == camera
+
+
+def test_camera_ausente_cai_no_lado_do_slot(carregar_central):
+    """Contrato antigo (camera="dispenser", uma fileira só) não some do painel.
+
+    Sem o fallback, a leitura não acharia chave de estado: sumiria do painel e
+    do histórico sem erro nenhum no log — o pior modo de falhar.
+    """
+    central = carregar_central()
+
+    _evento_visao(central, _leitura_dispenser(
+        SLOT_DIR, "dispenser", "leitura_dispenser_ok",
+        sku_lido="SKU-1", match_sku=True))
+
+    visao = central.modulo._estado["visao"]
+    assert visao["camera_dispenser_dir"]["ultima_leitura"] == "leitura_dispenser_ok"
+    assert visao["camera_dispenser_esq"]["ultima_leitura"] is None
+
+
+def test_falha_de_leitura_nomeia_o_lado_na_descricao(carregar_central):
+    """Quem lê o alarme precisa saber a qual câmera ir — não só a qual slot."""
+    central = carregar_central()
+
+    _evento_visao(central, _leitura_dispenser(
+        SLOT_DIR, "dispenser_dir", "leitura_dispenser_falha",
+        motivo="camera_obstruida"))
+
+    (alarme,) = central.banco.chamadas_de("salvar_alarme")
+    _, tipo, descricao = alarme["args"]
+    assert tipo == "falha_leitura_dispenser"
+    assert "direita" in descricao

@@ -42,7 +42,7 @@ ADAPTER_URL     = os.getenv("ADAPTER_URL",     "http://dispenser-adapter:8100")
 T_CARGA_UNID    = float(os.getenv("T_CARGA_UNID",   "0.3"))
 T_DISPENSA_UNID = float(os.getenv("T_DISPENSA_UNID", "0.5"))
 PROB_ERRO_MECANICO = float(os.getenv("PROB_ERRO_MECANICO", "0.01"))  # falha mecânica (atolamento, etc)
-NUM_SLOTS       = 6
+NUM_SLOTS       = int(os.getenv("NUM_SLOTS", "8"))
 TEMP_BASE       = {d: 22 + d * 0.5 for d in range(1, NUM_SLOTS + 1)}
 
 
@@ -334,7 +334,7 @@ def status():
 
 @app.get("/status/{slot_id}")
 def status_slot(slot_id: int):
-    if slot_id not in range(1, NUM_SLOTS + 1):
+    if not 1 <= slot_id <= NUM_SLOTS:
         raise HTTPException(400, f"slot_id deve ser 1-{NUM_SLOTS}")
     return _snapshot_slot(slot_id)
 
@@ -342,8 +342,8 @@ def status_slot(slot_id: int):
 @app.post("/executar/carregar")
 def executar_carregar(req: CarregarReq):
     slot_id = req.dispenser_id
-    if slot_id not in range(1, NUM_SLOTS + 1):
-        raise HTTPException(400, "dispenser_id deve ser 1-6")
+    if not 1 <= slot_id <= NUM_SLOTS:
+        raise HTTPException(400, f"dispenser_id deve ser 1-{NUM_SLOTS}")
 
     # Per-slot lock: check-and-set atômico para evitar race condition
     # entre dois POST simultâneos para o mesmo slot.
@@ -369,8 +369,8 @@ def executar_carregar(req: CarregarReq):
 @app.post("/executar/dispensar")
 def executar_dispensar(req: DispensarReq):
     slot_id = req.dispenser_id
-    if slot_id not in range(1, NUM_SLOTS + 1):
-        raise HTTPException(400, "dispenser_id deve ser 1-6")
+    if not 1 <= slot_id <= NUM_SLOTS:
+        raise HTTPException(400, f"dispenser_id deve ser 1-{NUM_SLOTS}")
 
     with _slot_locks[slot_id]:
         with _lock:
@@ -393,8 +393,8 @@ def executar_dispensar(req: DispensarReq):
 @app.post("/executar/limpar")
 def executar_limpar(req: LimparReq):
     slot_id = req.dispenser_id
-    if slot_id not in range(1, NUM_SLOTS + 1):
-        raise HTTPException(400, "dispenser_id deve ser 1-6")
+    if not 1 <= slot_id <= NUM_SLOTS:
+        raise HTTPException(400, f"dispenser_id deve ser 1-{NUM_SLOTS}")
 
     threading.Thread(
         target=_do_limpar,

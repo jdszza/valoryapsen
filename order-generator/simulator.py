@@ -150,8 +150,9 @@ def _consultar_fila() -> dict | None:
 def _esperar_vaga_na_fila() -> bool:
     """Espera a fila abrir vaga. True se há espaço, False se desistiu do ciclo.
 
-    Uma OS de 6 slots leva de 90 a 140s e o gerador posta a cada 90s: sem esta
-    checagem, o excesso ia bater no 429 do central toda vez. Pior sob trava do
+    Uma OS leva mais que os 90s do intervalo de geração (90 a 140s medidos na
+    célula de 6 slots; a de 8 leva mais): sem esta checagem, o excesso ia
+    bater no 429 do central toda vez. Pior sob trava do
     Triple Check, quando o orquestrador para por tempo indeterminado.
 
     Duas decisões deliberadas:

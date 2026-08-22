@@ -2,14 +2,20 @@
 APSEN - Vision Adapter v1.0
 Bridge bidirecional entre o Computador Central e o Vision Simulator.
 
-Câmera dos Dispensers: leitura de QR Code, DataMatrix e código de barras.
-  → Identifica e valida o produto carregado em cada slot.
+Câmeras dos Dispensers (duas, uma por fileira): leitura de QR Code, DataMatrix
+e código de barras.
+  → Identificam e validam o produto carregado em cada slot.
+  → QUAL das duas olha o slot é decidido pelo vision-simulator, a partir do
+    slot_id (ver `camera_do_slot`): o lado é característica física da bancada.
+    O adapter manda só o slot e recebe de volta o campo `camera` preenchido.
 
-Câmera da Mesa: detecção de posição, contagem visual e validação da operação.
-  → Confirma que os produtos foram dispensados corretamente na mesa.
+Câmera da Mesa (a da balança): detecção de posição, contagem visual e validação
+da operação.
+  → Confirma que os produtos foram dispensados corretamente na mesa de coleta,
+    onde fica a célula de carga HX711.
 
 Fluxo entrada (← Central):
-  POST /comandos/capturar/dispenser  → solicita leitura da câmera do dispenser
+  POST /comandos/capturar/dispenser  → solicita leitura da câmera do lado do slot
   POST /comandos/capturar/mesa       → solicita leitura da câmera da mesa
 
 Fluxo saída (← Vision Simulator):
@@ -77,7 +83,12 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 # ── Pydantic Models ────────────────────────────────────────────────────────────
 
 class CapturarDispenserReq(BaseModel):
-    """Comando do Central: fotografar câmera do dispenser para slot X."""
+    """Comando do Central: fotografar o slot X com a câmera do lado dele.
+
+    Não há campo `camera`: o simulador (ou, amanhã, o driver do hardware)
+    deriva o lado do próprio slot. Deixar o central escolher a câmera abriria
+    a chance de pedir a leitura de D7 para a câmera da esquerda.
+    """
     slot_id: int
     os_id: str
     sku_esperado: str = ""
@@ -86,7 +97,7 @@ class CapturarDispenserReq(BaseModel):
 
 
 class CapturarMesaReq(BaseModel):
-    """Comando do Central: fotografar câmera da mesa após dispensa no slot X."""
+    """Comando do Central: fotografar a mesa (balança) após dispensa no slot X."""
     slot_id: int
     os_id: str
     quantidade_esperada: int = 0
@@ -97,7 +108,7 @@ class CapturarMesaReq(BaseModel):
 class EventoVisionReq(BaseModel):
     """Evento recebido do Vision Simulator."""
     tipo: str
-    camera: str                    # "dispenser" | "mesa"
+    camera: str                    # "dispenser_esq" | "dispenser_dir" | "mesa"
     slot_id: Optional[int] = None
     os_id: Optional[str] = None
 
@@ -159,7 +170,7 @@ async def health():
 @app.post("/comandos/capturar/dispenser")
 async def capturar_dispenser(req: CapturarDispenserReq):
     """
-    Dispara captura da câmera do dispenser para o slot especificado.
+    Dispara captura da câmera de dispenser que cobre o slot especificado.
     Valida QR Code / DataMatrix / Código de Barras do produto carregado.
     """
     logger.info(

@@ -49,6 +49,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ADAPTER_URL      = os.getenv("ADAPTER_URL",      "http://weight-adapter:8103")
+# Faixa de slots aceita. Vem da MESMA env var do central e dos demais
+# simuladores: um valor por serviço viraria divergência silenciosa.
+NUM_SLOTS = int(os.getenv("NUM_SLOTS", "8"))
 TOLERANCIA_PERC  = float(os.getenv("TOLERANCIA_PERC",  "5.0"))
 PROB_ERRO_SENSOR = float(os.getenv("PROB_ERRO_SENSOR",  "0.01"))
 T_LEITURA        = float(os.getenv("T_LEITURA",         "1.5"))
@@ -233,8 +236,8 @@ def executar_tara(req: TaraReq):
 @app.post("/executar/pesar")
 def executar_pesar(req: PesarReq):
     """Captura leitura de peso após dispensa de um slot."""
-    if req.slot_id not in range(1, 7):
-        raise HTTPException(400, "slot_id deve ser 1-6")
+    if not 1 <= req.slot_id <= NUM_SLOTS:
+        raise HTTPException(400, f"slot_id deve ser 1-{NUM_SLOTS}")
     if req.peso_unitario_g <= 0:
         raise HTTPException(400, "peso_unitario_g deve ser > 0")
     if req.quantidade_real is not None and req.quantidade_real < 0:

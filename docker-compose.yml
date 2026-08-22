@@ -9,9 +9,11 @@
 #   cnc-adapter         → bridge: central ↔ cnc-simulator (porta 8101)
 #   vision-adapter      → bridge: central ↔ vision-simulator (porta 8102)
 #   weight-adapter      → bridge: central ↔ weight-simulator/HX711 (porta 8103)
-#   dispenser-simulator → simula 6 dispensers físicos, HTTP server (porta 8201)
+#   dispenser-simulator → simula os dispensers físicos (NUM_SLOTS, default 8,
+#                         em duas fileiras), HTTP server (porta 8201)
 #   cnc-simulator       → simula firmware CNC, HTTP server (porta 8200)
-#   vision-simulator    → simula câmera dispenser + câmera mesa (porta 8202)
+#   vision-simulator    → simula as 3 câmeras: uma por fileira de dispensers e
+#                         a da mesa/balança (porta 8202)
 #   weight-simulator    → simula célula de carga HX711 na mesa (porta 8203)
 #   order-generator     → gera OS aleatórias e envia ao central via HTTP
 #   dashboard           → Plotly Dash: monitoramento read-only (porta 8050)
@@ -99,6 +101,9 @@ services:
       SEED_MANUT_SENHA:       ${SEED_MANUT_SENHA:?defina SEED_MANUT_SENHA no .env}
       # Origens de browser autorizadas (dashboard e IHM).
       CORS_ORIGINS:           ${CORS_ORIGINS:-http://localhost:8050,http://localhost:8051}
+      # Nº de dispensers da célula (par: duas fileiras frente a frente).
+      # Uma variável só para todos os serviços — ver CLAUDE.md.
+      NUM_SLOTS:          ${NUM_SLOTS:-8}
       DISPENSER_ADAPTER_URL:  http://dispenser-adapter:8100
       CNC_ADAPTER_URL:        http://cnc-adapter:8101
       VISION_ADAPTER_URL:     http://vision-adapter:8102
@@ -251,6 +256,9 @@ services:
       - "8203:8203"
     environment:
       ADAPTER_URL:       http://weight-adapter:8103
+      # Nº de dispensers da célula (par: duas fileiras frente a frente).
+      # Uma variável só para todos os serviços — ver CLAUDE.md.
+      NUM_SLOTS:          ${NUM_SLOTS:-8}
       TOLERANCIA_PERC:   5.0    # tolerância de peso em %
       PROB_ERRO_SENSOR:  0.01   # probabilidade de falha do sensor HX711
       T_LEITURA:         1.5    # tempo de estabilização da leitura (s)
@@ -271,11 +279,20 @@ services:
       - "8202:8202"
     environment:
       ADAPTER_URL:                   http://vision-adapter:8102
+      # Nº de dispensers da célula (par: duas fileiras frente a frente).
+      # Uma variável só para todos os serviços — ver CLAUDE.md.
+      NUM_SLOTS:          ${NUM_SLOTS:-8}
+      # As três variáveis de dispenser valem para AS DUAS câmeras de fileira.
+      # Para simular UMA câmera com problema (sem mexer na outra), acrescente
+      # aqui a mesma variável com sufixo _ESQ ou _DIR — ex.:
+      #   PROB_FALHA_LEITURA_DISPENSER_DIR: 0.30
+      # O sufixo tem precedência; sem ele, vale o valor compartilhado.
       PROB_FALHA_LEITURA_DISPENSER:  0.02   # 2% falha câmera dispenser
       PROB_DIVERGENCIA_DISPENSER:    0.02   # 2% SKU errado no dispenser
+      T_SCAN_DISPENSER:              1.5    # segundos processamento scan dispenser
+      # Câmera da mesa (a da balança HX711) — uma só, sem lado a sobrescrever.
       PROB_FALHA_LEITURA_MESA:       0.02   # 2% câmera mesa não detecta
       PROB_DIVERGENCIA_MESA:         0.02   # 2% contagem errada na mesa
-      T_SCAN_DISPENSER:              1.5    # segundos processamento scan dispenser
       T_SCAN_MESA:                   2.0    # segundos processamento scan mesa
     healthcheck:
       <<: *healthcheck-padrao
@@ -293,6 +310,9 @@ services:
       - "8201:8201"
     environment:
       ADAPTER_URL:        http://dispenser-adapter:8100
+      # Nº de dispensers da célula (par: duas fileiras frente a frente).
+      # Uma variável só para todos os serviços — ver CLAUDE.md.
+      NUM_SLOTS:          ${NUM_SLOTS:-8}
       T_CARGA_UNID:       0.3
       T_DISPENSA_UNID:    0.5
       PROB_ERRO_MECANICO: 0.01   # falha mecânica (atolamento) — CV movido para vision-adapter
@@ -312,6 +332,12 @@ services:
       - "8200:8200"
     environment:
       ADAPTER_URL: http://cnc-adapter:8101
+      # Nº de dispensers da célula (par: duas fileiras frente a frente).
+      # Uma variável só para todos os serviços — ver CLAUDE.md.
+      NUM_SLOTS:          ${NUM_SLOTS:-8}
+      # HOME é o fallback: o central manda as coordenadas em cada comando.
+      HOME_X:      -120
+      HOME_Y:      0
       VEL_MM_S:    80
       INTERVALO:   0.5
     healthcheck:
@@ -371,6 +397,9 @@ services:
       - "8050:8050"
     environment:
       BACKEND_URL: http://central-computer:8000
+      # Nº de dispensers da célula (par: duas fileiras frente a frente).
+      # Uma variável só para todos os serviços — ver CLAUDE.md.
+      NUM_SLOTS:          ${NUM_SLOTS:-8}
       POLL_MS:     2000
     depends_on:
       central-computer:

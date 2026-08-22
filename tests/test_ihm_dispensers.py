@@ -18,6 +18,7 @@ import json
 
 import pytest
 
+from conftest import NUM_SLOTS
 
 SAIDA_LIMPAR = "msg-limpar-disp.children"
 
@@ -46,7 +47,7 @@ def _tipo_registrado_no_callback():
     return json.loads(entrada)["type"]
 
 
-def _dispensers_falsos(n=6):
+def _dispensers_falsos(n=NUM_SLOTS):
     return [
         {"dispenser_id": i, "medicamento": f"MED {i}", "quantidade_atual": 4,
          "categoria": "analgesicos", "capacidade": 100, "ultima_os_id": "OS-1"}
@@ -62,7 +63,7 @@ def test_todo_card_renderiza_o_botao_que_o_callback_escuta(ihm):
     pagina = ihm.modulo._render_dispensers("jwt")
     ids = [getattr(c, "id", None) for c in _percorrer(pagina)]
 
-    for d_id in range(1, 7):
+    for d_id in range(1, NUM_SLOTS + 1):
         assert {"type": tipo, "index": d_id} in ids, (
             f"D{d_id} não renderizou botão com o id que o callback escuta ({tipo})"
         )

@@ -74,7 +74,12 @@ class ComandoMoverReq(BaseModel):
 
 
 class ComandoHomingReq(BaseModel):
+    # Coordenadas do HOME vêm do central, como as de `mover`: a geometria da
+    # célula tem um dono só. Opcionais para não quebrar chamador antigo — o
+    # simulador cai no próprio default quando não vêm.
     os_id: str
+    posicao_x: float | None = None
+    posicao_y: float | None = None
 
 
 class EventoReq(BaseModel):
@@ -156,7 +161,10 @@ async def cmd_mover(req: ComandoMoverReq):
 @app.post("/comandos/homing")
 async def cmd_homing(req: ComandoHomingReq):
     logger.info("[CMD] HOMING ← OS %s", req.os_id)
-    resultado = await _post_sim("/executar/homing", {"os_id": req.os_id})
+    resultado = await _post_sim(
+        "/executar/homing",
+        {k: v for k, v in req.model_dump().items() if v is not None},
+    )
     return {"ok": True, "simulador": resultado}
 
 

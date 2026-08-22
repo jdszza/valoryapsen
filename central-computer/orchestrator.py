@@ -37,17 +37,41 @@ from database import (
 
 logger = logging.getLogger(__name__)
 
-# ── Posições físicas dos dispensers na mesa (mm) ───────────────────────────────
-POSICOES: dict[int, tuple[float, float]] = {
-    1: (0.0,   0.0),
-    2: (120.0, 0.0),
-    3: (240.0, 0.0),
-    4: (360.0, 0.0),
-    5: (480.0, 0.0),
-    6: (600.0, 0.0),
-}
-HOME: tuple[float, float] = (0.0, -50.0)
-NUM_SLOTS = 6
+# ── Geometria da célula (mm) ──────────────────────────────────────────────────
+# Duas fileiras de dispensers frente a frente, com o corredor da CNC no meio:
+#
+#        D1      D2      D3      D4          ← fileira esquerda (y = -150)
+#   ·  ─────────────────────────────────     ← corredor (y = 0), HOME em x=-120
+#        D5      D6      D7      D8          ← fileira direita  (y = +150)
+#        x=0    x=120   x=240   x=360
+#
+# Estes quatro números são a ÚNICA fonte do mapa: `POSICOES` é derivada deles, e
+# o cnc-simulator não tem cópia nenhuma (recebe x/y em cada comando). Mudar o
+# passo, o afastamento ou o nº de slots não exige tocar em mais nada.
+NUM_SLOTS         = settings.NUM_SLOTS         # total, somando as duas fileiras
+SLOTS_POR_FILEIRA = NUM_SLOTS // 2             # NUM_SLOTS é par (ver config)
+PASSO_X_MM        = 120.0                      # distância entre slots vizinhos
+AFASTAMENTO_Y_MM  = 150.0                      # meia-largura do corredor
+# HOME fica no centro do corredor, um passo ANTES do primeiro par: fora da
+# faixa de qualquer dispenser, e equidistante de D1 e D5.
+HOME: tuple[float, float] = (-PASSO_X_MM, 0.0)
+
+
+def _gerar_posicoes() -> dict[int, tuple[float, float]]:
+    """Mapa slot → (x, y). Ids 1..N/2 na fileira esquerda, N/2+1..N na direita.
+
+    A numeração deixa os pares frente a frente com distância fixa de
+    `SLOTS_POR_FILEIRA`: D1↔D5, D2↔D6, D3↔D7, D4↔D8 para N=8.
+    """
+    posicoes: dict[int, tuple[float, float]] = {}
+    for slot_id in range(1, NUM_SLOTS + 1):
+        coluna = (slot_id - 1) % SLOTS_POR_FILEIRA
+        lado   = -1.0 if slot_id <= SLOTS_POR_FILEIRA else 1.0
+        posicoes[slot_id] = (coluna * PASSO_X_MM, lado * AFASTAMENTO_Y_MM)
+    return posicoes
+
+
+POSICOES: dict[int, tuple[float, float]] = _gerar_posicoes()
 
 # Peso usado quando o catálogo não responde. É o mesmo default de
 # `database.get_peso_medicamento` para medicamento sem peso cadastrado.
@@ -60,8 +84,10 @@ _broadcast_fn = None          # função de broadcast injetada pelo main
 _loop: Optional[asyncio.AbstractEventLoop] = None  # event loop (para call_soon_threadsafe)
 
 # ── Fila e eventos de orquestração ────────────────────────────────────────────
-# Fila LIMITADA: o gerador posta a cada 90s, uma OS de 6 slots leva de 90 a
-# 140s, e com a trava do Triple Check ativa o loop para até um humano liberar.
+# Fila LIMITADA: o gerador posta a cada 90s e uma OS leva mais que isso — de
+# 90 a 140s quando a célula tinha 6 slots, e a de 8 acrescenta dois ciclos de
+# CNC + dispensa + câmera + pesagem. Com a trava do Triple Check ativa o loop
+# para até um humano liberar.
 # Sem teto, a fila cresce indefinidamente em memória e no banco. O limite é o
 # próprio `maxsize` — a estrutura recusa, em vez de cada chamador ter que
 # lembrar de conferir (ver `enfileirar_os` e `ha_vaga_na_fila`).
@@ -401,24 +427,62 @@ def avaliar_triple_check(
     )
 
 
-# ── Planejamento de rota CNC (nearest-neighbor) ────────────────────────────────
+# ── Planejamento de rota CNC (serpentina) ──────────────────────────────────────
+
+def distancia_rota(ordem: list[int], pos_inicial: tuple[float, float],
+                   voltar_para_home: bool = True) -> float:
+    """Comprimento em mm do trajeto `pos_inicial` → slots na ordem dada → HOME.
+
+    A volta entra por padrão porque ela SEMPRE acontece: o passo 5 de
+    `_processar_os` faz homing ao fim de toda OS. Uma rota avaliada sem a
+    perna de retorno é avaliada por um custo que a máquina não paga.
+    """
+    total = 0.0
+    pos = pos_inicial
+    for disp_id in ordem:
+        alvo = POSICOES[disp_id]
+        total += math.hypot(alvo[0] - pos[0], alvo[1] - pos[1])
+        pos = alvo
+    if voltar_para_home:
+        total += math.hypot(HOME[0] - pos[0], HOME[1] - pos[1])
+    return total
+
 
 def planejar_rota(dispenser_ids: list[int], pos_inicial: tuple[float, float]) -> list[int]:
-    """Ordena os dispensers para minimizar distância percorrida pela CNC."""
-    restantes = list(dispenser_ids)
-    ordem: list[int] = []
-    pos = pos_inicial
+    """Ordena os dispensers para minimizar a distância percorrida pela CNC.
 
-    while restantes:
-        mais_proximo = min(
-            restantes,
-            key=lambda d: math.hypot(POSICOES[d][0] - pos[0], POSICOES[d][1] - pos[1]),
-        )
-        ordem.append(mais_proximo)
-        restantes.remove(mais_proximo)
-        pos = POSICOES[mais_proximo]
+    SERPENTINA: sobe a fileira esquerda em x crescente e volta pela direita em
+    x decrescente, pulando quem não está na OS. Substituiu o nearest-neighbor
+    que servia enquanto a célula era uma fileira só — com o Y sempre em 0,
+    qualquer heurística devolvia a mesma linha, e a escolha não custava nada.
 
-    return ordem
+    Com duas fileiras ela passa a custar. O ciclo real é FECHADO
+    (HOME → slots → HOME, ver `distancia_rota`), e HOME mais as duas fileiras
+    estão todos na borda de um mesmo polígono convexo — caso em que o tour
+    ótimo é a ordem do contorno, que é o que a serpentina produz. Medido por
+    força bruta nos 255 subconjuntos não-vazios de 8 slots, partindo de HOME e
+    contra o ótimo de cada um: serpentina = ótimo em 255/255; nearest-neighbor
+    4,1% pior em média e 40,4% pior no pior caso (slots {1,3,5,6,7,8}, onde ele
+    cruza o corredor cedo e precisa cruzar de novo para fechar). A vantagem não
+    vem dos números escolhidos: vale para todo passo e afastamento testados.
+
+    `pos_inicial` decide por qual fileira começar: entrar pelo lado oposto ao
+    que a CNC ocupa custa uma travessia de corredor a mais na ida e outra na
+    volta. Toda OS parte de HOME (y=0, o `else` do teste), onde o argumento
+    empata e o contorno é percorrido pela esquerda; o espelhamento serve a
+    quem chame a função com a CNC parada do lado direito — aí ele economiza de
+    10% a 17%, mas sem a garantia de otimalidade, que é do trajeto por HOME.
+    """
+    esquerda = sorted(d for d in dispenser_ids if d <= SLOTS_POR_FILEIRA)
+    direita  = sorted((d for d in dispenser_ids if d > SLOTS_POR_FILEIRA), reverse=True)
+
+    if esquerda and direita:
+        # Começa pela fileira do lado em que a CNC já está: entrar pelo lado
+        # errado custa uma travessia de corredor a mais, na ida e na volta.
+        if pos_inicial[1] > 0:
+            esquerda, direita = list(reversed(direita)), list(reversed(esquerda))
+
+    return esquerda + direita
 
 
 # ── Comandos HTTP aos adapters ─────────────────────────────────────────────────
@@ -526,9 +590,15 @@ async def cmd_mover(disp_id: int, os_id: str, ciclo: int, total: int) -> bool:
 
 
 async def cmd_homing(os_id: str) -> bool:
+    """Manda a CNC voltar para HOME, com as coordenadas no próprio comando.
+
+    Mesmo princípio de `cmd_mover`: quem conhece a geometria é o central. Sem
+    isso o simulador precisaria de uma cópia do HOME, e a cópia divergiria no
+    dia em que o corredor mudasse de lugar.
+    """
     return await _post(
         settings.CNC_ADAPTER_URL + "/comandos/homing",
-        {"os_id": os_id},
+        {"os_id": os_id, "posicao_x": HOME[0], "posicao_y": HOME[1]},
     )
 
 

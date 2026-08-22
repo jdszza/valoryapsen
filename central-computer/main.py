@@ -94,12 +94,13 @@ _estado = {
             "quantidade_residual":   0,
             "os_id":                 None,
         }
-        for i in range(1, 7)
+        for i in range(1, settings.NUM_SLOTS + 1)
     },
     "fila_os":       [],
     "fila_tamanho":  0,
-    # Teto de OS esperando (MAX_FILA_OS). Vai no payload para o dashboard poder
-    # mostrar "3/5" em vez de um número sem escala.
+    # Teto de OS esperando (MAX_FILA_OS). Vai no payload para o dashboard saber
+    # quando a fila encostou no limite — o KPI mostra só a contagem, e usa este
+    # número para acender o alerta de fila cheia e explicá-lo no tooltip.
     "fila_capacidade": settings.MAX_FILA_OS,
     "atribuicao_ia": [],
     # Derivado do banco por _contar_alarmes_ativos() — nunca incrementado à mão.
@@ -117,10 +118,21 @@ _estado = {
         "slot_id":         None,
         "ts":              None,
     },
-    # Última leitura de cada câmera (atualizado por _handle_evento_visao)
+    # Última leitura de cada uma das TRÊS câmeras (atualizado por
+    # _handle_evento_visao). Uma câmera por fileira de dispensers — que é o que
+    # deixa "a câmera da esquerda parou de ler" visível no painel em vez de
+    # virar uma sequência de falhas em D1..D4 — e a da mesa, sobre a balança.
+    # As chaves são "camera_" + o valor do campo `camera` do evento.
     "visao": {
-        "camera_dispenser": {
+        "camera_dispenser_esq": {
             "ultima_leitura": None,   # tipo do último evento
+            "slot_id":        None,
+            "match_sku":      None,
+            "confianca":      None,
+            "ts":             None,
+        },
+        "camera_dispenser_dir": {
+            "ultima_leitura": None,
             "slot_id":        None,
             "match_sku":      None,
             "confianca":      None,
@@ -270,7 +282,8 @@ async def _db(fn, *args):
 # `get_total_alarmes_ativos()`.
 #
 # O número vai em TODO payload de `_broadcast_estado()`, que roda a cada evento
-# — só a telemetria periódica são 6 slots a cada 15s, mais CNC, visão e peso.
+# — só a telemetria periódica são NUM_SLOTS eventos a cada 15s (8 na célula
+# de duas fileiras), mais CNC, visão e peso.
 # Uma query por evento seria desperdício, então a leitura é cacheada por
 # `_ALARMES_TTL_S`.
 #
@@ -570,12 +583,38 @@ async def _handle_evento_cnc(payload: dict):
     _broadcast_estado(prioritario=tipo not in _TIPOS_ALTA_FREQUENCIA)
 
 
+# As duas câmeras que cobrem as fileiras de dispensers. A da mesa não entra
+# aqui: o tipo do evento (leitura_mesa_*) já a identifica sozinho.
+_CAMERAS_DISPENSER = ("dispenser_esq", "dispenser_dir")
+_LADO = {"dispenser_esq": "esquerda", "dispenser_dir": "direita"}
+
+
+def _camera_dispenser(camera: str, slot_id) -> str:
+    """Qual das duas câmeras de dispenser produziu a leitura.
+
+    O valor normal vem do próprio evento — quem sabe a geometria é o
+    simulador/driver, não o central. O fallback pelo slot cobre o contrato
+    ANTIGO (camera="dispenser", de quando a célula tinha uma fileira só) e o
+    payload sem o campo: sem ele, a leitura não acharia chave de estado e
+    sumiria do painel e do histórico, sem erro nenhum no log.
+    """
+    if camera in _CAMERAS_DISPENSER:
+        return camera
+    return ("dispenser_dir" if (slot_id or 0) > orch.SLOTS_POR_FILEIRA
+            else "dispenser_esq")
+
+
 async def _handle_evento_visao(payload: dict):
     """
-    Processa eventos do vision-adapter.
-    Tipos (câmera dispenser): leitura_dispenser_ok, leitura_dispenser_falha, leitura_dispenser_divergencia
-    Tipos (câmera mesa):      leitura_mesa_ok, leitura_mesa_falha, leitura_mesa_divergencia
-    Tipo  (telemetria):       telemetria (temperatura dos componentes de câmera)
+    Processa eventos do vision-adapter (três câmeras).
+    Tipos (câmeras de dispenser): leitura_dispenser_ok, leitura_dispenser_falha, leitura_dispenser_divergencia
+    Tipos (câmera da mesa):       leitura_mesa_ok, leitura_mesa_falha, leitura_mesa_divergencia
+    Tipo  (telemetria):           telemetria (temperatura dos componentes de câmera)
+
+    O TIPO diz o que foi lido; o campo `camera` diz QUEM leu. As duas câmeras de
+    dispenser emitem os mesmos tipos — separá-las por tipo obrigaria o
+    orquestrador e o Triple Check a conhecer o lado da bancada, e eles se
+    importam com o resultado, não com qual lente olhou.
 
     Estado atualizado síncronamente sob _lock.
     Alarmes gerados assincronamente via asyncio.to_thread.
@@ -588,13 +627,14 @@ async def _handle_evento_visao(payload: dict):
     db_tasks = []
 
     with _lock:
-        # ── Câmera dos Dispensers ──────────────────────────────────────────
-        if camera == "dispenser" and tipo in (
+        # ── Câmeras dos Dispensers (esquerda e direita) ────────────────────
+        if tipo in (
             "leitura_dispenser_ok",
             "leitura_dispenser_falha",
             "leitura_dispenser_divergencia",
         ):
-            _estado["visao"]["camera_dispenser"].update({
+            cam = _camera_dispenser(camera, slot_id)
+            _estado["visao"][f"camera_{cam}"].update({
                 "ultima_leitura": tipo,
                 "slot_id":        slot_id,
                 "match_sku":      payload.get("match_sku"),
@@ -604,17 +644,17 @@ async def _handle_evento_visao(payload: dict):
 
             # Persiste leitura no histórico (todos os tipos de câmera dispenser)
             db_tasks.append((salvar_leitura_visao, (
-                os_id, "dispenser", slot_id, tipo,
+                os_id, cam, slot_id, tipo,
                 payload.get("sku_esperado"), payload.get("sku_lido"),
                 payload.get("match_sku"), payload.get("confianca"),
                 None, None, payload.get("motivo"),
             )))
 
             if tipo == "leitura_dispenser_falha":
-                descricao = (f"Falha câmera dispenser slot {slot_id}: "
+                descricao = (f"Falha câmera {_LADO[cam]} slot {slot_id}: "
                              f"{payload.get('motivo', 'desconhecido')}")
                 db_tasks.append((salvar_alarme,
-                                 (f"camera_dispenser_{slot_id}",
+                                 (f"camera_{cam}_{slot_id}",
                                   "falha_leitura_dispenser", descricao)))
                 _log("alarme", descricao)
 
@@ -623,12 +663,12 @@ async def _handle_evento_visao(payload: dict):
                              f"esperado={payload.get('sku_esperado','?')} "
                              f"lido={payload.get('sku_lido','?')}")
                 db_tasks.append((salvar_alarme,
-                                 (f"camera_dispenser_{slot_id}",
+                                 (f"camera_{cam}_{slot_id}",
                                   "divergencia_sku", descricao)))
                 _log("alarme", descricao)
 
-        # ── Câmera da Mesa ─────────────────────────────────────────────────
-        elif camera == "mesa" and tipo in (
+        # ── Câmera da Mesa (sobre a balança) ───────────────────────────────
+        elif tipo in (
             "leitura_mesa_ok",
             "leitura_mesa_falha",
             "leitura_mesa_divergencia",
@@ -979,7 +1019,7 @@ class EventoCNCReq(BaseModel):
 
 class EventoVisionReq(BaseModel):
     tipo: str
-    camera: str                     # "dispenser" | "mesa" | "sistema"
+    camera: str                     # "dispenser_esq" | "dispenser_dir" | "mesa" | "sistema"
     slot_id: Optional[int] = None
     os_id: Optional[str] = None
 
@@ -1163,7 +1203,7 @@ def get_estado():
 def get_fila():
     """Ocupação da fila de OS — endpoint de backpressure do order-generator.
 
-    O `/estado` já traz `fila_tamanho`, mas serve o snapshot inteiro (6 slots,
+    O `/estado` já traz `fila_tamanho`, mas serve o snapshot inteiro (os 8 slots,
     CNC, visão, peso, trava) e ainda passa pelo contador de alarmes. Quem só
     precisa saber se cabe mais uma OS não deveria pagar por isso a cada ciclo —
     daí este endpoint de dois números. `fila_capacidade` continua no `/estado`
@@ -1532,15 +1572,15 @@ async def liberar_trava(user=Depends(_get_admin)):
 
 @app.post("/manutencao/dispensers/{dispenser_id}/limpar", tags=["Manutenção"],
     responses={
-        400: {"description": "`dispenser_id` fora da faixa 1..6."},
+        400: {"description": "`dispenser_id` fora da faixa de slots da célula."},
         401: {"description": "Token ausente, inválido, ou usuário desativado no banco."},
         409: {"description": "OS em andamento, ou slot em operação física (`carregando`/`dispensando`)."},
         503: {"description": "Dispenser-adapter indisponível."},
     })
 async def manut_limpar_dispenser(dispenser_id: int, user=Depends(_get_tecnico)):
     """Envia comando de limpeza ao dispenser-adapter. Bloqueado se slot está em operação."""
-    if dispenser_id not in range(1, 7):
-        raise HTTPException(400, "dispenser_id deve ser 1-6")
+    if not 1 <= dispenser_id <= settings.NUM_SLOTS:
+        raise HTTPException(400, f"dispenser_id deve ser 1-{settings.NUM_SLOTS}")
 
     with _lock:
         d_info   = _estado["dispensers"].get(str(dispenser_id), {})

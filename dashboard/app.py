@@ -25,6 +25,10 @@ import dash_bootstrap_components as dbc
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://central-computer:8000")
 POLL_MS     = int(os.getenv("POLL_MS", "2000"))
+# Mesma env var do central e dos simuladores — o painel desenha a célula que
+# existe, não uma contagem própria.
+NUM_SLOTS         = int(os.getenv("NUM_SLOTS", "8"))
+SLOTS_POR_FILEIRA = max(1, NUM_SLOTS // 2)
 
 app = dash.Dash(
     __name__,
@@ -198,7 +202,7 @@ app.layout = dbc.Container(
         # ── Row 4: Visão Computacional + Balança ─────────────────────────────
         dbc.Row([
             dbc.Col(dbc.Card([
-                dbc.CardHeader("📷 Visão Computacional"),
+                dbc.CardHeader("📷 Visão Computacional (3 câmeras)"),
                 dbc.CardBody(id="card-visao"),
             ]), md=6, className="mb-3"),
 
@@ -382,8 +386,12 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
     # ── Dispensers ────────────────────────────────────────────────────────────
     # Slots são dinâmicos — nenhum é fixo para um medicamento.
     # Estado recebido via GET /estado (polling REST) do central-computer.
-    disp_cards = []
-    for disp_id in range(1, 7):
+    # O painel espelha o arranjo FÍSICO: uma fileira de cards por fileira de
+    # dispensers, com o corredor da CNC entre as duas. Numa apresentação, é o
+    # que deixa "D7 travou" apontar para um lugar na bancada em vez de para uma
+    # posição no meio de uma lista.
+    disp_cards: dict[int, object] = {}
+    for disp_id in range(1, NUM_SLOTS + 1):
         info    = disp_map.get(str(disp_id), {})
         d_sts   = info.get("status", "idle")
         med     = info.get("medicamento")
@@ -408,44 +416,60 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
             cat_label  = ""
             res_label  = html.Small("aguardando OS", className="text-muted fst-italic")
 
-        disp_cards.append(
-            dbc.Col(
-                dbc.Card([
-                    dbc.CardHeader(
-                        html.Small([
-                            html.Strong(f"D{disp_id} "),
-                            _badge(d_sts, _cor(d_sts)),
-                        ]),
-                        className="py-1 px-2",
+        disp_cards[disp_id] = (
+            dbc.Card([
+                dbc.CardHeader(
+                    html.Small([
+                        html.Strong(f"D{disp_id} "),
+                        _badge(d_sts, _cor(d_sts)),
+                    ]),
+                    className="py-1 px-2",
+                ),
+                dbc.CardBody([
+                    html.P(
+                        [med_label, cat_label],
+                        className="mb-0 fw-semibold",
+                        style={"fontSize": "0.68rem"},
                     ),
-                    dbc.CardBody([
-                        html.P(
-                            [med_label, cat_label],
-                            className="mb-0 fw-semibold",
-                            style={"fontSize": "0.68rem"},
-                        ),
-                        html.Div(res_label, className="mb-1"),
-                        html.Div(
-                            f"{qtd_d} / {qtd_a}" if qtd_a else "—",
-                            className="text-center fw-bold mb-1 small",
-                        ),
-                        dbc.Progress(
-                            value=pct,
-                            color=_cor(d_sts),
-                            style={"height": "6px"},
-                        ) if qtd_a > 0 else html.Div(),
-                    ], className="py-1 px-2"),
-                ], className="h-100"),
-                md=2, sm=4, xs=6,
-                # `is-active` acende a borda dourada do slot que está em
-                # operação — num painel de 6 cartões iguais, é o que faz o
-                # operador achar o slot certo sem ler cada um.
-                className=("ap-slot mb-2 is-active"
-                           if d_sts not in ("idle", None) else "ap-slot mb-2"),
-            )
+                    html.Div(res_label, className="mb-1"),
+                    html.Div(
+                        f"{qtd_d} / {qtd_a}" if qtd_a else "—",
+                        className="text-center fw-bold mb-1 small",
+                    ),
+                    dbc.Progress(
+                        value=pct,
+                        color=_cor(d_sts),
+                        style={"height": "6px"},
+                    ) if qtd_a > 0 else html.Div(),
+                ], className="py-1 px-2"),
+            ], className="h-100"),
+            # `is-active` acende a borda dourada do slot que está em operação —
+            # num painel de cartões iguais, é o que faz o operador achar o slot
+            # certo sem ler cada um.
+            ("ap-slot mb-2 is-active" if d_sts not in ("idle", None)
+             else "ap-slot mb-2"),
         )
 
-    card_dispensers = dbc.Row(disp_cards)
+    # Largura derivada: 4 slots por fileira dão 3 colunas Bootstrap cada. O
+    # mínimo de 2 evita coluna de largura zero se a célula crescer muito.
+    largura_col = max(2, 12 // SLOTS_POR_FILEIRA)
+
+    def _fileira(ids: range) -> object:
+        return dbc.Row(
+            [dbc.Col(disp_cards[i][0], md=largura_col, sm=4, xs=6,
+                     className=disp_cards[i][1]) for i in ids],
+            className="g-2",
+        )
+
+    card_dispensers = html.Div([
+        _fileira(range(1, SLOTS_POR_FILEIRA + 1)),
+        # O corredor: a faixa que a CNC percorre entre as duas fileiras.
+        html.Div(
+            html.Span("corredor CNC", className="ap-corredor-rotulo"),
+            className="ap-corredor",
+        ),
+        _fileira(range(SLOTS_POR_FILEIRA + 1, NUM_SLOTS + 1)),
+    ])
 
     # ── Alarmes ───────────────────────────────────────────────────────────────
     if alarmes_data and isinstance(alarmes_data, list):
@@ -543,8 +567,14 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
         banner_trava = html.Div()
 
     # ── Visão Computacional ───────────────────────────────────────────────────
-    visao = estado.get("visao", {})
-    cam_disp = visao.get("camera_dispenser", {})
+    # Três câmeras: uma por fileira de dispensers e a da mesa, sobre a balança.
+    # O bloco repete o arranjo do painel de slots — fileira esquerda em cima,
+    # corredor no meio (é onde a mesa de coleta anda), fileira direita embaixo.
+    # Sem isso, "a câmera da direita parou de ler" obrigaria o operador a
+    # traduzir um nome de câmera para um lado da bancada.
+    visao    = estado.get("visao", {})
+    cam_esq  = visao.get("camera_dispenser_esq", {})
+    cam_dir  = visao.get("camera_dispenser_dir", {})
     cam_mesa = visao.get("camera_mesa", {})
 
     def _cor_leitura(tipo):
@@ -556,48 +586,56 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
             return "danger"
         return "info"
 
-    card_visao = dbc.Row([
-        dbc.Col([
-            html.P("📷 Câmera Dispenser (SKU)", className="fw-bold mb-1 small"),
+    def _painel_cam_disp(titulo, cam):
+        match = cam.get("match_sku")
+        return html.Div([
+            html.P(titulo, className="fw-bold mb-1 small"),
             html.Div([
                 html.Span("Última: "),
-                _badge(cam_disp.get("ultima_leitura") or "—",
-                       _cor_leitura(cam_disp.get("ultima_leitura"))),
-            ], className="small mb-1"),
-            html.Div([
-                html.Small(f"Slot D{cam_disp.get('slot_id') or '?'}", className="text-muted me-2"),
+                _badge(cam.get("ultima_leitura") or "—",
+                       _cor_leitura(cam.get("ultima_leitura"))),
+                html.Small(f"Slot D{cam.get('slot_id') or '?'}",
+                           className="text-muted ms-2"),
+                html.Small(f"Conf: {int((cam.get('confianca') or 0)*100)}%",
+                           className="text-muted ms-2"),
                 html.Small(
-                    f"Conf: {int((cam_disp.get('confianca') or 0)*100)}%",
-                    className="text-muted",
+                    f"Match SKU: {'✓' if match else ('✗' if match is False else '—')}",
+                    className=("ms-2 text-success" if match
+                               else "ms-2 text-danger" if match is False
+                               else "ms-2 text-muted"),
                 ),
-            ], className="mb-1"),
-            html.Small(
-                f"Match SKU: {'✓' if cam_disp.get('match_sku') else ('✗' if cam_disp.get('match_sku') is False else '—')}",
-                className=("text-success" if cam_disp.get("match_sku")
-                           else "text-danger" if cam_disp.get("match_sku") is False
-                           else "text-muted"),
-            ),
-        ], md=6),
-        dbc.Col([
-            html.P("📷 Câmera Mesa (Contagem)", className="fw-bold mb-1 small"),
+            ], className="small"),
+        ])
+
+    card_visao = html.Div([
+        _painel_cam_disp(
+            f"📷 Câmera Esquerda · D1–D{SLOTS_POR_FILEIRA} (SKU)", cam_esq),
+        html.Div(
+            html.Span("corredor CNC", className="ap-corredor-rotulo"),
+            className="ap-corredor",
+        ),
+        html.Div([
+            html.P("📷 Câmera da Mesa · balança (Contagem)",
+                   className="fw-bold mb-1 small"),
             html.Div([
                 html.Span("Última: "),
                 _badge(cam_mesa.get("ultima_leitura") or "—",
                        _cor_leitura(cam_mesa.get("ultima_leitura"))),
-            ], className="small mb-1"),
-            html.Div([
-                html.Small(f"Slot D{cam_mesa.get('slot_id') or '?'}", className="text-muted me-2"),
+                html.Small(f"Slot D{cam_mesa.get('slot_id') or '?'}",
+                           className="text-muted ms-2"),
+                html.Small(f"Conf: {int((cam_mesa.get('confianca') or 0)*100)}%",
+                           className="text-muted ms-2"),
                 html.Small(
-                    f"Conf: {int((cam_mesa.get('confianca') or 0)*100)}%",
-                    className="text-muted",
+                    f"Detectado: {cam_mesa.get('quantidade_detectada') or '—'} "
+                    f"/ Esperado: {cam_mesa.get('quantidade_esperada') or '—'}",
+                    className="text-muted ms-2",
                 ),
-            ], className="mb-1"),
-            html.Small(
-                f"Detectado: {cam_mesa.get('quantidade_detectada') or '—'} "
-                f"/ Esperado: {cam_mesa.get('quantidade_esperada') or '—'}",
-                className="text-muted",
-            ),
-        ], md=6),
+            ], className="small"),
+        ]),
+        html.Div(className="ap-corredor"),
+        _painel_cam_disp(
+            f"📷 Câmera Direita · D{SLOTS_POR_FILEIRA + 1}–D{NUM_SLOTS} (SKU)",
+            cam_dir),
     ])
 
     # ── Balança HX711 ─────────────────────────────────────────────────────────
@@ -628,6 +666,9 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
     # cartão nenhum. Todos saem do mesmo `estado` que os cartões já usam — a
     # faixa não custa requisição extra.
     fila_cap   = estado.get("fila_capacidade", 5)
+    # Fila vazia nunca é fila cheia: sem o primeiro termo, um `fila_capacidade`
+    # ausente ou zerado no payload pintaria "sem fila" de vermelho.
+    fila_cheia = bool(fila_tamanho) and fila_tamanho >= fila_cap
     slots_uso  = sum(
         1 for d in disp_map.values()
         if d.get("status") not in (None, "idle") or d.get("quantidade", 0) > 0
@@ -643,9 +684,15 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
         _kpi("OS em execução", os_id_curto, dica=os_id_full,
              tom="is-gold" if os_ativa else ""),
         _kpi("Progresso CNC", f"{pct_cnc:.0f}", "%", tom="is-blue" if total_ciclos else ""),
-        _kpi("Fila", f"{fila_tamanho}/{fila_cap}",
-             tom="is-err" if fila_tamanho >= fila_cap else ("is-warn" if fila_tamanho else "")),
-        _kpi("Slots em uso", f"{slots_uso}/6", tom="is-blue" if slots_uso else ""),
+        # A fila mostra QUANTAS esperam, não "n/capacidade": o teto é decisão de
+        # configuração, não número que o operador acompanhe — e "0/5" fazia uma
+        # fila vazia parecer uma medição pendente. A capacidade continua
+        # alcançável no `title`, junto do aviso de fila cheia.
+        _kpi("Fila", fila_tamanho if fila_tamanho else "sem fila",
+             dica=(f"{fila_tamanho} de {fila_cap} vagas ocupadas"
+                   + (" — fila cheia, novas OS são recusadas" if fila_cheia else "")),
+             tom="is-err" if fila_cheia else "is-warn" if fila_tamanho else "is-text"),
+        _kpi("Slots em uso", f"{slots_uso}/{NUM_SLOTS}", tom="is-blue" if slots_uso else ""),
         _kpi("Mesa CNC", cnc_status.replace("_", " "),
              tom="is-text is-err" if cnc_status == "erro"
                  else "is-text is-ok" if cnc_status != "idle" else "is-text"),

@@ -553,8 +553,16 @@ def _render_visao(token):
 
     visao    = estado.get("visao", {})
     peso     = estado.get("peso", {})
-    cam_disp = visao.get("camera_dispenser", {})
+    # Três câmeras: uma por fileira de dispensers e a da mesa (a da balança).
+    cam_esq  = visao.get("camera_dispenser_esq", {})
+    cam_dir  = visao.get("camera_dispenser_dir", {})
     cam_mesa = visao.get("camera_mesa", {})
+
+    # A cobertura de cada câmera sai do nº de slots que o próprio /estado
+    # trouxe — a IHM não precisa de mais uma env var em sincronia com o compose
+    # só para escrever "D1–D4" no cabeçalho do card.
+    n_slots     = len(estado.get("dispensers", {})) or 8
+    por_fileira = max(1, n_slots // 2)
 
     def _cor_leit(tipo):
         if not tipo:
@@ -600,20 +608,33 @@ def _render_visao(token):
         html.H5("📷 Visão Computacional", className="mb-3"),
         dbc.Row([
             dbc.Col(dbc.Card([
-                dbc.CardHeader("Câmera Dispenser (SKU)"),
+                dbc.CardHeader(f"Câmera Esquerda · D1–D{por_fileira} (SKU)"),
                 dbc.CardBody([
                     html.P([
                         "Última leitura: ",
-                        dbc.Badge(cam_disp.get("ultima_leitura") or "—",
-                                  color=_cor_leit(cam_disp.get("ultima_leitura"))),
+                        dbc.Badge(cam_esq.get("ultima_leitura") or "—",
+                                  color=_cor_leit(cam_esq.get("ultima_leitura"))),
                     ], className="mb-1 small"),
-                    html.Small(f"Slot: D{cam_disp.get('slot_id') or '?'}", className="text-muted me-2"),
-                    html.Small(f"Confiança: {int((cam_disp.get('confianca') or 0)*100)}%",
+                    html.Small(f"Slot: D{cam_esq.get('slot_id') or '?'}", className="text-muted me-2"),
+                    html.Small(f"Confiança: {int((cam_esq.get('confianca') or 0)*100)}%",
                                className="text-muted"),
                 ]),
-            ]), md=6, className="mb-3"),
+            ]), md=4, className="mb-3"),
             dbc.Col(dbc.Card([
-                dbc.CardHeader("Câmera Mesa (Contagem)"),
+                dbc.CardHeader(f"Câmera Direita · D{por_fileira + 1}–D{n_slots} (SKU)"),
+                dbc.CardBody([
+                    html.P([
+                        "Última leitura: ",
+                        dbc.Badge(cam_dir.get("ultima_leitura") or "—",
+                                  color=_cor_leit(cam_dir.get("ultima_leitura"))),
+                    ], className="mb-1 small"),
+                    html.Small(f"Slot: D{cam_dir.get('slot_id') or '?'}", className="text-muted me-2"),
+                    html.Small(f"Confiança: {int((cam_dir.get('confianca') or 0)*100)}%",
+                               className="text-muted"),
+                ]),
+            ]), md=4, className="mb-3"),
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Câmera da Mesa · balança (Contagem)"),
                 dbc.CardBody([
                     html.P([
                         "Última leitura: ",
@@ -626,7 +647,7 @@ def _render_visao(token):
                         className="text-muted",
                     ),
                 ]),
-            ]), md=6, className="mb-3"),
+            ]), md=4, className="mb-3"),
         ]),
 
         html.H5("⚖️ Balança HX711", className="mb-2"),

@@ -165,7 +165,8 @@ def test_os_recusada_por_503_pode_ser_reenviada(api):
 
 # ── Fila cheia (backpressure) ─────────────────────────────────────────────────
 #
-# O gerador posta uma OS a cada 90s; uma OS de 6 slots leva de 90 a 140s. Com a
+# O gerador posta uma OS a cada 90s; uma OS leva mais que isso (90 a 140s
+# medidos com 6 slots, mais com os 8 de hoje). Com a
 # trava do Triple Check ativa, o loop único do orquestrador para até um humano
 # liberar — e o gerador continua postando. Com fila ilimitada, as OS se
 # acumulavam em memória e no banco como "aguardando", sem teto.

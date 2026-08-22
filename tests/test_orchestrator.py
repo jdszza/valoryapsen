@@ -17,35 +17,45 @@ As duas metades da correção:
     chegou a reservar, devolvendo o slot ao pool.
 """
 import asyncio
+import itertools
 
 import pytest
+
+from conftest import NUM_SLOTS, SLOTS_POR_FILEIRA
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _dispensers(**slots) -> dict:
-    """Snapshot de estado dos 6 slots; os não citados ficam vazios.
+    """Snapshot de estado de todos os slots; os não citados ficam vazios.
 
     Uso: `_dispensers(**{"1": ("Dipirona", 5)})` → D1 com resíduo, resto livre.
     """
     estado = {
         str(i): {"medicamento": None, "sku": None, "categoria": None, "quantidade": 0}
-        for i in range(1, 7)
+        for i in range(1, NUM_SLOTS + 1)
     }
     for slot_id, (med, qtd) in slots.items():
         estado[slot_id].update({"medicamento": med, "quantidade": qtd})
     return estado
 
 
+# Slot que `_todos_ocupados` deixa com o MENOR resíduo — o que a política de
+# descarte deve sacrificar. Fica na fileira da direita (D5 numa célula de 8)
+# de propósito: a escolha é por estoque, não por posição.
+SLOT_MENOR_RESIDUO = SLOTS_POR_FILEIRA + 1
+RESIDUO_MENOR = 2
+RESIDUO_PADRAO = 9
+
+
 def _todos_ocupados() -> dict:
-    """Os 6 slots com medicamentos diferentes e resíduo — o cenário do impasse."""
+    """Todo slot com um medicamento diferente e resíduo — o cenário do impasse."""
     return _dispensers(**{
-        "1": ("Ibuprofeno",  7),
-        "2": ("Amoxicilina", 3),
-        "3": ("Losartana",   9),
-        "4": ("Omeprazol",   5),
-        "5": ("Metformina",  2),
-        "6": ("Captopril",   8),
+        str(i): (
+            f"Ocupante{i}",
+            RESIDUO_MENOR if i == SLOT_MENOR_RESIDUO else RESIDUO_PADRAO,
+        )
+        for i in range(1, NUM_SLOTS + 1)
     })
 
 
@@ -100,12 +110,12 @@ def test_slot_ocupado_por_outro_medicamento_e_aceito_com_limpeza(carregar_orques
 
 
 def test_limpeza_sacrifica_o_slot_de_menor_residual(carregar_orquestrador):
-    """Entre slots ocupados, descarta-se o que tem menos estoque (D5, com 2)."""
+    """Entre slots ocupados, descarta-se o que tem menos estoque."""
     orq = carregar_orquestrador()
 
     (atrib,) = orq.modulo.atribuir_slots([_item("Dipirona")], _todos_ocupados())
 
-    assert atrib["dispenser_id"] == 5
+    assert atrib["dispenser_id"] == SLOT_MENOR_RESIDUO
 
 
 def test_slots_a_limpar_nao_se_repetem_entre_itens(carregar_orquestrador):
@@ -126,7 +136,7 @@ def test_sem_slot_para_todos_os_itens_devolve_none(carregar_orquestrador):
     orq = carregar_orquestrador()
 
     atribuicoes = orq.modulo.atribuir_slots(
-        [_item(f"Med{i}") for i in range(7)], _todos_ocupados()
+        [_item(f"Med{i}") for i in range(NUM_SLOTS + 1)], _todos_ocupados()
     )
 
     assert atribuicoes is None
@@ -142,6 +152,188 @@ def test_atribuir_slots_nao_toca_no_estado_recebido(carregar_orquestrador):
 
     assert estado == antes
     assert orq.adapter.chamadas == []
+
+
+# ── Geometria e rota: duas fileiras frente a frente ────────────────────────────
+#
+# Enquanto a célula era uma fileira só, o Y de todo slot era 0 e qualquer
+# ordenação devolvia a mesma linha reta — a rota não tinha o que errar. Com as
+# duas fileiras, escolher a ordem passa a valer distância de verdade, e é aqui
+# que se cobra a escolha (serpentina; ver `planejar_rota`).
+
+def _slots_de_cada_lado() -> tuple[list[int], list[int]]:
+    esquerda = list(range(1, SLOTS_POR_FILEIRA + 1))
+    direita  = list(range(SLOTS_POR_FILEIRA + 1, NUM_SLOTS + 1))
+    return esquerda, direita
+
+
+def test_posicoes_formam_duas_fileiras_frente_a_frente(carregar_orquestrador):
+    """Pares D1↔D5, D2↔D6…: mesmo X, Y espelhado."""
+    orq = carregar_orquestrador()
+    pos = orq.modulo.POSICOES
+    afastamento = orq.modulo.AFASTAMENTO_Y_MM
+
+    assert len(pos) == NUM_SLOTS
+    esquerda, direita = _slots_de_cada_lado()
+    assert all(pos[d][1] == -afastamento for d in esquerda)
+    assert all(pos[d][1] == +afastamento for d in direita)
+    for frente, fundo in zip(esquerda, direita):
+        assert pos[frente][0] == pos[fundo][0], f"D{frente} e D{fundo} não são um par"
+
+
+def test_home_fica_no_corredor_antes_do_primeiro_par(carregar_orquestrador):
+    """HOME no eixo do corredor (y=0) e fora da faixa dos dispensers."""
+    orq = carregar_orquestrador()
+    home_x, home_y = orq.modulo.HOME
+
+    assert home_y == 0.0
+    assert home_x < min(x for x, _ in orq.modulo.POSICOES.values())
+
+
+def test_rota_devolve_todos_os_slots_pedidos_sem_repeticao(carregar_orquestrador):
+    """Slot que sai da rota é slot que a OS não dispensa."""
+    orq = carregar_orquestrador()
+    esquerda, direita = _slots_de_cada_lado()
+    pedidos = esquerda[:2] + direita[:2] + esquerda[-1:]
+
+    rota = orq.modulo.planejar_rota(pedidos, orq.modulo.HOME)
+
+    assert sorted(rota) == sorted(set(pedidos))
+    assert len(rota) == len(set(rota))
+
+
+def test_rota_nao_e_pior_que_a_ordem_de_entrada(carregar_orquestrador):
+    """Reordenar só se justifica se encurtar o trajeto — em TODO subconjunto.
+
+    Força bruta sobre todos os subconjuntos não-vazios da célula, não sobre um
+    caso escolhido a dedo: é o que pegaria uma heurística que melhora a média e
+    piora algum caso específico.
+    """
+    orq = carregar_orquestrador()
+    home = orq.modulo.HOME
+
+    for tamanho in range(1, NUM_SLOTS + 1):
+        for entrada in itertools.combinations(range(1, NUM_SLOTS + 1), tamanho):
+            rota = orq.modulo.planejar_rota(list(entrada), home)
+            assert (orq.modulo.distancia_rota(rota, home)
+                    <= orq.modulo.distancia_rota(list(entrada), home) + 1e-9), (
+                f"rota {rota} é mais longa que a ordem de entrada {list(entrada)}"
+            )
+
+
+def test_rota_e_a_mais_curta_possivel_a_partir_de_home(carregar_orquestrador):
+    """A serpentina não é só melhor que a entrada — é o ótimo do ciclo fechado.
+
+    O ciclo real é HOME → slots → HOME. Com HOME e as duas fileiras na borda de
+    um mesmo polígono convexo, o tour ótimo é a ordem do contorno; a serpentina
+    a reproduz. Conferido contra a permutação ótima de cada subconjunto.
+    """
+    orq = carregar_orquestrador()
+    home = orq.modulo.HOME
+
+    for tamanho in range(1, NUM_SLOTS + 1):
+        for entrada in itertools.combinations(range(1, NUM_SLOTS + 1), tamanho):
+            melhor = min(orq.modulo.distancia_rota(list(p), home)
+                         for p in itertools.permutations(entrada))
+            escolhida = orq.modulo.distancia_rota(
+                orq.modulo.planejar_rota(list(entrada), home), home
+            )
+            assert escolhida == pytest.approx(melhor), (
+                f"subconjunto {list(entrada)}: {escolhida:.1f}mm contra {melhor:.1f}mm"
+            )
+
+
+def test_rota_completa_desce_um_lado_e_volta_pelo_outro(carregar_orquestrador):
+    """A forma da serpentina, explícita: sem cruzar o corredor no meio."""
+    orq = carregar_orquestrador()
+    esquerda, direita = _slots_de_cada_lado()
+
+    rota = orq.modulo.planejar_rota(list(range(1, NUM_SLOTS + 1)), orq.modulo.HOME)
+
+    assert rota == esquerda + list(reversed(direita))
+
+
+def test_rota_independe_da_ordem_em_que_os_slots_chegam(carregar_orquestrador):
+    """Mesma OS, mesma rota: a ordem das atribuições não pode mudar o trajeto."""
+    orq = carregar_orquestrador()
+    esquerda, direita = _slots_de_cada_lado()
+    pedidos = [direita[-1], esquerda[0], direita[0], esquerda[-1]]
+
+    rota = orq.modulo.planejar_rota(pedidos, orq.modulo.HOME)
+
+    assert rota == orq.modulo.planejar_rota(sorted(pedidos), orq.modulo.HOME)
+
+
+def test_rota_de_um_lado_so_nao_cruza_o_corredor(carregar_orquestrador):
+    """OS inteira de um lado só: nenhuma travessia, ida em x crescente."""
+    orq = carregar_orquestrador()
+    esquerda, _ = _slots_de_cada_lado()
+
+    rota = orq.modulo.planejar_rota(list(reversed(esquerda)), orq.modulo.HOME)
+
+    assert rota == esquerda
+
+
+def test_cnc_recebe_a_posicao_do_mapa_do_central(carregar_orquestrador):
+    """O comando carrega x/y — é o que dispensa a cópia do mapa no simulador."""
+    orq = carregar_orquestrador()
+    alvo = SLOTS_POR_FILEIRA + 1   # primeiro slot da fileira de trás
+
+    asyncio.run(orq.modulo.cmd_mover(alvo, "OS-1", 1, 1))
+
+    (comando,) = orq.adapter.comandos("/comandos/mover")
+    assert (comando["posicao_x"], comando["posicao_y"]) == orq.modulo.POSICOES[alvo]
+
+
+def test_homing_tambem_leva_as_coordenadas(carregar_orquestrador):
+    """Mesma razão do mover: o HOME é do central, não do simulador."""
+    orq = carregar_orquestrador()
+
+    asyncio.run(orq.modulo.cmd_homing("OS-1"))
+
+    (comando,) = orq.adapter.comandos("/comandos/homing")
+    assert (comando["posicao_x"], comando["posicao_y"]) == orq.modulo.HOME
+
+
+# ── atribuir_slots com a célula inteira ────────────────────────────────────────
+
+def test_usa_os_slots_das_duas_fileiras(carregar_orquestrador):
+    """Uma OS que enche a célula ocupa os dois lados, sem repetir slot."""
+    orq = carregar_orquestrador()
+
+    atribuicoes = orq.modulo.atribuir_slots(
+        [_item(f"Med{i}") for i in range(NUM_SLOTS)], _dispensers()
+    )
+
+    ids = [a["dispenser_id"] for a in atribuicoes]
+    assert sorted(ids) == list(range(1, NUM_SLOTS + 1))
+    assert not any(a["precisa_limpeza"] for a in atribuicoes)
+
+
+def test_residual_da_fileira_de_tras_e_reaproveitado(carregar_orquestrador):
+    """Passo 1 não conhece geometria: o resíduo vale onde quer que esteja."""
+    orq = carregar_orquestrador()
+    alvo = NUM_SLOTS   # último slot da fileira da direita
+
+    (atrib,) = orq.modulo.atribuir_slots(
+        [_item("Dipirona")], _dispensers(**{str(alvo): ("Dipirona", 6)})
+    )
+
+    assert atrib["dispenser_id"] == alvo
+    assert atrib["precisa_limpeza"] is False
+
+
+def test_celula_cheia_sacrifica_um_slot_por_item(carregar_orquestrador):
+    """Todos ocupados: cada item leva um slot distinto, todos marcados."""
+    orq = carregar_orquestrador()
+
+    atribuicoes = orq.modulo.atribuir_slots(
+        [_item(f"Novo{i}") for i in range(NUM_SLOTS)], _todos_ocupados()
+    )
+
+    ids = [a["dispenser_id"] for a in atribuicoes]
+    assert sorted(ids) == list(range(1, NUM_SLOTS + 1))
+    assert all(a["precisa_limpeza"] for a in atribuicoes)
 
 
 # ── _abortar_os: devolve os slots ao pool ──────────────────────────────────────
@@ -185,7 +377,7 @@ def test_abort_devolve_o_estado_em_memoria_para_idle(carregar_orquestrador):
 
     assert orq.estado["os_ativa"] is None
     assert orq.estado["atribuicao_ia"] == []
-    for slot_id in range(1, 7):
+    for slot_id in range(1, NUM_SLOTS + 1):
         assert orq.slot(slot_id)["status"] == "idle"
         assert orq.slot(slot_id)["os_id"] is None
 
@@ -324,13 +516,14 @@ def test_abort_no_meio_da_os_termina_em_erro(carregar_orquestrador, monkeypatch)
 def test_os_rejeitada_por_falta_de_slot_termina_em_erro(carregar_orquestrador):
     """A rejeição é uma saída como as outras — e a mais fácil de esquecer.
 
-    7 itens para 6 slots: `atribuir_slots` devolve None e a OS nunca chega a
-    reservar slot nenhum, então nada há para limpar no hardware.
+    Um item a mais do que a célula tem slots: `atribuir_slots` devolve None e a
+    OS nunca chega a reservar slot nenhum, então nada há para limpar no
+    hardware.
     """
     orq = carregar_orquestrador()
 
     asyncio.run(orq.modulo._processar_os(
-        _payload_os("OS-9", *[_item(f"Med{i}") for i in range(7)])
+        _payload_os("OS-9", *[_item(f"Med{i}") for i in range(NUM_SLOTS + 1)])
     ))
 
     assert _status_gravados(orq) == [("OS-9", "em_andamento"), ("OS-9", "erro")]

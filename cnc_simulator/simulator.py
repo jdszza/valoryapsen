@@ -23,6 +23,7 @@ import random
 import threading
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -39,16 +40,20 @@ ADAPTER_URL     = os.getenv("ADAPTER_URL",    "http://cnc-adapter:8101")
 VELOCIDADE_MM_S = float(os.getenv("VEL_MM_S",   "80"))   # mm/s
 INTERVALO_PUB   = float(os.getenv("INTERVALO",  "0.5"))  # s entre publicações de posição
 
-# Posições XY (mm) dos dispensers na mesa
-POSICOES: dict[int, tuple[float, float]] = {
-    1: (0.0,   0.0),
-    2: (120.0, 0.0),
-    3: (240.0, 0.0),
-    4: (360.0, 0.0),
-    5: (480.0, 0.0),
-    6: (600.0, 0.0),
-}
-HOME: tuple[float, float] = (0.0, -50.0)
+# O simulador NÃO tem mapa de posições. Ele valida a faixa do slot e se move
+# para o (x, y) que vem no comando — o mapa é do central (`orchestrator.
+# POSICOES`), que já mandava `posicao_x`/`posicao_y` em todo /executar/mover.
+# A cópia que existia aqui era um segundo dicionário mantido à mão, num serviço
+# que nunca precisou dele para nada além da validação de faixa abaixo.
+NUM_SLOTS = int(os.getenv("NUM_SLOTS", "8"))
+
+# HOME idem: o central manda as coordenadas no /executar/homing. Este par é só
+# o fallback de quem chamar o endpoint sem elas (contrato antigo) e a posição
+# em que a CNC nasce, antes do primeiro comando.
+HOME: tuple[float, float] = (
+    float(os.getenv("HOME_X", "-120")),
+    float(os.getenv("HOME_Y", "0")),
+)
 
 COMPONENTES_TEMP = [
     ("motor_eixo_x", 35, 55),
@@ -114,6 +119,8 @@ class MoverReq(BaseModel):
 
 class HomingReq(BaseModel):
     os_id: str
+    posicao_x: Optional[float] = None
+    posicao_y: Optional[float] = None
 
 
 # ── Lógica de movimento ────────────────────────────────────────────────────────
@@ -199,8 +206,12 @@ def _mover_para(disp_id: int, alvo_x: float, alvo_y: float,
     })
 
 
-def _homing(os_id: str):
-    """Move a CNC de volta para HOME e reporta conclusão."""
+def _homing(os_id: str, destino: tuple[float, float] = HOME):
+    """Move a CNC de volta para HOME e reporta conclusão.
+
+    `destino` vem do comando (o central é quem sabe onde fica o HOME); o
+    default cobre o chamador que não o informa.
+    """
     with _lock:
         orig_x = _cnc_state["pos_x"]
         orig_y = _cnc_state["pos_y"]
@@ -209,7 +220,7 @@ def _homing(os_id: str):
             "dispenser_alvo": None,
         })
 
-    distancia = math.hypot(HOME[0] - orig_x, HOME[1] - orig_y)
+    distancia = math.hypot(destino[0] - orig_x, destino[1] - orig_y)
     duracao   = max(1.0, distancia / VELOCIDADE_MM_S)
     passos    = max(3, int(duracao / INTERVALO_PUB))
 
@@ -217,8 +228,8 @@ def _homing(os_id: str):
 
     for i in range(1, passos + 1):
         t     = i / passos
-        cur_x = orig_x + (HOME[0] - orig_x) * t
-        cur_y = orig_y + (HOME[1] - orig_y) * t
+        cur_x = orig_x + (destino[0] - orig_x) * t
+        cur_y = orig_y + (destino[1] - orig_y) * t
 
         with _lock:
             _cnc_state["pos_x"] = cur_x
@@ -235,8 +246,8 @@ def _homing(os_id: str):
 
     with _lock:
         _cnc_state.update({
-            "pos_x":       HOME[0],
-            "pos_y":       HOME[1],
+            "pos_x":       destino[0],
+            "pos_y":       destino[1],
             "status":      "idle",
             "os_id":       None,
             "ciclo_atual": 0,
@@ -249,8 +260,8 @@ def _homing(os_id: str):
     _evento({
         "tipo":      "concluido",
         "os_id":     os_id,
-        "posicao_x": HOME[0],
-        "posicao_y": HOME[1],
+        "posicao_x": destino[0],
+        "posicao_y": destino[1],
         "ts":        _ts(),
     })
     _em_movimento.clear()
@@ -276,9 +287,9 @@ def _thread_mover(disp_id: int, alvo_x: float, alvo_y: float,
         _em_movimento.clear()
 
 
-def _thread_homing(os_id: str):
+def _thread_homing(os_id: str, destino: tuple[float, float]):
     try:
-        _homing(os_id)
+        _homing(os_id, destino)
     except Exception as exc:
         logger.error("[CNC] Erro em homing: %s", exc, exc_info=True)
         with _lock:
@@ -308,8 +319,10 @@ def status():
 
 @app.post("/executar/mover")
 def executar_mover(req: MoverReq):
-    if req.dispenser_alvo not in POSICOES:
-        raise HTTPException(400, f"dispenser_alvo deve ser 1-6, recebido: {req.dispenser_alvo}")
+    if not 1 <= req.dispenser_alvo <= NUM_SLOTS:
+        raise HTTPException(
+            400, f"dispenser_alvo deve ser 1-{NUM_SLOTS}, recebido: {req.dispenser_alvo}"
+        )
 
     # Verifica e seta _em_movimento atomicamente para evitar race condition
     with _movimento_lock:
@@ -340,14 +353,18 @@ def executar_homing(req: HomingReq):
             raise HTTPException(409, "CNC em movimento — aguarde conclusão")
         _em_movimento.set()
 
+    destino = (
+        HOME[0] if req.posicao_x is None else req.posicao_x,
+        HOME[1] if req.posicao_y is None else req.posicao_y,
+    )
     threading.Thread(
         target=_thread_homing,
-        args=(req.os_id,),
+        args=(req.os_id, destino),
         daemon=True,
         name="cnc-homing",
     ).start()
 
-    return {"ok": True, "msg": "Homing iniciado", "home": {"x": HOME[0], "y": HOME[1]}}
+    return {"ok": True, "msg": "Homing iniciado", "home": {"x": destino[0], "y": destino[1]}}
 
 
 # ── Telemetria periódica ───────────────────────────────────────────────────────
@@ -409,7 +426,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=_telemetria_loop, daemon=True, name="telemetria").start()
     logger.info(
-        "CNC Simulator v3.0 | adapter=%s | vel=%.0fmm/s | HOME=(%.0f, %.0f)",
-        ADAPTER_URL, VELOCIDADE_MM_S, HOME[0], HOME[1],
+        "CNC Simulator v3.0 | adapter=%s | vel=%.0fmm/s | slots=1..%d | HOME=(%.0f, %.0f)",
+        ADAPTER_URL, VELOCIDADE_MM_S, NUM_SLOTS, HOME[0], HOME[1],
     )
     uvicorn.run(app, host="0.0.0.0", port=8200, log_level="warning")

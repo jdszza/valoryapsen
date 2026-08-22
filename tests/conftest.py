@@ -61,6 +61,13 @@ RAIZ_REPO = Path(__file__).resolve().parent.parent
 # chama a função direto.
 os.environ.setdefault("SECRET_KEY", "t" * 64)
 
+# Nº de dispensers da célula. Fixado aqui pelo mesmo motivo da SECRET_KEY: os
+# módulos leem `NUM_SLOTS` uma vez, em constante de módulo, no primeiro import
+# da sessão. `setdefault` deixa quem exporta a variável (para experimentar
+# outra célula) ditar o valor, sem que a suíte carregue um número próprio.
+NUM_SLOTS = int(os.environ.setdefault("NUM_SLOTS", "8"))
+SLOTS_POR_FILEIRA = NUM_SLOTS // 2
+
 # Caminho de cada simulador, relativo à raiz do repositório.
 SIMULADORES = {
     "cnc":       "cnc_simulator/simulator.py",
@@ -366,7 +373,7 @@ def _estado_zerado() -> dict:
                 "quantidade_residual":   0,
                 "os_id":                 None,
             }
-            for i in range(1, 7)
+            for i in range(1, NUM_SLOTS + 1)
         },
     }
 
