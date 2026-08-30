@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>APSEN · Console</title>
+<style>
+:root{
+  --ap-gold:#D9B45B; --ap-gold-bright:#F0D07A; --ap-blue:#4A90D9;
+  --ap-bg:#000000; --ap-surface:#17171B; --ap-surface-2:#1F1F24;
+  --ap-line:#33333B; --ap-text:#C9C9D0; --ap-muted:#8C8C95;
+  --ap-err:#C0392B;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+  background:var(--ap-bg); color:var(--ap-text);
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+.caixa{
+  width:min(92vw,380px); background:var(--ap-surface); border:1px solid var(--ap-line);
+  border-radius:12px; padding:28px 26px 24px;
+  box-shadow:0 1px 2px rgba(0,0,0,.7), 0 10px 26px -14px rgba(0,0,0,1);
+}
+h1{margin:0 0 4px; font-size:19px; letter-spacing:.5px; color:var(--ap-gold)}
+.sub{margin:0 0 22px; font-size:12.5px; color:var(--ap-muted); line-height:1.5}
+label{display:block; font-size:11px; text-transform:uppercase; letter-spacing:1px;
+      color:var(--ap-muted); margin-bottom:6px}
+input{
+  width:100%; padding:11px 12px; font-size:15px; color:var(--ap-text);
+  background:var(--ap-surface-2); border:1px solid var(--ap-line); border-radius:8px;
+}
+input:focus{outline:none; border-color:var(--ap-gold); box-shadow:0 0 0 2px rgba(217,180,91,.18)}
+button{
+  width:100%; margin-top:16px; padding:11px; font-size:14px; font-weight:600;
+  letter-spacing:.5px; color:#111; background:var(--ap-gold); border:0;
+  border-radius:8px; cursor:pointer;
+}
+button:hover{background:var(--ap-gold-bright)}
+.erro{
+  margin:0 0 16px; padding:9px 11px; font-size:12.5px; line-height:1.45;
+  color:#F2C0B8; background:rgba(192,57,43,.16);
+  border:1px solid var(--ap-err); border-radius:8px;
+}
+.rodape{margin:18px 0 0; font-size:11px; color:#6A6A73; text-align:center}
+</style>
+</head>
+<body>
+  <main class="caixa">
+    <h1>APSEN · Console de operação</h1>
+    <p class="sub">Acesso restrito. Esta senha é própria do console e não é a do
+    app de manutenção.</p>
+    <!--ERRO-->
+    <form method="post" action="/console/login">
+      <label for="senha">Senha</label>
+      <input id="senha" name="senha" type="password" autocomplete="current-password"
+             autofocus required>
+      <button type="submit">Entrar</button>
+    </form>
+    <p class="rodape">Computador Central APSEN</p>
+  </main>
+</body>
+</html>

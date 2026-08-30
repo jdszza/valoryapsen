@@ -559,7 +559,7 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
             ], className="mb-0 small"),
             html.P(
                 "⚠ O sistema está aguardando intervenção de supervisor. "
-                "Acesse a IHM para liberar a OS.",
+                "Acesse o app de Manutenção para liberar a OS.",
                 className="mt-2 mb-0 fw-bold",
             ),
         ], color="danger", className="mx-0 my-3")

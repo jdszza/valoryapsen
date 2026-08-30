@@ -1,5 +1,5 @@
 """
-APSEN - Autenticação JWT (IHM de Manutenção)
+APSEN - Autenticação JWT (app de Manutenção e Operação)
 Apenas técnicos de manutenção precisam de login (para registrar intervenções).
 O dashboard é read-only e não requer autenticação.
 """

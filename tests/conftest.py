@@ -25,13 +25,13 @@ Quatro fábricas são oferecidas:
           asyncio.run(central.modulo._handle_evento_dispenser({...}))
           assert central.banco.chamadas_de("salvar_dispenser_estado")
 
-  `carregar_ihm` — importa `ihm_web/app.py` (Dash) com `requests` duplado, para
-  testar callback sem subir servidor nem navegador.
+  `carregar_manut` — importa `manut_web/app.py` (Dash) com `requests` duplado,
+  para testar callback sem subir servidor nem navegador.
 
-      def test_download(carregar_ihm):
-          ihm = carregar_ihm()
-          ihm.requests.content = b"csv..."
-          dados, erro = ihm.modulo._buscar_relatorio("OS-1", "csv", "jwt")
+      def test_download(carregar_manut):
+          manut = carregar_manut()
+          manut.requests.content = b"csv..."
+          dados, erro = manut.modulo._buscar_relatorio("OS-1", "csv", "jwt")
 
   `carregar_orquestrador` — importa `central-computer/orchestrator.py` sozinho,
   com banco duplado e `_post` trocado por um adapter fake que grava os comandos
@@ -82,7 +82,8 @@ SIMULADORES = {
 class RespostaFake:
     """Resposta mínima com a superfície que os simuladores realmente usam.
 
-    `content` e `headers` existem para o download de relatório da IHM, que lê
+    `content` e `headers` existem para o download de relatório do app de
+    manutenção, que lê
     os bytes e o `Content-Disposition` em vez do JSON.
     """
 
@@ -96,6 +97,19 @@ class RespostaFake:
 
     def json(self) -> dict:
         return self._payload
+
+    def raise_for_status(self) -> None:
+        """Como o `requests` real: levanta em 4xx/5xx, silencioso no resto.
+
+        O order-generator usa isto nas duas cargas de boot (catálogo e ordens
+        padrão). Sem o método, o `AttributeError` caía no `except Exception` do
+        laço de retentativa e o teste via "central fora do ar" onde a resposta
+        tinha sido 200.
+        """
+        if self.status_code >= 400:
+            raise RequestsFake.exceptions.RequestException(
+                f"HTTP {self.status_code}"
+            )
 
 
 class RequestsFake:
@@ -140,7 +154,8 @@ class RequestsFake:
         return self._registrar("POST", url, json, **kwargs)
 
     def get(self, url, json=None, **kwargs) -> RespostaFake:
-        # `json=` explícito: o helper `_api` da IHM manda `json=None` em TODO
+        # `json=` explícito: o helper `_api` do app de manutenção manda
+        # `json=None` em TODO
         # método, inclusive GET. Deixá-lo cair no **kwargs colidia com o
         # posicional de `_registrar` e virava TypeError engolido pelo try/except
         # do chamador — a tela renderizava vazia sem dizer por quê.
@@ -209,13 +224,13 @@ def carregar_simulador(monkeypatch):
     return _carregar
 
 
-# ── IHM de manutenção (Dash) ───────────────────────────────────────────────────
+# ── App de manutenção e operação (Dash) ───────────────────────────────────────
 
-IHM_APP = RAIZ_REPO / "ihm_web" / "app.py"
+MANUT_APP = RAIZ_REPO / "manut_web" / "app.py"
 
 
-class IHMCarregada:
-    """Módulo `ihm_web/app.py` + as chamadas HTTP que ele tentou fazer."""
+class ManutCarregada:
+    """Módulo `manut_web/app.py` + as chamadas HTTP que ele tentou fazer."""
 
     def __init__(self, modulo, requests_fake: RequestsFake):
         self.modulo = modulo
@@ -227,8 +242,8 @@ class IHMCarregada:
 
 
 @pytest.fixture
-def carregar_ihm(monkeypatch):
-    """Importa `ihm_web/app.py` com `requests` duplado.
+def carregar_manut(monkeypatch):
+    """Importa `manut_web/app.py` com `requests` duplado.
 
     O import monta o layout e registra os callbacks; nada sobe servidor nem
     navegador. `dash` e `dash_bootstrap_components` são importados DE VERDADE
@@ -239,22 +254,40 @@ def carregar_ihm(monkeypatch):
     tem efeito antes do import — igual aos simuladores.
     """
 
-    def _carregar(env: dict[str, str] | None = None) -> IHMCarregada:
+    def _carregar(env: dict[str, str] | None = None) -> ManutCarregada:
         for chave, valor in (env or {}).items():
             monkeypatch.setenv(chave, valor)
 
         requests_fake = RequestsFake()
         monkeypatch.setitem(sys.modules, "requests", requests_fake)
 
-        nome_modulo = "apsen_ihm_web"
-        spec = importlib.util.spec_from_file_location(nome_modulo, IHM_APP)
+        nome_modulo = "apsen_manut_web"
+        spec = importlib.util.spec_from_file_location(nome_modulo, MANUT_APP)
         modulo = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, nome_modulo, modulo)
         spec.loader.exec_module(modulo)
 
-        return IHMCarregada(modulo, requests_fake)
+        return ManutCarregada(modulo, requests_fake)
 
     return _carregar
+
+
+# ── Ordens padrão ──────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="session")
+def os_templates():
+    """`central-computer/os_templates.py` importado por caminho.
+
+    Módulo sem dependência nenhuma — nem de `config`, nem de banco —, então não
+    precisa do aparato de `carregar_central`: basta o caminho. `scope="session"`
+    porque ele não tem estado mutável e o import roda o autoteste de estrutura.
+    """
+    caminho = RAIZ_REPO / "central-computer" / "os_templates.py"
+    spec = importlib.util.spec_from_file_location("apsen_os_templates", caminho)
+    modulo = importlib.util.module_from_spec(spec)
+    sys.modules["apsen_os_templates"] = modulo
+    spec.loader.exec_module(modulo)
+    return modulo
 
 
 # ── Computador central ─────────────────────────────────────────────────────────

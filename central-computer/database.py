@@ -656,8 +656,8 @@ def get_ordem_ativa() -> dict | None:
 
     Quem está rodando é dito pelo STATUS, não pela data: `_processar_os` grava
     'em_andamento' assim que tira a OS da fila. O fallback para 'aguardando'
-    existe para a IHM não ficar em branco entre duas OS, e aí a "próxima" é a
-    mais ANTIGA — a ordem em que o orquestrador vai puxá-las.
+    existe para o app de manutenção não ficar em branco entre duas OS, e aí a
+    "próxima" é a mais ANTIGA — a ordem em que o orquestrador vai puxá-las.
 
     Uma única query com `criado_em DESC` sobre os dois status — como era antes —
     devolvia, sempre que existisse fila, a OS enfileirada por ÚLTIMO: a que

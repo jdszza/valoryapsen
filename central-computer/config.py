@@ -50,9 +50,9 @@ def validar_secret_key(chave: str, ambiente: str) -> None:
 def _origens_cors() -> list[str]:
     """Origens de browser autorizadas a chamar o central.
 
-    Só o dashboard e a IHM falam com o central pelo navegador. `*` num serviço
-    autenticado deixa qualquer página aberta no mesmo browser do técnico
-    disparar requisições em nome dele.
+    Só o dashboard e o app de manutenção falam com o central pelo navegador.
+    `*` num serviço autenticado deixa qualquer página aberta no mesmo browser
+    do técnico disparar requisições em nome dele.
     """
     bruto = os.getenv("CORS_ORIGINS", "http://localhost:8050,http://localhost:8051")
     return [origem.strip() for origem in bruto.split(",") if origem.strip()]
@@ -132,6 +132,42 @@ def _num_slots() -> int:
     return valor
 
 
+def _console_senha() -> str:
+    """Senha do console de operação. Vazia = console DESABILITADO.
+
+    Independente do JWT de propósito: o console é a mesa de operação de quem
+    apresenta a planta, não mais um técnico do app de manutenção. Dar-lhe um
+    usuário no banco criaria uma conta com poder de disparar OS que ninguém
+    lembraria de desativar; exigir um JWT de admin o acorrentaria ao app que
+    ele existe para não precisar abrir.
+
+    Não existe default embutido, e a ausência não vira senha fraca: sem a
+    variável o console inteiro some (503 em toda rota `/console*`). Uma senha
+    padrão versionada aqui seria pior que não ter console nenhum — ela abriria
+    o disparo de OS para quem lesse o repositório.
+    """
+    return os.getenv("CONSOLE_SENHA", "").strip()
+
+
+def _console_sessao_horas() -> float:
+    """Validade do cookie de sessão do console. Faixa 0.25..24 h.
+
+    Oito horas, como o JWT: é um turno. Fora da faixa cai no default — 0
+    deslogaria a cada clique e 720 faria um notebook esquecido aberto virar
+    acesso permanente ao disparo de OS.
+    """
+    bruto = os.getenv("CONSOLE_SESSAO_HORAS", "8")
+    try:
+        valor = float(bruto)
+    except ValueError:
+        valor = 0.0
+    if not 0.25 <= valor <= 24:
+        _cfg_logger.warning(
+            "CONSOLE_SESSAO_HORAS=%r fora da faixa 0.25..24 — usando 8.", bruto)
+        return 8.0
+    return valor
+
+
 @dataclass
 class Settings:
     # ── MySQL ─────────────────────────────────────────────────────────────────
@@ -189,6 +225,12 @@ class Settings:
     # mapa de posições (orchestrator), a validação de slot (main) e o seed de
     # `dispenser_estado` (database).
     NUM_SLOTS: int = _num_slots()
+
+    # ── Console de operação ───────────────────────────────────────────────────
+    # Senha própria, independente do JWT. VAZIA = console desabilitado (503 em
+    # toda rota `/console*`) — nunca uma senha default embutida.
+    CONSOLE_SENHA: str = field(default_factory=_console_senha)
+    CONSOLE_SESSAO_HORAS: float = field(default_factory=_console_sessao_horas)
 
     # ── Volume de escrita e de broadcast ──────────────────────────────────────
     # Intervalo mínimo entre broadcasts de eventos de ALTA FREQUÊNCIA (posição

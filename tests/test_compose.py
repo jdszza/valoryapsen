@@ -167,3 +167,39 @@ def test_healthcheck_aponta_para_a_porta_publicada(servicos):
         assert f":{porta_container}/" in " ".join(hc["test"]), (
             f"{nome}: healthcheck não usa a porta {porta_container}"
         )
+
+
+# ── Renome para manut_web ─────────────────────────────────────────────────────
+# A antiga interface homem-máquina virou o app de MANUTENÇÃO E OPERAÇÃO: mudou o
+# nome, não a função. Estes testes prendem os três pontos que um rename esquece
+# — o nome do serviço, o do container e a porta — para que o `make log-manut`, o
+# `docker compose logs manut_web` e o bookmark do gestor continuem valendo.
+#
+# O nome antigo é montado por concatenação: escrito por extenso, este arquivo
+# reprovaria em `test_rename_manut.py`, que varre o repositório inteiro.
+NOME_ANTIGO = "i" + "hm_web"
+
+def test_o_servico_de_manutencao_se_chama_manut_web(servicos):
+    assert "manut_web" in servicos, (
+        f"serviço manut_web ausente; serviços: {sorted(servicos)}"
+    )
+
+
+def test_nenhum_servico_conserva_o_nome_antigo(servicos):
+    assert NOME_ANTIGO not in servicos, (
+        f"o serviço {NOME_ANTIGO} foi renomeado para manut_web"
+    )
+
+
+def test_manut_web_publica_a_porta_8051(servicos):
+    """A porta é o que o gestor tem no bookmark — o rename não a move."""
+    portas = [str(p) for p in servicos["manut_web"].get("ports", [])]
+    assert "8051:8051" in portas, f"manut_web não publica 8051: {portas}"
+
+
+def test_manut_web_constroi_do_diretorio_manut_web(servicos):
+    assert servicos["manut_web"]["build"] == "./manut_web"
+
+
+def test_container_de_manutencao_se_chama_apsen_manut(servicos):
+    assert servicos["manut_web"]["container_name"] == "apsen-manut"

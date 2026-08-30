@@ -14,7 +14,7 @@ Sistema automatizado de contagem e validação de medicamentos. Uma mesa CNC per
 ## Arquitetura (v3.2 — REST/HTTP)
 
 ```
-Order Generator (gera OS aleatórias por categoria)
+Order Generator (sorteia 1 das 10 ordens padrão e instancia um os_id novo)
   │ POST /api/v1/ordens
   ▼
 ┌────────────────────────────────────────────────────────────────────┐
@@ -48,7 +48,7 @@ Order Generator (gera OS aleatórias por categoria)
 └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘
 
 Dashboard  :8050  ←─ GET /estado (polling) ──── Central Computer
-IHM Web    :8051  ←─ JWT + REST + WS ────────── Central Computer
+Manutencao :8051  ←─ JWT + REST + WS ────────── Central Computer
 Displays          ←─ WebSocket /ws ──────────── Central Computer
 MySQL      :3306  ←─ pymysql (sync) ─────────── Central Computer
 ```
@@ -83,9 +83,9 @@ O Central emite o evento abaixo sempre que um produto é atribuído a um dispens
 | `cnc-simulator`       | 8200  | Simula firmware da mesa CNC                                  |
 | `vision-simulator`    | 8202  | Simula as 3 câmeras: uma por fileira + a da mesa/balança     |
 | `weight-simulator`    | 8203  | Simula célula de carga HX711 instalada sob a mesa CNC        |
-| `order-generator`     | —     | Gera OS aleatórias por categoria e envia ao central          |
+| `order-generator`     | —     | Dispara 1 das 10 ordens padrão por ciclo e envia ao central  |
 | `dashboard`           | 8050  | Monitoramento read-only (Plotly Dash)                        |
-| `ihm_web`             | 8051  | IHM de manutenção com autenticação JWT (Plotly Dash)         |
+| `manut_web`           | 8051  | Manutenção e operação com autenticação JWT (Plotly Dash)     |
 
 ---
 
@@ -134,10 +134,119 @@ pior caso. Ver `planejar_rota` e `tests/test_orchestrator.py`.
 
 ---
 
+## As 10 ordens padrão
+
+As Ordens de Saída **não são mais sorteadas item a item** do catálogo. Existem
+dez ordens fixas, com nome, categoria, itens e quantidades definidos em
+`central-computer/os_templates.py`. O acaso que sobrou é **qual delas** o
+order-generator dispara — para quem observa a planta, o comportamento continua
+imprevisível; para quem apresenta, o conteúdo de cada OS é conhecido de antemão.
+
+| Template        | Ordem                                    | Itens | Perfil                          |
+|-----------------|------------------------------------------|-------|---------------------------------|
+| `OS-URO-01`     | Urologia — ronda noturna                 | 2     | a mais curta                    |
+| `OS-DOR-01`     | Reumatologia / Dor — lote matinal        | 3     | curta                           |
+| `OS-VITAM-01`   | Vitaminas — suplementação ambulatorial   | 3     | curta                           |
+| `OS-GASTRO-01`  | Gastroenterologia — leito 118            | 4     | meia célula                     |
+| `OS-SNC-02`     | Neurologia — leito 207 (reposição)       | 4     | reaproveita residual da SNC-01  |
+| `OS-CARDIO-01`  | Cardiologia — leito 302                  | 5     |                                 |
+| `OS-SNC-01`     | Neurologia — leito 204                   | 5     |                                 |
+| `OS-LACTO-01`   | Intolerância a lactose — kit flora       | 6     |                                 |
+| `OS-INFECTO-01` | Infectologia — esquema antibiótico       | 6     |                                 |
+| `OS-GERAL-01`   | Carro de emergência — célula cheia       | 8     | **célula cheia**, rota completa |
+
+Todos os 39 medicamentos citados são itens reais do catálogo APSEN. Seis deles
+aparecem em mais de uma ordem (`ALOIS 10MG`, `INSIT 50MG`, `FLANCOX 500MG`,
+`RETEMIC 5MG`, `LONIUM 40MG`, `INPRUV DK 7000UI`), o que faz o reaproveitamento
+de residual entre OS acontecer de verdade: disparar `OS-SNC-01` e logo depois
+`OS-SNC-02` reencontra dois slots já carregados, e o passo 1 do `atribuir_slots`
+os usa sem limpar.
+
+**O template é fixo; o `os_id` é único a cada disparo**, no formato
+`{template_id}-{AAAAMMDDTHHMMSS}-{6 hex}` — por exemplo
+`OS-SNC-01-20260814T221104-A3F291`. `ordens.os_id` é UNIQUE e o central recusa
+reenvio com 409, então sem o sufixo a segunda vez que uma ordem padrão fosse
+disparada seria rejeitada.
+
+Editar as ordens na véspera de uma apresentação é mexer só na lista `TEMPLATES`
+— nome do medicamento (como está no catálogo) e quantidade, entre 2 e 15. As
+regras (2 a 8 itens, sem item repetido, faixa de quantidade) são validadas no
+import do módulo, no boot do central e no boot do gerador; `GET
+/api/v1/ordens/templates` serve as dez com o diagnóstico junto.
+
+---
+
+## Console de operação (`/console`)
+
+O central serve uma interface própria em **http://localhost:8000/console**: a
+mesa de onde se escolhe **qual** das dez ordens padrão entra no sistema e
+**quando**. Ela existe para a hora da apresentação — quando o sorteio do
+order-generator, que é o que dá naturalidade à planta rodando sozinha, passa a
+atrapalhar quem precisa mostrar um caso específico.
+
+O que dá para fazer de lá:
+
+| Ação | Detalhe |
+|------|---------|
+| Listar as 10 ordens | nome, categoria, itens, quantidades e quantos slots ocupa |
+| Disparar qualquer uma | um clique, sem confirmação — `os_id` novo a cada disparo |
+| Pausar / retomar o automático | assume o controle sem competir com o gerador |
+| Estado ao vivo | OS ativa, fila, trava (com motivo e slot) e os 8 dispensers |
+| Liberar a trava do Triple Check | **com confirmação** — é a única ação destrutiva |
+| Ver a resposta do central | código HTTP e corpo de cada ação, inclusive as recusas |
+
+**Acesso.** Rota discreta: não é linkada de lugar nenhum e não aparece no
+Swagger (`include_in_schema=False`). A senha é `CONSOLE_SENHA`, do `.env` —
+**própria do console, independente do login JWT do app de manutenção**. A
+sessão é um cookie `HttpOnly` assinado por HMAC, válido por
+`CONSOLE_SESSAO_HORAS` (8h) e restrito ao caminho `/console`; trocar a senha
+invalida na hora as sessões abertas, porque ela entra na chave de assinatura.
+Cinco senhas erradas em um minuto bloqueiam a origem por um minuto.
+
+> **Sem `CONSOLE_SENHA` o console não existe**: toda rota `/console*` responde
+> **503** com a instrução de definir a variável, e nenhuma senha confere. Não há
+> senha default embutida — ela estaria versionada aqui e abriria o disparo de OS
+> para quem lesse o repositório. A escolha de 503 em vez de 404: as duas
+> escondem o console de quem não tem a senha e nenhuma das duas o abre, então a
+> diferença só aparece para o operador que configurou errado — 404 o manda caçar
+> o erro na URL, no build ou no proxy; 503 encerra o assunto numa linha.
+
+**O disparo manual não é um segundo caminho de entrada.** O console monta o
+corpo com `os_templates.instanciar` — o mesmo que o gerador usa — e chama
+`receber_ordem`, a função do `POST /api/v1/ordens`. Fila cheia (**429**), OS
+duplicada (409) e banco fora do ar (503) aparecem na tela exatamente como o
+gerador os recebe, porque é o mesmo código respondendo. Duas portas de entrada
+divergiriam no primeiro ajuste de contrato, e a que ficaria para trás é a que
+um humano usa sob pressão.
+
+**Como a pausa chega ao gerador.** O order-generator é outro container, e o
+central não o para: ele publica um booleano em `GET /api/v1/gerador`, e o
+gerador consulta essa rota antes de cada envio (`ESPERA_PAUSA` entre consultas
+enquanto a pausa durar). Mandar o central falar com o daemon do Docker exigiria
+socket montado, privilégio de administrador da máquina e um acoplamento novo
+entre o central e o runtime que o hospeda — tudo para não dispensar medicamento
+por alguns minutos. Com o flag, o container segue de pé e volta a produzir no
+instante em que o console despausa. A pausa **não é persistida**: restart do
+central retoma o automático, porque uma pausa gravada sobreviveria à
+apresentação que a motivou e o sintoma seria uma planta em silêncio sem erro em
+lugar nenhum.
+
+Pausar **não** bloqueia o disparo manual — pausar é assumir o controle, não
+parar a planta.
+
+**Estado ao vivo pelo `/ws`.** A página consome o mesmo WebSocket do dashboard;
+nenhum polling novo foi criado. A bancada é desenhada em duas fileiras de
+quatro com o corredor da CNC no meio, como no dashboard e pelo mesmo motivo:
+"D7 travou" tem que apontar para um lugar na bancada, não para a sétima posição
+de uma lista.
+
+---
+
 ## Fluxo de uma OS
 
 ```
-1.  order-generator  →  POST /api/v1/ordens  →  central-computer
+1.  order-generator: sorteia 1 das 10 ordens padrão, instancia os_id
+    →  POST /api/v1/ordens  →  central-computer
 2.  central-computer: atribui slots por categoria/residual disponível
 3.  central-computer: planeja rota CNC (serpentina — desce uma fileira, volta pela outra)
 4.  central-computer  →  weight-adapter  →  POST /tara  (zera balança para a OS)
@@ -163,7 +272,7 @@ pior caso. Ver `planejar_rota` e `tests/test_orchestrator.py`.
        • OK → continua para o próximo slot
 9.  cnc-adapter  →  POST /executar/homing
 10. OS marcada como "concluída" no MySQL
-11. Broadcast WebSocket para Dashboard, IHM e Displays
+11. Broadcast WebSocket para Dashboard, app de Manutenção e Displays
 ```
 
 ---
@@ -237,7 +346,7 @@ PROB_FALHA_LEITURA_DISPENSER_DIR:  0.30   # ...menos a da direita, que está suj
 
 A câmera da mesa é uma só e não tem lado a sobrescrever.
 
-O estado ao vivo (`GET /estado`) traz as três em `visao`: `camera_dispenser_esq`, `camera_dispenser_dir` e `camera_mesa`. Dashboard e IHM mostram as três — no dashboard, cada câmera de dispenser fica do lado do corredor que ela cobre, para casar com o painel de slots.
+O estado ao vivo (`GET /estado`) traz as três em `visao`: `camera_dispenser_esq`, `camera_dispenser_dir` e `camera_mesa`. Dashboard e app de manutenção mostram as três — no dashboard, cada câmera de dispenser fica do lado do corredor que ela cobre, para casar com o painel de slots.
 
 ---
 
@@ -276,15 +385,22 @@ MYSQL_USER=apsen
 MYSQL_PASS=
 MYSQL_DB=apsen_db
 
-# ── Usuários seed da IHM de manutenção ───────────────────────────────────────
+# ── Usuários seed do app de manutenção ──────────────────────────────────────
 # OBRIGATÓRIAS. Criadas só na primeira inicialização do banco. TROQUE AMBAS
-# após o primeiro login, pela própria IHM (aba Usuários) — ficam em claro aqui.
+# após o primeiro login, pelo próprio app (aba Usuários) — ficam em claro aqui.
 SEED_ADMIN_SENHA=
 SEED_MANUT_SENHA=
 
 # ── Origens de browser autorizadas a chamar o central ────────────────────────
 # Ajuste ao publicar fora da máquina local. `*` não é aceito no central.
 CORS_ORIGINS=http://localhost:8050,http://localhost:8051
+
+# ── Console de operação do central (http://localhost:8000/console) ───────────
+# OPCIONAL e sem default embutido: vazia = console DESABILITADO (toda rota
+# /console* responde 503). Senha PRÓPRIA, independente do login do app de
+# manutenção.
+CONSOLE_SENHA=
+CONSOLE_SESSAO_HORAS=8
 FIM
 
 # Preencha as CINCO obrigatórias antes de seguir:
@@ -309,21 +425,26 @@ docker compose logs -f cnc-simulator
 
 ## Interfaces
 
-| Interface   | URL                        | Acesso    |
-|-------------|----------------------------|-----------|
-| Dashboard   | http://localhost:8050      | Público   |
-| IHM Web     | http://localhost:8051      | JWT       |
-| API Central | http://localhost:8000      | REST/WS   |
-| Docs API    | http://localhost:8000/docs | Swagger   |
+| Interface   | URL                           | Acesso           |
+|-------------|-------------------------------|------------------|
+| Dashboard   | http://localhost:8050         | Público          |
+| Manutenção  | http://localhost:8051         | JWT              |
+| Console     | http://localhost:8000/console | `CONSOLE_SENHA`  |
+| API Central | http://localhost:8000         | REST/WS          |
+| Docs API    | http://localhost:8000/docs    | Swagger          |
 
-**Usuários padrão (IHM):**
+O console é a interface de operação do central — ver
+[Console de operação](#console-de-operação-console). Ele fica **desabilitado**
+(503) enquanto `CONSOLE_SENHA` não estiver no `.env`.
+
+**Usuários padrão (app de Manutenção):**
 
 | Usuário  | Senha                        | Perfil      |
 |----------|------------------------------|-------------|
 | `admin`  | `SEED_ADMIN_SENHA` do `.env` | admin       |
 | `manut1` | `SEED_MANUT_SENHA` do `.env` | manutencao  |
 
-> **Troque as duas após o primeiro login**, pela própria IHM (aba 👥 Usuários).
+> **Troque as duas após o primeiro login**, pelo próprio app (aba 👥 Usuários).
 > As senhas seed ficam em arquivo, em claro, e são lidas apenas na criação do
 > banco — depois disso o `.env` só serve para lembrar quem tem acesso.
 
@@ -336,8 +457,9 @@ Nada de segredo entra no repositório. O `docker-compose.yml` lê tudo do `.env`
 |----------|----------|
 | `SECRET_KEY` | assina os JWT. Gere com `python -c "import secrets; print(secrets.token_hex(32))"` |
 | `MYSQL_ROOT_PASS`, `MYSQL_PASS` | credenciais do banco (lidas na criação do volume) |
-| `SEED_ADMIN_SENHA`, `SEED_MANUT_SENHA` | senhas iniciais da IHM |
+| `SEED_ADMIN_SENHA`, `SEED_MANUT_SENHA` | senhas iniciais do app de manutenção |
 | `APSEN_ENV` | `prod` (default) recusa segredo fraco; `dev` só avisa |
+| `CONSOLE_SENHA` | senha do console de operação. **Opcional** — vazia = console desabilitado (503), nunca uma senha default |
 
 O central **se recusa a subir** com `SECRET_KEY` default, vazia ou com menos de
 32 caracteres, a não ser com `APSEN_ENV=dev`. O valor default antigo está no
@@ -354,6 +476,7 @@ GET  /estado                             → estado completo em memória
 GET  /os/ativa                           → OS em execução (ou a próxima da fila)
 GET  /os/historico                       → histórico de OS
 GET  /medicamentos                       → catálogo (96 medicamentos APSEN)
+GET  /api/v1/ordens/templates            → as 10 ordens padrão (+ diagnóstico)
 GET  /dispensers/estado                  → estado dos 8 slots no DB
 GET  /alarmes                            → alarmes ativos/resolvidos
 WS   /ws                                 → push de estado em tempo real
@@ -362,6 +485,8 @@ POST /api/v1/ordens                      → recebe nova OS (order-generator)
                                            409 os_duplicada | 429 fila_cheia |
                                            503 persistencia_indisponivel
 GET  /api/v1/fila                        → ocupação da fila (backpressure)
+GET  /api/v1/gerador                     → flag de pausa do order-generator
+                                           (ele consulta antes de cada envio)
 POST /api/v1/eventos/dispenser           → recebe eventos (dispenser-adapter)
 POST /api/v1/eventos/cnc                 → recebe eventos (cnc-adapter)
 POST /api/v1/eventos/visao               → recebe resultados de CV (vision-adapter)
@@ -377,7 +502,23 @@ POST /api/v1/admin/liberar-trava         → libera trava de erro (admin/supervi
 GET  /api/v1/visao/historico             → histórico de leituras de CV
 GET  /api/v1/relatorio/os/{os_id}?formato=csv|xlsx
                                          → relatório da OS (só header Authorization;
-                                           a IHM baixa server-side e entrega ao navegador)
+                                           o app de manutenção baixa server-side
+                                           e entrega ao navegador)
+```
+
+O console de operação tem rotas próprias, **fora do Swagger**
+(`include_in_schema=False`) e atrás do cookie de sessão:
+
+```
+GET  /console                            → a página (sem sessão: 303 → /console/login)
+GET  /console/login                      → tela de senha
+POST /console/login                      → confere CONSOLE_SENHA, emite o cookie
+POST /console/logout                     → encerra a sessão
+POST /console/api/disparar               → dispara uma ordem padrão
+                                           (chama o MESMO receber_ordem do
+                                           POST /api/v1/ordens)
+POST /console/api/gerador                → pausa/retoma o order-generator
+POST /console/api/liberar-trava          → libera a trava do Triple Check
 ```
 
 ---
@@ -390,6 +531,10 @@ valoryapsen/
 │   ├── main.py             # FastAPI + handlers de eventos (dispenser, CNC, visão, peso)
 │   ├── orchestrator.py     # Lógica de negócio (fila, atribuição, rota, Triple Check)
 │   ├── database.py         # MySQL (10 tabelas, 96 medicamentos)
+│   ├── os_templates.py     # As 10 ordens padrão (fonte única; o gerador lê daqui)
+│   ├── console.py          # Console de operação: senha, sessão HMAC, flag de pausa
+│   ├── console.html        # Página do console (HTML+CSS+JS, sem build nem framework)
+│   ├── console_login.html  # Tela de senha do console
 │   ├── config.py           # Settings via env vars
 │   ├── auth.py             # JWT + bcrypt
 │   ├── requirements.txt
@@ -402,21 +547,14 @@ valoryapsen/
 ├── cnc_simulator/          # Simula firmware da CNC (:8200)
 ├── vision-simulator/       # Simula as 3 câmeras (2 de fileira + mesa) (:8202)
 ├── weight-simulator/       # Simula célula de carga HX711 sob a mesa CNC (:8203)
-├── order-generator/        # Gera OS aleatórias por categoria (sem porta)
+├── order-generator/        # Dispara 1 das 10 ordens padrão por ciclo (sem porta)
 ├── dashboard/              # Plotly Dash read-only :8050
-├── ihm_web/                # Plotly Dash IHM manutenção :8051
-├── ihm_esp32/              # ⚠️ firmware DEFASADO (ainda MQTT) — ver nota abaixo
+├── manut_web/              # Plotly Dash manutenção e operação :8051
 ├── mysql/init.sql          # Só charset/collation; o schema vem do database.py
 ├── tests/                  # pytest — sem Docker, sem MySQL (`make test`)
 ├── docker-compose.yml
 └── .gitignore
 ```
-
-> **`ihm_esp32/` está defasado.** O firmware fala MQTT (`PubSubClient`, tópicos
-> `apsen/*`), de antes da migração para REST/HTTP: não há broker no compose e
-> nenhum serviço publica tópico, então ele não conversa com o sistema atual.
-> Migrá-lo para `GET /estado` + `WS /ws` é trabalho pendente; o código segue
-> aqui como referência de layout de tela e pinagem.
 
 ---
 
@@ -428,7 +566,9 @@ valoryapsen/
 | `APSEN_ENV`                     | `prod` (`dev` afrouxa o segredo) | central-computer  |
 | `CORS_ORIGINS`                  | `http://localhost:8050,http://localhost:8051` | central-computer |
 | `AUTH_CACHE_TTL_S`              | `30`s de cache da revalidação   | central-computer   |
-| `NUM_SLOTS`                     | `8` dispensers (par; 2 fileiras) | **todos** — central, simuladores e dashboard |
+| `CONSOLE_SENHA`                 | (vazia) — vazia DESABILITA o console (503) | central-computer |
+| `CONSOLE_SESSAO_HORAS`          | `8`h de cookie (faixa 0.25–24)  | central-computer   |
+| `NUM_SLOTS`                     | `8` dispensers (par; 2 fileiras) | **todos** — central, simuladores, dashboard e order-generator |
 | `DISPENSER_ADAPTER_URL`         | `http://dispenser-adapter:8100` | central-computer   |
 | `CNC_ADAPTER_URL`               | `http://cnc-adapter:8101`       | central-computer   |
 | `VISION_ADAPTER_URL`            | `http://vision-adapter:8102`    | central-computer   |
@@ -463,8 +603,8 @@ valoryapsen/
 | `INTERVALO_OS`                  | `90`s entre OS                  | order-generator    |
 | `ESPERA_FILA_CHEIA`             | `20`s entre consultas à fila    | order-generator    |
 | `MAX_ESPERAS_FILA`              | `15` esperas antes de pular o ciclo | order-generator |
-| `MIN_MEDS_POR_OS`               | `2`                             | order-generator    |
-| `MAX_MEDS_POR_OS`               | `6`                             | order-generator    |
+| `RELOAD_CATALOGO_MIN`           | `30`min entre recargas de catálogo/ordens | order-generator |
+| `ESPERA_PAUSA`                  | `10`s entre consultas ao flag de pausa | order-generator |
 
 ---
 
@@ -479,13 +619,16 @@ valoryapsen/
 - Pré-registro de eventos antes de enviar comandos (resposta rápida nunca perdida)
 - `copy.deepcopy` sob o lock em todo snapshot de estado — a cópia rasa deixava
   os dicionários aninhados vivos durante a serialização, fora do lock
-- JWT + bcrypt para autenticação da IHM
+- JWT + bcrypt para autenticação do app de manutenção
+- Console de operação com senha própria e sessão HMAC (`HttpOnly`, path
+  `/console`), desabilitado por completo quando `CONSOLE_SENHA` não está
+  definida — sem senha default embutida
 - **Revalidação a cada requisição autenticada**: o token não é a palavra final;
   usuário desativado perde acesso na hora e a `role` vale a do banco, não a do
   token (cache de `AUTH_CACHE_TTL_S`)
 - Segredos só no `.env` (não versionado); o central **recusa subir** com
   `SECRET_KEY` default fora de `APSEN_ENV=dev`
-- CORS restrito ao dashboard e à IHM (`CORS_ORIGINS`), não `*`
+- CORS restrito ao dashboard e ao app de manutenção (`CORS_ORIGINS`), não `*`
 - Healthcheck em todos os serviços de aplicação e `depends_on` por
   `condition: service_healthy` — ordem de start não é prontidão
 - Triple Check com trava de erro garante intervenção humana em qualquer divergência (limiar 1, ajustável por `TRIPLE_CHECK_MIN_DIVERGENCIAS`)

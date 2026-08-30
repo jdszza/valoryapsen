@@ -1,6 +1,9 @@
 """
-APSEN - IHM de Manutenção v2.1 (porta 8051)
-=============================================
+APSEN - Aplicativo de Manutenção e Operação v2.1 (porta 8051)
+==============================================================
+Painel do GESTOR DA OPERAÇÃO: acompanha as necessidades do sistema
+(manutenção, alarmes, dispensers, visão, trava e ordens) em um lugar só.
+
 Requer autenticação JWT. Usuários padrão: admin / manut1
 (Senhas iniciais em SEED_ADMIN_SENHA e SEED_MANUT_SENHA no .env — troque ambas
 após o primeiro login, pela aba 👥 Usuários. Ver README.)
@@ -13,6 +16,8 @@ Funcionalidades:
   • 🚨 Alarmes (visualizar + resolver)
   • ➕ Nova Manutenção
   • 📦 Dispensers — estado residual + botão Limpar (novo)
+  • 📷 Visão / Balança — leituras das três câmeras e da célula de carga
+  • ⛔ Triple Check — trava de divergência (liberação pelo supervisor)
   • 🗂  Ordens (OS) — histórico + alterar status + ver JSON (novo)
   • 👥 Usuários — criar / editar role / ativar / desativar (novo, admin)
 """
@@ -32,7 +37,7 @@ POLL_MS     = int(os.getenv("POLL_MS", "5000"))
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.CYBORG],
-    title="APSEN — Manutenção",
+    title="APSEN — Manutenção e Operação",
     update_title=None,
     suppress_callback_exceptions=True,
 )
@@ -151,7 +156,7 @@ app.layout = dbc.Container(
                     dbc.CardHeader([
                         html.Div("AP", className="ap-login-logo"),
                         html.H4("APSEN", className="ap-login-title"),
-                        html.Span("Painel de Manutenção", className="ap-login-sub"),
+                        html.Span("Manutenção e Operação", className="ap-login-sub"),
                     ]),
                     dbc.CardBody([
                         dbc.Label("Usuário", html_for="inp-user"),
@@ -184,7 +189,7 @@ app.layout = dbc.Container(
                 dbc.Navbar(
                     dbc.Container([
                         dbc.NavbarBrand(
-                            [html.Span("AP", className="ap-brand-mark"), "APSEN Manutenção"],
+                            [html.Span("AP", className="ap-brand-mark"), "APSEN Manutenção e Operação"],
                             className="fw-bold",
                         ),
                         html.Span(id="span-username", className="me-auto ms-3"),
@@ -559,8 +564,8 @@ def _render_visao(token):
     cam_mesa = visao.get("camera_mesa", {})
 
     # A cobertura de cada câmera sai do nº de slots que o próprio /estado
-    # trouxe — a IHM não precisa de mais uma env var em sincronia com o compose
-    # só para escrever "D1–D4" no cabeçalho do card.
+    # trouxe — o app de manutenção não precisa de mais uma env var em
+    # sincronia com o compose só para escrever "D1–D4" no cabeçalho do card.
     n_slots     = len(estado.get("dispensers", {})) or 8
     por_fileira = max(1, n_slots // 2)
 
@@ -1010,10 +1015,10 @@ def _limpar_dispenser(n_clicks_list, token):
 #   2. o JWT ia na query string, ou seja, no histórico do navegador, no header
 #      `Referer` e no log de acesso do central.
 #
-# Agora quem busca o arquivo é o processo da IHM, que está DENTRO da rede
-# Docker (o hostname resolve) e manda o token no header `Authorization` (fora
-# da URL). Os bytes voltam ao navegador pelo `dcc.Download`, pela conexão que
-# o operador já tem aberta com a IHM.
+# Agora quem busca o arquivo é o processo do app de manutenção, que está
+# DENTRO da rede Docker (o hostname resolve) e manda o token no header
+# `Authorization` (fora da URL). Os bytes voltam ao navegador pelo
+# `dcc.Download`, pela conexão que o gestor já tem aberta com o painel.
 #
 # A alternativa era publicar uma `PUBLIC_BACKEND_URL` (ex.: localhost:8000) só
 # para os links; ela exigiria expor o central ao navegador e manter mais uma
@@ -1048,8 +1053,9 @@ def _erro_relatorio(resp, os_id: str) -> str:
 def _buscar_relatorio(os_id: str, formato: str, token: str) -> tuple[dict, str]:
     """Baixa o relatório da OS e devolve `(payload_do_dcc_download, erro)`.
 
-    Chamada SERVER-SIDE: roda no container da IHM, onde `BACKEND_URL` resolve.
-    O token vai no header — nunca em `params`, nunca na URL.
+    Chamada SERVER-SIDE: roda no container do app de manutenção, onde
+    `BACKEND_URL` resolve. O token vai no header — nunca em `params`, nunca
+    na URL.
     """
     if formato not in _TIPOS_RELATORIO:
         return None, f"Formato de relatório inválido: {formato}"
@@ -1094,7 +1100,7 @@ def _baixar_relatorio(n_clicks_list, token):
 # Registro explícito, em vez de `@callback` em cima da função: o decorador
 # devolve o wrapper do Dash, que só roda dentro de um callback context. Assim
 # `_baixar_relatorio` continua sendo função Python comum, testável direto
-# (tests/test_ihm_relatorio.py) sem subir servidor nem navegador.
+# (tests/test_manut_relatorio.py) sem subir servidor nem navegador.
 _cb_baixar_relatorio = callback(
     Output("download-relatorio", "data"),
     Output("msg-relatorio", "children"),

@@ -1,4 +1,5 @@
-"""O botão 🧹 Limpar da IHM: os ids do render têm que casar com o Input do callback.
+"""O botão 🧹 Limpar do app de manutenção: os ids do render têm que casar com o
+Input do callback.
 
 O botão é a única forma de o operador descartar estoque encalhado num slot, e
 já esteve inoperante por três motivos independentes (ver AUDITORIA.md 2, 3 e 4):
@@ -24,8 +25,8 @@ SAIDA_LIMPAR = "msg-limpar-disp.children"
 
 
 @pytest.fixture
-def ihm(carregar_ihm):
-    return carregar_ihm(env={"BACKEND_URL": "http://central-computer:8000"})
+def manut(carregar_manut):
+    return carregar_manut(env={"BACKEND_URL": "http://central-computer:8000"})
 
 
 def _percorrer(no):
@@ -55,12 +56,12 @@ def _dispensers_falsos(n=NUM_SLOTS):
     ]
 
 
-def test_todo_card_renderiza_o_botao_que_o_callback_escuta(ihm):
+def test_todo_card_renderiza_o_botao_que_o_callback_escuta(manut):
     """Id divergente = clique que não chega ao callback, sem erro nenhum."""
-    ihm.requests.payload = _dispensers_falsos()
+    manut.requests.payload = _dispensers_falsos()
     tipo = _tipo_registrado_no_callback()
 
-    pagina = ihm.modulo._render_dispensers("jwt")
+    pagina = manut.modulo._render_dispensers("jwt")
     ids = [getattr(c, "id", None) for c in _percorrer(pagina)]
 
     for d_id in range(1, NUM_SLOTS + 1):
@@ -69,21 +70,21 @@ def test_todo_card_renderiza_o_botao_que_o_callback_escuta(ihm):
         )
 
 
-def test_o_destino_da_mensagem_existe_na_pagina(ihm):
+def test_o_destino_da_mensagem_existe_na_pagina(manut):
     """O Output do callback precisa de alvo, senão o retorno some."""
-    ihm.requests.payload = _dispensers_falsos(1)
+    manut.requests.payload = _dispensers_falsos(1)
 
-    pagina = ihm.modulo._render_dispensers("jwt")
+    pagina = manut.modulo._render_dispensers("jwt")
     ids = [getattr(c, "id", None) for c in _percorrer(pagina)]
 
     assert SAIDA_LIMPAR.split(".")[0] in ids
 
 
-def test_backend_sem_resposta_nao_quebra_a_aba(ihm):
+def test_backend_sem_resposta_nao_quebra_a_aba(manut):
     """Central fora do ar: a aba renderiza vazia em vez de levantar."""
-    ihm.requests.payload = {"detail": "indisponível"}
+    manut.requests.payload = {"detail": "indisponível"}
 
-    pagina = ihm.modulo._render_dispensers("jwt")
+    pagina = manut.modulo._render_dispensers("jwt")
 
     ids = [getattr(c, "id", None) for c in _percorrer(pagina)]
     assert not any(isinstance(i, dict) and i.get("type") == "btn-limpar-disp" for i in ids)

@@ -4,7 +4,8 @@
 #
 # 13 serviços (sem MQTT):
 #   mysql               → banco de dados MySQL 8 (porta 3306)
-#   central-computer    → FastAPI: orquestrador + API REST + WebSocket (porta 8000)
+#   central-computer    → FastAPI: orquestrador + API REST + WebSocket + console
+#                         de operação em /console (porta 8000)
 #   dispenser-adapter   → bridge: central ↔ dispenser-simulator (porta 8100)
 #   cnc-adapter         → bridge: central ↔ cnc-simulator (porta 8101)
 #   vision-adapter      → bridge: central ↔ vision-simulator (porta 8102)
@@ -15,9 +16,10 @@
 #   vision-simulator    → simula as 3 câmeras: uma por fileira de dispensers e
 #                         a da mesa/balança (porta 8202)
 #   weight-simulator    → simula célula de carga HX711 na mesa (porta 8203)
-#   order-generator     → gera OS aleatórias e envia ao central via HTTP
+#   order-generator     → dispara 1 das 10 ordens padrão (os_templates.py) por ciclo
 #   dashboard           → Plotly Dash: monitoramento read-only (porta 8050)
-#   ihm_web             → Plotly Dash: IHM de manutenção com auth (porta 8051)
+#   manut_web           → Plotly Dash: app de manutenção e operação com auth
+#                         (porta 8051)
 #
 # Rebuild completo:
 #   docker compose down -v && docker compose build --no-cache && docker compose up -d
@@ -99,8 +101,13 @@ services:
       SECRET_KEY:             ${SECRET_KEY:?gere com python -c "import secrets; print(secrets.token_hex(32))"}
       SEED_ADMIN_SENHA:       ${SEED_ADMIN_SENHA:?defina SEED_ADMIN_SENHA no .env}
       SEED_MANUT_SENHA:       ${SEED_MANUT_SENHA:?defina SEED_MANUT_SENHA no .env}
-      # Origens de browser autorizadas (dashboard e IHM).
+      # Origens de browser autorizadas (dashboard e app de manutenção).
       CORS_ORIGINS:           ${CORS_ORIGINS:-http://localhost:8050,http://localhost:8051}
+      # Senha do console de operação (/console). SEM `:?`, ao contrário dos
+      # demais segredos: o console é opcional, e vazio significa DESABILITADO —
+      # toda rota `/console*` responde 503 e não existe senha default embutida.
+      CONSOLE_SENHA:          ${CONSOLE_SENHA:-}
+      CONSOLE_SESSAO_HORAS:   ${CONSOLE_SESSAO_HORAS:-8}
       # Nº de dispensers da célula (par: duas fileiras frente a frente).
       # Uma variável só para todos os serviços — ver CLAUDE.md.
       NUM_SLOTS:          ${NUM_SLOTS:-8}
@@ -364,10 +371,17 @@ services:
       # cheia, e quantas esperas antes de pular o ciclo. Ver README.
       ESPERA_FILA_CHEIA:   20
       MAX_ESPERAS_FILA:    15
-      MIN_MEDS_POR_OS:     2
-      MAX_MEDS_POR_OS:     6
-      QTD_MIN:             2
-      QTD_MAX:             15
+      # Intervalo entre consultas a GET /api/v1/gerador enquanto o console
+      # mantém a geração automática pausada. É o atraso entre clicar em
+      # "retomar" no console e a planta voltar a produzir.
+      ESPERA_PAUSA:        10
+      # Teto de itens por ordem padrão: mais itens que dispensers viraria uma
+      # OS abortada com `sem_slot` depois de já ter ocupado vaga na fila.
+      # O conteúdo das ordens NÃO está aqui — as dez são definidas em
+      # `central-computer/os_templates.py` e lidas de
+      # `GET /api/v1/ordens/templates`. Não existe mais sorteio de item nem
+      # de quantidade, então MIN/MAX_MEDS_POR_OS e QTD_MIN/QTD_MAX saíram.
+      NUM_SLOTS:           ${NUM_SLOTS:-8}
     depends_on:
       # Não basta o central: quem EXECUTA a OS são os adapters, e eles só
       # sobem depois que o central fica healthy — ou seja, em paralelo com
@@ -410,10 +424,10 @@ services:
     networks:
       - apsen-net
 
-  # ── IHM de Manutenção ────────────────────────────────────────────────────────
-  ihm_web:
-    build: ./ihm_web
-    container_name: apsen-ihm
+  # ── Manutenção e Operação ────────────────────────────────────────────────────
+  manut_web:
+    build: ./manut_web
+    container_name: apsen-manut
     logging: *default-logging
     restart: unless-stopped
     ports:

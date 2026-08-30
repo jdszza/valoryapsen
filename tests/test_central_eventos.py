@@ -201,7 +201,7 @@ def test_limpeza_ok_solta_o_slot(carregar_central):
     assert central.banco.chamadas_de("limpar_dispenser_estado")
 
 
-# ── Limpeza manual pela IHM ────────────────────────────────────────────────────
+# ── Limpeza manual pelo app de manutenção ─────────────────────────────────────
 
 def _permitir_comando_limpar(central, monkeypatch):
     """Neutraliza o HTTP para o dispenser-adapter, aceitando o comando."""
@@ -258,7 +258,8 @@ def test_limpeza_bloqueada_com_os_ativa(carregar_central, monkeypatch):
 # ── Contador de alarmes ativos ────────────────────────────────────────────────
 #
 # `_estado["alarmes_ativos"]` já foi um contador incrementado à mão nos
-# handlers: só subia. Resolver um alarme pela IHM não o baixava e um restart o
+# handlers: só subia. Resolver um alarme pelo app de manutenção não o baixava e
+# um restart o
 # zerava com o banco cheio de alarmes abertos — o badge do dashboard crescia
 # para sempre sem relação com a realidade. Hoje o número é sempre uma leitura
 # de `get_total_alarmes_ativos()`, e é isso que estes testes prendem.

@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>APSEN · Console de operação</title>
+<style>
+/* ============================================================================
+   Paleta e tokens: os mesmos de dashboard/assets/theme.css e
+   manut_web/assets/theme.css. Copiados, não importados — esta página é servida
+   pelo central, que não monta os assets de nenhum dos dois apps Dash.
+   ========================================================================== */
+:root{
+  --ap-gold:#D9B45B; --ap-gold-bright:#F0D07A; --ap-gold-deep:#8C6B1F;
+  --ap-blue:#4A90D9; --ap-blue-deep:#2C6399;
+  --ap-bg:#000000; --ap-surface:#17171B; --ap-surface-2:#1F1F24;
+  --ap-line:#33333B; --ap-line-soft:#26262C;
+  --ap-text:#C9C9D0; --ap-muted:#8C8C95; --ap-faint:#6A6A73;
+  --ap-ok:#3E8E5A; --ap-warn:#D9B45B; --ap-err:#C0392B;
+  --ap-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--ap-bg); color:var(--ap-text);
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; font-size:14px;
+}
+button{font-family:inherit}
+
+/* ── Barra de topo ─────────────────────────────────────────────────────────── */
+.topo{
+  display:flex; align-items:center; gap:18px; flex-wrap:wrap;
+  padding:10px 18px; background:var(--ap-surface); border-bottom:1px solid var(--ap-line);
+  position:sticky; top:0; z-index:20;
+}
+.marca{font-size:15px; font-weight:700; letter-spacing:1px; color:var(--ap-gold)}
+.marca small{display:block; font-size:10px; font-weight:400; letter-spacing:1.4px;
+             color:var(--ap-faint); text-transform:uppercase}
+.kpis{display:flex; gap:16px; flex-wrap:wrap; margin-left:auto; align-items:center}
+.kpi{min-width:96px}
+.kpi .rot{display:block; font-size:9.5px; letter-spacing:1.2px; text-transform:uppercase;
+          color:var(--ap-faint)}
+.kpi .val{display:block; font-size:15px; font-weight:600; color:var(--ap-text);
+          font-family:var(--ap-mono); white-space:nowrap; overflow:hidden;
+          text-overflow:ellipsis; max-width:230px}
+.kpi .val.alerta{color:var(--ap-err)}
+.kpi .val.ok{color:var(--ap-ok)}
+.pill{
+  display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px;
+  font-size:11px; font-weight:600; letter-spacing:.6px; border:1px solid var(--ap-line);
+  color:var(--ap-muted);
+}
+.pill .ponto{width:8px; height:8px; border-radius:50%; background:var(--ap-faint)}
+.pill.on{color:var(--ap-ok); border-color:rgba(62,142,90,.5)}
+.pill.on .ponto{background:var(--ap-ok)}
+.pill.off{color:var(--ap-err); border-color:rgba(192,57,43,.5)}
+.pill.off .ponto{background:var(--ap-err)}
+
+/* ── Botões ────────────────────────────────────────────────────────────────── */
+.btn{
+  padding:8px 14px; font-size:12.5px; font-weight:600; letter-spacing:.4px;
+  border-radius:8px; border:1px solid var(--ap-line); background:var(--ap-surface-2);
+  color:var(--ap-text); cursor:pointer;
+}
+.btn:hover:not(:disabled){border-color:var(--ap-gold); color:var(--ap-gold-bright)}
+.btn:disabled{opacity:.45; cursor:not-allowed}
+.btn-ouro{background:var(--ap-gold); color:#111; border-color:var(--ap-gold)}
+.btn-ouro:hover:not(:disabled){background:var(--ap-gold-bright); color:#111}
+.btn-perigo{background:var(--ap-err); color:#fff; border-color:var(--ap-err)}
+.btn-perigo:hover:not(:disabled){background:#D9483A; color:#fff}
+
+/* ── Faixa da trava ────────────────────────────────────────────────────────── */
+.trava{
+  display:none; align-items:center; gap:16px; flex-wrap:wrap;
+  padding:12px 18px; background:rgba(192,57,43,.14); border-bottom:2px solid var(--ap-err);
+}
+.trava.ativa{display:flex}
+.trava .titulo{font-size:14px; font-weight:700; letter-spacing:1px; color:#F2A093}
+.trava .detalhe{font-size:12.5px; color:var(--ap-text); font-family:var(--ap-mono)}
+
+/* ── Grade principal ───────────────────────────────────────────────────────── */
+.corpo{
+  display:grid; grid-template-columns:minmax(0,1.55fr) minmax(340px,1fr);
+  gap:14px; padding:14px 18px 26px; align-items:start;
+}
+@media (max-width:1100px){.corpo{grid-template-columns:1fr}}
+.painel{
+  background:var(--ap-surface); border:1px solid var(--ap-line); border-radius:12px;
+  overflow:hidden;
+}
+.painel > h2{
+  margin:0; padding:9px 14px; font-size:11px; font-weight:700; letter-spacing:1.4px;
+  text-transform:uppercase; color:var(--ap-gold); background:var(--ap-surface-2);
+  border-bottom:1px solid var(--ap-line); display:flex; align-items:center; gap:10px;
+}
+.painel > h2 .nota{margin-left:auto; font-weight:400; letter-spacing:.4px;
+                   text-transform:none; color:var(--ap-faint); font-size:11px}
+.painel .conteudo{padding:12px 14px}
+.coluna{display:flex; flex-direction:column; gap:14px}
+
+/* ── Cartões das 10 ordens ─────────────────────────────────────────────────── */
+.ordens{
+  display:grid; grid-template-columns:repeat(auto-fill,minmax(268px,1fr)); gap:10px;
+  padding:12px 14px;
+}
+.ordem{
+  display:flex; flex-direction:column; gap:8px; padding:11px 12px;
+  background:var(--ap-surface-2); border:1px solid var(--ap-line-soft); border-radius:10px;
+}
+.ordem .id{font-family:var(--ap-mono); font-size:13px; font-weight:700; color:var(--ap-gold)}
+.ordem .nome{font-size:12.5px; color:var(--ap-text); line-height:1.35}
+.ordem .meta{display:flex; gap:8px; align-items:center; font-size:10.5px;
+             letter-spacing:.6px; text-transform:uppercase; color:var(--ap-faint)}
+.ordem .slots{
+  padding:2px 8px; border-radius:999px; background:rgba(74,144,217,.14);
+  border:1px solid rgba(74,144,217,.4); color:#9CC4EC; letter-spacing:.4px;
+}
+.ordem ul{margin:0; padding:0; list-style:none; display:flex; flex-direction:column; gap:2px}
+.ordem li{display:flex; gap:8px; font-size:11.5px; font-family:var(--ap-mono);
+          color:var(--ap-muted)}
+.ordem li .qtd{margin-left:auto; color:var(--ap-text); font-weight:600}
+.ordem li.falta{color:#E08C82}
+.ordem .disparar{width:100%; padding:10px; font-size:13.5px; letter-spacing:1px}
+.ordem .aviso{font-size:11px; color:#E08C82; line-height:1.4}
+
+/* ── Bancada: duas fileiras e o corredor da CNC ────────────────────────────── */
+/* Mesmo arranjo do dashboard, e pelo mesmo motivo: "D7 travou" precisa apontar
+   para um lugar na bancada, não para a sétima posição de uma lista. */
+.bancada{display:flex; flex-direction:column; gap:6px; padding:12px 14px}
+.fileira{display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px}
+.corredor{
+  display:flex; align-items:center; justify-content:center; gap:10px;
+  padding:5px 8px; margin:2px 0; border-radius:6px;
+  background:linear-gradient(90deg,transparent,rgba(74,144,217,.10),transparent);
+  border-top:1px dashed var(--ap-line); border-bottom:1px dashed var(--ap-line);
+  font-size:10.5px; letter-spacing:1px; text-transform:uppercase; color:var(--ap-faint);
+}
+.corredor .cnc{font-family:var(--ap-mono); color:var(--ap-blue); letter-spacing:.4px;
+               text-transform:none}
+.slot{
+  padding:7px 8px; border-radius:8px; background:var(--ap-surface-2);
+  border:1px solid var(--ap-line-soft); border-left:3px solid var(--ap-faint);
+  min-height:64px;
+}
+.slot .cab{display:flex; align-items:baseline; gap:6px}
+.slot .id{font-family:var(--ap-mono); font-size:12px; font-weight:700; color:var(--ap-text)}
+.slot .st{font-size:9.5px; letter-spacing:.8px; text-transform:uppercase;
+          color:var(--ap-faint); margin-left:auto}
+.slot .med{font-size:10.5px; line-height:1.3; color:var(--ap-muted); margin-top:3px;
+           overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical}
+.slot .qtd{font-family:var(--ap-mono); font-size:11px; color:var(--ap-text); margin-top:2px}
+.slot.idle{border-left-color:var(--ap-faint)}
+.slot.carregado,.slot.pronto{border-left-color:var(--ap-blue)}
+.slot.carregando,.slot.dispensando{border-left-color:var(--ap-gold)}
+.slot.erro,.slot.falha{border-left-color:var(--ap-err)}
+
+/* ── Feedback ──────────────────────────────────────────────────────────────── */
+.feed{margin:0; padding:0; list-style:none; max-height:340px; overflow-y:auto}
+.feed li{
+  padding:8px 14px; border-bottom:1px solid var(--ap-line-soft);
+  border-left:3px solid var(--ap-faint); font-size:12px; line-height:1.45;
+}
+.feed li.ok{border-left-color:var(--ap-ok)}
+.feed li.err{border-left-color:var(--ap-err)}
+.feed li.info{border-left-color:var(--ap-blue)}
+.feed .linha1{display:flex; gap:8px; align-items:baseline}
+.feed .hora{font-family:var(--ap-mono); font-size:10.5px; color:var(--ap-faint)}
+.feed .acao{font-weight:600; color:var(--ap-text)}
+.feed .cod{margin-left:auto; font-family:var(--ap-mono); font-size:10.5px;
+           padding:1px 7px; border-radius:999px; border:1px solid var(--ap-line);
+           color:var(--ap-muted)}
+.feed li.ok .cod{color:var(--ap-ok); border-color:rgba(62,142,90,.45)}
+.feed li.err .cod{color:#E08C82; border-color:rgba(192,57,43,.5)}
+.feed .msg{color:var(--ap-muted); margin-top:2px}
+.feed .cru{font-family:var(--ap-mono); font-size:10.5px; color:var(--ap-faint);
+           margin-top:3px; white-space:pre-wrap; word-break:break-word}
+.vazio{padding:14px; font-size:12px; color:var(--ap-faint)}
+
+.problemas{
+  margin:0 14px 12px; padding:9px 11px; border-radius:8px; font-size:11.5px;
+  line-height:1.5; color:#F2C0B8; background:rgba(192,57,43,.14);
+  border:1px solid var(--ap-err);
+}
+.problemas ul{margin:5px 0 0; padding-left:18px}
+</style>
+</head>
+<body>
+
+<header class="topo">
+  <div class="marca">APSEN<small>Console de operação</small></div>
+
+  <div class="kpis">
+    <span id="wsPill" class="pill"><span class="ponto"></span><span id="wsTexto">conectando…</span></span>
+
+    <div class="kpi"><span class="rot">OS ativa</span>
+      <span class="val" id="kpiOs" title="">—</span></div>
+    <div class="kpi"><span class="rot">Fila</span>
+      <span class="val" id="kpiFila">—</span></div>
+    <div class="kpi"><span class="rot">Alarmes</span>
+      <span class="val" id="kpiAlarmes">—</span></div>
+
+    <button class="btn" id="btnGerador" disabled>Gerador…</button>
+    <form method="post" action="/console/logout" style="margin:0">
+      <button class="btn" type="submit">Sair</button>
+    </form>
+  </div>
+</header>
+
+<section class="trava" id="faixaTrava">
+  <span class="titulo">⛔ TRAVA DO TRIPLE CHECK ATIVA</span>
+  <span class="detalhe" id="travaDetalhe"></span>
+  <button class="btn btn-perigo" id="btnLiberar" style="margin-left:auto">
+    Liberar trava
+  </button>
+</section>
+
+<main class="corpo">
+
+  <section class="painel">
+    <h2>Ordens padrão
+      <span class="nota" id="notaOrdens">carregando…</span>
+    </h2>
+    <div id="problemas" class="problemas" hidden></div>
+    <div class="ordens" id="grade"></div>
+  </section>
+
+  <div class="coluna">
+    <section class="painel">
+      <h2>Bancada <span class="nota" id="notaCnc">CNC —</span></h2>
+      <div class="bancada" id="bancada"></div>
+    </section>
+
+    <section class="painel">
+      <h2>Respostas do central <span class="nota">mais recente no topo</span></h2>
+      <ul class="feed" id="feed"></ul>
+      <div class="vazio" id="feedVazio">Nenhuma ação nesta sessão.</div>
+    </section>
+  </div>
+
+</main>
+
+<script>
+"use strict";
+
+/* ──────────────────────────────────────────────────────────────────────────────
+   Estado local da página. `templates` vem de GET /api/v1/ordens/templates (a
+   MESMA rota que o order-generator lê — não existe segunda lista de ordens);
+   o resto chega pelo WebSocket /ws, que já publicava tudo isto para o
+   dashboard. Nenhum polling novo foi criado.
+   ────────────────────────────────────────────────────────────────────────── */
+var templates = [];
+var pausado = null;
+var travaAtiva = false;
+var ws = null, tentativasWs = 0;
+
+var $ = function (id) { return document.getElementById(id); };
+
+function hora() {
+  return new Date().toTimeString().slice(0, 8);
+}
+
+function texto(el, valor) {
+  if (el.textContent !== valor) el.textContent = valor;
+}
+
+/* ── Feedback: toda ação deixa rastro, com o código e o corpo do central ──── */
+function registrar(acao, classe, mensagem, cru, codigo) {
+  var li = document.createElement("li");
+  li.className = classe;
+
+  var l1 = document.createElement("div");
+  l1.className = "linha1";
+  l1.innerHTML = '<span class="hora"></span><span class="acao"></span>' +
+                 (codigo ? '<span class="cod"></span>' : "");
+  l1.querySelector(".hora").textContent = hora();
+  l1.querySelector(".acao").textContent = acao;
+  if (codigo) l1.querySelector(".cod").textContent = codigo;
+  li.appendChild(l1);
+
+  if (mensagem) {
+    var m = document.createElement("div");
+    m.className = "msg";
+    m.textContent = mensagem;
+    li.appendChild(m);
+  }
+  if (cru) {
+    var c = document.createElement("div");
+    c.className = "cru";
+    c.textContent = cru;
+    li.appendChild(c);
+  }
+
+  var feed = $("feed");
+  feed.insertBefore(li, feed.firstChild);
+  while (feed.children.length > 40) feed.removeChild(feed.lastChild);
+  $("feedVazio").hidden = true;
+}
+
+/* Corpo do central, resumido para uma linha legível. Os erros de contrato
+   (409 os_duplicada, 429 fila_cheia, 503 persistencia_indisponivel) chegam
+   como {"erro": ..., "mensagem": ...}; o resto vira JSON cru. */
+function resumo(corpo) {
+  if (!corpo || typeof corpo !== "object") return "";
+  if (corpo.mensagem) return corpo.mensagem;
+  if (corpo.erro) return String(corpo.erro);
+  if (corpo.detail) return String(corpo.detail);
+  return "";
+}
+
+async function chamar(acao, url, payload) {
+  try {
+    var resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+      credentials: "same-origin"
+    });
+    var corpo = null;
+    try { corpo = await resp.json(); } catch (e) { corpo = null; }
+
+    if (resp.status === 401) {
+      registrar(acao, "err", "Sessão do console expirada — recarregue a página " +
+                "e informe a senha de novo.", null, "401");
+      return null;
+    }
+    registrar(acao, resp.ok ? "ok" : "err", resumo(corpo),
+              corpo ? JSON.stringify(corpo) : null, String(resp.status));
+    return { status: resp.status, corpo: corpo, ok: resp.ok };
+  } catch (erro) {
+    registrar(acao, "err", "Não foi possível falar com o central: " + erro, null, "—");
+    return null;
+  }
+}
+
+/* ── Ordens padrão ────────────────────────────────────────────────────────── */
+async function carregarTemplates() {
+  try {
+    var resp = await fetch("/api/v1/ordens/templates", { credentials: "same-origin" });
+    var corpo = await resp.json();
+    templates = corpo.templates || [];
+    desenharOrdens(corpo);
+  } catch (erro) {
+    $("notaOrdens").textContent = "falha ao carregar";
+    registrar("Carregar ordens padrão", "err", String(erro), null, "—");
+  }
+}
+
+function desenharOrdens(corpo) {
+  var grade = $("grade");
+  grade.innerHTML = "";
+
+  $("notaOrdens").textContent =
+    templates.length + " ordens · " + corpo.num_slots + " slots na célula" +
+    (corpo.catalogo_carregado ? "" : " · CATÁLOGO INDISPONÍVEL");
+
+  var problemas = corpo.problemas || [];
+  var caixa = $("problemas");
+  if (problemas.length) {
+    caixa.hidden = false;
+    caixa.innerHTML = "<strong>Diagnóstico das ordens padrão</strong><ul></ul>";
+    var ul = caixa.querySelector("ul");
+    problemas.forEach(function (p) {
+      var li = document.createElement("li");
+      li.textContent = p;
+      ul.appendChild(li);
+    });
+  } else {
+    caixa.hidden = true;
+  }
+
+  templates.forEach(function (t) {
+    var faltando = (t.itens || []).filter(function (i) { return i.no_catalogo === false; });
+
+    var card = document.createElement("article");
+    card.className = "ordem";
+
+    var id = document.createElement("div");
+    id.className = "id";
+    id.textContent = t.template_id;
+    card.appendChild(id);
+
+    var nome = document.createElement("div");
+    nome.className = "nome";
+    nome.textContent = t.nome || t.descricao || "";
+    card.appendChild(nome);
+
+    var meta = document.createElement("div");
+    meta.className = "meta";
+    meta.innerHTML = '<span></span><span class="slots"></span>';
+    meta.children[0].textContent = t.categoria_desc || t.categoria || "";
+    meta.children[1].textContent = t.total_itens + " slots";
+    card.appendChild(meta);
+
+    var ul = document.createElement("ul");
+    (t.itens || []).forEach(function (item) {
+      var li = document.createElement("li");
+      if (item.no_catalogo === false) li.className = "falta";
+      var n = document.createElement("span");
+      n.textContent = item.medicamento;
+      var q = document.createElement("span");
+      q.className = "qtd";
+      q.textContent = "x" + item.quantidade;
+      li.appendChild(n); li.appendChild(q);
+      ul.appendChild(li);
+    });
+    card.appendChild(ul);
+
+    var btn = document.createElement("button");
+    btn.className = "btn btn-ouro disparar";
+    btn.textContent = "DISPARAR";
+    /* Um passo só, de propósito: disparar uma OS é a ação de rotina do console
+       e confirmação em dois cliques é o que faz a mão errar no ensaio. O que
+       exige confirmação é o destrutivo — liberar a trava. */
+    btn.addEventListener("click", function () { disparar(t.template_id, btn); });
+    if (faltando.length) {
+      btn.disabled = true;
+      btn.textContent = "INDISPONÍVEL";
+      var aviso = document.createElement("div");
+      aviso.className = "aviso";
+      aviso.textContent = faltando.length + " medicamento(s) fora do catálogo — " +
+        "a OS sairia sem SKU para a câmera comparar.";
+      card.appendChild(aviso);
+    }
+    card.appendChild(btn);
+
+    grade.appendChild(card);
+  });
+}
+
+async function disparar(templateId, btn) {
+  btn.disabled = true;
+  var rotulo = btn.textContent;
+  btn.textContent = "DISPARANDO…";
+  var r = await chamar("Disparar " + templateId, "/console/api/disparar",
+                       { template_id: templateId });
+  btn.textContent = rotulo;
+  btn.disabled = false;
+  if (r && r.ok && r.corpo && r.corpo.os_id) {
+    registrar("OS criada", "info", r.corpo.os_id + " · posição na fila: " +
+              (r.corpo.posicao_fila != null ? r.corpo.posicao_fila : "?"));
+  }
+}
+
+/* ── Pausa do order-generator ─────────────────────────────────────────────── */
+$("btnGerador").addEventListener("click", async function () {
+  var alvo = !pausado;
+  var r = await chamar(alvo ? "Pausar gerador automático"
+                            : "Retomar gerador automático",
+                       "/console/api/gerador", { pausado: alvo });
+  if (r && r.ok && r.corpo) aplicarGerador(r.corpo.pausado);
+});
+
+function aplicarGerador(valor) {
+  pausado = !!valor;
+  var btn = $("btnGerador");
+  btn.disabled = false;
+  btn.textContent = pausado ? "▶ Retomar automático" : "⏸ Pausar automático";
+  btn.className = pausado ? "btn btn-ouro" : "btn";
+  btn.title = pausado
+    ? "O order-generator está parado: nenhuma OS entra sozinha."
+    : "O order-generator dispara uma ordem padrão por ciclo.";
+}
+
+/* ── Trava do Triple Check (destrutiva: exige confirmação) ────────────────── */
+$("btnLiberar").addEventListener("click", async function () {
+  if (!window.confirm(
+        "Liberar a trava do Triple Check?\n\n" +
+        "A OS retoma de onde parou, com a divergência registrada e NÃO " +
+        "resolvida. Confirme só depois de conferir o slot na bancada.")) {
+    return;
+  }
+  await chamar("Liberar trava do Triple Check", "/console/api/liberar-trava", {});
+});
+
+/* ── Estado ao vivo pelo WebSocket /ws ────────────────────────────────────── */
+function conectar() {
+  var esquema = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(esquema + "//" + location.host + "/ws");
+
+  ws.onopen = function () {
+    tentativasWs = 0;
+    $("wsPill").className = "pill on";
+    texto($("wsTexto"), "ao vivo");
+  };
+  ws.onmessage = function (ev) {
+    try { aplicarEstado(JSON.parse(ev.data)); } catch (e) { /* frame parcial */ }
+  };
+  ws.onclose = function () {
+    $("wsPill").className = "pill off";
+    texto($("wsTexto"), "reconectando…");
+    tentativasWs += 1;
+    setTimeout(conectar, Math.min(1000 * tentativasWs, 8000));
+  };
+  ws.onerror = function () { try { ws.close(); } catch (e) {} };
+}
+
+function aplicarEstado(st) {
+  if (!st || !st.dispensers) return;
+
+  var os = st.os_ativa;
+  var kpiOs = $("kpiOs");
+  texto(kpiOs, os ? (os.os_id || "—") : "ociosa");
+  kpiOs.title = os ? (os.descricao || os.os_id || "") : "";
+  kpiOs.className = "val" + (os ? "" : " ok");
+
+  var cheia = st.fila_tamanho >= st.fila_capacidade;
+  var kpiFila = $("kpiFila");
+  texto(kpiFila, st.fila_tamanho + " / " + st.fila_capacidade);
+  kpiFila.className = "val" + (cheia ? " alerta" : "");
+  kpiFila.title = cheia ? "Fila no limite — o próximo disparo é recusado com 429."
+                        : "OS esperando (a em execução já saiu da fila).";
+
+  var kpiAl = $("kpiAlarmes");
+  texto(kpiAl, String(st.alarmes_ativos != null ? st.alarmes_ativos : "—"));
+  kpiAl.className = "val" + (st.alarmes_ativos > 0 ? " alerta" : " ok");
+
+  if (st.gerador_pausado != null && st.gerador_pausado !== pausado) {
+    aplicarGerador(st.gerador_pausado);
+  }
+
+  var trava = st.trava || {};
+  if (!!trava.ativa !== travaAtiva) {
+    travaAtiva = !!trava.ativa;
+    registrar(travaAtiva ? "Trava do Triple Check ATIVADA" : "Trava liberada",
+              travaAtiva ? "err" : "ok",
+              travaAtiva ? (trava.motivo || "") : "A OS retoma de onde parou.");
+  }
+  $("faixaTrava").className = "trava" + (trava.ativa ? " ativa" : "");
+  if (trava.ativa) {
+    texto($("travaDetalhe"),
+          "OS " + (trava.os_id || "?") + " · slot D" + (trava.slot_id || "?") +
+          " · " + (trava.motivo || "sem motivo registrado"));
+  }
+
+  var cnc = st.cnc || {};
+  texto($("notaCnc"), "CNC " + (cnc.status || "—") +
+        " · X " + Math.round(cnc.posicao_x || 0) +
+        " · Y " + Math.round(cnc.posicao_y || 0) +
+        (cnc.total_ciclos ? " · ciclo " + cnc.ciclo_atual + "/" + cnc.total_ciclos : ""));
+
+  desenharBancada(st.dispensers, cnc);
+}
+
+/* Duas fileiras frente a frente, com o corredor da CNC entre elas — o arranjo
+   da bancada real, igual ao do dashboard. Slot i e slot i+N/2 são o par que
+   compartilha o X. */
+function desenharBancada(dispensers, cnc) {
+  var ids = Object.keys(dispensers).map(Number).sort(function (a, b) { return a - b; });
+  var metade = Math.ceil(ids.length / 2);
+  var alvo = cnc && cnc.dispenser_alvo;
+
+  var html = "";
+  html += '<div class="fileira">' +
+          ids.slice(0, metade).map(function (i) { return cartaoSlot(i, dispensers[i], alvo); }).join("") +
+          "</div>";
+  html += '<div class="corredor">corredor da CNC<span class="cnc">' +
+          (alvo ? "→ D" + alvo : "") + "</span></div>";
+  html += '<div class="fileira">' +
+          ids.slice(metade).map(function (i) { return cartaoSlot(i, dispensers[i], alvo); }).join("") +
+          "</div>";
+
+  var bancada = $("bancada");
+  if (bancada.dataset.assinatura !== html) {
+    bancada.dataset.assinatura = html;
+    bancada.innerHTML = html;
+  }
+}
+
+function escapar(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function cartaoSlot(id, d, alvo) {
+  d = d || {};
+  var st = d.status || "idle";
+  var borda = alvo === id ? "border-color:var(--ap-gold);" : "";
+  return '<div class="slot ' + escapar(st) + '" style="' + borda + '">' +
+           '<div class="cab"><span class="id">D' + id + '</span>' +
+             '<span class="st">' + escapar(st) + "</span></div>" +
+           '<div class="med">' + escapar(d.medicamento || "—") + "</div>" +
+           '<div class="qtd">' +
+             (d.quantidade_alvo
+                ? escapar(d.quantidade_dispensada || 0) + " / " + escapar(d.quantidade_alvo)
+                : "resíduo " + escapar(d.quantidade_residual || d.quantidade || 0)) +
+           "</div>" +
+         "</div>";
+}
+
+carregarTemplates();
+conectar();
+</script>
+</body>
+</html>

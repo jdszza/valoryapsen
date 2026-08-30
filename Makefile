@@ -8,7 +8,7 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 
 .PHONY: up down restart build rebuild logs ps status test test-deps lint \
-        log-central log-dashboard log-ihm log-order-gen \
+        log-central log-dashboard log-manut log-order-gen \
         log-cnc-sim log-dispenser-sim log-vision-sim log-weight-sim \
         log-cnc-adapter log-dispenser-adapter log-vision-adapter \
         log-weight-adapter log-mysql \
@@ -33,7 +33,8 @@ up:
 	@printf "$(GREEN)$(BOLD)▶ Subindo todos os serviços APSEN...$(RESET)\n"
 	@test -f .env || (printf "$(RED)Falta o .env — veja o bloco do passo 2 em 'Como rodar', no README$(RESET)\n" && exit 1)
 	docker compose up -d
-	@printf "$(GREEN)✅ Serviços ativos. Dashboard: http://localhost:8050 | IHM: http://localhost:8051$(RESET)\n"
+	@printf "$(GREEN)✅ Serviços ativos. Dashboard: http://localhost:8050 | Manutenção: http://localhost:8051$(RESET)\n"
+	@printf "$(GREEN)   Console de operação: http://localhost:8000/console (precisa de CONSOLE_SENHA no .env)$(RESET)\n"
 
 down:
 	@printf "$(RED)$(BOLD)■ Parando todos os serviços...$(RESET)\n"
@@ -65,7 +66,7 @@ lint:
 	@printf "$(CYAN)$(BOLD)🔎 pyflakes...$(RESET)\n"
 	python -m pyflakes central-computer cnc_simulator dispenser_simulator \
 		vision-simulator weight-simulator cnc-adapter dispenser-adapter \
-		vision-adapter weight-adapter dashboard ihm_web order-generator tests
+		vision-adapter weight-adapter dashboard manut_web order-generator tests
 
 config:
 	@printf "$(CYAN)$(BOLD)🔎 Validando docker-compose.yml...$(RESET)\n"
@@ -84,6 +85,7 @@ status: ps
 	@printf "  Fila:   $(CYAN)curl -s localhost:8000/api/v1/fila$(RESET)\n"
 	@printf "  Estado: $(CYAN)curl -s localhost:8000/estado$(RESET)\n"
 	@printf "  Trava:  $(CYAN)curl -s localhost:8000/api/v1/trava$(RESET)\n"
+	@printf "  Gerador:$(CYAN) curl -s localhost:8000/api/v1/gerador$(RESET)  (pausado pelo console?)\n"
 
 # ── Logs individuais ──────────────────────────────────────────────────────────
 
@@ -99,9 +101,9 @@ log-dashboard:
 	@printf "$(BLUE)$(BOLD)━━━━ [DASHBOARD] Plotly Dash :8050 ━━━━━━━━━━━━━━━━━━━━━$(RESET)\n"
 	docker compose logs -f --tail=$(LOG_LINES) dashboard
 
-log-ihm:
-	@printf "$(MAGENTA)$(BOLD)━━━━ [IHM] Interface de Manutenção :8051 ━━━━━━━━━━━━━━$(RESET)\n"
-	docker compose logs -f --tail=$(LOG_LINES) ihm_web
+log-manut:
+	@printf "$(MAGENTA)$(BOLD)━━━━ [MANUT] Manutenção e Operação :8051 ━━━━━━━━━━━━━━$(RESET)\n"
+	docker compose logs -f --tail=$(LOG_LINES) manut_web
 
 log-order-gen:
 	@printf "$(YELLOW)$(BOLD)━━━━ [ORDER-GEN] Gerador de OS ━━━━━━━━━━━━━━━━━━━━━━━$(RESET)\n"
@@ -169,7 +171,7 @@ help:
 	@printf "\n$(BOLD)Logs por serviço:$(RESET)\n"
 	@printf "  $(BOLD)make log-central$(RESET)           — FastAPI + orquestrador :8000\n"
 	@printf "  $(BOLD)make log-dashboard$(RESET)         — Dash :8050\n"
-	@printf "  $(BOLD)make log-ihm$(RESET)               — IHM :8051\n"
+	@printf "  $(BOLD)make log-manut$(RESET)             — Manutenção :8051\n"
 	@printf "  $(BOLD)make log-order-gen$(RESET)         — gerador de OS\n"
 	@printf "  $(BOLD)make log-cnc-sim$(RESET)           — simulador CNC :8200\n"
 	@printf "  $(BOLD)make log-dispenser-sim$(RESET)     — simulador dispensers :8201\n"

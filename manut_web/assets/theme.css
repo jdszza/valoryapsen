@@ -1,15 +1,16 @@
 /* ============================================================================
-   APSEN IHM - tema visual (preto + dourado, apoio azul/branco)
+   APSEN Manutencao - tema visual (preto + dourado, apoio azul/branco)
    ----------------------------------------------------------------------------
    Mesma paleta e mesmos tokens do `dashboard/assets/theme.css`. A duplicacao e
-   deliberada: dashboard e IHM sao imagens Docker separadas, cada uma copiando
-   so o proprio diretorio, entao um arquivo compartilhado exigiria mudar os dois
-   Dockerfiles e o contexto de build. Se a paleta mudar, mude nos dois - o bloco
+   deliberada: dashboard e manut_web sao imagens Docker separadas, cada uma
+   copiando so o proprio diretorio, entao um arquivo compartilhado exigiria
+   mudar os dois Dockerfiles e o contexto de build. Se a paleta mudar, mude nos dois - o bloco
    `:root` abaixo e identico ao de la ate a linha do Bootstrap.
 
-   O bloco IHM (sidebar, login, formularios, tabelas, modal) e exclusivo daqui.
-   Substituiu o custom.css, cujas classes (.ihm-content, .ihm-topbar) nao eram
-   usadas em app.py — o arquivo carregava e nao aplicava nada.
+   O bloco do app de manutencao (sidebar, login, formularios, tabelas, modal)
+   e exclusivo daqui. Substituiu o custom.css, cujas classes (.manut-content,
+   .manut-topbar) nao eram usadas em app.py — o arquivo carregava e nao
+   aplicava nada.
    ========================================================================== */
 
 :root {
@@ -84,7 +85,7 @@ body {
 
 .ap-num, .ap-mono { font-family: var(--ap-mono); font-variant-numeric: tabular-nums; }
 
-/* Titulo de secao: a IHM usa H5 em toda aba */
+/* Titulo de secao: o app de manutencao usa H5 em toda aba */
 h5 {
     color: var(--ap-white);
     font-size: .95rem;

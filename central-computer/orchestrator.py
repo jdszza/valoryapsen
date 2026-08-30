@@ -132,7 +132,7 @@ async def encerrar():
 # ── API de trava ───────────────────────────────────────────────────────────────
 
 def get_trava_estado() -> dict:
-    """Retorna o estado atual da trava para o dashboard/IHM."""
+    """Retorna o estado atual da trava para o dashboard e o app de manutenção."""
     return {
         "ativa":    _trava_ativa,
         "motivo":   _trava_motivo,
@@ -193,7 +193,7 @@ async def _ativar_trava(os_id: str, slot_id: Optional[int], motivo: str) -> asyn
                 "slot_id": slot_id,
                 "motivo":  motivo,
             }
-    # Avisa todos os clientes conectados (dashboard, IHM) via WebSocket
+    # Avisa todos os clientes conectados (dashboard, manut_web) via WebSocket
     if _broadcast_fn:
         _broadcast_fn()
     try:
@@ -697,8 +697,8 @@ async def _processar_os(os_payload: dict):
         disp_snapshot = {k: dict(v) for k, v in _estado["dispensers"].items()}
 
     # O banco também precisa saber que esta OS saiu da fila: `get_ordem_ativa`
-    # — e o GET /os/ativa que a IHM consome — separa a OS em execução das que
-    # esperam pelo STATUS. Enquanto "em_andamento" só existia neste dicionário
+    # — e o GET /os/ativa que o app de manutenção consome — separa a OS em
+    # execução das que esperam pelo STATUS. Enquanto "em_andamento" só existia neste dicionário
     # em memória, toda OS do banco continuava "aguardando" e o endpoint
     # devolvia a última enfileirada, não a que estava rodando.
     try:

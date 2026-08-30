@@ -458,7 +458,8 @@ def test_liberar_slot_falha_quando_a_limpeza_e_recusada(carregar_orquestrador,
 
 # ── Status da OS no banco: quem está de fato em execução ───────────────────────
 #
-# "em_andamento" existia no enum, na IHM e no dashboard, mas NUNCA era gravado:
+# "em_andamento" existia no enum, no app de manutenção e no dashboard, mas NUNCA
+# era gravado:
 # o orquestrador só o escrevia no dicionário em memória. Com todas as OS do
 # banco paradas em "aguardando", o `ORDER BY criado_em DESC` de
 # `get_ordem_ativa` devolvia a última OS ENFILEIRADA — então o GET /os/ativa
@@ -647,7 +648,7 @@ def test_fonte_indisponivel_nao_esconde_divergencia_das_outras(carregar_orquestr
 
 
 def test_causas_nomeiam_a_fonte_e_os_numeros(carregar_orquestrador):
-    """O motivo da trava vai para a IHM — precisa dizer o que divergiu e quanto."""
+    """O motivo da trava vai para o painel — precisa dizer o que divergiu e quanto."""
     orq = carregar_orquestrador()
 
     veredito = _avaliar(orq, dispensado=8, mesa=MESA_DIVERGENTE, peso=PESO_DIVERGENTE)
@@ -762,7 +763,7 @@ def test_trava_de_sku_errado_e_liberavel_no_instante_do_broadcast(carregar_orque
     assert orq.estado["trava"]["ativa"] is False
 
 
-def test_ativar_trava_publica_o_motivo_para_a_ihm(carregar_orquestrador):
+def test_ativar_trava_publica_o_motivo_para_o_painel(carregar_orquestrador):
     """A publicação mudou de lugar (foi para dentro de `_ativar_trava`), não sumiu."""
     orq = carregar_orquestrador()
 

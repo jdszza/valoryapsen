@@ -265,6 +265,124 @@ def test_endpoint_de_fila_acompanha_o_enchimento(api):
     assert (fila["tamanho"], fila["disponivel"], fila["cheia"]) == (capacidade, 0, True)
 
 
+# ── Listagem das 10 ordens padrão ─────────────────────────────────────────────
+#
+# O catálogo das ordens fixas mora no central (`os_templates.py`) e não no
+# order-generator, porque o console de operação precisa listá-las. Este
+# endpoint é o que torna isso possível — e o que o gerador consome no boot, em
+# vez de manter uma segunda cópia da lista. O conteúdo dos templates é testado
+# em `test_order_generator.py`; aqui prende-se o CONTRATO da rota.
+
+def _catalogo_fake(central):
+    """`listar_medicamentos` devolvendo tudo o que os templates citam."""
+    return lambda *a, **k: [
+        {"nome": nome, "sku": f"SKU-{nome}", "categoria": "generica"}
+        for nome in central.modulo.os_templates.nomes_usados()
+    ]
+
+
+def test_templates_sao_servidos_com_sku_do_catalogo(api, monkeypatch):
+    """O template declara nome e quantidade; o SKU vem do banco na hora.
+
+    SKU congelado no template envelheceria em silêncio — e é ele que a câmera
+    do dispenser compara (`sku_esperado`).
+    """
+    monkeypatch.setattr(api.central.modulo, "listar_medicamentos",
+                        _catalogo_fake(api.central))
+
+    corpo = api.cliente.get("/api/v1/ordens/templates").json()
+
+    assert corpo["total"] == 10 == len(corpo["templates"])
+    assert corpo["num_slots"] == api.central.modulo.settings.NUM_SLOTS
+    assert corpo["catalogo_carregado"] is True
+    assert corpo["problemas"] == []
+    for template in corpo["templates"]:
+        assert template["total_itens"] == len(template["itens"])
+        for item in template["itens"]:
+            assert item["no_catalogo"] is True
+            assert item["sku"] == f"SKU-{item['medicamento']}"
+
+
+def test_templates_acusam_medicamento_que_sumiu_do_catalogo(api, monkeypatch):
+    """É o erro mais provável de aparecer em cima da hora, e ele precisa
+    aparecer NOMEADO — não como uma OS com `sku` vazio já na fila."""
+    completo = _catalogo_fake(api.central)()
+    monkeypatch.setattr(api.central.modulo, "listar_medicamentos",
+                        lambda *a, **k: [m for m in completo
+                                         if m["nome"] != "ALOIS 10MG"])
+
+    corpo = api.cliente.get("/api/v1/ordens/templates").json()
+
+    assert corpo["problemas"], "medicamento ausente não foi acusado"
+    assert all("ALOIS 10MG" in p for p in corpo["problemas"])
+    itens = [i for t in corpo["templates"] for i in t["itens"]
+             if i["medicamento"] == "ALOIS 10MG"]
+    assert itens and all(i["no_catalogo"] is False for i in itens)
+
+
+def test_templates_com_banco_fora_do_ar_nao_fingem_estar_validos(api, monkeypatch):
+    """Lista de problemas vazia SEM catálogo não pode ser lida como 'tudo certo'
+    — daí o `catalogo_carregado`."""
+    def _explodir(*a, **k):
+        raise RuntimeError("mysql fora")
+
+    monkeypatch.setattr(api.central.modulo, "listar_medicamentos", _explodir)
+
+    resposta = api.cliente.get("/api/v1/ordens/templates")
+
+    assert resposta.status_code == 200          # a listagem não depende do banco
+    corpo = resposta.json()
+    assert corpo["catalogo_carregado"] is False
+    assert corpo["total"] == 10
+    assert all(i["sku"] == "" for t in corpo["templates"] for i in t["itens"])
+
+
+def test_ordem_instanciada_de_um_template_e_aceita_pelo_endpoint(api):
+    """Fecha o laço: o payload que `instanciar` monta é o que `NovaOSReq` aceita.
+
+    Sem este teste, um campo renomeado num lado só apareceria em produção como
+    OS recusada com 400 — e a suíte dos templates continuaria verde, porque ela
+    nunca posta nada.
+    """
+    templates = api.central.modulo.os_templates
+    payload = templates.instanciar(templates.TEMPLATES[0])
+
+    resposta = api.cliente.post("/api/v1/ordens", json=payload)
+
+    assert resposta.status_code == 200
+    assert resposta.json()["os_id"] == payload["os_id"]
+    assert api.fila.enfileiradas == [payload["os_id"]]
+
+
+def test_dois_disparos_do_mesmo_template_nao_colidem_no_endpoint(api):
+    """O template é fixo, a chave primária não: o segundo disparo não pode
+    tomar 409 `os_duplicada`."""
+    templates = api.central.modulo.os_templates
+    template = templates.TEMPLATES[0]
+
+    primeira = api.cliente.post("/api/v1/ordens",
+                                json=templates.instanciar(template))
+    segunda  = api.cliente.post("/api/v1/ordens",
+                                json=templates.instanciar(template))
+
+    assert (primeira.status_code, segunda.status_code) == (200, 200)
+    assert len(set(api.fila.enfileiradas)) == 2
+
+
+def test_listar_templates_duas_vezes_nao_acumula_enriquecimento(api, monkeypatch):
+    """`os_templates.listar()` devolve cópia: sem isso, a segunda chamada
+    serviria os itens já mexidos pela primeira."""
+    monkeypatch.setattr(api.central.modulo, "listar_medicamentos",
+                        _catalogo_fake(api.central))
+
+    primeira = api.cliente.get("/api/v1/ordens/templates").json()
+    segunda  = api.cliente.get("/api/v1/ordens/templates").json()
+
+    assert primeira["templates"] == segunda["templates"]
+    assert api.central.modulo.os_templates.TEMPLATES[0]["itens"][0].keys() == \
+           {"medicamento", "quantidade"}
+
+
 # ── Validação de entrada ──────────────────────────────────────────────────────
 
 def test_os_sem_medicamentos_e_400_e_nao_toca_no_banco(api):

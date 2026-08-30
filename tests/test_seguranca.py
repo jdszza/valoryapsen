@@ -148,7 +148,7 @@ def test_banco_fora_do_ar_nega_acesso(carregar_central, monkeypatch):
 
 
 def test_revalidacao_usa_cache_curto(carregar_central, monkeypatch):
-    """Uma query por request derrubaria o throughput da IHM."""
+    """Uma query por request derrubaria o throughput do app de manutenção."""
     central = carregar_central()
     consultas = []
 
@@ -166,7 +166,7 @@ def test_revalidacao_usa_cache_curto(carregar_central, monkeypatch):
 
 
 def test_desativar_usuario_invalida_o_cache_na_hora(carregar_central, monkeypatch):
-    """O atraso do cache não pode valer para o botão "Desativar" da IHM."""
+    """O atraso do cache não pode valer para o botão "Desativar" do painel."""
     central = carregar_central()
     ativo = {"valor": True}
     monkeypatch.setattr(
@@ -199,9 +199,9 @@ def test_cors_do_central_nao_e_aberto(carregar_central):
 
 
 def test_cors_configuravel_por_env(config, monkeypatch):
-    monkeypatch.setenv("CORS_ORIGINS", "https://apsen.exemplo, https://ihm.exemplo")
+    monkeypatch.setenv("CORS_ORIGINS", "https://apsen.exemplo, https://manut.exemplo")
 
-    assert config._origens_cors() == ["https://apsen.exemplo", "https://ihm.exemplo"]
+    assert config._origens_cors() == ["https://apsen.exemplo", "https://manut.exemplo"]
 
 
 # ── Segredos fora do repositório ──────────────────────────────────────────────

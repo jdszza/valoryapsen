@@ -283,7 +283,7 @@ def _do_limpar(slot_id: int, solicitado_por: str):
         os_id_atual  = _estado[slot_id].get("os_id")
         # Bloqueia só o que tem peça se mexendo. "pronto", "concluido" e "erro" são
         # estados parados: limpar um slot com estoque encalhado é exatamente o
-        # propósito do botão da IHM.
+        # propósito do botão do app de manutenção.
         em_operacao  = status_atual in ("carregando", "dispensando")
 
     if em_operacao:

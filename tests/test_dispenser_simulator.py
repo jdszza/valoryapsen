@@ -1,7 +1,8 @@
 """
 Testes do dispenser-simulator (os dispensers físicos da célula).
 
-Regressão principal: o botão "Limpar Dispenser" da IHM parava de funcionar depois
+Regressão principal: o botão "Limpar Dispenser" do app de manutenção parava de
+funcionar depois
 da primeira OS. _do_dispensar() encerrava o slot com status="concluido" e deixava
 o os_id preso; _do_limpar() recusava a limpeza tanto por esse status quanto por
 `os_id is not None` — e era o único caminho que zerava esses dois campos.

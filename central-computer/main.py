@@ -1,7 +1,8 @@
 """
 APSEN - Computador Central v3.2
 Orquestrador ativo: recebe OS do order-generator, comanda adapters,
-consolida eventos, persiste no DB, serve dashboard/IHM via REST + WebSocket.
+consolida eventos, persiste no DB, serve dashboard/manutenção via REST +
+WebSocket.
 
 Comunicação: REST/HTTP/WebSocket — sem MQTT.
 
@@ -21,11 +22,17 @@ Endpoints de entrada (dos adapters e order-generator):
   POST /api/v1/eventos/visao       ← vision-adapter
   POST /api/v1/eventos/peso        ← weight-adapter
 
-Endpoints de leitura (dashboard, ihm_web):
+Endpoints de leitura (dashboard, manut_web):
   GET  /estado, /os/*, /dispensers/estado, /medicamentos, ...
   GET  /api/v1/trava
   GET  /api/v1/visao/historico
   WS   /ws
+
+Console de operação (interface própria do central, ver `console.py`):
+  GET  /console                    ← página; exige cookie de sessão
+  GET/POST /console/login          ← senha própria (CONSOLE_SENHA)
+  POST /console/api/*              ← disparo de OS, pausa do gerador, trava
+  GET  /api/v1/gerador             ← flag de pausa que o order-generator consulta
 """
 import asyncio
 import collections
@@ -40,14 +47,19 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import parse_qsl
 
-from fastapi import Depends, FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi import (Depends, FastAPI, HTTPException, Request, status,
+                     WebSocket, WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
+                               StreamingResponse)
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
+import console
 import orchestrator as orch
+import os_templates
 from auth import criar_token, decodificar_token, verificar_senha
 from config import settings, validar_secret_key
 from database import (
@@ -102,6 +114,12 @@ _estado = {
     # quando a fila encostou no limite — o KPI mostra só a contagem, e usa este
     # número para acender o alerta de fila cheia e explicá-lo no tooltip.
     "fila_capacidade": settings.MAX_FILA_OS,
+    # Publicação do interruptor do order-generator, cuja fonte é
+    # `console._pausado` (escrito só por `console.definir_pausa`). Vive no
+    # snapshot pelo mesmo motivo da trava: o console precisa ver a pausa ao
+    # vivo, e o `/ws` já entrega o snapshot a cada transição — publicar aqui
+    # evita um polling só para um booleano.
+    "gerador_pausado": False,
     "atribuicao_ia": [],
     # Derivado do banco por _contar_alarmes_ativos() — nunca incrementado à mão.
     "alarmes_ativos": 0,
@@ -277,8 +295,8 @@ async def _db(fn, *args):
 
 # ── Alarmes ativos: derivado do banco, com cache curto ────────────────────────
 # `alarmes_ativos` já foi um contador em memória incrementado nos handlers. Ele
-# só subia: resolver um alarme pela IHM não o baixava, e um restart o zerava
-# mesmo com alarmes abertos no banco. Agora o valor é sempre uma leitura de
+# só subia: resolver um alarme pelo app de manutenção não o baixava, e um
+# restart o zerava mesmo com alarmes abertos no banco. Agora o valor é sempre uma leitura de
 # `get_total_alarmes_ativos()`.
 #
 # O número vai em TODO payload de `_broadcast_estado()`, que roda a cada evento
@@ -293,8 +311,8 @@ async def _db(fn, *args):
 # `salvar_alarme` direto, sem passar por aqui — um cache invalidado apenas
 # pelos caminhos deste módulo ficaria permanentemente atrasado em relação a
 # eles. O TTL converge sozinho, seja quem for que escreveu. Os pontos que o
-# central conhece (handler que abriu alarme, resolução pela IHM, startup)
-# passam `forcar=True` para não fazer o badge esperar a janela.
+# central conhece (handler que abriu alarme, resolução pelo app de manutenção,
+# startup) passam `forcar=True` para não fazer o badge esperar a janela.
 _ALARMES_TTL_S = 5.0
 _alarmes_lock = threading.Lock()
 _alarmes_cache = {"valor": 0, "lido_em": None}   # lido_em None = nunca lido
@@ -818,6 +836,49 @@ async def _loop_expurgo():
         await asyncio.sleep(intervalo)
 
 
+# ── Ordens padrão ──────────────────────────────────────────────────────────────
+
+def _catalogo_por_nome(medicamentos: list) -> dict:
+    """Catálogo indexado por nome — a chave com que os templates citam itens."""
+    return {m["nome"]: m for m in (medicamentos or []) if m.get("nome")}
+
+
+async def _diagnosticar_templates() -> tuple[list, dict | None]:
+    """Diagnóstico das 10 ordens padrão: `(problemas, catálogo)`.
+
+    Duas checagens, e a segunda só vale se o banco respondeu: estrutura (faixa
+    de itens, quantidades, duplicidade) e existência de cada medicamento na
+    tabela `medicamentos`. Catálogo indisponível volta como `None` — e não como
+    `{}` — para ninguém ler "nenhum problema" como "os templates estão válidos".
+
+    Devolve o catálogo junto porque o endpoint precisa dele para enriquecer os
+    itens: separá-los custaria uma segunda varredura da tabela por chamada.
+    """
+    problemas = os_templates.validar_estrutura(num_slots=settings.NUM_SLOTS)
+    try:
+        catalogo = _catalogo_por_nome(await asyncio.to_thread(listar_medicamentos))
+    except Exception as exc:
+        logger.warning("[TEMPLATES] Catálogo indisponível (%s) — "
+                       "validação contra `medicamentos` não foi feita.", exc)
+        return problemas, None
+
+    if not catalogo:
+        return problemas, None
+    return problemas + os_templates.validar_contra_catalogo(catalogo), catalogo
+
+
+async def _validar_templates_no_boot() -> None:
+    problemas, catalogo = await _diagnosticar_templates()
+    if problemas:
+        logger.error("[TEMPLATES] %d problema(s) nas ordens padrão:\n  - %s",
+                     len(problemas), "\n  - ".join(problemas))
+        _log("templates_invalidos",
+             f"{len(problemas)} problema(s) nas 10 ordens padrão — ver log do central")
+    elif catalogo is not None:
+        logger.info("[TEMPLATES] %d ordens padrão válidas contra o catálogo.",
+                    len(os_templates.TEMPLATES))
+
+
 # ── FastAPI Lifespan ───────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -837,6 +898,14 @@ async def lifespan(app: FastAPI):
     # Segredo fraco derruba o boot (fora de APSEN_ENV=dev). O valor default é
     # público neste repositório: com ele qualquer um forja um JWT role=admin.
     validar_secret_key(settings.SECRET_KEY, settings.APSEN_ENV)
+
+    # As 10 ordens padrão contra o catálogo REAL, agora que o banco está de pé.
+    # Aqui é WARNING, não queda: o central serve a planta inteira e derrubá-lo
+    # por um nome de medicamento digitado errado no template trocaria um
+    # problema de demonstração por um de produção. Quem RECUSA disparar uma OS
+    # inválida é o order-generator, no startup dele, e o console vê o mesmo
+    # diagnóstico em `GET /api/v1/ordens/templates`.
+    await _validar_templates_no_boot()
 
     task_broadcast = asyncio.create_task(_broadcast_worker())
     task_flusher   = asyncio.create_task(_broadcast_flusher())
@@ -893,9 +962,9 @@ payload é o mesmo de `GET /estado`.
 documentados, esses, correspondem ao que o código realmente levanta.
 """,
 )
-# Só dashboard e IHM falam com o central pelo navegador. `*` num serviço
-# autenticado deixa qualquer página aberta no browser do técnico disparar
-# requisição em nome dele.
+# Só o dashboard e o app de manutenção falam com o central pelo navegador.
+# `*` num serviço autenticado deixa qualquer página aberta no browser do
+# técnico disparar requisição em nome dele.
 app.add_middleware(CORSMiddleware, allow_origins=settings.CORS_ORIGINS,
                    allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
@@ -1212,6 +1281,62 @@ def get_fila():
     return orch.fila_status()
 
 
+@app.get("/api/v1/gerador", tags=["Ordens de Serviço"])
+def get_gerador():
+    """Interruptor do order-generator — ele consulta ANTES de cada envio.
+
+    É assim que o console pausa a geração automática sem tocar no container do
+    gerador. A alternativa seria o central falar com o daemon do Docker (socket
+    montado, privilégio de administrador da máquina, acoplamento novo entre o
+    central e o runtime que o hospeda) para não dispensar medicamento por
+    alguns minutos. Um booleano no caminho HTTP que os dois já usam resolve o
+    mesmo problema, e o gerador volta a produzir no instante em que o console
+    despausa — sem esperar container subir.
+
+    Sem autenticação, como `/api/v1/fila`: quem lê é um serviço interno da rede
+    `apsen-net`, que não tem JWT. Quem ESCREVE é só o console
+    (`POST /console/api/gerador`), atrás da sessão dele.
+
+    O estado não é persistido: restart do central retoma o automático. Ver
+    `console.py` para o porquê.
+    """
+    return console.gerador_status()
+
+
+@app.get("/api/v1/ordens/templates", tags=["Ordens de Serviço"])
+async def get_templates_ordens():
+    """As 10 Ordens de Saída padrão, com os itens enriquecidos pelo catálogo.
+
+    Fonte única das ordens fixas (`os_templates.py`). O order-generator lê daqui
+    em vez de manter a própria cópia — se cada um tivesse a sua, o console
+    listaria uma coisa e a planta dispensaria outra, sem erro em lugar nenhum.
+    A justificativa completa está no topo de `os_templates.py`.
+
+    `problemas` é diagnóstico, não erro: um medicamento renomeado no catálogo
+    aparece aqui em vez de virar OS com `sku` vazio. Com o banco fora do ar a
+    lista sai só com os problemas ESTRUTURAIS e `catalogo_carregado=false` —
+    lista vazia sem catálogo não significa "está tudo certo".
+    """
+    problemas, catalogo = await _diagnosticar_templates()
+
+    templates = os_templates.listar()
+    for template in templates:
+        for item in template["itens"]:
+            med = (catalogo or {}).get(item["medicamento"], {})
+            item["sku"]         = med.get("sku", "")
+            item["categoria"]   = med.get("categoria", template["categoria"])
+            item["no_catalogo"] = item["medicamento"] in (catalogo or {})
+        template["total_itens"] = len(template["itens"])
+
+    return {
+        "templates":          templates,
+        "total":              len(templates),
+        "num_slots":          settings.NUM_SLOTS,
+        "catalogo_carregado": catalogo is not None,
+        "problemas":          problemas,
+    }
+
+
 @app.get("/os/ativa", tags=["Ordens de Serviço"])
 def os_ativa():
     ordem = get_ordem_ativa()
@@ -1256,11 +1381,11 @@ async def relatorio_os(
     Exporta relatório completo de uma OS em CSV ou XLSX.
 
     Autenticação **só** por `Authorization: Bearer <jwt>`. O `?token=` que
-    existia aqui servia para o navegador baixar direto de uma âncora da IHM, o
-    que punha o JWT no histórico do navegador, no `Referer` e no log de acesso
-    deste serviço. Hoje quem baixa é o processo da IHM (server-side, dentro da
-    rede Docker) e devolve os bytes ao operador pelo `dcc.Download` — nenhum
-    cliente precisa mais de token na URL.
+    existia aqui servia para o navegador baixar direto de uma âncora do app de
+    manutenção, o que punha o JWT no histórico do navegador, no `Referer` e no
+    log de acesso deste serviço. Hoje quem baixa é o processo do app de
+    manutenção (server-side, dentro da rede Docker) e devolve os bytes ao gestor
+    pelo `dcc.Download` — nenhum cliente precisa mais de token na URL.
     """
     raw_token = creds.credentials if creds else None
     if not raw_token or not decodificar_token(raw_token):
@@ -1467,7 +1592,7 @@ def log_eventos(limite: int = 50):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS — IHM MANUTENÇÃO (requer JWT)
+# ENDPOINTS — MANUTENÇÃO E OPERAÇÃO (requer JWT)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/auth/login", tags=["Autenticação"],
@@ -1560,14 +1685,30 @@ async def liberar_trava(user=Depends(_get_admin)):
     Libera a trava de Triple Check. Exige role admin ou supervisor.
     A OS retoma de onde parou após a liberação.
     """
-    liberado = await asyncio.to_thread(orch.liberar_trava, user["sub"])
-    if not liberado:
+    if not await _liberar_trava(user["sub"]):
         raise HTTPException(status_code=409, detail="Nenhuma trava ativa no momento.")
-    _log("trava", f"Trava liberada por {user['sub']}")
+    return {"ok": True, "liberado_por": user["sub"]}
+
+
+async def _liberar_trava(liberado_por: str) -> bool:
+    """Liberação da trava: soltar o evento, limpar o snapshot, publicar.
+
+    Extraído porque existem DOIS portões para a mesma ação — este endpoint
+    (JWT de admin, usado pelo app de manutenção) e o console de operação, que
+    tem sessão própria. Cada um autentica do seu jeito; o que acontece depois
+    tem que ser idêntico, e duas cópias divergiriam justamente no passo fácil
+    de esquecer — o `_estado["trava"]` que o dashboard lê. Sem ele, a faixa
+    vermelha continuaria na tela com a OS já rodando.
+
+    Devolve False quando não havia trava ativa; quem chama traduz para o 409.
+    """
+    if not await asyncio.to_thread(orch.liberar_trava, liberado_por):
+        return False
+    _log("trava", f"Trava liberada por {liberado_por}")
     with _lock:
         _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
     _broadcast_estado()
-    return {"ok": True, "liberado_por": user["sub"]}
+    return True
 
 
 @app.post("/manutencao/dispensers/{dispenser_id}/limpar", tags=["Manutenção"],
@@ -1597,8 +1738,8 @@ async def manut_limpar_dispenser(dispenser_id: int, user=Depends(_get_tecnico)):
         )
     # Bloqueio 2: dispenser em operação ativa.
     # "concluido" NÃO entra: o slot já terminou a dispensa e pode ter residual
-    # encalhado — limpar esse resto é justamente o propósito do botão da IHM.
-    # (O simulador aplica a mesma regra em _do_limpar.)
+    # encalhado — limpar esse resto é justamente o propósito do botão do app
+    # de manutenção. (O simulador aplica a mesma regra em _do_limpar.)
     STATUS_BLOQUEADOS = {"carregando", "pronto", "dispensando", "aguardando_carga"}
     if d_status in STATUS_BLOQUEADOS:
         med = d_info.get("medicamento", f"Dispenser {dispenser_id}")
@@ -1663,6 +1804,267 @@ def ativar_usuario(username: str, user=Depends(_get_admin)):
     resultado = toggle_usuario_ativo(username, True)
     _invalidar_cache_usuario(username)
     return resultado
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSOLE DE OPERAÇÃO — interface própria do central, em /console
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Rota discreta: não é linkada do dashboard nem do app de manutenção, e todas
+# as rotas daqui levam `include_in_schema=False` — o console não aparece no
+# `/docs` nem no `openapi.json`.
+#
+# A senha, a sessão assinada e o freio de força bruta vivem em `console.py`,
+# que é o módulo sem FastAPI e, por isso, o que dá para testar chamando função.
+# Aqui ficam só as rotas.
+#
+# **O console não é um caminho paralelo de entrada de OS.** `console_disparar`
+# monta o corpo com `os_templates.instanciar` — o mesmo que o gerador usa — e
+# CHAMA `receber_ordem`, a função do `POST /api/v1/ordens`. Fila cheia, OS
+# duplicada e banco fora do ar respondem no console exatamente o que respondem
+# ao gerador, porque é o mesmo código respondendo. Reimplementar o caminho aqui
+# faria as duas portas divergirem no primeiro ajuste de contrato — e a que
+# ficaria para trás é justamente a que um humano usa sob pressão.
+
+_ERRO_SENHA = "Senha incorreta."
+_ERRO_MUITAS_TENTATIVAS = ("Muitas tentativas seguidas. Aguarde um minuto antes "
+                           "de tentar de novo.")
+
+
+class ConsoleDisparoReq(BaseModel):
+    template_id: str
+
+
+class ConsoleGeradorReq(BaseModel):
+    pausado: bool
+
+
+def _console_indisponivel() -> JSONResponse:
+    """Resposta única para console desabilitado — 503, não 404.
+
+    As duas escondem o console de quem não tem a senha e nenhuma das duas o
+    abre; a diferença só aparece para o outro leitor, o operador que configurou
+    errado. 404 manda essa pessoa procurar o erro na URL, no build ou no proxy;
+    503 dizendo "defina CONSOLE_SENHA" encerra o assunto numa linha.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"erro": "console_desabilitado",
+                 "mensagem": console.motivo_indisponivel()},
+    )
+
+
+def _console_origem(request: Request) -> str:
+    """Chave do freio de força bruta. Atrás de proxy todos caem no mesmo balde —
+    o que endurece o freio, nunca o afrouxa."""
+    return request.client.host if request.client else "desconhecida"
+
+
+async def _console_senha_enviada(request: Request) -> str:
+    """Campo `senha` do formulário de login, lido sem `python-multipart`.
+
+    O `request.form()` do Starlette exige a biblioteca mesmo para
+    `application/x-www-form-urlencoded` — ele checa a dependência antes de
+    decidir o parser. Como o formulário do console tem um campo, `parse_qsl` da
+    stdlib resolve, e o central não ganha dependência nova para ler uma senha.
+
+    O corpo é lido inteiro em memória, então tem teto: um POST gigante nesta
+    rota é ou engano ou abuso, e nos dois casos a senha não estaria lá.
+    """
+    limite = 4096
+    try:
+        if int(request.headers.get("content-length") or 0) > limite:
+            return ""
+    except ValueError:
+        return ""
+
+    bruto = (await request.body())[:limite].decode("utf-8", "replace")
+    for chave, valor in parse_qsl(bruto, keep_blank_values=True):
+        if chave == "senha":
+            return valor
+    return ""
+
+
+def _console_tem_sessao(request: Request) -> bool:
+    return console.sessao_valida(request.cookies.get(console.COOKIE_SESSAO))
+
+
+def _console_exigir_sessao(request: Request) -> None:
+    """Portão das rotas `/console/api/*`. 503 antes de 401: sem `CONSOLE_SENHA`
+    não existe sessão possível, e responder 401 sugeriria que existe."""
+    if not console.habilitado():
+        raise HTTPException(503, console.motivo_indisponivel())
+    if not _console_tem_sessao(request):
+        raise HTTPException(401, "Sessão do console ausente ou expirada.")
+
+
+def _publicar_gerador(status_gerador: dict) -> None:
+    """Publica o interruptor no snapshot e avisa quem está com a tela aberta.
+
+    A fonte é `console._pausado`; isto é a publicação, na mesma ordem de
+    `_ativar_trava` — primeiro o estado real, depois o que a tela lê. Transição
+    de operador não passa pelo throttle: quem clicou precisa ver o efeito.
+    """
+    with _lock:
+        _estado["gerador_pausado"] = status_gerador["pausado"]
+    _broadcast_estado()
+
+
+# ── Sessão ────────────────────────────────────────────────────────────────────
+
+@app.get("/console", include_in_schema=False)
+def console_pagina(request: Request):
+    if not console.habilitado():
+        return _console_indisponivel()
+    if not _console_tem_sessao(request):
+        return RedirectResponse("/console/login", status_code=303)
+    return HTMLResponse(console.pagina_console())
+
+
+@app.get("/console/login", include_in_schema=False)
+def console_login_form(request: Request):
+    if not console.habilitado():
+        return _console_indisponivel()
+    if _console_tem_sessao(request):
+        return RedirectResponse("/console", status_code=303)
+    return HTMLResponse(console.pagina_login())
+
+
+@app.post("/console/login", include_in_schema=False)
+async def console_login(request: Request):
+    """Confere a senha e emite o cookie de sessão.
+
+    O corpo é lido por `_console_senha_enviada`, não por `Form(...)` nem por
+    `request.form()`: os dois exigiriam `python-multipart` — dependência nova
+    no central para ler um único campo de texto.
+    """
+    if not console.habilitado():
+        return _console_indisponivel()
+
+    origem = _console_origem(request)
+    espera = console.bloqueado(origem)
+    if espera:
+        logger.warning("[CONSOLE] Tentativas demais de %s — bloqueado por %ds.",
+                       origem, int(espera))
+        return HTMLResponse(console.pagina_login(_ERRO_MUITAS_TENTATIVAS),
+                            status_code=429,
+                            headers={"Retry-After": str(int(espera))})
+
+    if not console.senha_confere(await _console_senha_enviada(request)):
+        console.registrar_falha(origem)
+        logger.warning("[CONSOLE] Senha incorreta (origem %s).", origem)
+        return HTMLResponse(console.pagina_login(_ERRO_SENHA), status_code=401)
+
+    console.limpar_falhas(origem)
+    _log("console", "Sessão do console de operação aberta")
+    logger.info("[CONSOLE] Sessão aberta (origem %s).", origem)
+
+    resposta = RedirectResponse("/console", status_code=303)
+    resposta.set_cookie(
+        console.COOKIE_SESSAO, console.criar_sessao(),
+        max_age=console.duracao_cookie_s(),
+        httponly=True,          # a senha nunca vai ao cliente e o JS não lê o cookie
+        samesite="lax",
+        path=console.COOKIE_PATH,
+        # Ligado sozinho quando a página vier por TLS. Fixar True quebraria o
+        # console em http://localhost, que é como a planta é demonstrada; fixar
+        # False mandaria o cookie em claro num deploy https.
+        secure=request.url.scheme == "https",
+    )
+    return resposta
+
+
+@app.post("/console/logout", include_in_schema=False)
+def console_logout(request: Request):
+    if not console.habilitado():
+        return _console_indisponivel()
+    resposta = RedirectResponse("/console/login", status_code=303)
+    resposta.delete_cookie(console.COOKIE_SESSAO, path=console.COOKIE_PATH)
+    return resposta
+
+
+# ── Ações ─────────────────────────────────────────────────────────────────────
+
+@app.post("/console/api/disparar", include_in_schema=False)
+async def console_disparar(request: Request, req: ConsoleDisparoReq):
+    """Dispara UMA das ordens padrão, pelo mesmo caminho do order-generator.
+
+    O `sku` sai do catálogo na hora, como no gerador: congelá-lo no template
+    criaria a chance de ele divergir de `medicamentos`, e o sintoma seria uma
+    `leitura_dispenser_divergencia` num slot só — indistinguível de um
+    medicamento realmente trocado. Por isso catálogo indisponível RECUSA o
+    disparo (503) em vez de instanciar com SKU vazio: sem SKU a câmera não tem
+    o que comparar, e o Triple Check perde uma das três fontes em silêncio.
+    """
+    _console_exigir_sessao(request)
+
+    template = os_templates.por_id(req.template_id)
+    if not template:
+        return JSONResponse(
+            status_code=404,
+            content={"erro": "template_desconhecido", "template_id": req.template_id,
+                     "mensagem": f"Não existe ordem padrão '{req.template_id}'."},
+        )
+
+    _, catalogo = await _diagnosticar_templates()
+    if catalogo is None:
+        return JSONResponse(
+            status_code=503,
+            content={"erro": "catalogo_indisponivel", "template_id": req.template_id,
+                     "mensagem": ("Catálogo de medicamentos indisponível — a OS "
+                                  "sairia sem SKU para a câmera comparar.")},
+        )
+
+    faltando = os_templates.validar_contra_catalogo(catalogo, [template])
+    if faltando:
+        return JSONResponse(
+            status_code=422,
+            content={"erro": "template_invalido", "template_id": req.template_id,
+                     "problemas": faltando, "mensagem": "; ".join(faltando)},
+        )
+
+    corpo = os_templates.instanciar(template, catalogo)
+    logger.info("[CONSOLE] Disparo manual de %s → %s",
+                template["template_id"], corpo["os_id"])
+
+    # A MESMA função do POST /api/v1/ordens. Ela devolve dict (aceita) ou
+    # JSONResponse (409/429/503) — os dois seguem para o console como vieram,
+    # com o código de status intacto, que é o que a tela precisa mostrar.
+    resultado = await receber_ordem(NovaOSReq(**corpo))
+    if isinstance(resultado, JSONResponse):
+        return resultado
+    return {**resultado, "template_id": template["template_id"],
+            "descricao": corpo["descricao"]}
+
+
+@app.post("/console/api/gerador", include_in_schema=False)
+def console_gerador(request: Request, req: ConsoleGeradorReq):
+    """Pausa ou retoma o order-generator (ver `GET /api/v1/gerador`)."""
+    _console_exigir_sessao(request)
+    status_gerador = console.definir_pausa(req.pausado)
+    _publicar_gerador(status_gerador)
+    _log("console", "Gerador automático "
+                    + ("pausado" if req.pausado else "retomado") + " pelo console")
+    return {"ok": True, **status_gerador}
+
+
+@app.post("/console/api/liberar-trava", include_in_schema=False)
+async def console_liberar_trava(request: Request):
+    """Libera a trava do Triple Check sem passar pelo app de manutenção.
+
+    Mesma consequência do endpoint de admin — é literalmente a mesma função
+    (`_liberar_trava`). O que muda é o portão: lá um JWT com role admin, aqui a
+    sessão do console. A confirmação em dois passos é exigida do lado da
+    página: liberar trava é a única ação destrutiva daqui.
+    """
+    _console_exigir_sessao(request)
+    if not await _liberar_trava("console"):
+        return JSONResponse(
+            status_code=409,
+            content={"erro": "sem_trava",
+                     "mensagem": "Nenhuma trava ativa no momento."},
+        )
+    return {"ok": True, "liberado_por": "console"}
 
 
 # ── WebSocket ──────────────────────────────────────────────────────────────────
