@@ -183,6 +183,52 @@ button{font-family:inherit}
   border:1px solid var(--ap-err);
 }
 .problemas ul{margin:5px 0 0; padding-left:18px}
+
+/* ── Injeção de falha: caminho de DEMONSTRAÇÃO, e a tela diz isso ──────────── */
+/* Tratamento visual distinto do resto do console de propósito: nada aqui é
+   operação da planta. Quem olhar a tela de longe tem que conseguir dizer se há
+   uma falha provocada a caminho — senão, na análise dos logs depois, falha real
+   e falha armada viram a mesma coisa. */
+.injecao{padding:12px 14px; display:flex; flex-direction:column; gap:9px}
+.injecao .controles{display:flex; gap:8px; flex-wrap:wrap; align-items:center}
+.injecao select{
+  flex:1 1 210px; min-width:0; padding:8px 9px; border-radius:8px; font:inherit;
+  font-size:12.5px; color:var(--ap-text); background:var(--ap-surface-2);
+  border:1px solid var(--ap-line);
+}
+.injecao .efeito{font-size:11.5px; line-height:1.5; color:var(--ap-muted)}
+.armada{
+  display:none; gap:9px; align-items:center; padding:9px 11px; border-radius:8px;
+  font-size:12px; line-height:1.45; color:#F6DFA8;
+  background:rgba(196,154,58,.14); border:1px solid var(--ap-gold);
+}
+.armada.on{display:flex}
+.armada .txt{flex:1 1 auto}
+.armada .tipo{font-family:var(--ap-mono); font-weight:700}
+.pill.armado{border-color:var(--ap-gold); color:#F6DFA8}
+.pill.armado .ponto{background:var(--ap-gold)}
+
+/* ── Bancada: reset e histórico de demonstração ────────────────────────────── */
+/* As duas ações destrutivas do console. O painel fica por último e com a moldura
+   vermelha porque o que se procura numa apresentação é DISPARAR, não apagar. */
+.perigo{padding:12px 14px; display:flex; flex-direction:column; gap:10px}
+.perigo .bloco{display:flex; flex-direction:column; gap:7px;
+               padding:10px 11px; border-radius:8px;
+               background:var(--ap-surface-2); border:1px solid var(--ap-line-soft)}
+.perigo .titulo{font-size:12.5px; font-weight:600; color:var(--ap-text)}
+.perigo .nota{font-size:11.5px; line-height:1.5; color:var(--ap-muted)}
+.perigo .linha{display:flex; gap:8px; flex-wrap:wrap; align-items:center}
+.perigo label{display:flex; gap:6px; align-items:center; font-size:11.5px;
+              color:var(--ap-muted)}
+.perigo input[type=number]{
+  width:74px; padding:7px 8px; border-radius:8px; font:inherit; font-size:12.5px;
+  color:var(--ap-text); background:var(--ap-surface); border:1px solid var(--ap-line);
+}
+.perigo .selo{
+  align-self:flex-start; padding:2px 8px; border-radius:999px; font-size:10px;
+  letter-spacing:.7px; text-transform:uppercase;
+  color:#F6DFA8; background:rgba(196,154,58,.14); border:1px solid var(--ap-gold);
+}
 </style>
 </head>
 <body>
@@ -200,7 +246,12 @@ button{font-family:inherit}
     <div class="kpi"><span class="rot">Alarmes</span>
       <span class="val" id="kpiAlarmes">—</span></div>
 
+    <span id="injPill" class="pill" hidden>
+      <span class="ponto"></span><span id="injTexto"></span></span>
+
     <button class="btn" id="btnGerador" disabled>Gerador…</button>
+    <a class="btn" href="/console/prevoo"
+       title="Confere, item a item, se a stack inteira está de pé.">Pré-voo</a>
     <form method="post" action="/console/logout" style="margin:0">
       <button class="btn" type="submit">Sair</button>
     </form>
@@ -232,6 +283,67 @@ button{font-family:inherit}
     </section>
 
     <section class="painel">
+      <h2>Injeção de falha
+        <span class="nota">demonstração · dispara uma vez</span>
+      </h2>
+      <div class="injecao">
+        <div class="armada" id="faixaArmada">
+          <span class="txt">
+            <span class="tipo" id="armadaTipo"></span>
+            <span id="armadaDetalhe"></span>
+          </span>
+          <button class="btn" id="btnDesarmar">Desarmar</button>
+        </div>
+        <div class="controles">
+          <select id="selTipo"></select>
+          <select id="selSlot"></select>
+          <button class="btn btn-ouro" id="btnArmar">Armar</button>
+        </div>
+        <div class="efeito" id="efeitoTipo"></div>
+      </div>
+    </section>
+
+    <section class="painel">
+      <h2>Bancada <span class="nota">ações destrutivas · confirmam</span></h2>
+      <div class="perigo">
+        <div class="bloco">
+          <span class="titulo">Reset da planta</span>
+          <span class="nota">
+            Esvazia a fila, libera a trava, desarma a falha, manda LIMPAR os
+            slots de verdade, zera a balança e leva a CNC para HOME. Recusa
+            enquanto houver OS em execução.
+          </span>
+          <div class="linha">
+            <label>
+              <input type="checkbox" id="chkHistorico">
+              apagar também o histórico
+            </label>
+            <button class="btn btn-perigo" id="btnReset"
+                    style="margin-left:auto">Resetar</button>
+          </div>
+        </div>
+
+        <div class="bloco">
+          <span class="selo">dado de demonstração</span>
+          <span class="titulo">Semear histórico</span>
+          <span class="nota">
+            Cria OS concluídas nas últimas N noites, com dispensas, alarmes já
+            resolvidos e curvas de temperatura — para o dashboard não abrir
+            vazio. <strong>Nada disto aconteceu na planta</strong>: todo
+            <code>os_id</code> semeado começa com <code>DEMO-</code>.
+          </span>
+          <div class="linha">
+            <label>ordens <input type="number" id="numSeed" value="40"
+                                min="1" max="200" step="1"></label>
+            <label>dias <input type="number" id="diasSeed" value="7"
+                              min="1" max="60" step="1"></label>
+            <button class="btn" id="btnSeed" style="margin-left:auto">Semear</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="painel">
       <h2>Respostas do central <span class="nota">mais recente no topo</span></h2>
       <ul class="feed" id="feed"></ul>
       <div class="vazio" id="feedVazio">Nenhuma ação nesta sessão.</div>
@@ -245,13 +357,19 @@ button{font-family:inherit}
 
 /* ──────────────────────────────────────────────────────────────────────────────
    Estado local da página. `templates` vem de GET /api/v1/ordens/templates (a
-   MESMA rota que o order-generator lê — não existe segunda lista de ordens);
+   MESMA rota que o erp-simulator lê — não existe segunda lista de ordens);
    o resto chega pelo WebSocket /ws, que já publicava tudo isto para o
    dashboard. Nenhum polling novo foi criado.
    ────────────────────────────────────────────────────────────────────────── */
 var templates = [];
 var pausado = null;
 var travaAtiva = false;
+/* Tipos de falha injetável: vêm de GET /console/api/injecao, que os lê de
+   `injecao.TIPOS`. Não há lista escrita aqui de propósito — uma segunda lista
+   ofereceria um dia um tipo que nenhum simulador entende, e o sintoma seria o
+   gatilho armado que nunca dispara. */
+var tiposFalha = [];
+var falhaArmada = null;
 var ws = null, tentativasWs = 0;
 
 var $ = function (id) { return document.getElementById(id); };
@@ -442,7 +560,7 @@ async function disparar(templateId, btn) {
   }
 }
 
-/* ── Pausa do order-generator ─────────────────────────────────────────────── */
+/* ── Pausa do erp-simulator ─────────────────────────────────────────────── */
 $("btnGerador").addEventListener("click", async function () {
   var alvo = !pausado;
   var r = await chamar(alvo ? "Pausar gerador automático"
@@ -458,8 +576,8 @@ function aplicarGerador(valor) {
   btn.textContent = pausado ? "▶ Retomar automático" : "⏸ Pausar automático";
   btn.className = pausado ? "btn btn-ouro" : "btn";
   btn.title = pausado
-    ? "O order-generator está parado: nenhuma OS entra sozinha."
-    : "O order-generator dispara uma ordem padrão por ciclo.";
+    ? "O erp-simulator está parado: nenhuma OS entra sozinha."
+    : "O erp-simulator dispara uma ordem padrão por ciclo.";
 }
 
 /* ── Trava do Triple Check (destrutiva: exige confirmação) ────────────────── */
@@ -471,6 +589,146 @@ $("btnLiberar").addEventListener("click", async function () {
     return;
   }
   await chamar("Liberar trava do Triple Check", "/console/api/liberar-trava", {});
+});
+
+/* ── Injeção de falha (demonstração) ──────────────────────────────────────── */
+async function carregarInjecao() {
+  try {
+    var resp = await fetch("/console/api/injecao", { credentials: "same-origin" });
+    var corpo = await resp.json();
+    tiposFalha = corpo.tipos || [];
+    montarSeletores(corpo.num_slots || 8);
+    aplicarArmada(corpo.armada || null);
+  } catch (erro) {
+    registrar("Carregar tipos de falha", "err", String(erro), null, "—");
+  }
+}
+
+function montarSeletores(numSlots) {
+  var selTipo = $("selTipo");
+  selTipo.innerHTML = "";
+  tiposFalha.forEach(function (t) {
+    var op = document.createElement("option");
+    op.value = t.tipo;
+    op.textContent = t.rotulo + (t.bloqueante ? "  (trava a OS)" : "  (só alarme)");
+    selTipo.appendChild(op);
+  });
+
+  var selSlot = $("selSlot");
+  selSlot.innerHTML = "";
+  for (var i = 1; i <= numSlots; i++) {
+    var op = document.createElement("option");
+    op.value = String(i);
+    op.textContent = "D" + i;
+    selSlot.appendChild(op);
+  }
+  mostrarEfeito();
+}
+
+/* O efeito do tipo escolhido fica na tela ANTES de armar. Armar sem saber o que
+   vai acontecer é o que faz a demonstração desandar na frente da banca. */
+function mostrarEfeito() {
+  var tipo = $("selTipo").value;
+  var meta = tiposFalha.filter(function (t) { return t.tipo === tipo; })[0];
+  $("efeitoTipo").textContent = meta ? meta.efeito : "";
+}
+$("selTipo").addEventListener("change", mostrarEfeito);
+
+$("btnArmar").addEventListener("click", async function () {
+  var tipo = $("selTipo").value;
+  var slot = parseInt($("selSlot").value, 10);
+  if (!tipo) return;
+  /* Um clique, como disparar: armar não é destrutivo — a falha só acontece na
+     próxima ocorrência aplicável e dá para desarmar antes. */
+  var r = await chamar("Armar falha " + tipo + " em D" + slot,
+                       "/console/api/injecao", { tipo: tipo, slot_id: slot });
+  if (r && r.ok && r.corpo) aplicarArmada(r.corpo.armada);
+});
+
+$("btnDesarmar").addEventListener("click", async function () {
+  var r = await chamar("Desarmar falha", "/console/api/injecao/desarmar", {});
+  if (r && r.ok) aplicarArmada(null);
+});
+
+function aplicarArmada(g) {
+  falhaArmada = g || null;
+  var faixa = $("faixaArmada");
+  var pill  = $("injPill");
+
+  if (!falhaArmada) {
+    faixa.className = "armada";
+    pill.hidden = true;
+    return;
+  }
+  faixa.className = "armada on";
+  texto($("armadaTipo"), falhaArmada.tipo);
+  texto($("armadaDetalhe"),
+        " armada no slot D" + falhaArmada.slot_id +
+        " — dispara na próxima ocorrência aplicável e se desarma sozinha.");
+
+  pill.hidden = false;
+  pill.className = "pill armado";
+  texto($("injTexto"), "falha armada · D" + falhaArmada.slot_id);
+}
+
+/* ── Bancada: reset e seed (destrutivos: confirmam) ───────────────────────── */
+$("btnReset").addEventListener("click", async function () {
+  var comHistorico = $("chkHistorico").checked;
+  var aviso = comHistorico
+    ? "\n\nO HISTÓRICO SERÁ APAGADO: ordens, dispensas, alarmes, eventos da " +
+      "CNC e leituras de sensor. Não há como desfazer."
+    : "\n\nO histórico será PRESERVADO.";
+  if (!window.confirm(
+        "Resetar a planta?\n\n" +
+        "A fila é esvaziada (as OS que esperam são canceladas), os 8 slots " +
+        "recebem comando de limpeza REAL, a balança é zerada e a CNC volta " +
+        "para HOME." + aviso)) {
+    return;
+  }
+  var btn = $("btnReset");
+  btn.disabled = true; btn.textContent = "RESETANDO…";
+  var r = await chamar("Reset da planta", "/console/api/reset",
+                       { limpar_historico: comHistorico });
+  btn.textContent = "Resetar"; btn.disabled = false;
+
+  if (r && r.ok && r.corpo) {
+    var c = r.corpo;
+    /* Slot que não confirmou a limpeza é o único desfecho que manda alguém
+       olhar a bancada. Ele precisa aparecer separado do "deu certo". */
+    if ((c.slots_com_falha || []).length) {
+      registrar("Slots sem confirmação de limpeza", "err",
+                "D" + c.slots_com_falha.join(", D") +
+                " não confirmaram — confira a bancada antes da próxima OS.");
+    }
+    registrar("Planta resetada", "ok",
+              (c.slots_limpos || []).length + " slot(s) limpo(s) · " +
+              (c.os_canceladas || []).length + " OS cancelada(s)" +
+              (c.historico ? " · histórico apagado" : " · histórico preservado"));
+  }
+});
+
+$("btnSeed").addEventListener("click", async function () {
+  var n = parseInt($("numSeed").value, 10);
+  var dias = parseInt($("diasSeed").value, 10);
+  if (!window.confirm(
+        "Semear " + n + " ordens de DEMONSTRAÇÃO nos últimos " + dias +
+        " dia(s)?\n\nEste dado é FABRICADO: nada disto aconteceu na planta. " +
+        "Ele existe para o dashboard não abrir vazio, e some no reset com " +
+        "\"apagar também o histórico\".")) {
+    return;
+  }
+  var btn = $("btnSeed");
+  btn.disabled = true; btn.textContent = "SEMEANDO…";
+  var r = await chamar("Semear histórico de demonstração", "/console/api/seed",
+                       { n_ordens: n, dias: dias });
+  btn.textContent = "Semear"; btn.disabled = false;
+
+  if (r && r.ok && r.corpo) {
+    registrar("Histórico de DEMONSTRAÇÃO semeado", "info",
+              r.corpo.ordens + " OS · " + r.corpo.dispensas + " dispensas · " +
+              r.corpo.alarmes + " alarmes · " + r.corpo.leituras +
+              " leituras. Prefixo " + r.corpo.prefixo);
+  }
 });
 
 /* ── Estado ao vivo pelo WebSocket /ws ────────────────────────────────────── */
@@ -517,6 +775,26 @@ function aplicarEstado(st) {
 
   if (st.gerador_pausado != null && st.gerador_pausado !== pausado) {
     aplicarGerador(st.gerador_pausado);
+  }
+
+  /* Quem desarma de verdade é o orquestrador, no momento em que injeta a falha
+     no comando. A tela descobre por aqui, não por polling — e registra no feed,
+     porque "a falha saiu agora" é a informação que dá sentido ao que vai
+     aparecer na bancada nos segundos seguintes. */
+  if (st.falha_armada !== undefined) {
+    var antes = falhaArmada;
+    var agora = st.falha_armada || null;
+    var mudou = (antes ? antes.tipo + ":" + antes.slot_id : "") !==
+                (agora ? agora.tipo + ":" + agora.slot_id : "");
+    if (mudou) {
+      if (antes && !agora) {
+        registrar("Falha injetada na planta", "info",
+                  antes.tipo + " no slot D" + antes.slot_id +
+                  " — gatilho consumido e desarmado. O que aparecer a seguir " +
+                  "foi PROVOCADO.");
+      }
+      aplicarArmada(agora);
+    }
   }
 
   var trava = st.trava || {};
@@ -589,6 +867,7 @@ function cartaoSlot(id, d, alvo) {
 }
 
 carregarTemplates();
+carregarInjecao();
 conectar();
 </script>
 </body>

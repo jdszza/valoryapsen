@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+{% block title %}Estação de Visão — Apsen{% endblock %}
+
+{% block content %}
+<div class="mb-3">
+    <h4 class="mb-0 fw-bold"><i class="bi bi-camera-video me-2"></i>Estação de Visão</h4>
+    <small class="text-muted">
+        A câmera conta as caixas em cada dispenser e valida a saída contra a ordem em processo.
+        Dispenser mapeado aqui passa a ter o estoque controlado pela visão — o display deixa de descontá-lo.
+    </small>
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+        <div class="stat-card text-center">
+            <div class="stat-value">{{ monitorados }}</div>
+            <div class="stat-label">Dispensers monitorados</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="stat-card text-center">
+            <div class="stat-value text-success">{{ saidas }}</div>
+            <div class="stat-label">Saídas registradas</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="stat-card text-center">
+            <div class="stat-value {% if bloqueios %}text-danger{% endif %}">{{ bloqueios }}</div>
+            <div class="stat-label">Leituras recusadas</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="stat-card text-center">
+            <div class="stat-value" style="font-size:1rem; line-height:1.4rem; padding-top:.4rem">
+                {% if ultima %}{{ ultima['momento'] }}<br>
+                <span class="text-muted" style="font-size:.75rem">{{ ultima['estacao'] or 'sem nome' }}</span>
+                {% else %}<span class="text-muted">nunca</span>{% endif %}
+            </div>
+            <div class="stat-label">Última leitura</div>
+        </div>
+    </div>
+</div>
+
+{% if not monitorados %}
+<div class="alert alert-warning rounded-3">
+    <i class="bi bi-exclamation-triangle me-1"></i>
+    Nenhum dispenser está mapeado para a câmera. Enquanto isso, toda leitura que chegar
+    da estação é recusada por não saber a qual medicamento pertence.
+</div>
+{% endif %}
+
+<div class="table-card mb-4">
+    <div class="p-3 border-bottom">
+        <strong>Mapeamento zona da câmera &rarr; medicamento</strong>
+        <div class="text-muted small mt-1">
+            <b>Dispenser</b> é o número da zona em <code>visao_dispensers/config/zonas.json</code>.
+            Deixe vazio para o medicamento continuar sob controle do display.
+            <b>SKU</b> é o conteúdo do QR impresso na etiqueta (ex: <code>MED-001</code>).
+            <b>ArUco</b> é o id do marcador impresso na mesma etiqueta, leitura redundante que
+            aguenta ângulo e pouca luz melhor que o QR — deixe vazio para usar só QR.
+            <b>Un/caixa</b> converte a contagem da câmera (caixas) para o estoque (unidades) —
+            deixe <code>1</code> se o dispenser guarda unidades avulsas.
+            <br>
+            <b>Esta tabela é a fonte de verdade da estação de visão.</b> Ela busca este
+            mapeamento em <code>/api/visao/catalogo</code> ao iniciar e a cada minuto — é
+            daqui que sai o veredito de "medicamento no dispenser errado".
+            <br>
+            <b>A estação precisa mandar o header <code>X-API-Token</code></b> com o valor de
+            <code>APSEN_API_TOKEN</code> em toda chamada <code>/api/*</code>. Sem ele a
+            resposta é <code>401</code>; sem a variável definida aqui no painel, é
+            <code>503</code>.
+        </div>
+    </div>
+    <form method="POST" action="{{ url_for('visao_salvar_mapeamento') }}">
+        <table class="table table-sm align-middle mb-0">
+            <thead>
+                <tr>
+                    <th>Medicamento</th>
+                    <th style="width:110px">Estoque</th>
+                    <th style="width:110px">Dispenser</th>
+                    <th style="width:150px">SKU (QR)</th>
+                    <th style="width:95px">ArUco</th>
+                    <th style="width:110px">Un/caixa</th>
+                    <th style="width:120px">Equivale a</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for m in medicamentos %}
+                <tr>
+                    <td class="fw-semibold">{{ m['nome'] }}</td>
+                    <td class="text-muted">{{ m['quantidade'] }} / {{ m['capacidade'] }}</td>
+                    <td>
+                        <input type="number" min="1" class="form-control form-control-sm"
+                               name="dispenser_{{ m['id'] }}"
+                               value="{{ m['dispenser_visao'] if m['dispenser_visao'] is not none else '' }}"
+                               placeholder="—" {% if not pode('visao_editar') %}disabled{% endif %}>
+                    </td>
+                    <td>
+                        <input type="text" class="form-control form-control-sm"
+                               name="sku_{{ m['id'] }}" value="{{ m['sku_visao'] or '' }}"
+                               placeholder="MED-00X" {% if not pode('visao_editar') %}disabled{% endif %}>
+                    </td>
+                    <td>
+                        <input type="number" min="0" class="form-control form-control-sm"
+                               name="aruco_{{ m['id'] }}"
+                               value="{{ m['aruco_visao'] if m['aruco_visao'] is not none else '' }}"
+                               placeholder="—" {% if not pode('visao_editar') %}disabled{% endif %}>
+                    </td>
+                    <td>
+                        <input type="number" min="1" class="form-control form-control-sm"
+                               name="upc_{{ m['id'] }}" value="{{ m['unidades_por_caixa'] or 1 }}"
+                               {% if not pode('visao_editar') %}disabled{% endif %}>
+                    </td>
+                    <td class="text-muted small">
+                        {% if m['dispenser_visao'] is not none %}
+                            1 caixa = {{ m['unidades_por_caixa'] or 1 }} un
+                        {% else %}
+                            <span class="badge bg-secondary">display</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% if pode('visao_editar') %}
+        <div class="p-3 border-top">
+            <button type="submit" class="btn btn-primary btn-sm">
+                <i class="bi bi-save"></i> Salvar mapeamento
+            </button>
+        </div>
+        {% endif %}
+    </form>
+</div>
+
+<div class="table-card">
+    <div class="p-3 border-bottom d-flex justify-content-between align-items-center">
+        <div>
+            <strong>Leituras recentes</strong>
+            <div class="text-muted small mt-1">
+                Leitura com confiança abaixo de {{ '%.2f'|format(confianca_minima) }},
+                sem calibração de contagem ou com veredito crítico não altera o estoque.
+            </div>
+        </div>
+    </div>
+    <div class="table-responsive">
+    <table class="table table-hover table-sm align-middle mb-0">
+        <thead>
+            <tr>
+                <th style="width:145px">Momento</th>
+                <th style="width:60px">Disp</th>
+                <th>Medicamento</th>
+                <th style="width:70px">Caixas</th>
+                <th style="width:120px">Estoque</th>
+                <th style="width:90px">Conf.</th>
+                <th style="width:110px">OS</th>
+                <th style="width:110px">Ação</th>
+                <th>Detalhe</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for mv in movimentos %}
+            <tr>
+                <td class="small text-muted">{{ mv['momento'] }}</td>
+                <td>{{ mv['dispenser'] if mv['dispenser'] is not none else '—' }}</td>
+                <td class="fw-semibold">{{ mv['medicamento_nome'] or '—' }}</td>
+                <td>{{ mv['caixas'] if mv['caixas'] is not none else '—' }}</td>
+                <td class="small">
+                    {% if mv['delta'] is not none and mv['delta'] != 0 %}
+                        {{ mv['unidades_anterior'] }} &rarr; {{ mv['unidades'] }}
+                        <span class="{% if mv['delta'] < 0 %}text-danger{% else %}text-success{% endif %}">
+                            ({{ '+' if mv['delta'] > 0 }}{{ mv['delta'] }})
+                        </span>
+                    {% elif mv['unidades'] is not none %}
+                        {{ mv['unidades'] }} un
+                    {% else %}—{% endif %}
+                </td>
+                <td class="small">
+                    {% if mv['confianca'] is not none %}{{ '%.2f'|format(mv['confianca']) }}{% else %}—{% endif %}
+                </td>
+                <td class="small">{{ mv['numero_os'] or '—' }}</td>
+                <td>
+                    {% if mv['acao'] == 'saida' %}
+                        <span class="badge bg-primary">saída</span>
+                    {% elif mv['acao'] == 'reposicao' %}
+                        <span class="badge bg-success">reposição</span>
+                    {% elif mv['acao'] == 'bloqueado' %}
+                        <span class="badge bg-danger">bloqueado</span>
+                    {% elif mv['acao'] == 'erro' %}
+                        <span class="badge bg-danger">erro</span>
+                    {% elif mv['acao'] == 'ignorado' %}
+                        <span class="badge bg-warning text-dark">ignorado</span>
+                    {% else %}
+                        <span class="badge bg-secondary">sem mudança</span>
+                    {% endif %}
+                </td>
+                <td class="small text-muted">{{ mv['detalhe'] }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="9" class="text-center text-muted py-4">
+                Nenhuma leitura recebida da estação de visão ainda.
+            </td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</div>
+{% endblock %}

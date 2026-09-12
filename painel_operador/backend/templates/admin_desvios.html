@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Desvios — Apsen{% endblock %}
+
+{% block content %}
+<div class="mb-3">
+    <h4 class="mb-0 fw-bold"><i class="bi bi-exclamation-diamond me-2"></i>Desvios / Não-Conformidade</h4>
+    <small class="text-muted">Ocorrências registradas no display (estoque insuficiente, erros operacionais, etc.)</small>
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+        <div class="stat-card text-center">
+            <div class="stat-value text-danger">{{ abertos }}</div>
+            <div class="stat-label">Abertos</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="stat-card text-center">
+            <div class="stat-value" style="color:#EA580C">{{ em_tratativa }}</div>
+            <div class="stat-label">Em tratativa</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="stat-card text-center">
+            <div class="stat-value text-success">{{ resolvidos }}</div>
+            <div class="stat-label">Resolvidos</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="stat-card text-center">
+            <div class="stat-value">{{ abertos + em_tratativa + resolvidos }}</div>
+            <div class="stat-label">Total</div>
+        </div>
+    </div>
+</div>
+
+<div class="table-card p-3 mb-3">
+    <form method="GET" class="row g-2 align-items-end">
+        <div class="col-md-3">
+            <label class="form-label small fw-semibold mb-1">Status</label>
+            <select name="status" class="form-select form-select-sm">
+                <option value="">Todos</option>
+                <option value="Aberto" {% if filtro_status == 'Aberto' %}selected{% endif %}>Aberto</option>
+                <option value="Em Tratativa" {% if filtro_status == 'Em Tratativa' %}selected{% endif %}>Em Tratativa</option>
+                <option value="Resolvido" {% if filtro_status == 'Resolvido' %}selected{% endif %}>Resolvido</option>
+            </select>
+        </div>
+        <div class="col-md-3">
+            <button type="submit" class="btn btn-primary btn-sm w-100"><i class="bi bi-funnel"></i> Filtrar</button>
+        </div>
+    </form>
+</div>
+
+<div class="table-card">
+    <table class="table table-hover table-sm align-middle mb-0">
+        <thead>
+            <tr>
+                <th style="width:150px">Abertura</th>
+                <th>OS</th>
+                <th>Tipo</th>
+                <th>Descrição</th>
+                <th>Operador</th>
+                <th style="width:130px">Status</th>
+                {% if pode('desvios_editar') %}<th style="width:70px"></th>{% endif %}
+            </tr>
+        </thead>
+        <tbody>
+        {% for d in desvios %}
+        <tr>
+            <td class="small text-muted font-monospace">{{ d.data_abertura }}</td>
+            <td><strong>{{ d.numero_os or '—' }}</strong></td>
+            <td><span class="badge bg-secondary-subtle text-secondary">{{ d.tipo }}</span></td>
+            <td class="small">{{ d.descricao or '—' }}</td>
+            <td class="small">{{ d.operador or '—' }}</td>
+            <td>
+                {% if d.status == 'Aberto' %}<span class="badge bg-danger-subtle text-danger">Aberto</span>
+                {% elif d.status == 'Em Tratativa' %}<span class="badge bg-warning-subtle text-warning">Em Tratativa</span>
+                {% else %}<span class="badge bg-success-subtle text-success">Resolvido</span>{% endif %}
+            </td>
+            {% if pode('desvios_editar') %}
+            <td>
+                <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalDesvio{{ d.id }}">
+                    <i class="bi bi-pencil"></i>
+                </button>
+            </td>
+            {% endif %}
+        </tr>
+        {% else %}
+        <tr>
+            <td colspan="7" class="text-center text-muted py-5">
+                <i class="bi bi-check2-circle fs-3 d-block mb-2"></i>
+                Nenhum desvio registrado.
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<!-- Modais ficam FORA da tabela (um <div> dentro de <tbody> e HTML invalido
+     e quebra a renderizacao das linhas seguintes no navegador). -->
+{% if pode('desvios_editar') %}
+{% for d in desvios %}
+<div class="modal fade" id="modalDesvio{{ d.id }}" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <form method="POST" action="{{ url_for('atualizar_desvio', id=d.id) }}">
+                <div class="modal-header">
+                    <h5 class="modal-title">Tratativa — {{ d.numero_os or 'Desvio #' ~ d.id }}</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="small text-muted">{{ d.descricao }}</p>
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold">Status</label>
+                        <select name="status" class="form-select">
+                            <option value="Aberto" {% if d.status == 'Aberto' %}selected{% endif %}>Aberto</option>
+                            <option value="Em Tratativa" {% if d.status == 'Em Tratativa' %}selected{% endif %}>Em Tratativa</option>
+                            <option value="Resolvido" {% if d.status == 'Resolvido' %}selected{% endif %}>Resolvido</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold">Causa raiz</label>
+                        <textarea name="causa_raiz" class="form-control" rows="2">{{ d.causa_raiz }}</textarea>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small fw-semibold">Ação corretiva</label>
+                        <textarea name="acao_corretiva" class="form-control" rows="2">{{ d.acao_corretiva }}</textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary">Salvar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}

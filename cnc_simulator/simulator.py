@@ -37,8 +37,82 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ADAPTER_URL     = os.getenv("ADAPTER_URL",    "http://cnc-adapter:8101")
-VELOCIDADE_MM_S = float(os.getenv("VEL_MM_S",   "80"))   # mm/s
+
+
+# ── Controles globais de demonstração ─────────────────────────────────────────
+# Cópia deliberada do bloco que existe nos quatro simuladores e no
+# `central-computer/config.py` — imagens separadas, sem módulo compartilhado.
+# `tests/test_modo_apresentacao.py` compara as cinco cópias entre si.
+#
+# A CNC não sorteia falha nenhuma: `MODO_APRESENTACAO` não muda o comportamento
+# dela. Ela lê a variável mesmo assim para que o log de startup diga qual modo
+# está em vigor — um serviço calado sobre isso é um serviço sobre o qual se
+# duvida na hora da apresentação.
+
+def _modo_apresentacao() -> bool:
+    """Modo demonstração: o acaso é desligado, o sistema roda determinístico.
+
+    Aceita as grafias que alguém digita no `.env` sem pensar ("1", "true",
+    "sim", "on"); qualquer outra coisa é falso. Nunca levanta: um valor
+    estranho aqui não pode impedir o simulador de subir.
+    """
+    return os.getenv("MODO_APRESENTACAO", "0").strip().lower() in (
+        "1", "true", "yes", "sim", "on",
+    )
+
+
+def _fator_velocidade() -> float:
+    """Multiplicador de TODOS os tempos simulados. Faixa válida: 0.1..10.
+
+    0.5 roda a demo no dobro da velocidade; 2.0, na metade, para explicar cada
+    etapa com calma. Fora da faixa cai em 1.0 com warning, em vez de virar
+    comportamento silencioso: 0 faria toda etapa terminar instantaneamente
+    (sem nada para mostrar) e um valor enorme travaria a apresentação inteira
+    em cima do primeiro slot.
+    """
+    bruto = os.getenv("FATOR_VELOCIDADE", "1.0")
+    try:
+        valor = float(bruto)
+    except ValueError:
+        valor = 0.0
+    if not 0.1 <= valor <= 10.0:
+        logger.warning(
+            "FATOR_VELOCIDADE=%r fora da faixa 0.1..10 — usando 1.0.", bruto)
+        return 1.0
+    return valor
+
+
+MODO_APRESENTACAO = _modo_apresentacao()
+FATOR_VELOCIDADE  = _fator_velocidade()
+
+# Aqui o fator entra DIVIDINDO, e é a única inversão de sinal do sistema: o
+# fator multiplica TEMPO, e `VEL_MM_S` é o inverso de tempo. Fator 2.0 ("na
+# metade da velocidade") tem que produzir uma CNC mais LENTA, ou seja, menos
+# mm/s — multiplicar aqui faria a CNC acelerar justamente quando se pediu calma
+# para narrar o movimento, e o sintoma seria a CNC chegando ao slot antes da
+# frase que a anuncia.
+VEL_MM_S_BASE   = float(os.getenv("VEL_MM_S",   "80"))   # mm/s, antes do fator
+VELOCIDADE_MM_S = VEL_MM_S_BASE / FATOR_VELOCIDADE
+
+# Piso de duração de um movimento. Escala junto: sem isso, um trajeto curto
+# ficaria preso em 1 s enquanto todo o resto da célula desacelerou — a CNC seria
+# a única peça fora do compasso.
+DURACAO_MIN_S   = 1.0 * FATOR_VELOCIDADE
+
+# `INTERVALO` NÃO escala: é a cadência de PUBLICAÇÃO da posição, não um tempo
+# físico simulado. Desacelerar o movimento mantendo a cadência dá mais passos
+# (trajetória mais suave na tela, que é o desejado); acelerar dá menos, com o
+# piso de 3 passos que já existia.
 INTERVALO_PUB   = float(os.getenv("INTERVALO",  "0.5"))  # s entre publicações de posição
+
+if MODO_APRESENTACAO:
+    logger.warning(
+        "MODO APRESENTACAO LIGADO — a CNC não sorteia falha em nenhum modo; "
+        "nada muda aqui além deste registro.")
+if FATOR_VELOCIDADE != 1.0:
+    logger.warning(
+        "FATOR_VELOCIDADE=%.2f — CNC a %.1f mm/s (base %.1f).",
+        FATOR_VELOCIDADE, VELOCIDADE_MM_S, VEL_MM_S_BASE)
 
 # O simulador NÃO tem mapa de posições. Ele valida a faixa do slot e se move
 # para o (x, y) que vem no comando — o mapa é do central (`orchestrator.
@@ -156,7 +230,7 @@ def _mover_para(disp_id: int, alvo_x: float, alvo_y: float,
         })
         return
 
-    duracao = max(1.0, distancia / VELOCIDADE_MM_S)
+    duracao = max(DURACAO_MIN_S, distancia / VELOCIDADE_MM_S)
     passos  = max(3, int(duracao / INTERVALO_PUB))
 
     logger.info("[CNC] Movendo de (%.1f, %.1f) → (%.1f, %.1f) | %.0fmm | ~%.1fs | %d passos",
@@ -221,7 +295,7 @@ def _homing(os_id: str, destino: tuple[float, float] = HOME):
         })
 
     distancia = math.hypot(destino[0] - orig_x, destino[1] - orig_y)
-    duracao   = max(1.0, distancia / VELOCIDADE_MM_S)
+    duracao   = max(DURACAO_MIN_S, distancia / VELOCIDADE_MM_S)
     passos    = max(3, int(duracao / INTERVALO_PUB))
 
     logger.info("[CNC] HOMING: %.0fmm | ~%.1fs", distancia, duracao)
@@ -426,7 +500,9 @@ if __name__ == "__main__":
 
     threading.Thread(target=_telemetria_loop, daemon=True, name="telemetria").start()
     logger.info(
-        "CNC Simulator v3.0 | adapter=%s | vel=%.0fmm/s | slots=1..%d | HOME=(%.0f, %.0f)",
+        "CNC Simulator v3.0 | adapter=%s | vel=%.0fmm/s | slots=1..%d | "
+        "HOME=(%.0f, %.0f) | modo=%s | fator_velocidade=%.2f",
         ADAPTER_URL, VELOCIDADE_MM_S, NUM_SLOTS, HOME[0], HOME[1],
+        "APRESENTACAO" if MODO_APRESENTACAO else "realista", FATOR_VELOCIDADE,
     )
     uvicorn.run(app, host="0.0.0.0", port=8200, log_level="warning")

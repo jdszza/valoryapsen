@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}{% if ordem %}Editar OS{% else %}Nova OS{% endif %} - Apsen{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+    <a href="{{ url_for('listar_ordens') }}" class="text-decoration-none">
+        <i class="bi bi-arrow-left"></i> Voltar
+    </a>
+</div>
+
+<div class="row justify-content-center">
+    <div class="col-lg-9">
+        <div class="table-card p-4">
+            <h5 class="mb-4">
+                {% if ordem %}
+                    <i class="bi bi-pencil me-2"></i>Editar Ordem {{ ordem.numero_os }}
+                {% else %}
+                    <i class="bi bi-plus-circle me-2"></i>Nova Ordem de Servico
+                {% endif %}
+            </h5>
+
+            {% if erro %}
+            <div class="alert alert-danger py-2">{{ erro }}</div>
+            {% endif %}
+
+            <form method="post">
+                <div class="row g-3 mb-4">
+                    <div class="col-md-3">
+                        <label class="form-label fw-bold">Numero OS</label>
+                        <input type="text" name="numero_os" class="form-control"
+                               value="{{ ordem.numero_os if ordem else numero_os }}"
+                               {% if ordem %}readonly{% endif %} required>
+                    </div>
+                    <div class="col-md-5">
+                        <label class="form-label fw-bold">Destino (Cliente)</label>
+                        <input type="text" name="destino" class="form-control" list="listaClientes"
+                               value="{{ ordem.destino if ordem else '' }}"
+                               placeholder="Ex: Farmacia SP" required>
+                        <datalist id="listaClientes">
+                            {% for c in clientes %}
+                            <option value="{{ c }}">
+                            {% endfor %}
+                        </datalist>
+                        <div class="form-text">
+                            Cliente não cadastrado? <a href="{{ url_for('listar_clientes') }}" target="_blank">Cadastre aqui</a>.
+                        </div>
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label fw-bold">Prioridade</label>
+                        <select name="prioridade" class="form-select">
+                            {% for p in ['Baixa', 'Normal', 'Alta', 'Urgente'] %}
+                            <option value="{{ p }}" {% if ordem and ordem.prioridade == p %}selected{% elif not ordem and p == 'Normal' %}selected{% endif %}>
+                                {{ p }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    {% if ordem %}
+                    <div class="col-md-2">
+                        <label class="form-label fw-bold">Status</label>
+                        <select name="status" class="form-select">
+                            {% for s in ['Pendente', 'Em Processo', 'Concluido', 'Cancelado'] %}
+                            <option value="{{ s }}" {% if ordem.status == s %}selected{% endif %}>{{ s }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    {% endif %}
+                </div>
+
+                <!-- Medicamentos -->
+                <div class="border rounded p-3 mb-3" style="background: #F8FAFC;">
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                        <h6 class="mb-0"><i class="bi bi-capsule me-1"></i> Medicamentos</h6>
+                        <button type="button" class="btn btn-sm btn-primary" onclick="addItem()">
+                            <i class="bi bi-plus-lg"></i> Adicionar
+                        </button>
+                    </div>
+
+                    <div id="itens-list">
+                        <!-- Rows are added by JS -->
+                    </div>
+                </div>
+
+                <div class="d-flex gap-2">
+                    <button type="submit" class="btn btn-primary">
+                        <i class="bi bi-check-lg me-1"></i>
+                        {% if ordem %}Salvar{% else %}Criar Ordem{% endif %}
+                    </button>
+                    <a href="{{ url_for('listar_ordens') }}" class="btn btn-outline-secondary">Cancelar</a>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+const MEDS = {{ medicamentos | tojson }};
+let itemCount = 0;
+
+function medOptions(selected) {
+    let html = '<option value="">Selecione...</option>';
+    MEDS.forEach(m => {
+        const sel = (m === selected) ? 'selected' : '';
+        html += `<option value="${m}" ${sel}>${m}</option>`;
+    });
+    return html;
+}
+
+function addItem(med, qtd) {
+    med = med || '';
+    qtd = qtd || 1;
+    const id = itemCount++;
+    const row = document.createElement('div');
+    row.className = 'row g-2 mb-2 align-items-end item-row';
+    row.id = 'item-' + id;
+    row.innerHTML = `
+        <div class="col-7">
+            <select name="med[]" class="form-select" required>
+                ${medOptions(med)}
+            </select>
+        </div>
+        <div class="col-3">
+            <input type="number" name="qtd[]" class="form-control" min="1" value="${qtd}" placeholder="Qtd" required>
+        </div>
+        <div class="col-2">
+            <button type="button" class="btn btn-outline-danger btn-sm w-100" onclick="removeItem(${id})">
+                <i class="bi bi-trash"></i>
+            </button>
+        </div>
+    `;
+    document.getElementById('itens-list').appendChild(row);
+}
+
+function removeItem(id) {
+    const el = document.getElementById('item-' + id);
+    if (el) el.remove();
+}
+
+// Init
+{% if ordem %}
+    {% for it in parse_itens(ordem) %}
+        addItem('{{ it.med }}', {{ it.qtd }});
+    {% endfor %}
+{% else %}
+    addItem('', 1);
+{% endif %}
+</script>
+{% endblock %}

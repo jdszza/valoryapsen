@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Relatorio - Apsen{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h4 class="mb-0"><i class="bi bi-file-earmark-bar-graph me-2"></i>Relatorio de Ordens</h4>
+    <button onclick="window.print()" class="btn btn-outline-dark">
+        <i class="bi bi-printer"></i> Imprimir
+    </button>
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-lg-4">
+        <div class="table-card p-4 text-center">
+            <h6 class="mb-3">QR Code - Relatorio</h6>
+            <img src="{{ url_for('relatorio_qrcode') }}" alt="QR Code" class="img-fluid mb-3" style="max-width: 200px;">
+            <p class="text-muted small">Escaneie com o celular para acessar este relatorio na mesma rede</p>
+            <code class="d-block small">{{ qr_url }}</code>
+        </div>
+    </div>
+
+    <div class="col-lg-8">
+        <div class="row g-3">
+            <div class="col-6">
+                <div class="stat-card">
+                    <div class="stat-label">Total de Ordens</div>
+                    <div class="stat-value">{{ total }}</div>
+                </div>
+            </div>
+            <div class="col-6">
+                <div class="stat-card">
+                    <div class="stat-label">Concluidas</div>
+                    <div class="stat-value text-success">{{ concluidas }}</div>
+                </div>
+            </div>
+            <div class="col-6">
+                <div class="stat-card">
+                    <div class="stat-label">Pendentes</div>
+                    <div class="stat-value text-warning">{{ pendentes }}</div>
+                </div>
+            </div>
+            <div class="col-6">
+                <div class="stat-card">
+                    <div class="stat-label">Em Processo</div>
+                    <div class="stat-value" style="color: #2563EB;">{{ em_processo }}</div>
+                </div>
+            </div>
+            <div class="col-6">
+                <div class="stat-card">
+                    <div class="stat-label">Com Erro</div>
+                    <div class="stat-value text-danger">{{ com_erro }}</div>
+                </div>
+            </div>
+            <div class="col-6">
+                <div class="stat-card">
+                    <div class="stat-label">Canceladas</div>
+                    <div class="stat-value text-muted">{{ canceladas }}</div>
+                </div>
+            </div>
+        </div>
+        {% if total > 0 %}
+        <div class="stat-card mt-3">
+            <h6 class="mb-2">Taxa de Conclusao</h6>
+            <div class="progress" style="height: 24px;">
+                <div class="progress-bar bg-success" style="width: {{ (concluidas * 100 / total)|int }}%">
+                    {{ (concluidas * 100 / total)|int }}%
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="table-card">
+    <div class="p-3 border-bottom">
+        <h6 class="mb-0">Historico Completo</h6>
+    </div>
+    <div class="table-responsive">
+        <table class="table table-hover table-sm">
+            <thead>
+                <tr>
+                    <th>OS</th>
+                    <th>Medicamentos</th>
+                    <th>Destino</th>
+                    <th>Prioridade</th>
+                    <th>Status</th>
+                    <th>Criado em</th>
+                    <th>Atualizado</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for o in ordens %}
+                <tr>
+                    <td><strong>{{ o.numero_os }}</strong></td>
+                    <td><small>{{ itens_resumo(o) }}</small></td>
+                    <td>{{ o.destino }}</td>
+                    <td>
+                        {% if o.prioridade == 'Urgente' %}
+                            <span class="badge badge-urgente">Urgente</span>
+                        {% elif o.prioridade == 'Alta' %}
+                            <span class="badge badge-alta">Alta</span>
+                        {% else %}
+                            <span class="badge badge-normal">{{ o.prioridade }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if o.status == 'Pendente' %}
+                            <span class="badge badge-pendente">Pendente</span>
+                        {% elif o.status == 'Em Processo' %}
+                            <span class="badge badge-processo">Em Processo</span>
+                        {% elif o.status == 'Concluido' %}
+                            <span class="badge badge-concluido">Concluido</span>
+                        {% else %}
+                            <span class="badge badge-cancelado">{{ o.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td><small>{{ o.data_criacao[:16] }}</small></td>
+                    <td><small>{{ o.data_atualizacao[:16] }}</small></td>
+                </tr>
+                {% endfor %}
+                {% if not ordens %}
+                <tr><td colspan="7" class="text-center text-muted py-4">Nenhuma ordem registrada</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

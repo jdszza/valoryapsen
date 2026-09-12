@@ -7,7 +7,7 @@ e quantidades fixos — e o acaso ficou restrito a QUAL delas é disparada. Para
 quem assiste, o sistema continua imprevisível; para quem apresenta, o conteúdo
 de cada OS é conhecido de antemão.
 
-Por que o arquivo mora no central e não no order-generator
+Por que o arquivo mora no central e não no erp-simulator
 ──────────────────────────────────────────────────────────
 O console de operação (servido pelo próprio central) precisa LISTAR as dez e
 disparar a que o operador escolher. Se a definição vivesse só no gerador — um

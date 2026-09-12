@@ -1,4 +1,4 @@
-"""Ordens padrão e backpressure do order-generator.
+"""Ordens padrão e backpressure do erp-simulator.
 
 Duas famílias de teste vivem aqui porque as duas prendem o mesmo processo:
 
@@ -199,14 +199,14 @@ def test_listar_devolve_copia(os_templates):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ORDER-GENERATOR
+# ERP-SIMULATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
 @pytest.fixture
 def gerador(carregar_simulador):
-    """Order-generator com `requests` duplado e esperas de 0s (teste rápido)."""
+    """`erp-simulator` com `requests` duplado e esperas de 0s (teste rápido)."""
     return carregar_simulador(
-        "order-generator/simulator.py",
+        "erp-simulator/simulator.py",
         env={"ESPERA_FILA_CHEIA": "0", "MAX_ESPERAS_FILA": "3"},
     )
 

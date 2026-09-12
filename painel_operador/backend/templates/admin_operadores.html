@@ -1,0 +1,254 @@
+{% extends "base.html" %}
+{% block title %}Operadores — Apsen{% endblock %}
+
+{% block content %}
+{% set perfil_badge = {
+    "Admin":    "danger",
+    "PCP":      "primary",
+    "PCM":      "success",
+    "Operador": "secondary"
+} %}
+
+<div class="d-flex align-items-center justify-content-between mb-3">
+    <div>
+        <h4 class="mb-0 fw-bold">Operadores do Sistema</h4>
+        <small class="text-muted">Gerencie acessos, perfis e PINs</small>
+    </div>
+    <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalNovo">
+        <i class="bi bi-person-plus"></i> Novo Operador
+    </button>
+</div>
+
+<!-- Stats -->
+<div class="row g-3 mb-4">
+    <div class="col-6 col-md-2">
+        <div class="stat-card text-center">
+            <div class="stat-value text-danger">{{ total_por_perfil.get("Admin", 0) }}</div>
+            <div class="stat-label">Admin</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-2">
+        <div class="stat-card text-center">
+            <div class="stat-value text-primary">{{ total_por_perfil.get("PCP", 0) }}</div>
+            <div class="stat-label">PCP</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-2">
+        <div class="stat-card text-center">
+            <div class="stat-value text-success">{{ total_por_perfil.get("PCM", 0) }}</div>
+            <div class="stat-label">PCM</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-2">
+        <div class="stat-card text-center">
+            <div class="stat-value text-secondary">{{ total_por_perfil.get("Operador", 0) }}</div>
+            <div class="stat-label">Operador</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-2">
+        <div class="stat-card text-center">
+            <div class="stat-value text-muted">{{ inativos }}</div>
+            <div class="stat-label">Inativos</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-2">
+        <div class="stat-card text-center">
+            <div class="stat-value">{{ operadores | length }}</div>
+            <div class="stat-label">Total</div>
+        </div>
+    </div>
+</div>
+
+<!-- Tabela -->
+<div class="table-card">
+    <table class="table table-hover align-middle mb-0">
+        <thead>
+            <tr>
+                <th style="width:40px">#</th>
+                <th>Nome</th>
+                <th>Perfil</th>
+                <th>PIN</th>
+                <th>Status</th>
+                <th>Criado em</th>
+                <th style="width:120px">Ações</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for op in operadores %}
+        <tr class="{% if not op.ativo %}table-light text-muted{% endif %}">
+            <td class="text-muted small">{{ op.id }}</td>
+            <td class="fw-semibold">
+                <i class="bi bi-person-circle me-1 text-muted"></i>{{ op.nome }}
+            </td>
+            <td>
+                <span class="badge bg-{{ perfil_badge.get(op.perfil, 'secondary') }}-subtle text-{{ perfil_badge.get(op.perfil, 'secondary') }} border border-{{ perfil_badge.get(op.perfil, 'secondary') }}-subtle rounded-pill px-2">
+                    {{ op.perfil }}
+                </span>
+            </td>
+            <td>
+                {# O PIN nao existe mais em claro no banco: a coluna guarda hash.
+                   Mostrar o hash aqui nao ajudaria ninguem e daria a um ombro
+                   curioso o material para quebrar um PIN de 4 digitos offline. #}
+                {% if op.pin_hash %}
+                <span class="text-muted font-monospace">••••</span>
+                {% else %}
+                <span class="badge bg-warning-subtle text-warning border border-warning-subtle">sem PIN</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if op.ativo %}
+                <span class="badge bg-success-subtle text-success border border-success-subtle">Ativo</span>
+                {% else %}
+                <span class="badge bg-secondary-subtle text-secondary border border-secondary-subtle">Inativo</span>
+                {% endif %}
+            </td>
+            <td class="small text-muted">{{ op.data_criacao }}</td>
+            <td>
+                <button class="btn btn-sm btn-outline-primary me-1"
+                    data-bs-toggle="modal"
+                    data-bs-target="#modalEditar{{ op.id }}">
+                    <i class="bi bi-pencil"></i>
+                </button>
+                <form method="POST" action="{{ url_for('admin_excluir_operador', id=op.id) }}"
+                      class="d-inline"
+                      onsubmit="return confirm('Excluir {{ op.nome }}?')">
+                    <button class="btn btn-sm btn-outline-danger">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </form>
+            </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted py-4">Nenhum operador cadastrado.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<!-- Modais ficam FORA da tabela: um <div> dentro de <tbody> e HTML invalido
+     e faz o navegador quebrar a renderizacao das linhas seguintes. -->
+{% for op in operadores %}
+<div class="modal fade" id="modalEditar{{ op.id }}" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <form method="POST" action="{{ url_for('admin_editar_operador', id=op.id) }}">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-pencil me-2"></i>Editar — {{ op.nome }}</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Nome</label>
+                        <input type="text" name="nome" class="form-control"
+                               value="{{ op.nome }}" required maxlength="32">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Novo PIN (numérico)</label>
+                        <input type="text" name="pin" class="form-control font-monospace"
+                               maxlength="12" pattern="[0-9]{4,12}"
+                               title="Somente números, mínimo 4 dígitos"
+                               placeholder="deixe em branco para manter o atual">
+                        <div class="form-text">
+                            O PIN atual não aparece aqui — o banco guarda só o hash.
+                            Preencha apenas se for trocá-lo.
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">UID do crachá RFID</label>
+                        <input type="text" name="rfid_uid" class="form-control font-monospace text-uppercase"
+                               value="{{ op.rfid_uid or '' }}" maxlength="20"
+                               placeholder="Ex: 04A2B3C4 (opcional)">
+                        <div class="form-text">Aproxime o crachá do leitor no display para ver o UID no monitor serial.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Perfil</label>
+                        <select name="perfil" class="form-select">
+                            {% for p in perfis %}
+                            <option value="{{ p }}" {% if p == op.perfil %}selected{% endif %}>{{ p }}</option>
+                            {% endfor %}
+                        </select>
+                        <div class="form-text">
+                            <strong>Admin</strong>: acesso total ao sistema web &nbsp;|&nbsp;
+                            <strong>PCP</strong>: planejar e criar ordens &nbsp;|&nbsp;
+                            <strong>PCM</strong>: manutenção e máquinas &nbsp;|&nbsp;
+                            <strong>Operador</strong>: operar o display
+                        </div>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" name="ativo" id="ativo{{ op.id }}"
+                               {% if op.ativo %}checked{% endif %}>
+                        <label class="form-check-label" for="ativo{{ op.id }}">Ativo (pode fazer login no display)</label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="bi bi-check2"></i> Salvar
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endfor %}
+
+<div class="mt-3 small text-muted">
+    <i class="bi bi-info-circle me-1"></i>
+    O display busca operadores ativos via cabo Serial (<code>cmd: get_operadores</code>) a cada 60 s.
+    PINs são sincronizados automaticamente.
+</div>
+
+<!-- Modal Novo Operador -->
+<div class="modal fade" id="modalNovo" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <form method="POST" action="{{ url_for('admin_novo_operador') }}">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-person-plus me-2"></i>Novo Operador</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Nome completo</label>
+                        <input type="text" name="nome" class="form-control" required maxlength="32"
+                               placeholder="Ex: João Silva">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">PIN (numérico, 4–12 dígitos)</label>
+                        <input type="text" name="pin" class="form-control font-monospace" required
+                               maxlength="12" pattern="[0-9]{4,12}"
+                               title="Somente números, mínimo 4 dígitos"
+                               placeholder="Ex: 4567">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">UID do crachá RFID</label>
+                        <input type="text" name="rfid_uid" class="form-control font-monospace text-uppercase"
+                               maxlength="20" placeholder="Ex: 04A2B3C4 (opcional)">
+                        <div class="form-text">Deixe em branco e cadastre depois — o UID aparece no monitor serial do display na primeira leitura.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Perfil de acesso</label>
+                        <select name="perfil" class="form-select">
+                            {% for p in perfis %}
+                            <option value="{{ p }}" {% if p == "Operador" %}selected{% endif %}>{{ p }}</option>
+                            {% endfor %}
+                        </select>
+                        <div class="form-text">
+                            <strong>Admin</strong>: acesso total ao sistema web &nbsp;|&nbsp;
+                            <strong>PCP</strong>: planejar e criar ordens &nbsp;|&nbsp;
+                            <strong>PCM</strong>: manutenção e máquinas &nbsp;|&nbsp;
+                            <strong>Operador</strong>: operar o display
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="bi bi-check2"></i> Criar Operador
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

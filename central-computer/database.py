@@ -7,6 +7,7 @@ não declara nada — ver CLAUDE.md, "Schema do banco".
 """
 import json
 import logging
+import queue
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -33,13 +34,127 @@ def _make_conn(autocommit: bool = True) -> pymysql.Connection:
     )
 
 
+# ── Pool de conexões ───────────────────────────────────────────────────────────
+#
+# Antes havia UMA conexão nova por operação: TCP + handshake + autenticação,
+# usados para um único INSERT e jogados fora. O custo não aparecia numa query
+# isolada, mas o central não faz queries isoladas — cada evento de adapter são
+# de 1 a 3 escritas, e só a telemetria dos slots são `NUM_SLOTS` gravações a
+# cada 15s, somadas às da CNC, da visão e da balança.
+#
+# O pool é uma `queue.LifoQueue` sobre o `_make_conn` que já existia, e não o
+# `PooledDB` do DBUtils: a dependência nova resolveria o mesmo problema, e este
+# repositório já recusou acrescentar uma ao central por menos (ver o `parse_qsl`
+# do login do console). Trinta linhas de stdlib também são trinta linhas que a
+# suíte consegue exercitar sem MySQL.
+#
+# LIFO, e não FIFO, de propósito: devolver sempre a conexão usada há menos tempo
+# mantém o conjunto quente pequeno e deixa as do fundo envelhecerem até serem
+# descartadas — com FIFO, um pico de 8 conexões mantém as 8 vivas para sempre,
+# mesmo depois de a carga voltar a uma.
+#
+# Três regras, e cada uma cobre um modo de falhar:
+#
+#  1. **Conexão parada é verificada antes de voltar a ser usada.** O MySQL fecha
+#     sozinho o que passa de `wait_timeout` (8h por padrão, e o DBA da casa pode
+#     ter baixado para minutos); reaproveitar um socket já fechado transforma
+#     uma escrita de telemetria em exceção. O `ping(reconnect=True)` custa um
+#     round trip, então só roda depois de `_PING_APOS_S` parada — no caminho
+#     quente, que é o que este pool existe para acelerar, ele nunca roda.
+#  2. **Conexão que viu exceção NÃO volta para o pool.** Erro no meio de um
+#     statement pode deixar resultado por ler no socket, e o sintoma disso é a
+#     operação SEGUINTE falhar — em outra thread, com outro SQL, sem relação
+#     visível com a causa. Descartar é barato; diagnosticar isso, não.
+#  3. **Transação aberta morre com o empréstimo.** Só quem pediu
+#     `autocommit=False` paga o ROLLBACK de devolução: com autocommit não há o
+#     que desfazer, e cobrar o round trip de todo mundo devolveria boa parte do
+#     que o pool acabou de economizar.
+#
+# O pool é um TETO de conexões GUARDADAS, não de conexões abertas: pool vazio
+# abre uma nova (o comportamento antigo) em vez de bloquear a thread. Uma rajada
+# acima do teto fica lenta, como antes; ela não fica parada, e o `to_thread` do
+# orquestrador não vira gargalo por causa de um número de configuração.
+
+_PING_APOS_S = 30.0
+
+_pool: "queue.LifoQueue[tuple[pymysql.Connection, float]]" = queue.LifoQueue(
+    maxsize=settings.MYSQL_POOL_MAX
+)
+
+
+def _fechar_silencioso(conn) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _reaproveitavel(conn, devolvida_em: float) -> bool:
+    """Conexão parada há pouco vale sem perguntar; parada há muito, pergunta."""
+    if (time.monotonic() - devolvida_em) < _PING_APOS_S:
+        return True
+    try:
+        conn.ping(reconnect=True)
+        return True
+    except Exception:
+        return False
+
+
+def _pegar_conn(autocommit: bool):
+    while True:
+        try:
+            conn, devolvida_em = _pool.get_nowait()
+        except queue.Empty:
+            return _make_conn(autocommit=autocommit)
+        if not _reaproveitavel(conn, devolvida_em):
+            _fechar_silencioso(conn)
+            continue
+        try:
+            # PyMySQL só emite `SET autocommit` quando o modo muda de verdade,
+            # então o caso comum (tudo autocommit) não paga round trip nenhum.
+            conn.autocommit(autocommit)
+        except Exception:
+            _fechar_silencioso(conn)
+            continue
+        return conn
+
+
+def _devolver_conn(conn, autocommit: bool) -> None:
+    if not autocommit:
+        try:
+            conn.rollback()
+        except Exception:
+            _fechar_silencioso(conn)
+            return
+    try:
+        _pool.put_nowait((conn, time.monotonic()))
+    except queue.Full:
+        _fechar_silencioso(conn)
+
+
+def fechar_pool() -> None:
+    """Fecha o que estiver guardado. Chamado no shutdown do central."""
+    while True:
+        try:
+            conn, _ = _pool.get_nowait()
+        except queue.Empty:
+            return
+        _fechar_silencioso(conn)
+
+
 @contextmanager
 def _conn(autocommit: bool = True):
-    conn = _make_conn(autocommit=autocommit)
+    conn = _pegar_conn(autocommit)
     try:
         yield conn
-    finally:
-        conn.close()
+    except BaseException:
+        # Regra 2: o que viu exceção não volta ao pool. Vale para `BaseException`
+        # porque um `CancelledError` no meio de um statement deixa o socket no
+        # mesmo estado que um erro de SQL deixaria.
+        _fechar_silencioso(conn)
+        raise
+    else:
+        _devolver_conn(conn, autocommit)
 
 
 def _ts() -> str:
@@ -967,6 +1082,232 @@ def limpar_dispenser_estado(dispenser_id: int):
                 "medicamento=NULL, categoria=NULL, atualizado_em=%s WHERE dispenser_id=%s",
                 (_ts(), dispenser_id),
             )
+
+
+# ── Diagnóstico de pré-voo ─────────────────────────────────────────────────────
+
+def _nome_da_tabela(ddl: str) -> str:
+    """Nome declarado num `CREATE TABLE IF NOT EXISTS <nome> (`.
+
+    Extração por posição, e não por regex: o DDL é escrito aqui mesmo, com a
+    mesma forma nas onze entradas, e uma regex daria a impressão de aceitar
+    variações que este arquivo não produz.
+    """
+    return ddl.split("IF NOT EXISTS", 1)[1].split("(", 1)[0].strip()
+
+
+TABELAS_DO_SCHEMA = tuple(_nome_da_tabela(ddl) for ddl in _DDL_TABELAS)
+
+
+def diagnosticar(num_slots: int) -> dict:
+    """Fatos que a tela de pré-voo precisa do banco, numa conexão só.
+
+    Uma consulta por item custaria cinco empréstimos do pool para montar uma
+    tela que existe para ser rápida. Levanta se o banco não responder — quem
+    chama transforma isso no ÚNICO item vermelho, em vez de quatro
+    diagnósticos derivados da mesma causa.
+
+    O que a checagem de schema cobre: presença de toda tabela do
+    `_DDL_TABELAS` e de toda coluna do `_COLUNAS_EVOLUTIVAS`. Não é a varredura
+    completa de colunas que o `tests/test_schema.py` faz por AST — essa exige
+    parsear o DDL inteiro, e aqui o alvo é outro: o banco ANTIGO, que tem as
+    tabelas e não recebeu os ALTER. É esse o drift que aparece em campo.
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT VERSION() AS v")
+            versao = (cur.fetchone() or {}).get("v", "")
+
+            existentes = _colunas_existentes(cur)
+
+            cur.execute("SELECT COUNT(*) AS n FROM medicamentos")
+            medicamentos = (cur.fetchone() or {}).get("n", 0)
+
+            cur.execute("SELECT COUNT(*) AS n FROM dispenser_estado")
+            slots = (cur.fetchone() or {}).get("n", 0)
+
+    faltando: list[str] = []
+    for tabela in TABELAS_DO_SCHEMA:
+        if tabela not in existentes:
+            faltando.append(f"tabela `{tabela}`")
+    for tabela, colunas in _COLUNAS_EVOLUTIVAS.items():
+        presentes = existentes.get(tabela)
+        if presentes is None:
+            continue          # a tabela inteira já entrou na lista acima
+        for coluna in colunas:
+            if coluna not in presentes:
+                faltando.append(f"`{tabela}`.`{coluna}`")
+
+    return {
+        "versao":          versao,
+        "tabelas":         len(TABELAS_DO_SCHEMA),
+        "schema_faltando": faltando,
+        "medicamentos":    medicamentos,
+        "slots_presentes": slots,
+        "slots_esperados": num_slots,
+    }
+
+
+# ── Reset e seed de DEMONSTRAÇÃO ───────────────────────────────────────────────
+#
+# Nada aqui roda sozinho: não há chamada no `init_db`, no `lifespan` nem em
+# healthcheck nenhum. As funções abaixo só têm um chamador, o console, e ele
+# exige confirmação explícita. Ver `seed_demo.py` para o porquê.
+#
+# As queries moram aqui, e não no `seed_demo.py`, por uma razão concreta: o
+# `tests/test_schema.py` varre ESTE arquivo por AST e exige que toda tabela e
+# coluna referenciada exista no DDL. SQL escrito em outro módulo ficaria fora
+# dessa varredura, e o drift que ela existe para pegar voltaria por ali.
+
+# Ordem de limpeza: das tabelas-folha para as de cabeçalho. Não há FK declarada
+# no schema, então a ordem não é exigida pelo banco; ela existe para que uma
+# interrupção no meio deixe o banco sem ÓRFÃO — item sem ordem é invisível,
+# ordem sem item aparece na tela como OS vazia.
+_TABELAS_HISTORICO = (
+    "visao_leituras", "leituras_sensores", "cnc_eventos",
+    "alarmes", "dispensas", "os_itens", "ordens",
+)
+# SQL literal por tabela, pelo mesmo motivo de `_SQL_EXPURGO`: nome de tabela
+# interpolado escaparia da varredura do `test_schema.py`.
+_SQL_LIMPAR_HISTORICO = {
+    "visao_leituras":    "DELETE FROM visao_leituras",
+    "leituras_sensores": "DELETE FROM leituras_sensores",
+    "cnc_eventos":       "DELETE FROM cnc_eventos",
+    "alarmes":           "DELETE FROM alarmes",
+    "dispensas":         "DELETE FROM dispensas",
+    "os_itens":          "DELETE FROM os_itens",
+    "ordens":            "DELETE FROM ordens",
+}
+
+
+def limpar_historico() -> dict:
+    """Apaga TODO o histórico operacional. Devolve linhas removidas por tabela.
+
+    Destrutivo e sem volta: é o que o reset do console faz quando se pede para
+    não preservar o histórico. `medicamentos`, `usuarios`, `log_manutencao` e
+    `dispenser_estado` NÃO entram — catálogo e contas não são histórico; o log
+    de manutenção é o registro de quem mexeu no equipamento, e apagá-lo junto
+    seria apagar a trilha da própria operação de reset; e o estado dos
+    dispensers é zerado pelo orquestrador, que também precisa comandar a
+    limpeza FÍSICA nos simuladores.
+
+    `DELETE` e não `TRUNCATE`: o TRUNCATE é DDL, faz commit implícito e não
+    devolve contagem — e é a contagem que dá, a quem acabou de apagar a planta
+    inteira, uma confirmação do tamanho do estrago.
+    """
+    removidos: dict[str, int] = {}
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            for tabela in _TABELAS_HISTORICO:
+                cur.execute(_SQL_LIMPAR_HISTORICO[tabela])
+                removidos[tabela] = cur.rowcount
+    logger.warning("[DB] Histórico APAGADO pelo reset: %s", removidos)
+    return removidos
+
+
+def cancelar_ordens_pendentes(os_ids: list) -> int:
+    """Fecha em `cancelada` as OS que saíram da fila sem serem processadas.
+
+    O reset esvazia a fila em memória, e cada uma daquelas OS tem linha em
+    `ordens` com status "aguardando" — `salvar_ordem` roda ANTES do enfileira
+    (ver CLAUDE.md, "OS não entra na fila sem linha no banco"). Deixá-las assim
+    é pior que não resetar: `get_ordem_ativa` cai no fallback de "aguardando
+    mais antiga" e o `GET /os/ativa` passa a anunciar, para sempre, uma OS que
+    ninguém vai executar.
+    """
+    if not os_ids:
+        return 0
+    marcadores = ",".join(["%s"] * len(os_ids))
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ordens SET status=%s WHERE os_id IN "
+                + "(" + marcadores + ") AND status=%s",
+                ("cancelada", *os_ids, "aguardando"),
+            )
+            return cur.rowcount
+
+
+def semear_historico_demo(dados: dict) -> dict:
+    """Grava o histórico FABRICADO por `seed_demo.gerar_historico`.
+
+    DADO DE DEMONSTRAÇÃO — ver o cabeçalho de `seed_demo.py`.
+
+    Uma transação só: histórico semeado pela metade — ordens sem dispensas,
+    dispensas sem itens — seria exatamente o painel incoerente que o seed existe
+    para evitar. `executemany` porque são milhares de leituras de sensor, e um
+    INSERT por linha pagaria um round trip para cada uma.
+    """
+    ordens    = dados.get("ordens", [])
+    itens     = dados.get("itens", [])
+    dispensas = dados.get("dispensas", [])
+    alarmes   = dados.get("alarmes", [])
+    leituras  = dados.get("leituras", [])
+
+    with _conn(autocommit=False) as conn:
+        try:
+            with conn.cursor() as cur:
+                if ordens:
+                    cur.executemany(
+                        "INSERT IGNORE INTO ordens "
+                        "(os_id, descricao, categoria, status, payload_json, "
+                        " criado_em, concluida_em) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        [(o["os_id"], o["descricao"], o.get("categoria", ""),
+                          o["status"],
+                          json.dumps(o["payload_json"], ensure_ascii=False),
+                          o["criado_em"], o.get("concluida_em"))
+                         for o in ordens],
+                    )
+                if itens:
+                    cur.executemany(
+                        "INSERT INTO os_itens "
+                        "(os_id, dispenser_id, medicamento, sku, categoria, "
+                        " quantidade_alvo, quantidade_real, status) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                        [(i["os_id"], i["dispenser_id"], i["medicamento"],
+                          i.get("sku"), i.get("categoria"),
+                          i["quantidade_alvo"], i["quantidade_real"], i["status"])
+                         for i in itens],
+                    )
+                if dispensas:
+                    cur.executemany(
+                        "INSERT INTO dispensas "
+                        "(os_id, dispenser_id, medicamento, quantidade_dispensada, "
+                        " quantidade_alvo, validado, motivo_falha, ts) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                        [(d["os_id"], d["dispenser_id"], d["medicamento"],
+                          d["quantidade_dispensada"], d["quantidade_alvo"],
+                          1 if d["validado"] else 0, d.get("motivo_falha"), d["ts"])
+                         for d in dispensas],
+                    )
+                if alarmes:
+                    cur.executemany(
+                        "INSERT INTO alarmes (fonte, tipo, descricao, resolvido, ts) "
+                        "VALUES (%s,%s,%s,%s,%s)",
+                        [(a["fonte"], a["tipo"], a["descricao"],
+                          1 if a["resolvido"] else 0, a["ts"]) for a in alarmes],
+                    )
+                if leituras:
+                    cur.executemany(
+                        "INSERT INTO leituras_sensores "
+                        "(componente, tipo, valor, unidade, ts) VALUES (%s,%s,%s,%s,%s)",
+                        [(le["componente"], le["tipo"], le["valor"],
+                          le["unidade"], le["ts"]) for le in leituras],
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    resumo = {
+        "ordens":    len(ordens),
+        "itens":     len(itens),
+        "dispensas": len(dispensas),
+        "alarmes":   len(alarmes),
+        "leituras":  len(leituras),
+    }
+    logger.warning("[DB] Histórico de DEMONSTRAÇÃO semeado: %s", resumo)
+    return resumo
 
 
 # ── Usuarios ───────────────────────────────────────────────────────────────────

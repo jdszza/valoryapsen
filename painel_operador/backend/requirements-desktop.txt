@@ -1,0 +1,4 @@
+# Dependencias extras so para gerar/rodar o app desktop (apsen.exe).
+# O requirements.txt continua sendo o minimo para `python app.py`.
+pywebview>=5.4
+pyinstaller>=6.10

@@ -15,7 +15,7 @@ se quebrarem:
   2. **Sem sessão, nada.** A página não pode sair pelo caminho do redirect
      levando as ordens junto, e as rotas de ação não podem aceitar cookie
      forjado, vencido, ou emitido com outra senha.
-  3. **O disparo manual é o MESMO caminho do order-generator** — chama
+  3. **O disparo manual é o MESMO caminho do erp-simulator** — chama
      `receber_ordem`, a função do `POST /api/v1/ordens`. Duas portas de entrada
      de OS divergem no primeiro ajuste de contrato, e a que fica para trás é a
      que um humano usa sob pressão.
@@ -458,7 +458,7 @@ def test_catalogo_indisponivel_recusa_o_disparo(logado, monkeypatch):
 def test_fila_cheia_chega_ao_console_como_429(logado):
     """A recusa por backpressure precisa aparecer com clareza na tela.
 
-    Mesmo corpo de contrato que o order-generator recebe (`fila_cheia`, com a
+    Mesmo corpo de contrato que o erp-simulator recebe (`fila_cheia`, com a
     ocupação junto) — porque é a mesma função respondendo.
     """
     fila_real = logado.modulo.orch._os_queue
@@ -477,7 +477,7 @@ def test_fila_cheia_chega_ao_console_como_429(logado):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. Pausa do gerador: o console escreve, o order-generator lê
+# 4. Pausa do gerador: o console escreve, o erp-simulator lê
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_gerador_nasce_rodando(console):
@@ -489,7 +489,7 @@ def test_pausar_altera_o_flag_que_o_gerador_consulta(logado):
 
     assert resposta.status_code == 200
     assert resposta.json()["pausado"] is True
-    # O que o order-generator vê, na rota que ele consulta.
+    # O que o erp-simulator vê, na rota que ele consulta.
     consulta = logado.cliente.get("/api/v1/gerador").json()
     assert consulta["pausado"] is True
     assert consulta["desde"] is not None
@@ -527,10 +527,10 @@ def test_pausa_nao_bloqueia_o_disparo_manual(logado):
     assert len(logado.fila.enfileiradas) == 1
 
 
-# ── O lado do order-generator ─────────────────────────────────────────────────
+# ── O lado do erp-simulator ─────────────────────────────────────────────────
 
-def test_order_generator_consulta_o_flag_antes_de_enviar(carregar_simulador):
-    sim = carregar_simulador("order-generator/simulator.py")
+def test_erp_simulator_consulta_o_flag_antes_de_enviar(carregar_simulador):
+    sim = carregar_simulador("erp-simulator/simulator.py")
     sim.requests.payload = {"pausado": True}
 
     assert sim.modulo._gerador_pausado() is True
@@ -538,21 +538,21 @@ def test_order_generator_consulta_o_flag_antes_de_enviar(carregar_simulador):
     assert sim.chamadas[-1]["metodo"] == "GET"
 
 
-def test_order_generator_segue_gerando_se_o_flag_nao_responde(carregar_simulador):
+def test_erp_simulator_segue_gerando_se_o_flag_nao_responde(carregar_simulador):
     """Consulta auxiliar que falha não pode parar a planta.
 
     O pior caso deste default é uma OS entrar durante uma pausa que o operador
     ainda pode desfazer. O contrário — parar de gerar porque o central
     reiniciou — deixaria a planta em silêncio sem ninguém ter pedido.
     """
-    sim = carregar_simulador("order-generator/simulator.py")
+    sim = carregar_simulador("erp-simulator/simulator.py")
     sim.requests.status_code = 500
 
     assert sim.modulo._gerador_pausado() is False
 
 
-def test_order_generator_espera_enquanto_a_pausa_durar(carregar_simulador, monkeypatch):
-    sim = carregar_simulador("order-generator/simulator.py")
+def test_erp_simulator_espera_enquanto_a_pausa_durar(carregar_simulador, monkeypatch):
+    sim = carregar_simulador("erp-simulator/simulator.py")
     monkeypatch.setattr(sim.modulo, "ESPERA_PAUSA", 0)
 
     respostas = iter([True, True, False])
@@ -563,8 +563,8 @@ def test_order_generator_espera_enquanto_a_pausa_durar(carregar_simulador, monke
     assert next(respostas, "esgotado") == "esgotado"
 
 
-def test_order_generator_nao_espera_quando_nao_ha_pausa(carregar_simulador, monkeypatch):
-    sim = carregar_simulador("order-generator/simulator.py")
+def test_erp_simulator_nao_espera_quando_nao_ha_pausa(carregar_simulador, monkeypatch):
+    sim = carregar_simulador("erp-simulator/simulator.py")
     dormiu = []
     monkeypatch.setattr(sim.modulo.time, "sleep", lambda s: dormiu.append(s))
     sim.requests.payload = {"pausado": False}
@@ -622,7 +622,7 @@ def test_nenhuma_rota_do_console_aparece_no_openapi(console):
 
 
 def test_o_flag_do_gerador_CONTINUA_no_openapi(console):
-    """`/api/v1/gerador` não é rota de console: é contrato com o order-generator.
+    """`/api/v1/gerador` não é rota de console: é contrato com o erp-simulator.
 
     Esconder um endpoint que outro serviço consome trocaria discrição por
     documentação faltando — quem mantiver o gerador precisa achá-lo no /docs.

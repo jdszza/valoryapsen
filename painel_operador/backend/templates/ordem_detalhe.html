@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}{{ ordem.numero_os }} — Rastreamento{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+    <a href="{{ url_for('listar_ordens') }}" class="text-decoration-none small">
+        <i class="bi bi-arrow-left"></i> Voltar para Ordens
+    </a>
+</div>
+
+<div class="d-flex justify-content-between align-items-start mb-4 flex-wrap gap-2">
+    <div>
+        <h4 class="mb-0 fw-bold"><i class="bi bi-clock-history me-2"></i>{{ ordem.numero_os }}</h4>
+        <small class="text-muted">Rastreamento completo — linha do tempo, lotes consumidos e desvios</small>
+    </div>
+    <div>
+        {% if ordem.status == 'Pendente' %}<span class="badge badge-pendente fs-6">Pendente</span>
+        {% elif ordem.status == 'Em Processo' %}<span class="badge badge-processo fs-6">Em Processo</span>
+        {% elif ordem.status == 'Pausado' %}<span class="badge badge-pausado fs-6">Pausado</span>
+        {% elif ordem.status == 'Concluido' %}<span class="badge badge-concluido fs-6">Concluído</span>
+        {% else %}<span class="badge badge-cancelado fs-6">{{ ordem.status }}</span>{% endif %}
+        {% if ordem.origem == 'central' %}
+        <span class="badge bg-dark fs-6 ms-1" title="Ordem do computador central — o painel espelha, nao comanda">
+            <i class="bi bi-cpu"></i> Central
+        </span>
+        {% endif %}
+    </div>
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-md-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1">Destino</div>
+            <div class="fw-semibold">
+                <a href="{{ url_for('rastreabilidade') }}?cliente={{ ordem.destino|urlencode }}" class="text-decoration-none">
+                    {{ ordem.destino }} <i class="bi bi-box-arrow-up-right small"></i>
+                </a>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1">Prioridade</div>
+            <div class="fw-semibold">{{ ordem.prioridade }}</div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1">Criada em</div>
+            <div class="fw-semibold">{{ ordem.data_criacao }}</div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1">Última atualização</div>
+            <div class="fw-semibold">{{ ordem.data_atualizacao }}</div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-3">
+    <div class="col-lg-5">
+        <div class="table-card p-3 mb-3">
+            <h6 class="fw-semibold mb-3"><i class="bi bi-capsule me-1"></i>Itens da ordem</h6>
+            {% for it in parse_itens(ordem) %}
+            <span class="badge bg-light text-dark border me-1 mb-1">{{ it.med }} x{{ it.qtd }}</span>
+            {% endfor %}
+        </div>
+
+        <div class="table-card p-3">
+            <h6 class="fw-semibold mb-3"><i class="bi bi-box-seam me-1"></i>Lotes consumidos (genealogia)</h6>
+            {% if lotes_consumidos %}
+            <table class="table table-sm align-middle mb-0">
+                <thead>
+                    <tr><th>Medicamento</th><th>Lote</th><th>Qtd.</th><th>Data</th></tr>
+                </thead>
+                <tbody>
+                {% for c in lotes_consumidos %}
+                    <tr>
+                        <td class="small">{{ c.medicamento_nome }}</td>
+                        <td>
+                            {% if c.lote == 'SEM LOTE REGISTRADO' %}
+                            <span class="badge bg-secondary-subtle text-secondary small">{{ c.lote }}</span>
+                            {% else %}
+                            <a href="{{ url_for('rastreabilidade', lote=c.lote) }}" class="badge bg-primary-subtle text-primary text-decoration-none small">{{ c.lote }}</a>
+                            {% endif %}
+                        </td>
+                        <td>{{ c.quantidade }}</td>
+                        <td class="small text-muted">{{ c.data }}</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="text-center text-muted py-4">
+                <i class="bi bi-inbox fs-3 d-block mb-2"></i>
+                Nenhum lote consumido ainda (ordem não concluída).
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="col-lg-4">
+        <div class="table-card p-3">
+            <h6 class="fw-semibold mb-3"><i class="bi bi-signpost-split me-1"></i>Linha do tempo</h6>
+            {% if eventos %}
+            <ul class="list-unstyled mb-0">
+                {% for ev in eventos %}
+                <li class="d-flex gap-2 pb-3 {% if not loop.last %}border-start border-2 ms-2 ps-3{% endif %}"
+                    style="{% if not loop.last %}margin-left:3px{% endif %}">
+                    <div>
+                        <div class="fw-semibold small">{{ ev.acao }}</div>
+                        <div class="text-muted small">{{ ev.operador }}{% if ev.perfil %} — {{ ev.perfil }}{% endif %}</div>
+                        <div class="text-muted" style="font-size:.72rem">{{ ev.timestamp }}</div>
+                    </div>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <div class="text-center text-muted py-4">
+                <i class="bi bi-hourglass fs-3 d-block mb-2"></i>
+                Nenhum evento registrado ainda.
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="col-lg-3">
+        <div class="table-card p-3">
+            <h6 class="fw-semibold mb-3"><i class="bi bi-exclamation-diamond me-1"></i>Desvios relacionados</h6>
+            {% if desvios_relacionados %}
+            {% for d in desvios_relacionados %}
+            <div class="border rounded p-2 mb-2">
+                <div class="d-flex justify-content-between align-items-start">
+                    <span class="badge bg-secondary-subtle text-secondary small">{{ d.tipo }}</span>
+                    {% if d.status == 'Aberto' %}<span class="badge bg-danger-subtle text-danger small">Aberto</span>
+                    {% elif d.status == 'Em Tratativa' %}<span class="badge bg-warning-subtle text-warning small">Em Tratativa</span>
+                    {% else %}<span class="badge bg-success-subtle text-success small">Resolvido</span>{% endif %}
+                </div>
+                <div class="small mt-1">{{ d.descricao }}</div>
+                <div class="text-muted" style="font-size:.7rem">{{ d.data_abertura }}</div>
+            </div>
+            {% endfor %}
+            {% if pode('desvios_ver') %}
+            <a href="{{ url_for('admin_desvios') }}" class="small text-decoration-none">Ver todos os desvios →</a>
+            {% endif %}
+            {% else %}
+            <div class="text-center text-muted py-4">
+                <i class="bi bi-check2-circle fs-3 d-block mb-2"></i>
+                Nenhum desvio relacionado.
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

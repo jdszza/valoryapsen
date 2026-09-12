@@ -46,6 +46,12 @@ sobrescreve uma delas (para simular uma câmera com problema em campo):
   PROB_FALHA_LEITURA_MESA       0.02  câmera da mesa não detecta produto
   PROB_DIVERGENCIA_MESA         0.02  detecta produto mas contagem errada
   T_SCAN_MESA                   2.0   segundos para processar scan da mesa
+
+Dois controles globais valem por cima de tudo isso (ver CLAUDE.md):
+
+  MODO_APRESENTACAO             0     1 zera as SEIS probabilidades acima,
+                                      inclusive os overrides _ESQ/_DIR
+  FATOR_VELOCIDADE              1.0   multiplica T_SCAN_DISPENSER e T_SCAN_MESA
 """
 import logging
 import os
@@ -53,7 +59,7 @@ import random
 import threading
 import time
 from datetime import datetime, timezone
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -93,6 +99,72 @@ class ConfigCamera(NamedTuple):
     t_scan:           float
 
 
+# ── Controles globais de demonstração ─────────────────────────────────────────
+# Cópia deliberada do bloco que existe nos quatro simuladores e no
+# `central-computer/config.py` — imagens separadas, sem módulo compartilhado.
+# `tests/test_modo_apresentacao.py` compara as cinco cópias entre si.
+
+def _modo_apresentacao() -> bool:
+    """Modo demonstração: o acaso é desligado, o sistema roda determinístico.
+
+    Aceita as grafias que alguém digita no `.env` sem pensar ("1", "true",
+    "sim", "on"); qualquer outra coisa é falso. Nunca levanta: um valor
+    estranho aqui não pode impedir o simulador de subir.
+    """
+    return os.getenv("MODO_APRESENTACAO", "0").strip().lower() in (
+        "1", "true", "yes", "sim", "on",
+    )
+
+
+def _fator_velocidade() -> float:
+    """Multiplicador de TODOS os tempos simulados. Faixa válida: 0.1..10.
+
+    0.5 roda a demo no dobro da velocidade; 2.0, na metade, para explicar cada
+    etapa com calma. Fora da faixa cai em 1.0 com warning, em vez de virar
+    comportamento silencioso: 0 faria toda etapa terminar instantaneamente
+    (sem nada para mostrar) e um valor enorme travaria a apresentação inteira
+    em cima do primeiro slot.
+    """
+    bruto = os.getenv("FATOR_VELOCIDADE", "1.0")
+    try:
+        valor = float(bruto)
+    except ValueError:
+        valor = 0.0
+    if not 0.1 <= valor <= 10.0:
+        logger.warning(
+            "FATOR_VELOCIDADE=%r fora da faixa 0.1..10 — usando 1.0.", bruto)
+        return 1.0
+    return valor
+
+
+MODO_APRESENTACAO = _modo_apresentacao()
+FATOR_VELOCIDADE  = _fator_velocidade()
+
+
+def _prob(valor: float) -> float:
+    """Probabilidade de falha ALEATÓRIA — zerada em modo apresentação.
+
+    Só o acaso passa por aqui. Falha injetada de propósito é outro caminho e
+    continua valendo com o modo ligado.
+    """
+    return 0.0 if MODO_APRESENTACAO else valor
+
+
+def _tempo(valor: float) -> float:
+    """Tempo simulado escalado pelo fator de velocidade."""
+    return valor * FATOR_VELOCIDADE
+
+
+if MODO_APRESENTACAO:
+    logger.warning(
+        "MODO APRESENTACAO LIGADO — nenhuma falha nem divergência aleatória "
+        "será emitida pelas TRÊS câmeras (probabilidades forçadas a 0, "
+        "inclusive os overrides _ESQ/_DIR).")
+if FATOR_VELOCIDADE != 1.0:
+    logger.warning("FATOR_VELOCIDADE=%.2f — tempos de scan escalados.",
+                   FATOR_VELOCIDADE)
+
+
 def _cfg_float(base: str, sufixo: str, default: str) -> float:
     """Valor da câmera específica, caindo no padrão compartilhado.
 
@@ -109,9 +181,13 @@ def _config_dispenser(nome: str, sufixo: str, rotulo: str) -> ConfigCamera:
     return ConfigCamera(
         nome             = nome,
         rotulo           = rotulo,
-        prob_falha       = _cfg_float("PROB_FALHA_LEITURA_DISPENSER", sufixo, "0.02"),
-        prob_divergencia = _cfg_float("PROB_DIVERGENCIA_DISPENSER",   sufixo, "0.02"),
-        t_scan           = _cfg_float("T_SCAN_DISPENSER",             sufixo, "1.5"),
+        # `_prob` depois de `_cfg_float`, e não antes: o modo apresentação tem
+        # que vencer também o override por câmera (`..._DIR`), senão uma
+        # variável deixada num teste de campo reintroduziria justamente a falha
+        # que o modo foi ligado para não ter.
+        prob_falha       = _prob(_cfg_float("PROB_FALHA_LEITURA_DISPENSER", sufixo, "0.02")),
+        prob_divergencia = _prob(_cfg_float("PROB_DIVERGENCIA_DISPENSER",   sufixo, "0.02")),
+        t_scan           = _tempo(_cfg_float("T_SCAN_DISPENSER",            sufixo, "1.5")),
     )
 
 
@@ -124,10 +200,26 @@ CAMERAS_DISPENSER: dict[str, ConfigCamera] = {
 CAMERA_MESA = ConfigCamera(
     nome             = CAM_MESA,
     rotulo           = "CAM-MESA",
-    prob_falha       = float(os.getenv("PROB_FALHA_LEITURA_MESA", "0.02")),
-    prob_divergencia = float(os.getenv("PROB_DIVERGENCIA_MESA",   "0.02")),
-    t_scan           = float(os.getenv("T_SCAN_MESA",             "2.0")),
+    prob_falha       = _prob(float(os.getenv("PROB_FALHA_LEITURA_MESA", "0.02"))),
+    prob_divergencia = _prob(float(os.getenv("PROB_DIVERGENCIA_MESA",   "0.02"))),
+    t_scan           = _tempo(float(os.getenv("T_SCAN_MESA",            "2.0"))),
 )
+
+
+# ── Injeção de falha (DEMONSTRAÇÃO) ───────────────────────────────────────────
+# Os três valores de `injetar_falha` que este simulador reconhece. Os nomes são
+# os mesmos de `central-computer/injecao.TIPOS`, e `tests/test_injecao.py` cobra
+# a igualdade: uma string divergente aqui viraria gatilho armado que nunca
+# dispara — sem erro em lugar nenhum, que é o pior modo de falhar para uma
+# feature cuja razão de existir é não depender de sorte.
+INJECAO_SKU_DISPENSER          = "sku_dispenser"
+INJECAO_FALHA_LEITURA_DISP     = "falha_leitura_dispenser"
+INJECAO_DIVERGENCIA_MESA       = "divergencia_mesa"
+
+# SKU fixo na injeção, e aleatório no sorteio. Um número sorteado tornaria a
+# linha do log diferente a cada ensaio, e a primeira coisa que se faz com uma
+# falha provocada é conferir se o que apareceu na tela é o que se armou.
+SKU_INJETADO = "APSEN-INJETADO-000"
 
 
 def camera_do_slot(slot_id: int) -> str:
@@ -175,6 +267,9 @@ class CapturarDispenserReq(BaseModel):
     sku_esperado: str = ""
     medicamento_esperado: str = ""
     quantidade_esperada: int = 0
+    # Caminho de DEMONSTRAÇÃO, ausente em toda captura normal. Ver o bloco
+    # "Injeção de falha" acima e `central-computer/injecao.py`.
+    injetar_falha: Optional[str] = None
 
 
 class CapturarMesaReq(BaseModel):
@@ -183,28 +278,51 @@ class CapturarMesaReq(BaseModel):
     quantidade_esperada: int = 0
     posicao_x: float = 0.0
     posicao_y: float = 0.0
+    injetar_falha: Optional[str] = None
 
 
 # ── Câmeras dos Dispensers (uma por fileira) ──────────────────────────────────
 
 def _do_capturar_dispenser(slot_id: int, os_id: str, sku_esperado: str,
-                            medicamento_esperado: str, quantidade_esperada: int):
+                            medicamento_esperado: str, quantidade_esperada: int,
+                            injetar_falha: Optional[str] = None):
     """
     Simula o processamento da câmera de dispenser do lado do slot:
     1. Escolhe a câmera pelo slot (esquerda ou direita)
     2. Delay de processamento (iluminação + leitura óptica)
     3. Decide se a leitura falha, acerta ou diverge
     4. Envia evento ao adapter, marcado com a câmera que olhou
+
+    `injetar_falha` é o caminho de DEMONSTRAÇÃO: quando presente, ele decide o
+    resultado e NENHUM sorteio roda nesta captura. É o que faz a injeção valer
+    também com `MODO_APRESENTACAO` ligado — o modo zera as probabilidades, a
+    injeção não passa por elas.
     """
     cam = config_do_slot(slot_id)
+
+    # ── Injeção: decidida ANTES do primeiro sorteio, num bloco só ─────────────
+    inj_falha       = injetar_falha == INJECAO_FALHA_LEITURA_DISP
+    inj_divergencia = injetar_falha == INJECAO_SKU_DISPENSER
+    injetando       = inj_falha or inj_divergencia
+    if injetar_falha and not injetando:
+        # Typo do console não pode virar leitura silenciosamente diferente da
+        # que se pediu: ignora e AVISA.
+        logger.warning("[%s] Injeção desconhecida ignorada: %r",
+                       cam.rotulo, injetar_falha)
+    elif injetando:
+        logger.warning(
+            "[%s] ⚡ INJEÇÃO ARMADA (demonstração) slot=%d → %s. "
+            "NÃO é falha real da câmera.", cam.rotulo, slot_id, injetar_falha,
+        )
+
     logger.info("[%s] Iniciando scan slot=%d | sku=%s", cam.rotulo, slot_id, sku_esperado)
     time.sleep(cam.t_scan)
 
     ts = _ts()
 
     # Caso 1: falha de hardware (câmera, iluminação, código sujo/danificado)
-    if random.random() < cam.prob_falha:
-        motivo = random.choice([
+    if inj_falha or (not injetando and random.random() < cam.prob_falha):
+        motivo = "injecao_demonstracao" if inj_falha else random.choice([
             "camera_obstruida",
             "iluminacao_insuficiente",
             "codigo_danificado",
@@ -219,13 +337,15 @@ def _do_capturar_dispenser(slot_id: int, os_id: str, sku_esperado: str,
             "motivo":        motivo,
             "sku_esperado":  sku_esperado,
             "confianca":     0.0,
+            "falha_injetada": inj_falha,
             "ts":            ts,
         })
         return
 
     # Caso 2: leitura bem-sucedida mas SKU divergente (produto errado)
-    if random.random() < cam.prob_divergencia:
-        sku_simulado = f"APSEN-ERRADO-{random.randint(100,999)}"
+    if inj_divergencia or (not injetando and random.random() < cam.prob_divergencia):
+        sku_simulado = (SKU_INJETADO if inj_divergencia
+                        else f"APSEN-ERRADO-{random.randint(100,999)}")
         logger.error(
             "[%s] DIVERGÊNCIA slot=%d | esperado=%s | lido=%s",
             cam.rotulo, slot_id, sku_esperado, sku_simulado,
@@ -240,6 +360,7 @@ def _do_capturar_dispenser(slot_id: int, os_id: str, sku_esperado: str,
             "medicamento_lido": f"Medicamento desconhecido ({sku_simulado})",
             "match_sku":        False,
             "confianca":        round(random.uniform(0.88, 0.96), 3),
+            "falha_injetada":   inj_divergencia,
             "ts":               ts,
         })
         return
@@ -267,14 +388,30 @@ def _do_capturar_dispenser(slot_id: int, os_id: str, sku_esperado: str,
 # ── Câmera da Mesa (sobre a balança HX711) ────────────────────────────────────
 
 def _do_capturar_mesa(slot_id: int, os_id: str, quantidade_esperada: int,
-                       posicao_x: float, posicao_y: float):
+                       posicao_x: float, posicao_y: float,
+                       injetar_falha: Optional[str] = None):
     """
     Simula o processamento da câmera da mesa de coleta (a da balança):
     1. Delay de processamento (análise de imagem, contagem)
     2. Decide se não detecta nada, conta corretamente ou diverge na contagem
     3. Envia evento ao adapter
+
+    `injetar_falha` é o caminho de DEMONSTRAÇÃO — quando presente, decide o
+    resultado e nenhum sorteio roda nesta captura.
     """
     cam = CAMERA_MESA
+
+    # ── Injeção: decidida ANTES do primeiro sorteio ──────────────────────────
+    inj_divergencia = injetar_falha == INJECAO_DIVERGENCIA_MESA
+    if injetar_falha and not inj_divergencia:
+        logger.warning("[%s] Injeção desconhecida ignorada: %r",
+                       cam.rotulo, injetar_falha)
+    elif inj_divergencia:
+        logger.warning(
+            "[%s] ⚡ INJEÇÃO ARMADA (demonstração) slot=%d → %s. "
+            "NÃO é falha real da câmera.", cam.rotulo, slot_id, injetar_falha,
+        )
+
     logger.info(
         "[%s] Iniciando scan slot=%d | qtd_esp=%d | pos=(%.1f,%.1f)",
         cam.rotulo, slot_id, quantidade_esperada, posicao_x, posicao_y,
@@ -284,7 +421,7 @@ def _do_capturar_mesa(slot_id: int, os_id: str, quantidade_esperada: int,
     ts = _ts()
 
     # Caso 1: câmera não detecta produto (produto fora da zona, obstrução)
-    if random.random() < cam.prob_falha:
+    if not inj_divergencia and random.random() < cam.prob_falha:
         motivo = random.choice([
             "produto_fora_zona_coleta",
             "obstrucao_visual",
@@ -303,14 +440,18 @@ def _do_capturar_mesa(slot_id: int, os_id: str, quantidade_esperada: int,
             "posicao_x":          posicao_x,
             "posicao_y":          posicao_y,
             "confianca":          0.0,
+            "falha_injetada":     False,
             "ts":                 ts,
         })
         return
 
     # Caso 2: detecta produto mas conta errado (divergência de quantidade)
-    if random.random() < cam.prob_divergencia:
-        # Simula contagem levemente errada (±1 a ±2 unidades)
-        delta    = random.choice([-2, -1, 1, 2])
+    if inj_divergencia or random.random() < cam.prob_divergencia:
+        # Injeção conta sempre UMA A MENOS: é o quadro de uma falha mecânica
+        # real (produto que não saiu), o mais útil de explicar. Contar a MAIS
+        # seria a câmera vendo o que não existe — quadro possível, mas que
+        # confunde quem está aprendendo o que o Triple Check faz.
+        delta = (-1 if quantidade_esperada > 0 else 0) if inj_divergencia                 else random.choice([-2, -1, 1, 2])
         detectado = max(0, quantidade_esperada + delta)
         logger.warning(
             "[%s] DIVERGÊNCIA slot=%d | esperado=%d | detectado=%d",
@@ -327,6 +468,7 @@ def _do_capturar_mesa(slot_id: int, os_id: str, quantidade_esperada: int,
             "posicao_x_detectada": round(posicao_x + random.uniform(-2.0, 2.0), 2),
             "posicao_y_detectada": round(posicao_y + random.uniform(-2.0, 2.0), 2),
             "confianca":           round(random.uniform(0.80, 0.92), 3),
+            "falha_injetada":      inj_divergencia,
             "ts":                  ts,
         })
         return
@@ -397,7 +539,8 @@ def executar_capturar_dispenser(req: CapturarDispenserReq):
     threading.Thread(
         target=_do_capturar_dispenser,
         args=(req.slot_id, req.os_id, req.sku_esperado,
-              req.medicamento_esperado, req.quantidade_esperada),
+              req.medicamento_esperado, req.quantidade_esperada,
+              req.injetar_falha),
         daemon=True,
         name=f"vision-disp-{req.slot_id}",
     ).start()
@@ -424,7 +567,7 @@ def executar_capturar_mesa(req: CapturarMesaReq):
     threading.Thread(
         target=_do_capturar_mesa,
         args=(req.slot_id, req.os_id, req.quantidade_esperada,
-              req.posicao_x, req.posicao_y),
+              req.posicao_x, req.posicao_y, req.injetar_falha),
         daemon=True,
         name=f"vision-mesa-{req.slot_id}",
     ).start()
@@ -481,7 +624,8 @@ if __name__ == "__main__":
         "Vision Simulator v1.0 | adapter=%s | %d slots (%d por fileira)\n"
         "  CAM-ESQ  (D1-D%d):   falha=%.0f%% div=%.0f%% scan=%.1fs\n"
         "  CAM-DIR  (D%d-D%d):   falha=%.0f%% div=%.0f%% scan=%.1fs\n"
-        "  CAM-MESA (balança): falha=%.0f%% div=%.0f%% scan=%.1fs",
+        "  CAM-MESA (balança): falha=%.0f%% div=%.0f%% scan=%.1fs\n"
+        "  modo=%s | fator_velocidade=%.2f",
         ADAPTER_URL, NUM_SLOTS, SLOTS_POR_FILEIRA,
         SLOTS_POR_FILEIRA,
         _esq.prob_falha * 100, _esq.prob_divergencia * 100, _esq.t_scan,
@@ -489,5 +633,6 @@ if __name__ == "__main__":
         _dir.prob_falha * 100, _dir.prob_divergencia * 100, _dir.t_scan,
         CAMERA_MESA.prob_falha * 100, CAMERA_MESA.prob_divergencia * 100,
         CAMERA_MESA.t_scan,
+        "APRESENTACAO" if MODO_APRESENTACAO else "realista", FATOR_VELOCIDADE,
     )
     uvicorn.run(app, host="0.0.0.0", port=8202, log_level="warning")

@@ -78,6 +78,11 @@ class ComandoCarregarReq(BaseModel):
 class ComandoDispensarReq(BaseModel):
     dispenser_id: int
     os_id: str
+    # Campo de DEMONSTRAÇÃO, ausente no caminho normal (ver
+    # `central-computer/injecao.py`). O adapter não o interpreta: repassa como
+    # veio, do mesmo jeito que faz com as duas quantidades da pesagem. Quem
+    # decide é o central; quem executa é o simulador, num ramo isolado.
+    injetar_falha: Optional[str] = None
 
 
 class ComandoLimparReq(BaseModel):
@@ -106,18 +111,63 @@ async def _post_sim(path: str, payload: dict, timeout: float = TIMEOUT_CMD) -> d
         raise HTTPException(503, f"Dispenser simulator indisponível: {exc}")
 
 
+# ── Encaminhamento do evento ao Central ───────────────────────────────────────
+#
+# Este é o ÚNICO caminho de volta ao orquestrador. Ele postava uma vez e, em
+# falha, só logava — e quem paga por um evento perdido não é o adapter: é a OS.
+# O orquestrador fica bloqueado em `aguardar_evento` esperando o `dispensado`
+# do slot, estoura `TIMEOUT_DISPENSA` e aborta uma OS cujo hardware fez tudo
+# certo. O caminho de IDA (orquestrador → adapter) sempre retentou 3x; era só a
+# volta que não.
+#
+# A política é a mesma do `_post` do orquestrador, e por isso o critério
+# também: retenta em falha de rede, timeout e 5xx — as três em que tentar de
+# novo pode dar outro resultado. 4xx é recusa determinística (um 422 é payload
+# que não passa na validação, e não passará na terceira tentativa); insistir só
+# encheria o log com a mesma linha três vezes.
+#
+# O custo é o tempo de resposta AO SIMULADOR: com o central fora do ar, este
+# handler pode segurar a requisição por até
+# `_TENTATIVAS_EVENTO * TIMEOUT_EVENT + 2 * _ESPERA_ENTRE_TENTATIVAS_S`. O
+# simulador desiste antes (o `requests.post` dele tem timeout de 5s) e o
+# encaminhamento segue até o fim assim mesmo — o que é exatamente o desejado:
+# quem precisa do evento é o orquestrador, e o simulador ignora o retorno
+# (`_evento` é fire-and-forget).
+_TENTATIVAS_EVENTO = 3
+_ESPERA_ENTRE_TENTATIVAS_S = 1.0
+
+
+def _vale_retentar(status: int) -> bool:
+    """5xx é o lado de lá falhando; 408/429 é ele pedindo para esperar."""
+    return status >= 500 or status in (408, 429)
+
+
 async def _post_central(payload: dict) -> bool:
-    """Encaminha evento ao Central. Silencioso em falha (não aborta o fluxo)."""
-    try:
-        r = await _client.post(
-            CENTRAL_URL + "/api/v1/eventos/dispenser",
-            json=payload,
-            timeout=TIMEOUT_EVENT,
-        )
-        return r.status_code < 300
-    except Exception as exc:
-        logger.warning("[FWD] Falha ao encaminhar evento ao Central: %s", exc)
-        return False
+    """Encaminha evento ao Central, com retry. Nunca lança — devolve False.
+
+    False significa "o evento NÃO chegou depois de `_TENTATIVAS_EVENTO`
+    tentativas", e quem chama já registra isso no log. Não aborta o fluxo do
+    adapter: ele não tem o que fazer com a informação, e derrubar a resposta ao
+    simulador não traria o evento de volta.
+    """
+    url = CENTRAL_URL + "/api/v1/eventos/dispenser"
+    for tentativa in range(_TENTATIVAS_EVENTO):
+        try:
+            r = await _client.post(url, json=payload, timeout=TIMEOUT_EVENT)
+            if r.status_code < 300:
+                return True
+            if not _vale_retentar(r.status_code):
+                logger.warning("[FWD] Central recusou o evento (status %d) — "
+                               "recusa definitiva, sem retry.", r.status_code)
+                return False
+            logger.warning("[FWD] Central respondeu %d (tentativa %d/%d).",
+                           r.status_code, tentativa + 1, _TENTATIVAS_EVENTO)
+        except Exception as exc:
+            logger.warning("[FWD] Falha ao encaminhar evento ao Central "
+                           "(tentativa %d/%d): %s", tentativa + 1, _TENTATIVAS_EVENTO, exc)
+        if tentativa < _TENTATIVAS_EVENTO - 1:
+            await asyncio.sleep(_ESPERA_ENTRE_TENTATIVAS_S)
+    return False
 
 
 # ── Endpoints de Comandos (Central → Adapter → Simulator) ─────────────────────
@@ -167,7 +217,8 @@ async def cmd_dispensar(req: ComandoDispensarReq):
     logger.info("[CMD] DISPENSAR D%d ← OS %s", req.dispenser_id, req.os_id)
     resultado = await _post_sim(
         "/executar/dispensar",
-        {"dispenser_id": req.dispenser_id, "os_id": req.os_id},
+        {"dispenser_id": req.dispenser_id, "os_id": req.os_id,
+         "injetar_falha": req.injetar_falha},
     )
     return {"ok": True, "simulador": resultado}
 

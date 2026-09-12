@@ -1,0 +1,14 @@
+flask==3.1.1
+# `central_client.py` importa `requests` no topo, e `app.py` importa
+# `central_client` incondicionalmente: sem esta linha o painel NAO SOBE num
+# venv limpo. A suite nao pega isso de proposito: `carregar_painel` troca
+# `requests` no `sys.modules` para nenhum teste fazer rede, entao a
+# dependencia ausente fica invisivel para ela. Mesma versao dos demais
+# servicos do repositorio.
+requests==2.31.0
+qrcode[pil]==8.0
+pyserial==3.5
+# Servidor de producao. O `python app.py` o usa sozinho quando ele esta
+# instalado; sem ele o painel ainda sobe, pelo servidor de desenvolvimento do
+# Flask (que nao aguenta a bancada inteira e nao deve ficar exposto).
+waitress==3.0.2

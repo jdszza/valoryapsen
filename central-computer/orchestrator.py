@@ -27,11 +27,15 @@ from typing import NamedTuple, Optional
 
 import httpx
 
+import injecao
 from config import settings
 from database import (
     atribuir_dispenser_item,
     atualizar_status_ordem,
+    cancelar_ordens_pendentes,
     get_peso_medicamento,
+    limpar_dispenser_estado,
+    limpar_historico,
     salvar_alarme,
 )
 
@@ -213,6 +217,17 @@ def registrar_evento(chave: str) -> asyncio.Event:
     evt = asyncio.Event()
     _pending_events[chave] = evt
     return evt
+
+
+async def _nulo() -> None:
+    """Corrotina que resolve em `None` imediatamente.
+
+    Serve para preencher a posição de um `gather` cujo evento já se sabe que
+    nunca chegará — comando que o adapter recusou. Sem ela a alternativa seria
+    `aguardar_evento`, que gastaria o timeout inteiro para produzir o mesmo
+    `None`; com ela o slot cai no ramo "sem medição" na hora.
+    """
+    return None
 
 
 async def aguardar_evento(chave: str, timeout: float) -> Optional[dict]:
@@ -487,19 +502,84 @@ def planejar_rota(dispenser_ids: list[int], pos_inicial: tuple[float, float]) ->
 
 # ── Comandos HTTP aos adapters ─────────────────────────────────────────────────
 
+_TENTATIVAS_POST = 3
+_ESPERA_ENTRE_POSTS_S = 1.0
+
+# Status que valem uma segunda chance: o lado de lá falhou por conta própria
+# (5xx) ou pediu para esperar (408, 429). Todo o resto do 3xx/4xx é uma RECUSA
+# DETERMINÍSTICA — a mesma requisição vai receber a mesma resposta, e insistir
+# só gasta os 2s de `sleep` entre as tentativas.
+#
+# O caso concreto é o 409 `limpeza_em_operacao` do dispenser-simulator: o slot
+# está limpando, e ele vai continuar limpando pelos próximos dois segundos. O
+# 422 do FastAPI é pior ainda de retentar — payload que não passa na validação
+# não passa na terceira tentativa, e o log fica com três linhas idênticas para
+# um erro de contrato que aconteceu uma vez.
+#
+# Isso importa porque o `_post` é o relógio de quem chama: a etapa 3 do
+# `_processar_os` dispara os comandos de todos os slots em `gather`, e cada
+# recusa determinística segurava um slot por 2s a mais enquanto o
+# `TIMEOUT_CARREGAMENTO` do primeiro já corria.
+def _vale_retentar(status: int) -> bool:
+    return status >= 500 or status in (408, 429)
+
+
 async def _post(url: str, payload: dict, timeout: float = 10.0) -> bool:
-    """POST HTTP com retry básico. Retorna True se 2xx."""
-    for tentativa in range(3):
+    """POST HTTP. Retorna True se 2xx.
+
+    Retenta em falha de rede, timeout e 5xx — as três em que tentar de novo
+    pode dar outro resultado. Recusa determinística (409, 422, 404...) devolve
+    False na hora: ver `_vale_retentar`.
+    """
+    for tentativa in range(_TENTATIVAS_POST):
         try:
             r = await _client.post(url, json=payload, timeout=timeout)
             if r.status_code < 300:
                 return True
+            if not _vale_retentar(r.status_code):
+                logger.warning("[HTTP] %s → status %d — recusa definitiva, sem retry.",
+                               url, r.status_code)
+                return False
             logger.warning("[HTTP] %s → status %d (tentativa %d)", url, r.status_code, tentativa + 1)
         except Exception as exc:
             logger.warning("[HTTP] %s falhou (tentativa %d): %s", url, tentativa + 1, exc)
-        if tentativa < 2:
-            await asyncio.sleep(1.0)
+        if tentativa < _TENTATIVAS_POST - 1:
+            await asyncio.sleep(_ESPERA_ENTRE_POSTS_S)
     return False
+
+
+def _injecao_para(comando: str, slot_id: int) -> dict:
+    """Campo `injetar_falha` a acrescentar no corpo do comando, se houver.
+
+    Devolve `{}` no caso normal — o comando sai byte a byte como saía antes de
+    esta feature existir, e o simulador nem vê o campo. Devolve
+    `{"injetar_falha": tipo}` quando o gatilho armado no console casa com ESTE
+    slot e ESTE comando; `injecao.consumir` é check-and-pop, então o gatilho já
+    se desarmou quando esta função retorna.
+
+    A publicação em `_estado` vem junto e nesta ordem — gatilho consumido
+    primeiro, tela depois —, a mesma de `_ativar_trava` e pelo mesmo motivo:
+    publicar antes abriria a janela em que o console mostra "desarmado" com a
+    falha ainda por sair.
+    """
+    tipo = injecao.consumir(slot_id, comando)
+    if not tipo:
+        return {}
+    _publicar_injecao()
+    return {"injetar_falha": tipo}
+
+
+def _publicar_injecao() -> None:
+    """Espelha o gatilho em `_estado["falha_armada"]` e avisa quem está olhando.
+
+    Transição de operador: não passa pelo throttle do broadcast. Quem armou
+    precisa ver o gatilho aparecer, e quem está explicando a planta precisa ver
+    o gatilho sumir no instante em que a falha saiu.
+    """
+    with _lock:
+        _estado["falha_armada"] = injecao.armada()
+    if _broadcast_fn:
+        _broadcast_fn()
 
 
 async def cmd_carregar(disp_id: int, medicamento: str, sku: str, categoria: str,
@@ -520,7 +600,8 @@ async def cmd_carregar(disp_id: int, medicamento: str, sku: str, categoria: str,
 async def cmd_dispensar(disp_id: int, os_id: str) -> bool:
     return await _post(
         settings.DISPENSER_ADAPTER_URL + "/comandos/dispensar",
-        {"dispenser_id": disp_id, "os_id": os_id},
+        {"dispenser_id": disp_id, "os_id": os_id,
+         **_injecao_para("/comandos/dispensar", disp_id)},
     )
 
 
@@ -613,6 +694,7 @@ async def cmd_visao_dispenser(slot_id: int, sku: str, medicamento: str,
             "sku_esperado":        sku,
             "medicamento_esperado": medicamento,
             "quantidade_esperada": quantidade,
+            **_injecao_para("/comandos/capturar/dispenser", slot_id),
         },
         timeout=5.0,   # comando é rápido — o resultado chega via evento async
     )
@@ -629,6 +711,7 @@ async def cmd_visao_mesa(slot_id: int, os_id: str, quantidade: int,
             "quantidade_esperada": quantidade,
             "posicao_x":         pos_x,
             "posicao_y":         pos_y,
+            **_injecao_para("/comandos/capturar/mesa", slot_id),
         },
         timeout=5.0,
     )
@@ -671,6 +754,7 @@ async def cmd_pesar(slot_id: int, os_id: str, quantidade: int, peso_unitario_g: 
             "quantidade_esperada": quantidade,
             "quantidade_real":     quantidade if quantidade_real is None else quantidade_real,
             "peso_unitario_g":     peso_unitario_g,
+            **_injecao_para("/comandos/pesar", slot_id),
         },
         timeout=5.0,
     )
@@ -797,13 +881,31 @@ async def _processar_os(os_payload: dict):
     for chave in chaves_carga:
         registrar_evento(chave)
 
-    for a in atribuicoes:
-        ok = await cmd_carregar(
+    # O `gather` aqui não é otimização: é o que torna o TIMEOUT_CARREGAMENTO
+    # comparável entre os slots. `_post` retenta 3x com sleep(1) e timeout de
+    # 10s, ou seja, até ~32s por comando — em laço sequencial, com a célula
+    # cheia, o comando do último slot só sairia ~4 min depois do primeiro,
+    # enquanto o relógio dos 180s do PRIMEIRO já corre desde o começo. A OS
+    # abortava por "timeout" de um dispenser que ainda nem tinha sido chamado.
+    envios = await asyncio.gather(*[
+        cmd_carregar(
             a["dispenser_id"], a["medicamento"], a.get("sku", ""),
             a.get("categoria", ""), a["quantidade"], os_id,
         )
-        if not ok:
-            logger.error("[ORCH] Falha ao enviar comando carregar para D%d", a["dispenser_id"])
+        for a in atribuicoes
+    ])
+
+    # Envio recusado é informação que já temos: esperar os 180s de um comando
+    # que sabidamente não chegou ao adapter só atrasa o abort — e mantém a fila
+    # inteira parada nesse intervalo, porque o orquestrador é um loop único.
+    nao_enviados = [a["dispenser_id"] for a, ok in zip(atribuicoes, envios) if not ok]
+    if nao_enviados:
+        logger.error(
+            "[ORCH] Falha ao enviar comando carregar para %s. Abortando OS %s.",
+            ", ".join(f"D{d}" for d in nao_enviados), os_id,
+        )
+        await _abortar_os(os_id, "erro_envio_carregamento", atribuicoes)
+        return
 
     logger.info("[ORCH] Comandos de carregamento enviados. Aguardando dispensers prontos...")
 
@@ -835,18 +937,36 @@ async def _processar_os(os_payload: dict):
     for chave in chaves_visao_disp:
         registrar_evento(chave)
 
-    # Dispara scans em paralelo para todos os dispensers carregados
-    for a in atribuicoes:
-        ok = await cmd_visao_dispenser(
+    # Dispara scans em paralelo — mesmo motivo do carregamento: em laço
+    # sequencial o relógio do primeiro slot corre enquanto o comando do último
+    # ainda está sendo retentado.
+    envios_scan = await asyncio.gather(*[
+        cmd_visao_dispenser(
             a["dispenser_id"], a.get("sku", ""), a["medicamento"],
             a["quantidade"], os_id,
         )
+        for a in atribuicoes
+    ])
+
+    # Aqui o envio recusado NÃO aborta a OS, ao contrário do carregamento:
+    # câmera que não leu é fonte que deixou de confirmar, não fonte que
+    # contradisse — é a mesma regra que já vale para `leitura_dispenser_falha`
+    # e para o timeout logo abaixo. O que muda é só a espera: sem o comando na
+    # planta o evento nunca vem, então o `aguardar_evento` seria TIMEOUT_VISAO_
+    # DISPENSER de relógio queimado por um resultado que já sabemos que não
+    # existe. Resolvemos o slot como `None` na hora, que é onde ele cairia.
+    for a, ok in zip(atribuicoes, envios_scan):
         if not ok:
-            logger.warning("[ORCH] Não foi possível solicitar scan câmera dispenser D%d", a["dispenser_id"])
+            logger.warning(
+                "[ORCH] Não foi possível solicitar scan câmera dispenser D%d — "
+                "slot segue sem validação de SKU.", a["dispenser_id"],
+            )
+            _pending_events.pop(f"{os_id}:visao_dispenser:{a['dispenser_id']}", None)
 
     # Aguarda resultados dos scans (com timeout próprio)
     resultados_visao_disp = await asyncio.gather(*[
         aguardar_evento(chave, settings.TIMEOUT_VISAO_DISPENSER)
+        if chave in _pending_events else _nulo()
         for chave in chaves_visao_disp
     ])
 
@@ -1148,6 +1268,168 @@ async def _processar_os(os_payload: dict):
         _broadcast_fn()
 
 
+# ── Reset da planta (console) ─────────────────────────────────────────────────
+
+class ResetRecusado(RuntimeError):
+    """Reset pedido num momento em que ele estragaria mais do que arruma."""
+
+
+def _drenar_fila() -> list:
+    """Tira todas as OS que ESPERAM e devolve os ids, na ordem em que estavam.
+
+    `get_nowait` em laço, e não `_os_queue = Queue()`: trocar o objeto deixaria
+    o `loop_orquestrador` pendurado no `await _os_queue.get()` da fila ANTIGA —
+    o consumidor pararia de consumir e a planta inteira ficaria muda, sem erro
+    em lugar nenhum. O `maxsize` também se perderia junto.
+    """
+    ids: list = []
+    while True:
+        try:
+            payload = _os_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        ids.append(payload.get("os_id", "?"))
+        # O `task_done` casa com o `get_nowait`: sem ele, um `join()` futuro na
+        # fila nunca retornaria.
+        _os_queue.task_done()
+
+    with _lock:
+        _estado["fila_os"] = []
+        _estado["fila_tamanho"] = 0
+    return ids
+
+
+async def resetar_planta(limpar_historico_tambem: bool = False) -> dict:
+    """Devolve a bancada ao estado de boot. DESTRUTIVO.
+
+    Existe porque repetir a demonstração exigia `docker compose down -v`, que
+    apaga o banco e leva minutos.
+
+    **Recusa enquanto houver OS em execução**, e essa é a decisão central desta
+    função. O orquestrador é um loop ÚNICO parado dentro de `_processar_os`, a
+    meio caminho de um ciclo de CNC; não há como interrompê-lo daqui sem
+    cancelar a própria task do loop — o que pararia o consumidor da fila e
+    calaria a planta inteira. E resetar POR CIMA de uma OS viva seria pior que
+    não resetar: `cmd_limpar` num slot que está dispensando toma 409
+    `limpeza_em_operacao`, a tara zera a balança no meio de uma pesagem e a OS
+    aborta por divergência de peso que ninguém provocou.
+
+    Tudo ou nada, e a recusa é explícita: um reset pela metade é o estado mais
+    difícil de diagnosticar que esta planta consegue produzir. Com a trava
+    ativa, a saída é liberá-la primeiro (o console tem o botão ao lado) e
+    esperar a OS fechar.
+
+    Devolve um relatório do que foi feito — inclusive os slots que NÃO
+    confirmaram a limpeza, que é o que manda o operador olhar a bancada em vez
+    de confiar na tela.
+    """
+    # `global` no topo: a mensagem de recusa logo abaixo já LÊ `_trava_ativa`, e
+    # Python recusa a declaração depois do primeiro uso no corpo da função.
+    global _trava_ativa, _trava_evento, _trava_motivo, _trava_slot_id, _trava_os_id
+
+    with _lock:
+        os_ativa = _estado.get("os_ativa")
+    if os_ativa:
+        raise ResetRecusado(
+            f"OS {os_ativa.get('os_id', '?')} em execução. "
+            + ("Libere a trava do Triple Check e espere a OS fechar antes de resetar."
+               if _trava_ativa else
+               "Espere a OS terminar (ou pause o gerador para não entrar outra).")
+        )
+
+    logger.warning("[ORCH] RESET DA PLANTA pedido pelo console "
+                   "(limpar_historico=%s).", limpar_historico_tambem)
+
+    relatorio: dict = {
+        "os_canceladas":   [],
+        "slots_limpos":    [],
+        "slots_com_falha": [],
+        "tara":            False,
+        "homing":          False,
+        "historico":       None,
+    }
+
+    # 1. Fila — memória e banco juntos. A linha "aguardando" que sobrasse viraria
+    #    a OS que `get_ordem_ativa` anuncia para sempre.
+    canceladas = _drenar_fila()
+    relatorio["os_canceladas"] = canceladas
+    if canceladas:
+        try:
+            await asyncio.to_thread(cancelar_ordens_pendentes, canceladas)
+        except Exception as exc:
+            logger.warning("[DB] cancelar_ordens_pendentes: %s", exc)
+
+    # 2. Trava e gatilho de injeção: dois estados que sobrevivem ao fim de uma
+    #    OS e que ninguém lembra de limpar à mão antes da próxima demonstração.
+    if _trava_ativa and _trava_evento is not None:
+        _trava_evento.set()
+    _trava_ativa = False
+    _trava_evento = None
+    _trava_motivo = ""
+    _trava_slot_id = None
+    _trava_os_id = None
+    injecao.desarmar()
+
+    # 3. Estoque FÍSICO dos slots. Comandar a limpeza de verdade é o ponto: só
+    #    zerar `_estado["dispensers"]` deixaria o medicamento dentro do
+    #    dispenser, e a OS seguinte tomaria 409 na etapa 1b — o mesmo bug que a
+    #    seção "Ciclo de vida de um slot" do CLAUDE.md registra.
+    #    Em paralelo, pelo mesmo motivo do `gather` das etapas 3 e 3b: são
+    #    NUM_SLOTS comandos e cada um pode retentar por até ~32s.
+    resultados = await asyncio.gather(*[
+        _liberar_slot(slot, "reset_console") for slot in range(1, NUM_SLOTS + 1)
+    ])
+    for slot, ok in zip(range(1, NUM_SLOTS + 1), resultados):
+        (relatorio["slots_limpos"] if ok else relatorio["slots_com_falha"]).append(slot)
+        try:
+            await asyncio.to_thread(limpar_dispenser_estado, slot)
+        except Exception as exc:
+            logger.warning("[DB] limpar_dispenser_estado D%d: %s", slot, exc)
+
+    with _lock:
+        for key, slot in _estado["dispensers"].items():
+            slot.update({
+                "status": "idle", "medicamento": None, "sku": None,
+                "categoria": None, "quantidade": 0, "quantidade_alvo": 0,
+                "quantidade_dispensada": 0, "quantidade_residual": 0,
+                "os_id": None,
+            })
+        _estado["os_ativa"] = None
+        _estado["atribuicao_ia"] = []
+        _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
+        _estado["falha_armada"] = None
+
+    # 4. Balança e CNC. A tara vem DEPOIS da limpeza dos slots: zerar antes e
+    #    depois mexer na bancada deixaria o offset da tara contando o peso do
+    #    que ainda estava lá.
+    relatorio["tara"] = await cmd_tara("reset")
+    relatorio["homing"] = await cmd_homing("reset")
+
+    # 5. Histórico — opcional e à parte, porque "repetir a demo" e "apagar o que
+    #    já rodou" são decisões diferentes: quase sempre se quer a bancada limpa
+    #    COM o histórico de pé, que é o que dá forma ao dashboard.
+    if limpar_historico_tambem:
+        try:
+            relatorio["historico"] = await asyncio.to_thread(limpar_historico)
+        except Exception as exc:
+            logger.error("[DB] limpar_historico: %s", exc)
+            relatorio["historico"] = {"erro": str(exc)}
+
+    # Os eventos pendentes de qualquer OS morta saem junto: chave órfã em
+    # `_pending_events` é vazamento de memória e, pior, uma notificação futura
+    # que casaria com a espera errada.
+    _pending_events.clear()
+    _pending_data.clear()
+
+    if _broadcast_fn:
+        _broadcast_fn()
+
+    logger.warning("[ORCH] RESET concluído: %d OS canceladas, %d slot(s) limpo(s), "
+                   "%d com falha.", len(relatorio["os_canceladas"]),
+                   len(relatorio["slots_limpos"]), len(relatorio["slots_com_falha"]))
+    return relatorio
+
+
 def _limpar_eventos_os(os_id: str):
     """Remove todos os eventos pendentes associados a uma OS (evita memory leak e notificações cruzadas)."""
     prefixo = f"{os_id}:"
@@ -1203,9 +1485,17 @@ async def _abortar_os(os_id: str, motivo: str, atribuicoes: Optional[list] = Non
     with _lock:
         _estado["os_ativa"] = None
         _estado["atribuicao_ia"] = []
-        for key in _estado["dispensers"]:
-            _estado["dispensers"][key]["status"] = "idle"
-            _estado["dispensers"][key]["os_id"] = None
+        # Só os slots QUE ESTA OS RESERVOU, como no caminho de sucesso. Varrer
+        # `_estado["dispensers"]` inteiro apagava o `os_id` de slot que guarda
+        # resíduo de outra OS — e `os_id` é justamente o que diz de quem é o
+        # medicamento parado ali. Zerado, o resíduo vira órfão sem dono
+        # aparente: o painel mostra o slot como idle, e o próximo
+        # `atribuir_slots` o toma por livre.
+        for a in atribuicoes or []:
+            key = str(a["dispenser_id"])
+            if key in _estado["dispensers"]:
+                _estado["dispensers"][key]["status"] = "idle"
+                _estado["dispensers"][key]["os_id"] = None
 
     if _broadcast_fn:
         _broadcast_fn()
@@ -1214,7 +1504,7 @@ async def _abortar_os(os_id: str, motivo: str, atribuicoes: Optional[list] = Non
 # ── Loop principal do orquestrador ────────────────────────────────────────────
 
 def fila_status() -> dict:
-    """Ocupação da fila — o que o order-generator consulta antes de gerar OS.
+    """Ocupação da fila — o que o erp-simulator consulta antes de gerar OS.
 
     `tamanho` conta apenas quem ESPERA: a OS em execução já saiu da fila. Por
     isso `os_ativa` e `trava_ativa` vão junto — fila vazia com trava ativa não
@@ -1284,13 +1574,33 @@ async def loop_orquestrador():
             await _processar_os(os_payload)
         except Exception as exc:
             logger.error("[ORCH] Exceção não tratada em _processar_os: %s", exc, exc_info=True)
-            try:
-                await asyncio.to_thread(
-                    atualizar_status_ordem, os_payload.get("os_id", "?"), "erro"
-                )
-            except Exception:
-                pass
+            # Uma exceção inesperada encerra a OS no MEIO do ciclo, e é
+            # justamente o encerramento que precisa fazer o mesmo que um abort
+            # explícito: gravar "erro", DESCARTAR o estoque que ficou nos slots
+            # e apagar os eventos pendentes da OS morta.
+            #
+            # Fechar só o status (o que esta cláusula fazia) deixava três
+            # rastros: o medicamento fisicamente no dispenser, o `os_id` da OS
+            # morta na memória dos slots, e as chaves `{os_id}:...` em
+            # `_pending_events`. O sintoma aparecia na OS SEGUINTE, longe daqui
+            # — a limpeza prévia batia em 409 no slot que ninguém liberou.
+            #
+            # As atribuições vêm de `_estado["atribuicao_ia"]`, que `_processar_os`
+            # publica na etapa 1: é o registro de quais slots esta OS chegou a
+            # reservar. Lista vazia (exceção antes da reserva) faz `_abortar_os`
+            # não mandar limpeza nenhuma, que é o correto.
             with _lock:
-                _estado["os_ativa"] = None
+                atribuicoes = list(_estado.get("atribuicao_ia") or [])
+            try:
+                await _abortar_os(os_payload.get("os_id", "?"),
+                                  "excecao_nao_tratada", atribuicoes)
+            except Exception as exc_abort:
+                # O abort é a limpeza do caminho de erro; se ELE falhar, o loop
+                # ainda precisa seguir para a próxima OS — parar aqui deixaria
+                # a planta inteira parada por uma falha de limpeza.
+                logger.error("[ORCH] Falha ao abortar OS após exceção: %s",
+                             exc_abort, exc_info=True)
+                with _lock:
+                    _estado["os_ativa"] = None
         finally:
             _os_queue.task_done()

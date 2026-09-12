@@ -1,6 +1,6 @@
 """
 APSEN - Computador Central v3.2
-Orquestrador ativo: recebe OS do order-generator, comanda adapters,
+Orquestrador ativo: recebe OS do erp-simulator, comanda adapters,
 consolida eventos, persiste no DB, serve dashboard/manutenção via REST +
 WebSocket.
 
@@ -15,8 +15,8 @@ Novidades v3.2:
   - GET /api/v1/visao/historico — histórico de leituras CV
   - POST /api/v1/eventos/peso — eventos da balança HX711
 
-Endpoints de entrada (dos adapters e order-generator):
-  POST /api/v1/ordens              ← order-generator
+Endpoints de entrada (dos adapters e erp-simulator):
+  POST /api/v1/ordens              ← erp-simulator
   POST /api/v1/eventos/dispenser   ← dispenser-adapter
   POST /api/v1/eventos/cnc         ← cnc-adapter
   POST /api/v1/eventos/visao       ← vision-adapter
@@ -32,7 +32,11 @@ Console de operação (interface própria do central, ver `console.py`):
   GET  /console                    ← página; exige cookie de sessão
   GET/POST /console/login          ← senha própria (CONSOLE_SENHA)
   POST /console/api/*              ← disparo de OS, pausa do gerador, trava
-  GET  /api/v1/gerador             ← flag de pausa que o order-generator consulta
+  GET/POST /console/api/injecao    ← falha armada para demonstração (`injecao.py`)
+  POST /console/api/reset          ← devolve a bancada ao estado de boot
+  POST /console/api/seed           ← histórico FABRICADO (`seed_demo.py`)
+  GET  /console/prevoo             ← tela de pré-voo (`prevoo.py`)
+  GET  /api/v1/gerador             ← flag de pausa que o erp-simulator consulta
 """
 import asyncio
 import collections
@@ -57,7 +61,13 @@ from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
+import httpx
+
 import console
+import injecao
+import necessidades
+import prevoo
+import seed_demo
 import orchestrator as orch
 import os_templates
 from auth import criar_token, decodificar_token, verificar_senha
@@ -65,7 +75,7 @@ from config import settings, validar_secret_key
 from database import (
     atualizar_item_os, atualizar_status_ordem,
     get_historico_visao, salvar_leitura_visao,
-    atualizar_usuario, criar_usuario, expurgar_dados_antigos,
+    atualizar_usuario, criar_usuario, expurgar_dados_antigos, fechar_pool,
     get_alarmes, get_alarmes_por_os, get_cnc_recentes, get_dispensas, get_dispensas_recentes,
     get_dispensers_estado,
     get_historico_ordens, get_historico_sensor, get_log_manutencao,
@@ -74,7 +84,9 @@ from database import (
     init_db, limpar_dispenser_estado, listar_categorias, listar_medicamentos,
     resolver_alarme,
     salvar_alarme, salvar_cnc_evento, salvar_dispensa, salvar_dispenser_estado,
+    diagnosticar,
     salvar_leitura_sensor, salvar_manutencao, salvar_ordem,
+    semear_historico_demo,
     toggle_usuario_ativo,
 )
 
@@ -114,12 +126,25 @@ _estado = {
     # quando a fila encostou no limite — o KPI mostra só a contagem, e usa este
     # número para acender o alerta de fila cheia e explicá-lo no tooltip.
     "fila_capacidade": settings.MAX_FILA_OS,
-    # Publicação do interruptor do order-generator, cuja fonte é
+    # Publicação do interruptor do erp-simulator, cuja fonte é
     # `console._pausado` (escrito só por `console.definir_pausa`). Vive no
     # snapshot pelo mesmo motivo da trava: o console precisa ver a pausa ao
     # vivo, e o `/ws` já entrega o snapshot a cada transição — publicar aqui
     # evita um polling só para um booleano.
     "gerador_pausado": False,
+    # Modo de demonstração em vigor. Publicado no snapshot pelo mesmo motivo da
+    # trava e da pausa do gerador: quem opera precisa ver na tela, ao vivo, se o
+    # acaso está desligado. Um painel que não diz isso faz a demo sem imprevisto
+    # passar por hardware perfeito — e, no dia seguinte, faz alguém procurar
+    # defeito na planta porque "ontem não falhava".
+    "modo_apresentacao": settings.MODO_APRESENTACAO,
+    "fator_velocidade":  settings.FATOR_VELOCIDADE,
+    # Gatilho de falha armado no console, ou `None`. É PUBLICAÇÃO: a fonte é
+    # `injecao._armada`, e quem escreve aqui é o mesmo par de funções que arma
+    # e que consome. Vive no snapshot pelo mesmo motivo da trava — o console
+    # tem que mostrar o gatilho ao vivo, e quem explica a planta tem que ver o
+    # gatilho sumir no instante em que a falha saiu.
+    "falha_armada": None,
     "atribuicao_ia": [],
     # Derivado do banco por _contar_alarmes_ativos() — nunca incrementado à mão.
     "alarmes_ativos": 0,
@@ -903,7 +928,7 @@ async def lifespan(app: FastAPI):
     # Aqui é WARNING, não queda: o central serve a planta inteira e derrubá-lo
     # por um nome de medicamento digitado errado no template trocaria um
     # problema de demonstração por um de produção. Quem RECUSA disparar uma OS
-    # inválida é o order-generator, no startup dele, e o console vê o mesmo
+    # inválida é o erp-simulator, no startup dele, e o console vê o mesmo
     # diagnóstico em `GET /api/v1/ordens/templates`.
     await _validar_templates_no_boot()
 
@@ -912,12 +937,27 @@ async def lifespan(app: FastAPI):
     task_orch      = asyncio.create_task(orch.loop_orquestrador())
     task_expurgo   = asyncio.create_task(_loop_expurgo())
 
+    if settings.MODO_APRESENTACAO:
+        logger.warning(
+            "MODO APRESENTACAO LIGADO — os simuladores não sorteiam falha. "
+            "O Triple Check só trava por falha INJETADA de propósito.")
+    if settings.FATOR_VELOCIDADE != 1.0:
+        logger.warning(
+            "FATOR_VELOCIDADE=%.2f — timeouts de orquestração escalados por "
+            "%.2f (carregamento=%.0fs, dispensa=%.0fs).",
+            settings.FATOR_VELOCIDADE, max(1.0, settings.FATOR_VELOCIDADE),
+            settings.TIMEOUT_CARREGAMENTO, settings.TIMEOUT_DISPENSA)
+
     logger.info("Computador Central APSEN v3.1 iniciado.")
     yield
 
     for tarefa in (task_broadcast, task_flusher, task_orch, task_expurgo):
         tarefa.cancel()
     await orch.encerrar()
+    # As conexões do pool sobrevivem a cada operação de propósito; no shutdown
+    # não há mais operação seguinte, e deixá-las abertas faz o MySQL segurar os
+    # slots até o `wait_timeout` — reinício em laço encosta no max_connections.
+    await asyncio.to_thread(fechar_pool)
 
 
 _TAGS_META = [
@@ -1104,7 +1144,7 @@ class EventoPesoReq(BaseModel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS — RECEBIMENTO (adapters e order-generator)
+# ENDPOINTS — RECEBIMENTO (adapters e erp-simulator)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/v1/ordens", tags=["Ordens de Serviço"],
@@ -1114,7 +1154,7 @@ class EventoPesoReq(BaseModel):
         503: {"description": "Banco indisponível (`persistencia_indisponivel`). A OS não entra na fila."},
     })
 async def receber_ordem(req: NovaOSReq):
-    """Recebe nova OS do order-generator.
+    """Recebe nova OS do erp-simulator.
 
     **Nenhuma OS é enfileirada sem linha no banco.** A fila é o que dispensa
     medicamento; o banco é o que registra o que foi dispensado. Aceitar uma
@@ -1134,7 +1174,7 @@ async def receber_ordem(req: NovaOSReq):
 
     Os corpos seguem a forma `{"erro": ..., "os_id": ...}` do contrato, e por
     isso são `JSONResponse` — `HTTPException` embrulharia tudo em `detail`.
-    Em todos os casos o order-generator apenas loga e segue para a próxima OS
+    Em todos os casos o erp-simulator apenas loga e segue para a próxima OS
     no ciclo seguinte (`_enviar_os` devolve False e ninguém retenta), então não
     há laço de reenvio nem processo derrubado.
 
@@ -1270,7 +1310,7 @@ def get_estado():
 
 @app.get("/api/v1/fila", tags=["Ordens de Serviço"])
 def get_fila():
-    """Ocupação da fila de OS — endpoint de backpressure do order-generator.
+    """Ocupação da fila de OS — endpoint de backpressure do erp-simulator.
 
     O `/estado` já traz `fila_tamanho`, mas serve o snapshot inteiro (os 8 slots,
     CNC, visão, peso, trava) e ainda passa pelo contador de alarmes. Quem só
@@ -1283,7 +1323,7 @@ def get_fila():
 
 @app.get("/api/v1/gerador", tags=["Ordens de Serviço"])
 def get_gerador():
-    """Interruptor do order-generator — ele consulta ANTES de cada envio.
+    """Interruptor do erp-simulator — ele consulta ANTES de cada envio.
 
     É assim que o console pausa a geração automática sem tocar no container do
     gerador. A alternativa seria o central falar com o daemon do Docker (socket
@@ -1307,7 +1347,7 @@ def get_gerador():
 async def get_templates_ordens():
     """As 10 Ordens de Saída padrão, com os itens enriquecidos pelo catálogo.
 
-    Fonte única das ordens fixas (`os_templates.py`). O order-generator lê daqui
+    Fonte única das ordens fixas (`os_templates.py`). O erp-simulator lê daqui
     em vez de manter a própria cópia — se cada um tivesse a sua, o console
     listaria uma coisa e a planta dispensaria outra, sem erro em lugar nenhum.
     A justificativa completa está no topo de `os_templates.py`.
@@ -1337,6 +1377,37 @@ async def get_templates_ordens():
     }
 
 
+# ── Teto do `limite` das rotas de histórico ───────────────────────────────────
+#
+# O parâmetro ia CRU para o `LIMIT %s` das queries. Dois estragos, e o primeiro
+# era visível:
+#
+#   * `?limite=-1` vira `LIMIT -1`, que é erro de SINTAXE no MySQL (1064). O
+#     central devolvia 500 numa rota de leitura, e o 1064 ainda passa pela
+#     classificação de `init_db` como "schema inválido" se aparecer no boot;
+#   * `?limite=99999999` é aceito e varre a tabela inteira — em `dispensas` e
+#     `cnc_eventos`, que são as de maior cardinalidade, uma requisição sozinha
+#     ocupa o pool de conexões e a memória do processo por bastante tempo.
+#
+# Um helper só, e não `Query(ge=1, le=...)` por rota: a validação do FastAPI
+# responderia 422 a quem hoje recebe dados, e o valor esquisito quase sempre vem
+# de um dashboard montando a URL, não de alguém pedindo o erro. Clamp devolve a
+# página que a pessoa queria; 422 devolve uma tela vazia.
+#
+# O teto é o que `/api/v1/visao/historico` já praticava sozinho — ele passou a
+# usar o mesmo helper, para não haver dois números.
+_LIMITE_MAX = 500
+
+
+def _limite(valor: int, maximo: int = _LIMITE_MAX) -> int:
+    """Encaixa `valor` em 1..`maximo`. Nunca devolve 0 nem negativo."""
+    try:
+        valor = int(valor)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(valor, maximo))
+
+
 @app.get("/os/ativa", tags=["Ordens de Serviço"])
 def os_ativa():
     ordem = get_ordem_ativa()
@@ -1347,7 +1418,7 @@ def os_ativa():
 
 @app.get("/os/historico", tags=["Ordens de Serviço"])
 def os_historico(limite: int = 50):
-    return get_historico_ordens(limite)
+    return get_historico_ordens(_limite(limite))
 
 
 @app.get("/os/{os_id}", tags=["Ordens de Serviço"],
@@ -1375,7 +1446,7 @@ def os_detalhe(os_id: str):
 async def relatorio_os(
     os_id: str,
     formato: str = "csv",
-    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    user=Depends(_get_tecnico),
 ):
     """
     Exporta relatório completo de uma OS em CSV ou XLSX.
@@ -1386,10 +1457,16 @@ async def relatorio_os(
     log de acesso deste serviço. Hoje quem baixa é o processo do app de
     manutenção (server-side, dentro da rede Docker) e devolve os bytes ao gestor
     pelo `dcc.Download` — nenhum cliente precisa mais de token na URL.
+
+    E quem confere o token é `_get_tecnico`, como em todo o resto do central —
+    não um `decodificar_token` local. A diferença não é de estilo: o JWT vale 8
+    horas e é assinado, então não dá para "editar" o que já foi emitido; a
+    palavra final é o banco (ver CLAUDE.md, "O JWT não é a palavra final"). Com
+    a decodificação solta, desativar um técnico tirava dele o app de manutenção
+    inteiro e deixava de pé justamente a rota que exporta o histórico de
+    dispensação nominal da OS — a de maior valor para quem acabou de perder o
+    acesso.
     """
-    raw_token = creds.credentials if creds else None
-    if not raw_token or not decodificar_token(raw_token):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token ausente ou inválido")
     # Buscar dados em paralelo
     os_data, dispensas_data, visao_data, alarmes_data = await asyncio.gather(
         asyncio.to_thread(get_ordem_por_id, os_id),
@@ -1548,9 +1625,7 @@ async def _gerar_xlsx(os_id, os_data, dispensas_data, visao_data, alarmes_data) 
 @app.get("/api/v1/visao/historico", tags=["Estado e Telemetria"])
 async def visao_historico(os_id: str = None, limite: int = 100):
     """Retorna histórico de leituras de visão computacional. Filtra por os_id se fornecido."""
-    if limite > 500:
-        limite = 500
-    rows = await asyncio.to_thread(get_historico_visao, os_id, limite)
+    rows = await asyncio.to_thread(get_historico_visao, os_id, _limite(limite))
     return {"leituras": rows, "total": len(rows)}
 
 
@@ -1566,6 +1641,7 @@ def get_categorias():
 
 @app.get("/dispensas", tags=["Estado e Telemetria"])
 def dispensas(os_id: str = None, limite: int = 100):
+    limite = _limite(limite)
     if os_id:
         return get_dispensas(os_id, limite)
     return get_dispensas_recentes(limite)
@@ -1578,31 +1654,81 @@ def dispensers_estado():
 
 @app.get("/cnc/historico", tags=["Estado e Telemetria"])
 def cnc_historico(limite: int = 50):
-    return get_cnc_recentes(limite)
+    return get_cnc_recentes(_limite(limite))
 
 
 @app.get("/alarmes", tags=["Estado e Telemetria"])
 def alarmes(resolvido: bool = False, limite: int = 50):
-    return get_alarmes(resolvido=resolvido, limite=limite)
+    return get_alarmes(resolvido=resolvido, limite=_limite(limite))
 
 
 @app.get("/log/eventos", tags=["Estado e Telemetria"])
 def log_eventos(limite: int = 50):
-    return list(_log_eventos)[:limite]
+    # Não vai a banco, mas `[:−1]` devolveria "todos menos o último" — um
+    # recorte que ninguém pediu. O mesmo helper das rotas de histórico.
+    return list(_log_eventos)[:_limite(limite)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS — MANUTENÇÃO E OPERAÇÃO (requer JWT)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _origem_login(request: Request, username: str) -> str:
+    """Chave do freio de força bruta do login: IP **e** username.
+
+    Só o IP puniria o turno inteiro por causa de um técnico que erra a senha —
+    a bancada fala com o central por um NAT só, e atrás de proxy todo mundo cai
+    no mesmo `client.host`. Só o username deixaria qualquer um trancar a conta
+    alheia de fora, que é negação de serviço disfarçada de proteção.
+
+    O par não cobre varredura de MUITOS usernames a partir de um IP: cada
+    combinação tem o próprio balde. Cobrir isso pede um segundo balde, por IP e
+    com teto mais alto — o que este freio resolve é o caso que existe aqui, que
+    é adivinhar a senha de uma conta conhecida (`admin` está no README).
+
+    O prefixo separa o balde do console, que usa o mesmo dicionário: sem ele,
+    errar a senha do console gastaria tentativa de quem faz login na API.
+    """
+    ip = request.client.host if request.client else "desconhecida"
+    return f"login:{ip}|{username}"
+
+
 @app.post("/auth/login", tags=["Autenticação"],
     responses={
         401: {"description": "Credenciais inválidas."},
+        429: {"description": "Tentativas demais desta origem para este usuário."},
     })
-def login(req: LoginReq):
+def login(req: LoginReq, request: Request):
+    """Emite o JWT de 8h. Com freio de força bruta, o mesmo do console.
+
+    O console já tinha o freio e esta rota não — sendo que ela é a que dá o
+    token de `admin`, o username do seed está documentado no README e a resposta
+    não tem custo nenhum para quem tenta. Reaproveitar `console.registrar_falha`
+    /`bloqueado` em vez de escrever um segundo contador vale pelo motivo de
+    sempre: duas implementações da mesma regra divergem no primeiro ajuste, e a
+    que fica para trás é a que ninguém está olhando.
+    """
+    origem = _origem_login(request, req.username)
+    espera = console.bloqueado(origem)
+    if espera:
+        logger.warning("[AUTH] Tentativas demais para '%s' — bloqueado por %ds.",
+                       req.username, int(espera))
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Tentativas demais. Aguarde e tente novamente.",
+            headers={"Retry-After": str(int(espera))},
+        )
+
     user = get_usuario(req.username)
     if not user or not verificar_senha(req.senha, user["senha_hash"]):
+        console.registrar_falha(origem)
+        logger.warning("[AUTH] Credenciais inválidas para '%s'.", req.username)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Credenciais inválidas")
+
+    # Quem sabe a senha não é varredura: zerar o contador evita que um técnico
+    # que errou três vezes e acertou na quarta fique a uma tentativa do bloqueio
+    # pelo resto da janela.
+    console.limpar_falhas(origem)
     role  = user.get("role", "manutencao")
     token = criar_token(user["username"], user["nome_completo"], role)
     return {
@@ -1628,6 +1754,67 @@ def alterar_status_os(os_id: str, req: StatusOSReq, user=Depends(_get_tecnico)):
     return {"ok": True, "os_id": os_id, "status": req.status}
 
 
+@app.get("/manutencao/necessidades", tags=["Manutenção"])
+async def manut_necessidades(user=Depends(_get_tecnico)):
+    """O que precisa de atenção, numa lista priorizada. Ver `necessidades.py`.
+
+    **Por que um agregado, e não seis chamadas do app de manutenção.** A tela de
+    necessidades é a PRIMEIRA aba, ou seja, a que fica aberta — e o app repolla a
+    cada `POLL_MS` (5s), por cliente conectado. Montá-la com
+    `/api/v1/trava` + `/manutencao/alarmes` + `/manutencao/sensores` +
+    `/dispensers/estado` + `/os/historico` + `/api/v1/fila` seriam seis
+    requisições por tique por gestor com a tela aberta, e as seis atravessariam
+    a rede para responder uma pergunta só.
+
+    É o mesmo raciocínio da seção "O dashboard tem UM ponto de I/O" do
+    CLAUDE.md, e o custo aqui é ainda menor: três das seis fontes saem do
+    `_estado` em memória (trava, fila, dispensers) e as outras três viram um
+    `gather` de consultas independentes.
+
+    A DECISÃO da lista — o que é pendência, em que ordem, com que limiar — não
+    mora aqui: mora em `necessidades.py`, que é puro. Este endpoint só junta os
+    fatos.
+    """
+    with _lock:
+        snapshot = copy.deepcopy(_estado)
+
+    # As três consultas ao banco em paralelo: são independentes, e esperar uma
+    # depois da outra somaria as latências numa rota que é repollada.
+    alarmes, ordens, leituras = await asyncio.gather(
+        asyncio.to_thread(get_alarmes, False, 100),
+        asyncio.to_thread(get_historico_ordens, 50),
+        asyncio.to_thread(get_ultimas_leituras),
+        return_exceptions=True,
+    )
+    # Banco fora não pode apagar a tela: trava, fila e resíduo vivem em memória
+    # e continuam valendo. Perder a parte que veio do banco é muito melhor que
+    # perder a trava ativa, que é o item que mais importa desta lista — e é por
+    # isso que o `return_exceptions=True` não é opcional aqui.
+    faltou = False
+    for nome, valor in (("alarmes", alarmes), ("ordens", ordens),
+                        ("sensores", leituras)):
+        if isinstance(valor, BaseException):
+            faltou = True
+            logger.warning("[NECESSIDADES] %s indisponível: %s", nome, valor)
+
+    def _ou_vazio(valor):
+        return [] if isinstance(valor, BaseException) else (valor or [])
+
+    resultado = necessidades.montar(
+        trava=snapshot.get("trava"),
+        fila=orch.fila_status(),
+        alarmes=_ou_vazio(alarmes),
+        leituras=_ou_vazio(leituras),
+        dispensers=snapshot.get("dispensers"),
+        os_ativa=snapshot.get("os_ativa"),
+        ordens=_ou_vazio(ordens),
+    )
+    # A tela precisa saber que está incompleta: "nada pendente" com o banco
+    # fora seria a afirmação mais perigosa que este endpoint pode fazer.
+    resultado["banco_disponivel"] = not faltou
+    return resultado
+
+
 @app.get("/manutencao/sensores", tags=["Manutenção"])
 def manut_sensores(user=Depends(_get_tecnico)):
     return get_ultimas_leituras()
@@ -1636,12 +1823,12 @@ def manut_sensores(user=Depends(_get_tecnico)):
 @app.get("/manutencao/sensores/{componente}", tags=["Manutenção"])
 def manut_sensor_hist(componente: str, tipo: str = "temperatura", limite: int = 60,
                       user=Depends(_get_tecnico)):
-    return get_historico_sensor(componente, tipo, limite)
+    return get_historico_sensor(componente, tipo, _limite(limite))
 
 
 @app.get("/manutencao/log", tags=["Manutenção"])
 def manut_log(limite: int = 100, user=Depends(_get_tecnico)):
-    return get_log_manutencao(limite)
+    return get_log_manutencao(_limite(limite))
 
 
 @app.post("/manutencao/log", tags=["Manutenção"])
@@ -1651,7 +1838,7 @@ def manut_registrar(req: ManutencaoReq, user=Depends(_get_tecnico)):
 
 @app.get("/manutencao/alarmes", tags=["Manutenção"])
 def manut_alarmes(resolvido: bool = False, limite: int = 100, user=Depends(_get_tecnico)):
-    return get_alarmes(resolvido=resolvido, limite=limite)
+    return get_alarmes(resolvido=resolvido, limite=_limite(limite))
 
 
 @app.put("/manutencao/alarmes/{alarme_id}/resolver", tags=["Manutenção"])
@@ -1839,6 +2026,24 @@ class ConsoleGeradorReq(BaseModel):
     pausado: bool
 
 
+class ConsoleInjecaoReq(BaseModel):
+    tipo: str
+    slot_id: int
+
+
+class ConsoleResetReq(BaseModel):
+    # Default FALSO nos dois: o corpo que chega sem campo nenhum faz a coisa
+    # menos destrutiva possível. Preservar histórico é o caso comum — quase
+    # sempre se quer a bancada limpa COM o histórico de pé, que é o que dá
+    # forma ao dashboard.
+    limpar_historico: bool = False
+
+
+class ConsoleSeedReq(BaseModel):
+    n_ordens: int = 40
+    dias: int = 7
+
+
 def _console_indisponivel() -> JSONResponse:
     """Resposta única para console desabilitado — 503, não 404.
 
@@ -1907,6 +2112,20 @@ def _publicar_gerador(status_gerador: dict) -> None:
     """
     with _lock:
         _estado["gerador_pausado"] = status_gerador["pausado"]
+    _broadcast_estado()
+
+
+def _publicar_injecao() -> None:
+    """Espelha o gatilho armado no snapshot e avisa quem está com a tela aberta.
+
+    Mesma função que o orquestrador chama ao CONSUMIR o gatilho
+    (`orchestrator._publicar_injecao`, que faz o mesmo sobre o mesmo `_estado`).
+    Duas escritas, uma regra: a fonte é sempre `injecao.armada()`, nunca um
+    valor montado pelo chamador — é o que impede a tela de mostrar armado o que
+    já foi consumido.
+    """
+    with _lock:
+        _estado["falha_armada"] = injecao.armada()
     _broadcast_estado()
 
 
@@ -1987,7 +2206,7 @@ def console_logout(request: Request):
 
 @app.post("/console/api/disparar", include_in_schema=False)
 async def console_disparar(request: Request, req: ConsoleDisparoReq):
-    """Dispara UMA das ordens padrão, pelo mesmo caminho do order-generator.
+    """Dispara UMA das ordens padrão, pelo mesmo caminho do erp-simulator.
 
     O `sku` sai do catálogo na hora, como no gerador: congelá-lo no template
     criaria a chance de ele divergir de `medicamentos`, e o sintoma seria uma
@@ -2039,7 +2258,7 @@ async def console_disparar(request: Request, req: ConsoleDisparoReq):
 
 @app.post("/console/api/gerador", include_in_schema=False)
 def console_gerador(request: Request, req: ConsoleGeradorReq):
-    """Pausa ou retoma o order-generator (ver `GET /api/v1/gerador`)."""
+    """Pausa ou retoma o erp-simulator (ver `GET /api/v1/gerador`)."""
     _console_exigir_sessao(request)
     status_gerador = console.definir_pausa(req.pausado)
     _publicar_gerador(status_gerador)
@@ -2065,6 +2284,237 @@ async def console_liberar_trava(request: Request):
                      "mensagem": "Nenhuma trava ativa no momento."},
         )
     return {"ok": True, "liberado_por": "console"}
+
+
+# ── Injeção de falha sob demanda ──────────────────────────────────────────────
+#
+# O gatilho mora em `injecao.py` e viaja no comando que o orquestrador já
+# manda; estas rotas só armam, desarmam e listam. Quem consome — e portanto
+# quem desarma de verdade — é `orchestrator._injecao_para`, no momento em que o
+# comando é montado. Ver `injecao.py` para por que a fonte é uma só.
+
+@app.get("/console/api/injecao", include_in_schema=False)
+def console_injecao_catalogo(request: Request):
+    """Tipos que dá para armar + o gatilho em vigor.
+
+    O console monta o seletor com o que vem daqui, em vez de trazer a lista no
+    HTML: uma segunda lista ofereceria um dia um tipo que nenhum simulador
+    entende, e o sintoma seria um gatilho armado que nunca dispara.
+    """
+    _console_exigir_sessao(request)
+    return {
+        "tipos":     injecao.catalogo(),
+        "armada":    injecao.armada(),
+        "num_slots": settings.NUM_SLOTS,
+    }
+
+
+@app.post("/console/api/injecao", include_in_schema=False)
+def console_injecao_armar(request: Request, req: ConsoleInjecaoReq):
+    """Arma a próxima falha. Substitui o gatilho anterior, se houver."""
+    _console_exigir_sessao(request)
+    try:
+        gatilho = injecao.armar(req.tipo, req.slot_id)
+    except injecao.InjecaoInvalida as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"erro": "injecao_invalida", "mensagem": str(exc)},
+        )
+    _publicar_injecao()
+    _log("console", f"Falha armada para demonstração: {req.tipo} no slot "
+                    f"D{req.slot_id}")
+    return {"ok": True, "armada": gatilho}
+
+
+@app.post("/console/api/injecao/desarmar", include_in_schema=False)
+def console_injecao_desarmar(request: Request):
+    """Desarma sem consumir. 409 quando não havia nada armado."""
+    _console_exigir_sessao(request)
+    anterior = injecao.desarmar()
+    _publicar_injecao()
+    if not anterior:
+        return JSONResponse(
+            status_code=409,
+            content={"erro": "sem_injecao",
+                     "mensagem": "Nenhuma falha armada no momento."},
+        )
+    _log("console", f"Falha armada cancelada: {anterior['tipo']} no slot "
+                    f"D{anterior['slot_id']}")
+    return {"ok": True, "desarmada": anterior}
+
+
+# ── Reset da planta e seed de histórico ───────────────────────────────────────
+#
+# As duas ações destrutivas do console, e as únicas que a página confirma em
+# dois passos junto com a liberação de trava.
+#
+# O SEED É DADO FABRICADO e nunca roda sozinho: não há chamada dele no
+# `init_db`, no `lifespan` nem em healthcheck nenhum — só aqui, atrás da sessão
+# do console e da confirmação. Ver `seed_demo.py`.
+
+@app.post("/console/api/reset", include_in_schema=False)
+async def console_reset(request: Request, req: ConsoleResetReq):
+    """Devolve a bancada ao estado de boot, comandando limpeza REAL nos slots.
+
+    Recusa com 409 enquanto houver OS em execução — ver `resetar_planta` para
+    por que a alternativa (resetar por cima) produz o estado mais difícil de
+    diagnosticar que esta planta consegue gerar.
+    """
+    _console_exigir_sessao(request)
+    try:
+        relatorio = await orch.resetar_planta(req.limpar_historico)
+    except orch.ResetRecusado as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"erro": "os_em_execucao", "mensagem": str(exc)},
+        )
+
+    await _atualizar_alarmes_ativos(forcar=True)
+    _log("console", "Reset da planta pelo console"
+                    + (" (histórico APAGADO)" if req.limpar_historico else
+                       " (histórico preservado)"))
+    _broadcast_estado()
+    return {"ok": True, **relatorio}
+
+
+@app.post("/console/api/seed", include_in_schema=False)
+async def console_seed(request: Request, req: ConsoleSeedReq):
+    """Semeia histórico de DEMONSTRAÇÃO — ordens, dispensas, alarmes, leituras.
+
+    O catálogo real é consultado antes: sem ele o histórico sairia com SKU
+    vazio, e um relatório de dispensação sem SKU é justamente o documento que
+    não serve para nada. Mesma recusa (503) do disparo manual, pelo mesmo
+    motivo.
+    """
+    _console_exigir_sessao(request)
+
+    _, catalogo = await _diagnosticar_templates()
+    if catalogo is None:
+        return JSONResponse(
+            status_code=503,
+            content={"erro": "catalogo_indisponivel",
+                     "mensagem": ("Catálogo de medicamentos indisponível — o "
+                                  "histórico sairia sem SKU.")},
+        )
+    # O catálogo já vem indexado por nome, no mesmo formato que
+    # `os_templates.instanciar` consome — não há segunda consulta a fazer.
+    try:
+        dados = seed_demo.gerar_historico(req.n_ordens, catalogo, dias=req.dias)
+    except seed_demo.SeedInvalido as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"erro": "seed_invalido", "mensagem": str(exc)},
+        )
+
+    try:
+        resumo = await asyncio.to_thread(semear_historico_demo, dados)
+    except Exception as exc:
+        logger.error("[SEED] falha ao gravar: %s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={"erro": "persistencia_indisponivel", "mensagem": str(exc)},
+        )
+
+    await _atualizar_alarmes_ativos(forcar=True)
+    _log("console", f"Histórico de DEMONSTRAÇÃO semeado: {resumo['ordens']} OS "
+                    f"em {req.dias} dia(s)")
+    _broadcast_estado()
+    return {"ok": True, "demonstracao": True, "prefixo": seed_demo.PREFIXO_DEMO,
+            **resumo}
+
+
+# ── Pré-voo: "está tudo de pé para apresentar?" ───────────────────────────────
+#
+# A regra do arquivo `prevoo.py` vale aqui: a tela não pode travar por causa de
+# um serviço morto, que é justamente o caso em que ela é mais necessária. Todas
+# as sondas correm em `gather` com timeout curto, e o conjunto tem um teto
+# próprio — o tempo total é o da sonda mais lenta, não a soma das treze.
+
+@app.get("/console/prevoo", include_in_schema=False)
+def console_prevoo_pagina(request: Request):
+    """Página do pré-voo. Tela própria, e não mais um painel no console.
+
+    O console é a mesa de OPERAÇÃO, usada durante a apresentação; o pré-voo é
+    lido cinco minutos ANTES e não volta a ser aberto. Misturar os dois poria
+    quatro dezenas de linhas de conferência entre o operador e o botão de
+    disparar.
+    """
+    if not console.habilitado():
+        return _console_indisponivel()
+    if not _console_tem_sessao(request):
+        return RedirectResponse("/console/login", status_code=303)
+    return HTMLResponse(console.pagina_prevoo())
+
+
+async def _prevoo_banco() -> dict | None:
+    """Fatos do banco, ou `None` se ele não respondeu.
+
+    O `None` é o que faz o relatório mostrar UM item vermelho em vez de quatro:
+    com o MySQL fora, dizer também "schema incompleto" e "catálogo vazio" seria
+    derivar três diagnósticos da mesma causa.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(diagnosticar, settings.NUM_SLOTS),
+            timeout=prevoo.TIMEOUT_SONDA_S,
+        )
+    except Exception as exc:
+        logger.warning("[PREVOO] banco indisponível: %s", exc)
+        return None
+
+
+@app.get("/console/api/prevoo", include_in_schema=False)
+async def console_prevoo(request: Request):
+    """O relatório, item a item. Nunca levanta por causa de um serviço fora."""
+    _console_exigir_sessao(request)
+
+    with _lock:
+        snapshot = copy.deepcopy(_estado)
+
+    async with httpx.AsyncClient() as cliente:
+        # Banco e sondas HTTP juntos: o banco é I/O como as outras, e esperá-lo
+        # antes somaria o tempo dele ao da sonda mais lenta.
+        try:
+            servicos, banco = await asyncio.wait_for(
+                asyncio.gather(prevoo.sondar_servicos(cliente), _prevoo_banco()),
+                timeout=prevoo.TIMEOUT_TOTAL_S,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[PREVOO] conjunto de sondas estourou %.0fs.",
+                         prevoo.TIMEOUT_TOTAL_S)
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "itens": [{
+                        "id": "prevoo", "grupo": "Serviços",
+                        "titulo": "Verificação", "estado": prevoo.FALHA,
+                        "detalhe": f"As sondas não terminaram em "
+                                   f"{prevoo.TIMEOUT_TOTAL_S:.0f}s",
+                        "acao": "O event loop do central está saturado. "
+                                "Verifique `docker compose logs central-computer` "
+                                "e considere reiniciá-lo.",
+                    }],
+                    "resumo": {"pronto": False,
+                               "contagem": {prevoo.FALHA: 1}, "total": 1},
+                },
+            )
+
+    problemas, catalogo = await _diagnosticar_templates()
+    fila = orch.fila_status()
+
+    itens = (
+        [prevoo.item_central()]
+        + servicos
+        + [prevoo.item_gerador(bool(snapshot.get("gerador_pausado")))]
+        + prevoo.itens_banco(banco)
+        + [prevoo.item_templates(problemas, len(os_templates.listar()),
+                                 catalogo is not None)]
+        + [prevoo.item_fila(fila["tamanho"], fila["capacidade"])]
+        + prevoo.itens_celula(snapshot, orch.HOME)
+        + prevoo.itens_modo(settings.MODO_APRESENTACAO, settings.FATOR_VELOCIDADE,
+                            injecao.armada(), len(_ws_manager.active))
+    )
+    return {"itens": itens, "resumo": prevoo.resumo(itens)}
 
 
 # ── WebSocket ──────────────────────────────────────────────────────────────────

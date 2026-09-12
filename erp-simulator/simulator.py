@@ -1,18 +1,36 @@
 """
-APSEN - Order Generator v2.0 (era SAP Simulator)
-Dispara Ordens de Saída no central-computer via HTTP. Sem MQTT.
+APSEN - ERP Simulator v2.1
+O sistema que, na planta real, EMITE as ordens de saída. Fala com o
+central-computer por HTTP; sem MQTT.
 
-O que mudou na v2.0: não existe mais geração aleatória de conteúdo. As dez
-ordens padrão são definidas no central (`central-computer/os_templates.py`,
+Por que este nome
+─────────────────
+Ele não monta mais o conteúdo das ordens — escolhe uma das dez ordens padrão e a
+despacha. O nome anterior descrevia uma geração que deixou de existir, e o
+resíduo de nomenclatura é o mesmo que motivou o rename do app de manutenção.
+
+"erp-simulator" e não "os-dispatcher" por duas razões. A primeira é de
+vocabulário: todos os outros simuladores desta planta são nomeados pelo que
+SUBSTITUEM (`cnc_simulator`, `dispenser_simulator`, `vision-simulator`,
+`weight-simulator`), e "dispatcher" nomearia o mecanismo — seria o único
+serviço batizado pelo COMO. A segunda é de arquitetura: este container não é uma
+peça do APSEN, é o sistema do hospital que manda a ordem para o APSEN. O nome
+diz de onde a OS vem, que é a informação que faltava — e o diretório já se
+chamou `sap_simulator`, ou seja, é a categoria do que sempre foi (SAP é um
+fornecedor; ERP é o papel).
+
+O que ele faz
+─────────────
+As dez ordens padrão são definidas no central (`central-computer/os_templates.py`,
 servidas por `GET /api/v1/ordens/templates`) e este serviço só decide QUAL
 delas dispara e QUANDO. Cada disparo instancia um `os_id` novo — o template é
 fixo, a chave primária não pode ser, porque `ordens.os_id` é UNIQUE e o central
 responde 409 a um reenvio.
 
-Para quem observa a planta, o comportamento continua o de antes: as OS chegam
-em intervalos regulares e não dá para prever qual vem. O que mudou é que o
-CONTEÚDO de cada uma é conhecido de antemão — que é o que permite ensaiar uma
-apresentação.
+Para quem observa a planta, o comportamento é o de um ERP em operação: as OS
+chegam em intervalos regulares e não dá para prever qual vem. O que mudou com as
+ordens padrão é que o CONTEÚDO de cada uma é conhecido de antemão — que é o que
+permite ensaiar uma apresentação.
 
 Por que os templates NÃO moram aqui: o console de operação do central precisa
 listar as dez e disparar a escolhida. Uma cópia local viraria duas listas
@@ -22,6 +40,10 @@ Este serviço também obedece ao interruptor do console: antes de cada envio ele
 consulta `GET /api/v1/gerador` e, se a resposta for `pausado`, espera. É como o
 operador assume o controle da planta sem competir com o automático — e sem que
 ninguém precise parar este container. Ver `central-computer/console.py`.
+
+A rota manteve o nome `/api/v1/gerador` de propósito: rename de serviço não é
+rename de rota, e a mesma regra valeu no rename do app de manutenção, cujas
+rotas `/manutencao/*` continuaram como estavam.
 """
 import logging
 import os
@@ -34,7 +56,7 @@ import requests
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [ORDER-GEN] %(levelname)s %(message)s",
+    format="%(asctime)s [ERP-SIM] %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -252,7 +274,12 @@ def _instanciar_os(template: dict, catalogo: dict) -> dict:
             for item in template["itens"]
         ],
         "criado_em":      _ts(),
-        "origem":         "ORDER_GEN_v2.0",
+        # Marca de PROVENIÊNCIA, gravada em `ordens.payload_json`. Ninguém a
+        # lê hoje; ela existe para quem for auditar de onde a OS veio.
+        # Acompanhou o rename: linhas antigas no banco guardam o valor
+        # anterior, que é o correto — elas foram criadas pelo serviço
+        # com o nome de então.
+        "origem":         "ERP_SIM_v2.1",
     }
 
 
@@ -327,7 +354,11 @@ def _esperar_vaga_na_fila() -> bool:
 # ── Pausa comandada pelo console ──────────────────────────────────────────────
 
 def _gerador_pausado() -> bool:
-    """O console pausou a geração automática?
+    """O console pausou a emissão automática de ordens?
+
+    O nome da função e o da rota (`/api/v1/gerador`) ficaram como estavam: rename
+    de serviço não é rename de contrato, e o `_estado["gerador_pausado"]` que o
+    console e o dashboard leem tem o mesmo dono do outro lado.
 
     Central mudo devolve False — "pode gerar". Mesma decisão de
     `_esperar_vaga_na_fila`: uma consulta auxiliar que falha não pode parar a
@@ -359,11 +390,11 @@ def _aguardar_retomada() -> None:
     """
     if not _gerador_pausado():
         return
-    logger.warning("[PAUSA] Geração automática PAUSADA pelo console. "
+    logger.warning("[PAUSA] Emissão automática PAUSADA pelo console. "
                    "Aguardando retomada (consulta a cada %ds).", ESPERA_PAUSA)
     while _gerador_pausado():
         time.sleep(ESPERA_PAUSA)
-    logger.info("[PAUSA] Geração automática retomada pelo console.")
+    logger.info("[PAUSA] Emissão automática retomada pelo console.")
 
 
 def _enviar_os(os_payload: dict) -> bool:
@@ -434,7 +465,7 @@ def main():
     templates     = _validar_templates(_carregar_templates(), catalogo)
     ultimo_reload = time.time()
 
-    logger.info("Order Generator v2.0 pronto — 1 das %d ordens padrão a cada %ds "
+    logger.info("ERP Simulator v2.1 pronto — 1 das %d ordens padrão a cada %ds "
                 "| catálogo com %d medicamentos | pausável pelo console",
                 len(templates), INTERVALO_OS, len(catalogo))
     for t in templates:
