@@ -85,7 +85,7 @@ há teste que falha se um `requests.post/put` aparecer lá. Um espelho que escre
 ### 1. Suba a célula
 
 ```bash
-docker compose up -d --build          # na raiz; ver "Build e deploy"
+docker compose --profile simulado up -d --build   # na raiz; ver "Build e deploy"
 ```
 
 Confira em <http://localhost:8000/console/prevoo> antes de seguir.
@@ -267,7 +267,7 @@ Agora **feche o monitor** (`Ctrl+C`) — ver o passo 5.
 ## 4. Suba a célula e o backend
 
 ```bash
-docker compose up -d --build                    # raiz; confira em /console/prevoo
+docker compose --profile simulado up -d --build   # raiz; confira em /console/prevoo
 ```
 
 ```bash
@@ -322,10 +322,23 @@ Uma linha JSON por mensagem, terminada em `\n`, 115200 baud:
 
 | direção | mensagens |
 |---|---|
-| display → backend | 9 `cmd`: `ping`, `get_ordens`, `get_catalogo`, `get_operadores`, `get_dispensers`, `validar_operador`, `set_status`, `sync_dispensers`, `set_dispenser_med` |
-| backend → display | 7 tags de `resp`: `pong`, `ordens`, `catalogo`, `operadores`, `dispensers`, `operador`, `ok` |
+| display → backend | 11 `cmd`: `ping`, `get_ordens`, `get_catalogo`, `get_operadores`, `get_dispensers`, `validar_operador`, `set_status`, `sync_dispensers`, `set_dispenser_med`, `get_trava`, `liberar_trava` |
+| backend → display | 8 tags de `resp`: `pong`, `ordens`, `catalogo`, `operadores`, `dispensers`, `operador`, `ok`, `trava` |
 | display → backend | 3 `event` (fire-and-forget): `historico`, `desvio`, `ordem_concluida` |
-| backend → display | 2 `push` (não solicitados): `ordem_status`, `dispensers` |
+| backend → display | 3 `push` (não solicitados): `ordem_status`, `dispensers`, `trava` |
+
+As mensagens da trava do Triple Check, por extenso:
+
+```
+display → backend   {"cmd":"get_trava"}
+backend → display   {"resp":"trava","ativa":bool,"os_id":str,"slot_id":int|null,"motivo":str,"ts":int}
+display → backend   {"cmd":"liberar_trava","nome":str,"pin":str}
+backend → display   {"resp":"ok","ok":bool,"msg":str}
+backend → display   {"push":"trava","ativa":bool,"os_id":str,"slot_id":int|null,"motivo":str}   ← só quando MUDA
+```
+
+As três decisões por trás desse contrato estão em
+[A trava do Triple Check no display](#a-trava-do-triple-check-no-display).
 
 Esse contrato é escrito **à mão em três lugares e duas linguagens** — firmware
 (C++), backend e simulador (Python). Divergir não quebra nada visivelmente: o
@@ -337,6 +350,102 @@ Por isso `tests/test_protocolo_serial.py` compara as três cópias e ainda checa
 em runtime, que o backend responde a cada comando — inclusive que **nenhuma
 resposta passa dos 4096 bytes** do `s2_buf` do firmware, porque a linha que não
 couber é descartada sem erro.
+
+## Perfil Supervisor e a liberação da trava
+
+O central para a fila inteira quando o Triple Check diverge, e só um humano a
+solta. A decisão de operação foi tomada: **o supervisor libera a trava pelo
+painel de bancada**, autenticado por PIN, tanto na web quanto no display de 7".
+
+Do lado do painel:
+
+| Perfil | Vê | Libera a trava? |
+|---|---|---|
+| `Admin` | tudo | **sim** |
+| `Supervisor` | dashboard e ordens | **sim** |
+| `PCP` / `PCM` | como antes | não |
+| `Operador` | só o display | não |
+
+A permissão é `trava_liberar`, em `PERMISSOES` no topo do `app.py`, e é
+conferida **no servidor** (`POST /trava/liberar` exige a sessão de um perfil
+que a tenha). Na web, o botão *Liberar trava* só aparece para quem pode —
+botão que o backend vai recusar não é botão desabilitado, é botão ausente, a
+mesma regra da ordem espelhada. O dashboard mostra a faixa vermelha com motivo,
+OS e slot para todos os perfis que entram na web.
+
+### Por que `central_comandos.py` existe separado
+
+O espelho de ordens e estoque continua de **mão única**: `central_client.py`
+só tem `GET`, e `tests/test_painel_ordens.py` reprova um `requests.post` lá
+dentro. A liberação da trava é a **única** escrita que o painel faz no central
+— deliberada, nomeada e num arquivo em que dá para ver todas as escritas de
+uma vez: `backend/central_comandos.py`. Ele:
+
+* autentica no central com uma **conta de serviço** (`PAINEL_CENTRAL_USER` /
+  `PAINEL_CENTRAL_SENHA`, um usuário com role `supervisor` criado pelo app de
+  manutenção), guarda o JWT (o central emite com 8 h) e refaz o login em 401;
+* manda `em_nome_de` com o nome de quem digitou o PIN na bancada. Sem isso,
+  toda liberação vinda daqui apareceria no log do central com o nome da conta
+  de serviço, e o rastro de QUEM liberou — o ponto inteiro de existir uma
+  trava — se perderia. O central grava `"<conta> (em nome de <nome>)"` em
+  `log_manutencao`;
+* **nunca levanta**, como o resto do painel: quem chama é a thread que serve a
+  tela que o operador está olhando.
+
+**Sem as duas variáveis, a liberação fica desligada com mensagem clara e o
+painel sobe** — a mesma divisão do `APSEN_API_TOKEN`: uma variável ausente
+derruba só o recurso, nunca a ponte serial. A leitura do estado da trava
+(`GET /api/v1/trava`, público no central) fica em `central_client.py`, com os
+outros GETs; só a escrita saiu de lá.
+
+A thread do espelho lê a trava no **mesmo ciclo** das ordens e do estoque, a
+cada `CENTRAL_SYNC_S`, e guarda o estado anterior: é a comparação entre os
+dois que decide quando empurrar o push ao display.
+
+## A trava do Triple Check no display
+
+O contrato está na tabela do protocolo acima. As três decisões:
+
+- **`liberar_trava` carrega `nome` + `pin`, em vez de usar o operador logado
+  no display.** O operador logado é um Operador; o supervisor é outra pessoa,
+  que chega à bancada, libera e vai embora — o mesmo desenho do
+  `validar_operador`. O display lista, no popup de liberação, os operadores com
+  perfil `Supervisor` ou `Admin` (a resposta de `get_operadores` traz
+  `perfil`), e o PIN entra pelo mesmo numpad do login.
+- **Quem confere o PIN é o backend, nunca o display** — igual ao
+  `validar_operador` e pelo mesmo motivo (ver [PIN de operador](#pin-de-operador)):
+  PIN de 4 dígitos são 10 mil candidatos, e hash só protege entrada que não dá
+  para enumerar. A resposta nunca carrega o PIN. O pedido custa hash (~300 ms)
+  + `POST` no central (`CENTRAL_TIMEOUT_S`, 3 s), então o firmware espera
+  **5 s** nele — a mesma janela do `validar_operador`, não os 800 ms de sempre.
+- **O push existe E o `get_trava` existe.** Push é uma linha serial, e linha
+  serial se perde num reset do ESP32 ou numa reconexão da porta — o mesmo
+  raciocínio de `fetch_ordens_api` refrescando ordem espelhada que já conhece.
+  O push sai da thread do espelho **só na transição** (estado igual não gera
+  push); `get_trava` cai num cache de 2 s (`TRAVA_CACHE_S`) pelo mesmo motivo
+  do cache de dispensers: o pedido roda dentro da ponte serial, e central lento
+  faria o display desistir antes de o backend ter a resposta.
+
+No firmware, o motivo é guardado em `MAX_MOTIVO_LEN` (256), dimensionado pela
+ORIGEM do dado: o orquestrador monta
+`"Triple Check FALHOU (n/3 fontes divergentes, limiar=x) — Dk: "` mais até três
+causas, e o pior caso real passa de 240 caracteres. O que não couber passa por
+`copy_trunc()` e termina em `...` — truncar de propósito e deixar rastro, nunca
+cortar em silêncio.
+
+Na tela: a trava abre uma tela própria com OS, slot e motivo; um badge `TRAVA`
+fica no cabeçalho enquanto ela durar (tocar nele reabre a tela); e o botão
+*Liberar (supervisor)* abre o numpad pedindo nome + PIN. Sem placa, o
+`simulador_serial.py` faz os dois papéis: responde `get_trava` e
+`liberar_trava` (PIN `4321` da "Supervisora Teste") e empurra um push de trava
+ativa, e depois liberada, no ciclo de comandos.
+
+> **O firmware em campo precisa ser regravado de novo.** O display que está
+> na bancada não conhece `get_trava`, `liberar_trava` nem o push `trava`: ele
+> descarta os três em silêncio e continua mostrando a fila como se a célula
+> estivesse rodando. Regrave (ver [Gravar e testar o display
+> físico](#gravar-e-testar-o-display-físico-esp32-s3)) — a gravação acumula com
+> as pendências anteriores (`os_id` longo e `validar_operador`).
 
 ## Segredos do painel
 
@@ -617,6 +726,7 @@ em 16 bytes), `origem` `central`, `local` e **ausente**, uma ordem em
 |---|---|
 | `app.py` | Rotas web, API, ponte serial, regras de estoque e lote |
 | `central_client.py` | Leitura do computador central. Só `GET` — ver o docstring |
+| `central_comandos.py` | A única escrita no central: liberar a trava, por conta de serviço, em nome do supervisor |
 | `templates/` | Telas (Jinja2 + Bootstrap) |
 | `apsen.db` | Banco. Recriado automaticamente se apagado. |
 | `desktop.py` | Empacotamento como app de desktop (opcional) |
@@ -638,8 +748,11 @@ guarda `MAX_ORDENS 5` e o central limita a fila a `MAX_FILA_OS 5` — o teto cas
 por construção. A lista traz `Pendente` **e** `Em Processo`; sem o segundo, o
 operador não veria no display a ordem que a célula está executando agora.
 
-**Perfis de acesso.** `Admin`, `PCP`, `PCM` e `Operador` — a matriz está em
-`PERMISSOES`, no topo do `app.py`. `Operador` não tem acesso web (só ao display).
+**Perfis de acesso.** `Admin`, `Supervisor`, `PCP`, `PCM` e `Operador` — a
+matriz está em `PERMISSOES`, no topo do `app.py`. `Operador` não tem acesso web
+(só ao display); `Supervisor` vê o dashboard e as ordens e é quem libera a
+trava do Triple Check (ver [Perfil Supervisor e a liberação da
+trava](#perfil-supervisor-e-a-liberação-da-trava)).
 
 **Estação de visão.** As rotas `/api/visao/*`, a tela `/visao` e as colunas
 `dispenser_visao`, `sku_visao`, `aruco_visao` e `unidades_por_caixa` existem e
@@ -666,9 +779,15 @@ cada tentativa de detecção, e ele nunca chegava a responder. Se mexer em
 `_probe_port`, **não volte ao `serial.Serial(porta)` direto.**
 
 **O display muda de porta COM sozinho.** Ao trocar de porta USB o Windows dá
-outro número e deixa a antiga como entrada fantasma (`Status: Unknown`). O
-backend varre todas as portas e acha sozinho — mas se for **regravar o
-firmware**, confira a porta atual antes.
+outro número e deixa a antiga como entrada fantasma (`Status: Unknown`). Sem
+`APSEN_DISPLAY_PORTA` o backend varre todas as portas e acha sozinho — mas se
+for **regravar o firmware**, confira a porta atual antes.
+
+**Na célula montada, fixe a porta.** `APSEN_DISPLAY_PORTA=COMx` faz o backend
+abrir só aquela porta e **não varrer**: com cinco placas no mini PC, cada
+processo que varre abre as portas dos outros por até 9,5 s e derruba o dono de
+verdade. A varredura é para desenvolvimento sem hardware. Ver o README, seção
+"Portas seriais na célula montada", e [DEPLOY_WINDOWS.md](DEPLOY_WINDOWS.md).
 
 **Processos órfãos.** Fechar o terminal nem sempre mata o Python. Se algo
 estranho acontecer com a porta, o primeiro palpite deve ser processo duplicado,

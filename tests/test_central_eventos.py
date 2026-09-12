@@ -658,3 +658,114 @@ def test_falha_de_leitura_nomeia_o_lado_na_descricao(carregar_central):
     _, tipo, descricao = alarme["args"]
     assert tipo == "falha_leitura_dispenser"
     assert "direita" in descricao
+
+
+# ── Telemetria da balança: o peso ao vivo chega ao estado e ao banco ─────────
+# `docs/PROTOCOLO_SERIAL.md` §5 declara o evento `telemetria` da balança com
+# `componente`, `temperatura_c`, `peso_atual_g` e `ts`. O handler gravava só a
+# temperatura, e `_estado["peso"]` só mudava em `peso_ok`, `peso_divergencia` e
+# `tara_ok`: `peso_atual_g` atravessava a placa, o adapter e o endpoint e
+# morria no handler. O peso ao vivo nunca chegava ao dashboard nem ao banco —
+# e é o dado que a bancada mais quer ver entre uma pesagem e outra.
+
+def _evento_peso(central, payload: dict) -> None:
+    asyncio.run(central.modulo._handle_evento_peso(payload))
+
+
+def _pesagem_de_slot(central) -> dict:
+    """Uma pesagem real, para que haja veredito no estado antes da telemetria."""
+    _evento_peso(central, {
+        "tipo": "peso_divergencia", "os_id": "OS-42", "slot_id": 3,
+        "peso_medido_g": 450.0, "peso_esperado_g": 500.0, "desvio_pct": 10.0,
+        "ts": "2026-09-12T10:00:00",
+    })
+    return dict(central.modulo._estado["peso"])
+
+
+def _telemetria_balanca(peso_atual_g: float = 123.4, ts: str = "2026-09-12T10:00:15") -> dict:
+    return {
+        "tipo": "telemetria", "componente": "hx711_balanca_mesa",
+        "temperatura_c": 24.7, "peso_atual_g": peso_atual_g, "ts": ts,
+    }
+
+
+def test_peso_atual_e_gravado_como_leitura_de_sensor(carregar_central):
+    """No mesmo padrão da temperatura: uma linha em `leituras_sensores`."""
+    central = carregar_central()
+
+    _evento_peso(central, _telemetria_balanca(peso_atual_g=123.4))
+
+    leituras = {c["args"][1]: c["args"] for c in central.banco.chamadas_de("salvar_leitura_sensor")}
+    assert leituras["temperatura"] == ("hx711_balanca_mesa", "temperatura", 24.7, "°C")
+    assert leituras["peso"] == ("hx711_balanca_mesa", "peso", 123.4, "g")
+
+
+def test_peso_atual_e_publicado_no_estado_em_campo_proprio(carregar_central):
+    central = carregar_central()
+
+    _evento_peso(central, _telemetria_balanca(peso_atual_g=123.4, ts="2026-09-12T10:00:15"))
+
+    peso = central.modulo._estado["peso"]
+    assert peso["peso_atual_g"] == 123.4
+    assert peso["peso_atual_ts"] == "2026-09-12T10:00:15"
+
+
+def test_telemetria_nao_toca_nos_campos_do_triple_check(carregar_central):
+    """O caso que passaria calado: telemetria desfazendo o veredito da pesagem.
+
+    `peso_medido_g`, `peso_esperado_g`, `desvio_pct`, `ultima_leitura`,
+    `slot_id` e `ts` são a última PESAGEM de slot — o que o Triple Check
+    decidiu e o que o cartão da balança mostra. A leitura contínua tem o seu
+    próprio par de campos e não pode encostar nesses: é a regra "fontes de
+    verdade" do README aplicada à balança.
+    """
+    central = carregar_central()
+    antes = _pesagem_de_slot(central)
+
+    _evento_peso(central, _telemetria_balanca(peso_atual_g=7.0, ts="2026-09-12T10:00:15"))
+
+    depois = central.modulo._estado["peso"]
+    for campo in ("ultima_leitura", "slot_id", "peso_medido_g",
+                  "peso_esperado_g", "desvio_pct", "ts"):
+        assert depois[campo] == antes[campo], campo
+    assert depois["ultima_leitura"] == "peso_divergencia"
+    assert depois["peso_atual_g"] == 7.0
+    assert depois["peso_atual_ts"] == "2026-09-12T10:00:15"
+
+
+def test_telemetria_sem_peso_nao_inventa_leitura(carregar_central):
+    """Placa antiga que só mande temperatura: nada de linha "peso" com zero."""
+    central = carregar_central()
+
+    _evento_peso(central, {"tipo": "telemetria", "componente": "hx711_balanca_mesa",
+                           "temperatura_c": 24.7, "ts": "2026-09-12T10:00:15"})
+
+    tipos = [c["args"][1] for c in central.banco.chamadas_de("salvar_leitura_sensor")]
+    assert tipos == ["temperatura"]
+    assert central.modulo._estado["peso"]["peso_atual_g"] is None
+
+
+def test_telemetria_da_balanca_continua_segurada_pelo_throttle(carregar_central,
+                                                                monkeypatch):
+    """Publicar no estado não pode contornar o throttle: telemetria é periódica."""
+    central = carregar_central()
+    assert "telemetria" in central.modulo._TIPOS_ALTA_FREQUENCIA
+    _evento_cnc(central, "movendo")          # consome a janela do throttle
+    enviados = _contar_broadcasts(central, monkeypatch)
+
+    for i in range(10):
+        _evento_peso(central, _telemetria_balanca(peso_atual_g=100.0 + i))
+
+    assert enviados == []
+    assert central.modulo._broadcast_pendente is True
+
+
+def test_pesagem_de_slot_continua_saindo_na_hora(carregar_central, monkeypatch):
+    """Controle: o que NÃO é telemetria não pode ter caído no throttle junto."""
+    central = carregar_central()
+    _evento_cnc(central, "movendo")
+    enviados = _contar_broadcasts(central, monkeypatch)
+
+    _pesagem_de_slot(central)
+
+    assert len(enviados) == 1

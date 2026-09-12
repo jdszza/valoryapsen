@@ -11,7 +11,8 @@ Novidades v3.2:
   - Triple Check: valida dispenser × câmera_mesa × balança após cada dispensa
     → 2+ divergências ativam trava de emergência (bloqueia OS)
   - GET /api/v1/trava — estado da trava
-  - POST /api/v1/admin/liberar-trava — libera trava (role admin)
+  - POST /api/v1/admin/liberar-trava — libera trava (role admin ou supervisor;
+    `em_nome_de` opcional registra quem liberou pela bancada)
   - GET /api/v1/visao/historico — histórico de leituras CV
   - POST /api/v1/eventos/peso — eventos da balança HX711
 
@@ -73,6 +74,7 @@ import os_templates
 from auth import criar_token, decodificar_token, verificar_senha
 from config import settings, validar_secret_key
 from database import (
+    ROLES_VALIDAS,
     atualizar_item_os, atualizar_status_ordem,
     get_historico_visao, salvar_leitura_visao,
     atualizar_usuario, criar_usuario, expurgar_dados_antigos, fechar_pool,
@@ -155,11 +157,23 @@ _estado = {
         "slot_id": None,
         "motivo":  "",
     },
-    # Última leitura da balança HX711
+    # Última leitura da balança HX711.
+    #
+    # Dois relógios convivem aqui, e eles NÃO se misturam. `ultima_leitura`,
+    # `slot_id`, `peso_medido_g`, `peso_esperado_g`, `desvio_pct` e `ts` são a
+    # última PESAGEM de slot (tara_ok / peso_ok / peso_divergencia) — é o que o
+    # Triple Check e o cartão da balança leem. `peso_atual_g` / `peso_atual_ts`
+    # são a leitura CONTÍNUA que a placa manda como `telemetria`, entre uma
+    # pesagem e outra. Telemetria só escreve no seu próprio par de campos:
+    # deixá-la encostar nos da pesagem faria o peso ao vivo apagar o veredito
+    # da última dispensa — a regra "fontes de verdade" do README, aplicada à
+    # balança.
     "peso": {
         "ultima_leitura":  None,
         "slot_id":         None,
         "ts":              None,
+        "peso_atual_g":    None,
+        "peso_atual_ts":   None,
     },
     # Última leitura de cada uma das TRÊS câmeras (atualizado por
     # _handle_evento_visao). Uma câmera por fileira de dispensers — que é o que
@@ -821,6 +835,23 @@ async def _handle_evento_peso(payload: dict):
             componente = payload.get("componente", "hx711_balanca_mesa")
             db_tasks.append((salvar_leitura_sensor,
                              (componente, "temperatura", payload.get("temperatura_c", 0), "°C")))
+            # `peso_atual_g` atravessava a placa, o adapter e o endpoint — e
+            # morria aqui: só a temperatura era gravada, e `_estado["peso"]`
+            # só mudava nas pesagens de slot. O peso ao vivo nunca chegava ao
+            # dashboard nem ao banco, e é o dado que a bancada mais quer ver
+            # entre uma pesagem e outra.
+            #
+            # Vai para o banco no mesmo padrão da temperatura (uma linha em
+            # `leituras_sensores`, tipo "peso") e para o estado num par de
+            # campos PRÓPRIO. Os campos da pesagem (`ultima_leitura`,
+            # `peso_medido_g`, `peso_esperado_g`, `desvio_pct`, `ts`) ficam
+            # intocados: telemetria não pode desfazer o fluxo.
+            peso_atual = payload.get("peso_atual_g")
+            if peso_atual is not None:
+                db_tasks.append((salvar_leitura_sensor,
+                                 (componente, "peso", peso_atual, "g")))
+                _estado["peso"]["peso_atual_g"]  = peso_atual
+                _estado["peso"]["peso_atual_ts"] = payload.get("ts")
 
     for fn, args in db_tasks:
         await _db(fn, *args)
@@ -976,7 +1007,7 @@ _TAGS_META = [
     {"name": "Manutenção",
      "description": "Sensores, log, alarmes e limpeza de dispenser. Exige JWT de técnico."},
     {"name": "Triple Check",
-     "description": "Trava de emergência. 1 fonte divergente já trava (`TRIPLE_CHECK_MIN_DIVERGENCIAS`); liberar exige role admin."},
+     "description": "Trava de emergência. 1 fonte divergente já trava (`TRIPLE_CHECK_MIN_DIVERGENCIAS`); liberar exige role admin ou supervisor."},
     {"name": "Usuários",
      "description": "Gestão de técnicos. Exige role admin."},
 ]
@@ -1074,6 +1105,43 @@ def _get_admin(user=Depends(_get_tecnico)):
     return user
 
 
+# Portão da trava do Triple Check. É um portão à PARTE, e não um afrouxamento
+# de `_get_admin`: a gestão de usuários continua só admin. O docstring de
+# `liberar_trava` prometia "admin ou supervisor" desde sempre, e a role
+# "supervisor" não existia em lugar nenhum do central — a documentação mentia.
+# Hoje ela existe (ver `database.ROLES_VALIDAS`), e é o perfil de quem chega à
+# bancada, libera e vai embora: o supervisor da operação, autenticado por PIN
+# no painel de bancada e no display de 7", que chamam este endpoint por uma
+# conta de serviço com esta role.
+#
+# A role continua vindo do BANCO a cada requisição (`_get_tecnico`), nunca do
+# token.
+_ROLES_QUE_LIBERAM_TRAVA = frozenset({"admin", "supervisor"})
+
+
+def _get_supervisor_ou_admin(user=Depends(_get_tecnico)):
+    if user.get("role") not in _ROLES_QUE_LIBERAM_TRAVA:
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "Requer perfil admin ou supervisor")
+    return user
+
+
+def _validar_role(role: str) -> None:
+    """400, e não gravado: role desconhecida criaria um usuário sem acesso a
+    nada e sem erro em lugar nenhum. O vocabulário mora em `database.py`.
+
+    Compara com a TUPLA `ROLES_VALIDAS`, e não com `database.role_valida`: a
+    suíte troca toda função de `database` por um duplo que devolve None, e
+    uma validação que passasse por função viraria 400 para toda role — o teste
+    de "role válida é aceita" pegaria, mas só depois de meia hora de espanto.
+    """
+    if not isinstance(role, str) or role not in ROLES_VALIDAS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"role inválida: {role!r}. Válidas: {', '.join(ROLES_VALIDAS)}",
+        )
+
+
 # ── Pydantic Models ────────────────────────────────────────────────────────────
 class LoginReq(BaseModel):
     username: str
@@ -1101,6 +1169,50 @@ class UsuarioUpdateReq(BaseModel):
     nome_completo: Optional[str] = None
     role: Optional[str] = None
     nova_senha: Optional[str] = None
+
+
+class LiberarTravaReq(BaseModel):
+    """Corpo OPCIONAL de `POST /api/v1/admin/liberar-trava`.
+
+    `em_nome_de` é quem de fato liberou, quando a chamada vem por uma conta de
+    serviço — o painel de bancada e o display de 7" autenticam o supervisor por
+    PIN e falam com o central com a conta deles. Sem este campo toda liberação
+    vinda da bancada apareceria no log com o nome da conta de serviço, e o
+    rastro de QUEM liberou — que é o ponto inteiro de existir uma trava — se
+    perderia.
+    """
+    em_nome_de: Optional[str] = None
+
+
+# Teto do `em_nome_de`. O valor vai para o log e para `log_manutencao.tecnico`
+# (VARCHAR(100)), ao lado do username: 60 deixa folga para os dois.
+EM_NOME_DE_MAX = 60
+
+
+def _sanitizar_em_nome_de(valor) -> Optional[str]:
+    """Nome de quem liberou, pronto para o log e para o banco — ou None.
+
+    Caractere não imprimível (quebra de linha, tab, controle) vira espaço e o
+    espaço é colapsado: uma quebra de linha aqui faria o nome se passar por
+    DUAS linhas de log, e a segunda por uma entrada que ninguém escreveu. O
+    corte em `EM_NOME_DE_MAX` é truncamento, não recusa: um nome longo demais
+    não pode ser o que impede um supervisor de liberar a produção.
+    """
+    if not isinstance(valor, str):
+        return None
+    limpo = "".join(ch if ch.isprintable() else " " for ch in valor)
+    limpo = " ".join(limpo.split())
+    return limpo[:EM_NOME_DE_MAX] or None
+
+
+def _identificar_liberacao(sub: str, em_nome_de=None) -> str:
+    """O `liberado_por` gravado: `sub`, ou `sub (em nome de X)`.
+
+    Sem `em_nome_de` o resultado é exatamente o de antes deste campo existir:
+    só o username de quem chamou.
+    """
+    nome = _sanitizar_em_nome_de(em_nome_de)
+    return f"{sub} (em nome de {nome})" if nome else sub
 
 
 class NovaOSReq(BaseModel):
@@ -1867,37 +1979,61 @@ def get_trava():
 @app.post("/api/v1/admin/liberar-trava", tags=["Triple Check"],
     responses={
         401: {"description": "Token ausente, inválido, ou usuário desativado no banco."},
-        403: {"description": "Requer role admin (a role vem do banco, não do token)."},
+        403: {"description": "Requer role admin ou supervisor (a role vem do banco, não do token)."},
         409: {"description": "Nenhuma trava ativa no momento."},
     })
-async def liberar_trava(user=Depends(_get_admin)):
+async def liberar_trava(req: Optional[LiberarTravaReq] = None,
+                        user=Depends(_get_supervisor_ou_admin)):
     """
     Libera a trava de Triple Check. Exige role admin ou supervisor.
     A OS retoma de onde parou após a liberação.
+
+    Corpo opcional `{"em_nome_de": "<nome>"}`: quando a chamada vem por uma
+    conta de serviço (painel de bancada, display de 7"), é o nome do
+    supervisor que digitou o PIN — o `liberado_por` gravado vira
+    `"<conta> (em nome de <nome>)"`. Sem o campo, o comportamento é o de
+    sempre: só o username de quem chamou.
     """
-    if not await _liberar_trava(user["sub"]):
+    liberado_por = _identificar_liberacao(
+        user["sub"], req.em_nome_de if req is not None else None,
+    )
+    if not await _liberar_trava(liberado_por):
         raise HTTPException(status_code=409, detail="Nenhuma trava ativa no momento.")
-    return {"ok": True, "liberado_por": user["sub"]}
+    return {"ok": True, "liberado_por": liberado_por}
 
 
 async def _liberar_trava(liberado_por: str) -> bool:
     """Liberação da trava: soltar o evento, limpar o snapshot, publicar.
 
     Extraído porque existem DOIS portões para a mesma ação — este endpoint
-    (JWT de admin, usado pelo app de manutenção) e o console de operação, que
-    tem sessão própria. Cada um autentica do seu jeito; o que acontece depois
-    tem que ser idêntico, e duas cópias divergiriam justamente no passo fácil
-    de esquecer — o `_estado["trava"]` que o dashboard lê. Sem ele, a faixa
-    vermelha continuaria na tela com a OS já rodando.
+    (JWT de admin ou supervisor, usado pelo app de manutenção e pelo painel de
+    bancada) e o console de operação, que tem sessão própria. Cada um
+    autentica do seu jeito; o que acontece depois tem que ser idêntico, e duas
+    cópias divergiriam justamente no passo fácil de esquecer — o
+    `_estado["trava"]` que o dashboard lê. Sem ele, a faixa vermelha
+    continuaria na tela com a OS já rodando.
 
     Devolve False quando não havia trava ativa; quem chama traduz para o 409.
     """
+    trava = orch.get_trava_estado()
     if not await asyncio.to_thread(orch.liberar_trava, liberado_por):
         return False
     _log("trava", f"Trava liberada por {liberado_por}")
     with _lock:
         _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
     _broadcast_estado()
+    # A trilha de QUEM liberou vai para `log_manutencao`, que é o registro de
+    # quem mexeu no equipamento (o mesmo do reset e da limpeza manual). Até
+    # aqui a liberação só existia numa linha de log de processo — e é ela, não
+    # a ativação, que diz quem assumiu a responsabilidade pela OS que seguiu.
+    # `tecnico` é VARCHAR(100); o `liberado_por` cabe por construção
+    # (`EM_NOME_DE_MAX`), e o corte é só cinto sobre suspensório.
+    await _db(
+        salvar_manutencao, "trava_liberada", "triple_check",
+        f"Trava da OS {trava.get('os_id')} (slot D{trava.get('slot_id')}) "
+        f"liberada por {liberado_por}. Motivo: {trava.get('motivo') or ''}",
+        liberado_por[:100],
+    )
     return True
 
 
@@ -1960,8 +2096,10 @@ def listar_usuarios(user=Depends(_get_admin)):
     return get_usuarios()
 
 
-@app.post("/manutencao/usuarios", tags=["Usuários"])
+@app.post("/manutencao/usuarios", tags=["Usuários"],
+    responses={400: {"description": "role fora de `ROLES_VALIDAS` — nada é gravado."}})
 def criar_novo_usuario(req: UsuarioReq, user=Depends(_get_admin)):
+    _validar_role(req.role)
     resultado = criar_usuario(req.username, req.senha, req.nome_completo, req.role)
     if not resultado.get("ok"):
         raise HTTPException(409, resultado.get("erro", "Erro ao criar usuário"))
@@ -1970,6 +2108,8 @@ def criar_novo_usuario(req: UsuarioReq, user=Depends(_get_admin)):
 
 @app.put("/manutencao/usuarios/{username}", tags=["Usuários"])
 def editar_usuario(username: str, req: UsuarioUpdateReq, user=Depends(_get_admin)):
+    if req.role is not None:
+        _validar_role(req.role)
     resultado = atualizar_usuario(username, req.nome_completo, req.role, req.nova_senha)
     if not resultado.get("ok"):
         raise HTTPException(400, resultado.get("erro", "Erro ao atualizar"))

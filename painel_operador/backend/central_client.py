@@ -132,3 +132,17 @@ def dispensers_estado() -> list:
     """Uma linha por slot físico da célula: quem manda no estoque é quem o mede."""
     dados = _get("/dispensers/estado")
     return dados if isinstance(dados, list) else []
+
+
+def trava_estado() -> dict | None:
+    """A trava do Triple Check, como o central a publica (`GET /api/v1/trava`,
+    sem autenticação). `None` = central sem responder — que é diferente de
+    "sem trava", e quem chama precisa distinguir os dois.
+
+    A LEITURA mora aqui, junto com os outros GETs. A ESCRITA (liberar a trava)
+    não mora, de propósito: ela é a única exceção ao espelho de mão única e
+    vive sozinha em `central_comandos.py`, onde dá para ver todas as escritas
+    de uma vez.
+    """
+    dados = _get("/api/v1/trava")
+    return dados if isinstance(dados, dict) else None

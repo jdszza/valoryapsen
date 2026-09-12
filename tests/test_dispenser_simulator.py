@@ -211,3 +211,15 @@ def test_get_status_slot_individual_responde_sem_travar(disp):
     assert terminou, "GET /status/{slot_id} travou"
     assert resposta["dispenser_id"] == SLOT
     assert resposta["quantidade"] == 5
+
+
+def test_estado_celula_tem_rota_e_so_loga(disp):
+    """A perna de cima não pode saber qual transporte está embaixo: sem esta
+    rota o http tomaria 404 (recusa determinística) enquanto a placa das telas
+    de verdade, por serial, funciona. O simulador é os mecanismos — sem tela,
+    sem evento."""
+    req = disp.modulo.EstadoCelulaReq(trava_ativa=True, trava_slot_id=3,
+                                      os_id="OS-1", trava_resumo="divergência de peso")
+    resposta = disp.modulo.executar_estado_celula(req)
+    assert resposta["ok"] is True
+    assert disp.eventos == []

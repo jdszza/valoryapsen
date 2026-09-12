@@ -163,14 +163,23 @@ def liberar_trava(liberado_por: str) -> bool:
         _loop.call_soon_threadsafe(_trava_evento.set)
     else:
         _trava_evento.set()
+    # As telas dos slots voltam ao normal. Agendado, não esperado: esta função
+    # roda numa thread (`to_thread`, a partir do endpoint) e a resposta ao
+    # supervisor não pode depender da placa das telas.
+    _agendar_aviso_telas(False, None, None, "")
     return True
 
 
-async def _ativar_trava(os_id: str, slot_id: Optional[int], motivo: str) -> asyncio.Event:
+async def _ativar_trava(os_id: str, slot_id: Optional[int], motivo: str,
+                        resumo: str = "") -> asyncio.Event:
     """
     Ativa a trava de erro: suspende a OS até intervenção de supervisor.
     Retorna o Event que será aguardado pelo orquestrador.
     Deve ser chamado DENTRO do event loop (é async).
+
+    `resumo` é a categoria da divergência que vai às telas TFT dos slots
+    (teto de TRAVA_RESUMO_MAX) — nunca o `motivo` formatado, que é do display
+    de 7" e da web, onde o supervisor decide.
     """
     global _trava_ativa, _trava_evento, _trava_motivo, _trava_slot_id, _trava_os_id
     # PRIMEIRO o estado interno, DEPOIS a publicação. `liberar_trava` responde
@@ -197,6 +206,11 @@ async def _ativar_trava(os_id: str, slot_id: Optional[int], motivo: str) -> asyn
                 "slot_id": slot_id,
                 "motivo":  motivo,
             }
+    # As telas dos slots — agendado ANTES do broadcast e sem esperar: o aviso
+    # corre em paralelo (uma placa de telas fora do ar não segura nada aqui),
+    # e ficar na frente do broadcast garante a ORDEM: se a liberação vier no
+    # instante do broadcast, o aviso de "liberada" sai depois do de "ativa".
+    _agendar_aviso_telas(True, slot_id, os_id, resumo)
     # Avisa todos os clientes conectados (dashboard, manut_web) via WebSocket
     if _broadcast_fn:
         _broadcast_fn()
@@ -367,6 +381,10 @@ class ResultadoTripleCheck(NamedTuple):
     divergencias: list[str]
     fontes_indisponiveis: list[str]
     limiar: int
+    # A CATEGORIA de cada divergência, na mesma ordem de `divergencias`
+    # ("dispenser divergente", "contagem divergente", "divergência de peso").
+    # É daqui — e não do texto — que sai o `trava_resumo` das telas TFT.
+    categorias: tuple = ()
 
 
 def avaliar_triple_check(
@@ -408,6 +426,7 @@ def avaliar_triple_check(
     )
 
     divergencias: list[str] = []
+    categorias: list[str] = []
     indisponiveis: list[str] = []
 
     # Fonte 1 — dispenser (sempre presente: sem o evento a OS já teria abortado)
@@ -415,6 +434,7 @@ def avaliar_triple_check(
         divergencias.append(
             f"dispenser: dispensou {quantidade_dispensada} de {quantidade_esperada} esperados"
         )
+        categorias.append("dispenser divergente")
 
     # Fonte 2 — câmera da mesa
     if resultado_mesa is None:
@@ -422,6 +442,7 @@ def avaliar_triple_check(
     elif resultado_mesa.get("tipo") == "leitura_mesa_divergencia":
         det = resultado_mesa.get("quantidade_detectada", "?")
         divergencias.append(f"câmera_mesa: detectou {det} de {quantidade_esperada}")
+        categorias.append("contagem divergente")
     elif resultado_mesa.get("tipo") == "leitura_mesa_falha":
         indisponiveis.append("câmera_mesa: falha de leitura")
 
@@ -431,6 +452,7 @@ def avaliar_triple_check(
     elif resultado_peso.get("tipo") == "peso_divergencia":
         desvio = resultado_peso.get("desvio_pct") or 0
         divergencias.append(f"balança: desvio={desvio:.1f}%")
+        categorias.append("divergência de peso")
     elif resultado_peso.get("tipo") == "erro_sensor":
         indisponiveis.append("balança: sensor indisponível")
 
@@ -439,6 +461,7 @@ def avaliar_triple_check(
         divergencias=divergencias,
         fontes_indisponiveis=indisponiveis,
         limiar=limiar,
+        categorias=tuple(categorias),
     )
 
 
@@ -546,6 +569,85 @@ async def _post(url: str, payload: dict, timeout: float = 10.0) -> bool:
         if tentativa < _TENTATIVAS_POST - 1:
             await asyncio.sleep(_ESPERA_ENTRE_POSTS_S)
     return False
+
+
+# ── Aviso à célula: as 8 telas TFT, pelo dispenser-adapter ────────────────────
+#
+# UMA tentativa, timeout curto, sem retry — e NUNCA por `_post`: ele retenta
+# 3× com sleep(1) e timeout de 10 s, e uma placa de telas fora do ar
+# acrescentaria até ~32 s ao caminho da trava, que é justamente o momento em
+# que a tela tem que mudar na hora. Falha aqui NUNCA muda o fluxo da OS: não
+# aborta, não propaga exceção, não entra no veredito do Triple Check e não
+# atrasa o `_broadcast_fn` que o dashboard espera — loga e segue. Tela é
+# cosmética; a trava, não.
+TIMEOUT_AVISO_TELAS_S = 3.0
+
+# Teto do `trava_resumo` que vai às telas (docs/PROTOCOLO_SERIAL.md §6). Ele
+# sai da CATEGORIA da divergência, nunca da string `motivo` formatada — o texto
+# é para humano e vai mudar; a categoria é dado do veredito.
+TRAVA_RESUMO_MAX = 48
+
+
+def resumo_da_trava(veredito: "ResultadoTripleCheck") -> str:
+    """A categoria da PRIMEIRA divergência do veredito, no teto das telas.
+
+    Derivado de `ResultadoTripleCheck.categorias`, não de regex sobre o
+    `motivo`: o motivo é montado para gente ler e vai mudar de formato; a
+    categoria é o dado que já estava no veredito.
+    """
+    categoria = veredito.categorias[0] if veredito.categorias else "divergência"
+    return categoria[:TRAVA_RESUMO_MAX]
+
+
+async def _avisar_telas(trava_ativa: bool, slot_id: Optional[int],
+                        os_id: Optional[str], resumo: str) -> bool:
+    """POST único em `/comandos/estado-celula`. Nunca levanta; devolve se chegou."""
+    if _client is None:
+        return False
+    payload = {
+        "trava_ativa":   bool(trava_ativa),
+        "trava_slot_id": slot_id,
+        "os_id":         os_id or "",
+        "trava_resumo":  (resumo or "")[:TRAVA_RESUMO_MAX],
+    }
+    url = settings.DISPENSER_ADAPTER_URL + "/comandos/estado-celula"
+    try:
+        r = await _client.post(url, json=payload, timeout=TIMEOUT_AVISO_TELAS_S)
+    except Exception as exc:  # noqa: BLE001 — cosmético: loga e segue
+        logger.warning("[TELAS] estado-celula não entregue (%s) — as telas ficam "
+                       "desatualizadas até o próximo aviso.", exc)
+        return False
+    if r.status_code >= 300:
+        logger.warning("[TELAS] estado-celula → HTTP %d — as telas ficam "
+                       "desatualizadas até o próximo aviso.", r.status_code)
+        return False
+    try:
+        telas = (r.json() or {}).get("telas")
+    except Exception:  # noqa: BLE001 — corpo não é JSON: o status já disse que chegou
+        telas = None
+    if telas and telas != "ok":
+        logger.warning("[TELAS] estado-celula aceito pelo adapter, telas=%s", telas)
+    return True
+
+
+def _agendar_aviso_telas(trava_ativa: bool, slot_id: Optional[int],
+                         os_id: Optional[str], resumo: str) -> None:
+    """Dispara `_avisar_telas` SEM esperar por ele.
+
+    Serve de dentro do event loop (`_ativar_trava`) e de fora dele
+    (`liberar_trava`, que o main chama por `to_thread`). Não esperar é o que
+    mantém a ativação da trava na casa de milissegundos com o adapter fora do
+    ar — o aviso corre em paralelo, e a trava já está armada e publicada.
+    """
+    coro = _avisar_telas(trava_ativa, slot_id, os_id, resumo)
+    if _loop is not None and not _loop.is_closed():
+        asyncio.run_coroutine_threadsafe(coro, _loop)
+        return
+    try:
+        asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        coro.close()
+        logger.debug("[TELAS] sem event loop — aviso de trava descartado")
 
 
 def _injecao_para(comando: str, slot_id: int) -> dict:
@@ -1011,7 +1113,8 @@ async def _processar_os(os_payload: dict):
         # `_ativar_trava` arma o estado interno e só então publica em
         # `_estado["trava"]` — publicar aqui antes reabriria a janela em que a
         # tela mostra trava que `liberar_trava` ainda não reconhece.
-        evento_lib = await _ativar_trava(os_id, a_err["dispenser_id"], motivo)
+        evento_lib = await _ativar_trava(os_id, a_err["dispenser_id"], motivo,
+                                         resumo="SKU errado")
         logger.warning(
             "[ORCH] Aguardando operador corrigir dispenser D%d (OS %s)…",
             a_err["dispenser_id"], os_id,
@@ -1220,7 +1323,8 @@ async def _processar_os(os_payload: dict):
             # Mesma ordem do bloco de SKU errado: `_ativar_trava` arma o estado
             # interno antes de publicar. Aguarda liberação manual por
             # supervisor/admin — bloqueia aqui.
-            evento_liberacao = await _ativar_trava(os_id, disp_id, motivo_trava)
+            evento_liberacao = await _ativar_trava(os_id, disp_id, motivo_trava,
+                                                   resumo=resumo_da_trava(veredito))
             logger.warning("[ORCH] Aguardando liberação da trava (OS %s, D%d)…", os_id, disp_id)
             await evento_liberacao.wait()
             logger.info("[ORCH] Trava liberada. Retomando OS %s a partir de D%d.", os_id, disp_id)
@@ -1369,6 +1473,9 @@ async def resetar_planta(limpar_historico_tambem: bool = False) -> dict:
     _trava_slot_id = None
     _trava_os_id = None
     injecao.desarmar()
+    # As telas dos slots ficam sabendo que a trava saiu. Aqui dá para esperar:
+    # o reset não é caminho de OS, e o teto é TIMEOUT_AVISO_TELAS_S.
+    await _avisar_telas(False, None, "", "")
 
     # 3. Estoque FÍSICO dos slots. Comandar a limpeza de verdade é o ponto: só
     #    zerar `_estado["dispensers"]` deixaria o medicamento dentro do

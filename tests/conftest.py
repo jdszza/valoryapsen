@@ -113,9 +113,17 @@ ADAPTERS = [
     ("weight",    "weight-adapter",    "/api/v1/eventos/peso"),
 ]
 
-# Os três que ganharam firmware. O `vision-adapter` ficou de fora da migração
-# serial: a visão continua por HTTP.
-ADAPTERS_SERIAIS = ["dispenser", "cnc", "weight"]
+# Os subsistemas com firmware serial. O `vision-adapter` ficou de fora da
+# migração serial: a visão continua por HTTP. O `dispenser_tft` (as 8 telas
+# TFT) é a SEGUNDA porta do dispenser-adapter — mesmo `main.py`, outro
+# `LinkSerial` —, e por isso não é um quinto adapter em `ADAPTERS`.
+ADAPTERS_SERIAIS = ["dispenser", "cnc", "weight", "dispenser_tft"]
+
+# Pasta de cada subsistema serial. Uma tabela só, derivada de `ADAPTERS`, para
+# que `test_serial_link.py` e `test_protocolo_placas.py` não carreguem cada um
+# a sua cópia do mapa.
+PASTA_DO_ADAPTER = {nome: pasta for nome, pasta, _ in ADAPTERS}
+PASTA_DO_ADAPTER["dispenser_tft"] = "dispenser-adapter"
 
 
 # ── Duplo de `requests` ────────────────────────────────────────────────────────
@@ -286,7 +294,7 @@ def carregar_adapter(monkeypatch):
     carregados: list[Path] = []
 
     def _carregar(nome: str, env: dict[str, str] | None = None):
-        pasta = next(p for n, p, _ in ADAPTERS if n == nome)
+        pasta = PASTA_DO_ADAPTER[nome]
         diretorio = RAIZ_REPO / pasta
         caminho = diretorio / "main.py"
 
@@ -405,10 +413,15 @@ class CentralFake:
     timeout ou uma conexão recusada fazem depois de passarem pelo try/except.
     """
 
-    def __init__(self, ordens=None, detalhes=None, dispensers=None):
+    def __init__(self, ordens=None, detalhes=None, dispensers=None, trava=None):
         self.ordens = list(ordens or [])
         self.detalhes = dict(detalhes or {})
         self.dispensers = list(dispensers or [])
+        # `GET /api/v1/trava` como o central a publica. O default é "sem trava",
+        # que é o estado de boot da célula.
+        self.trava = dict(trava) if trava is not None else {
+            "ativa": False, "os_id": None, "slot_id": None, "motivo": "",
+        }
         self.fora_do_ar = False
         self.caminhos: list[str] = []
 
@@ -420,6 +433,8 @@ class CentralFake:
             return self.ordens
         if caminho == "/dispensers/estado":
             return self.dispensers
+        if caminho == "/api/v1/trava":
+            return self.trava
         if caminho == "/estado":
             return {"ok": True}
         if caminho == "/os/ativa":
@@ -513,7 +528,8 @@ def carregar_painel(monkeypatch, tmp_path):
     modulos_antes = set(sys.modules)
 
     def _carregar(ordens_central=None, detalhes_central=None,
-                  dispensers_central=None, env=None) -> PainelCarregado:
+                  dispensers_central=None, env=None,
+                  trava_central=None) -> PainelCarregado:
         db_path = tmp_path / "painel.db"
         monkeypatch.setenv("APSEN_DB", str(db_path))
         for chave, valor in (env or {}).items():
@@ -541,7 +557,8 @@ def carregar_painel(monkeypatch, tmp_path):
         monkeypatch.setitem(sys.modules, "apsen_painel_app", modulo)
         spec.loader.exec_module(modulo)
 
-        central = CentralFake(ordens_central, detalhes_central, dispensers_central)
+        central = CentralFake(ordens_central, detalhes_central, dispensers_central,
+                              trava_central)
         monkeypatch.setattr(modulo.central_client, "_get", central.get)
         modulo.app.config["TESTING"] = True
 

@@ -1326,7 +1326,28 @@ def get_usuarios() -> list:
             return _rows(cur.fetchall())
 
 
+# Vocabulário FECHADO de `usuarios.role`. A coluna é VARCHAR(30) sem CHECK, e
+# até aqui qualquer texto entrava: um typo no app de manutenção criava um
+# usuário sem acesso a nada, sem erro em lugar nenhum — o técnico só descobria
+# ao tomar 403 em tudo.
+#
+#   admin       — gestão de usuários, e libera a trava do Triple Check;
+#   supervisor  — libera a trava do Triple Check (pelo app, pelo painel de
+#                 bancada ou pelo display de 7"), e nada de gestão de usuários;
+#   manutencao  — técnico: lê e registra manutenção, não libera trava.
+#
+# Quem valida na borda é `main.py` (400 antes de chegar aqui); a checagem
+# abaixo é a última linha, para quem chamar estas funções direto.
+ROLES_VALIDAS = ("admin", "supervisor", "manutencao")
+
+
+def role_valida(role) -> bool:
+    return isinstance(role, str) and role in ROLES_VALIDAS
+
+
 def criar_usuario(username: str, senha: str, nome_completo: str, role: str = "manutencao") -> dict:
+    if not role_valida(role):
+        return {"ok": False, "erro": f"role invalida: {role!r} (validas: {', '.join(ROLES_VALIDAS)})"}
     with _conn() as conn:
         with conn.cursor() as cur:
             try:
@@ -1344,6 +1365,8 @@ def atualizar_usuario(username: str, nome_completo: str = None, role: str = None
     if nome_completo is not None:
         updates.append("nome_completo=%s"); vals.append(nome_completo)
     if role is not None:
+        if not role_valida(role):
+            return {"ok": False, "erro": f"role invalida: {role!r} (validas: {', '.join(ROLES_VALIDAS)})"}
         updates.append("role=%s"); vals.append(role)
     if nova_senha is not None:
         updates.append("senha_hash=%s"); vals.append(hash_senha(nova_senha))

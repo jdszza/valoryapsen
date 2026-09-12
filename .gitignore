@@ -60,3 +60,4 @@ CLAUDE.md
 
 # Banco da bancada (contem PINs de operador) — nunca versionar
 painel_operador/backend/apsen.db
+TASKS*.md

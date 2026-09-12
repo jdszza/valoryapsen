@@ -34,18 +34,29 @@ from pathlib import Path
 
 import pytest
 
-from conftest import ADAPTERS, ADAPTERS_SERIAIS
+from conftest import ADAPTERS_SERIAIS, PASTA_DO_ADAPTER
 from fakes.placa_cnc import PlacaCNC
 from fakes.placa_dispenser import PlacaDispenser
+from fakes.placa_dispenser_tft import PlacaDispenserTFT
 from fakes.placa_weight import PlacaWeight
 
 RAIZ_REPO = Path(__file__).resolve().parent.parent
 DOC = RAIZ_REPO / "docs" / "PROTOCOLO_SERIAL.md"
-PASTA = {nome: pasta for nome, pasta, _ in ADAPTERS}
-PLACAS = {"dispenser": PlacaDispenser, "cnc": PlacaCNC, "weight": PlacaWeight}
+PASTA = PASTA_DO_ADAPTER
+PLACAS = {"dispenser": PlacaDispenser, "cnc": PlacaCNC, "weight": PlacaWeight,
+          "dispenser_tft": PlacaDispenserTFT}
 
 # Seção do documento que descreve cada subsistema.
-SECAO = {"dispenser": "## 3.", "cnc": "## 4.", "weight": "## 5."}
+SECAO = {"dispenser": "## 3.", "cnc": "## 4.", "weight": "## 5.",
+         "dispenser_tft": "## 6."}
+
+# Onde cada subsistema declara, DENTRO do módulo do adapter, os comandos que
+# manda e a função por onde eles saem. O `dispenser_tft` é a segunda porta do
+# dispenser-adapter: mesmo arquivo, outra tabela (`_COMANDOS_TFT`) e outra
+# função de envio (`_enviar_tft`) — os dois lados do arquivo são lidos em
+# separado, senão o `slot` das telas apareceria como comando dos mecanismos.
+TABELA_DE_COMANDOS = {"dispenser_tft": "_COMANDOS_TFT"}     # default: _ROTAS_SIM
+FUNCAO_DE_ENVIO = {"dispenser_tft": "_enviar_tft"}          # default: _enviar
 
 
 @pytest.fixture(scope="module")
@@ -117,10 +128,11 @@ def adapter_comandos(subsistema: str) -> set[str]:
     """Chaves de `_ROTAS_SIM` — o nome do comando é o mesmo nos dois transportes."""
     fonte = (RAIZ_REPO / PASTA[subsistema] / "main.py").read_text(encoding="utf-8")
     arvore = ast.parse(fonte)
+    tabela = TABELA_DE_COMANDOS.get(subsistema, "_ROTAS_SIM")
     for no in ast.walk(arvore):
         if (isinstance(no, ast.Assign) and no.targets
                 and isinstance(no.targets[0], ast.Name)
-                and no.targets[0].id == "_ROTAS_SIM"):
+                and no.targets[0].id == tabela):
             return {c.value for c in no.value.keys}
     return set()
 
@@ -134,10 +146,11 @@ def adapter_campos_enviados(subsistema: str) -> dict[str, set[str]]:
     """
     fonte = (RAIZ_REPO / PASTA[subsistema] / "main.py").read_text(encoding="utf-8")
     arvore = ast.parse(fonte)
+    funcao = FUNCAO_DE_ENVIO.get(subsistema, "_enviar")
     enviados: dict[str, set[str]] = {}
     for no in ast.walk(arvore):
         if not (isinstance(no, ast.Call) and isinstance(no.func, ast.Name)
-                and no.func.id == "_enviar" and len(no.args) == 2):
+                and no.func.id == funcao and len(no.args) == 2):
             continue
         alvo, payload = no.args
         if not isinstance(alvo, ast.Constant):
@@ -191,13 +204,23 @@ EXEMPLOS_DE_COMANDO = {
         "pesar": {"os_id": "OS-1", "slot_id": 1, "quantidade_esperada": 10,
                   "quantidade_real": 10, "peso_unitario_g": 50.0},
     },
+    "dispenser_tft": {
+        "slot": {"dispenser_id": 1, "medicamento": "Dipirona 500mg",
+                 "sku": "APSEN-001", "categoria": "analgesico",
+                 "quantidade_alvo": 10, "quantidade_dispensada": 0,
+                 "quantidade_residual": 0, "status": "carregando", "os_id": "OS-1"},
+        "estado_celula": {"trava_ativa": True, "trava_slot_id": 3, "os_id": "OS-1",
+                          "trava_resumo": "divergência de peso"},
+    },
 }
 
-# Eventos que a placa emite fora do ciclo comando → resultado.
+# Eventos que a placa emite fora do ciclo comando → resultado. As telas SÓ
+# emitem por conta própria: pintar não produz resultado.
 EXTRAS_DA_PLACA = {
-    "dispenser": lambda p: [p.telemetria(1)],
-    "cnc":       lambda p: [p.movendo("OS-1", 3, 120.0, -150.0)],
-    "weight":    lambda p: [p.telemetria()],
+    "dispenser":     lambda p: [p.telemetria(1)],
+    "cnc":           lambda p: [p.movendo("OS-1", 3, 120.0, -150.0)],
+    "weight":        lambda p: [p.telemetria()],
+    "dispenser_tft": lambda p: [p.telemetria(), p.erro()],
 }
 
 
@@ -378,13 +401,24 @@ def test_o_documento_registra_que_ack_nao_e_conclusao(doc):
     assert "`cmd_id` — todo comando leva" in doc
 
 
-def test_o_documento_lista_os_tres_subsistemas_e_so_eles(doc):
-    """O `vision-adapter` ficou de fora da migração — e a ausência é decisão."""
+def test_o_documento_lista_os_quatro_subsistemas_e_so_eles(doc):
+    """Quatro portas — dispenser, dispenser_tft, cnc, weight —, e o
+    `vision-adapter` continua fora da migração: a ausência é decisão."""
     subs = set(re.findall(r'\{"cmd":"ping","sub":"(\w+)"\}', doc))
     assert subs <= set(ADAPTERS_SERIAIS) | {"<subsistema>"}
     for subsistema in ADAPTERS_SERIAIS:
         assert f"`{subsistema}`" in doc
     assert "vision" not in doc.lower().split("## 3.")[1]
+
+
+def test_as_duas_portas_do_dispenser_adapter_estao_no_documento(doc):
+    """`dispenser` e `dispenser_tft` são DUAS portas físicas do MESMO adapter,
+    e é o documento que diz isso a quem for escrever o firmware."""
+    tabela = doc.split("## 1.", 1)[0]
+    assert tabela.count("`dispenser-adapter`") == 2
+    assert "`dispenser_tft`" in tabela
+    assert "duas portas físicas do mesmo adapter" in doc
+    assert "48" in _secao(doc, "dispenser_tft")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -397,10 +431,14 @@ def test_o_documento_lista_os_tres_subsistemas_e_so_eles(doc):
 # mesma guarda que `tests/test_protocolo_serial.py` carrega no último bloco, e
 # ela existe lá porque o erro já aconteceu.
 
+# `eventos` é o que o DOCUMENTO lista; `emitidos` é o que a placa falsa produz
+# com os exemplos daqui (um exemplar por tipo, não a lista inteira).
 MINIMOS = {
-    "dispenser": {"comandos": 3, "eventos": 6},
-    "cnc":       {"comandos": 2, "eventos": 6},
-    "weight":    {"comandos": 2, "eventos": 5},
+    "dispenser":     {"comandos": 3, "eventos": 6, "emitidos": 3, "campos_de_evento": 20},
+    "cnc":           {"comandos": 2, "eventos": 6, "emitidos": 3, "campos_de_evento": 20},
+    "weight":        {"comandos": 2, "eventos": 5, "emitidos": 3, "campos_de_evento": 20},
+    # As telas só emitem telemetria e erro: 2 eventos, 7 campos.
+    "dispenser_tft": {"comandos": 2, "eventos": 2, "emitidos": 2, "campos_de_evento": 7},
 }
 
 
@@ -412,7 +450,7 @@ def test_a_leitura_do_documento_acha_o_que_deve(doc, subsistema):
     assert len(eventos) >= MINIMOS[subsistema]["eventos"], eventos
     # Tabela lida sem campo nenhum é tabela não lida.
     assert all(campos for campos in comandos.values()), comandos
-    assert sum(len(c) for c in eventos.values()) >= 20, eventos
+    assert sum(len(c) for c in eventos.values()) >= MINIMOS[subsistema]["campos_de_evento"], eventos
 
 
 @pytest.mark.parametrize("subsistema", ADAPTERS_SERIAIS)
@@ -429,7 +467,7 @@ def test_a_placa_falsa_emite_mais_de_um_evento(subsistema):
     """Placa que não emite nada faria o bloco 2 passar sem comparar coisa
     alguma — o caso em que o teste some sem ninguém notar."""
     emitidos = placa_eventos_emitidos(subsistema)
-    assert len(emitidos) >= 3, sorted(emitidos)
+    assert len(emitidos) >= MINIMOS[subsistema]["emitidos"], sorted(emitidos)
     assert all(len(exemplo) > 2 for exemplo in emitidos.values()), emitidos
 
 

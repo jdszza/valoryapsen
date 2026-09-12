@@ -645,7 +645,7 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
                   else "danger" if tipo_peso == "peso_divergencia"
                   else "warning" if tipo_peso == "tara_ok"
                   else "secondary")
-    card_peso = html.Div([
+    filhos_peso = [
         html.Div([
             html.Span("Status: "),
             _badge(tipo_peso or "—", cor_peso),
@@ -659,7 +659,15 @@ def _render(estado: dict, eventos: list, os_hist: list, alarmes_data: list):
             "Aguardando pesagem…",
             className="text-muted",
         ),
-    ])
+    ]
+    # A leitura CONTÍNUA (telemetria da placa), num campo próprio do estado —
+    # separada da última pesagem de slot logo acima, que é o que o Triple Check
+    # decidiu. É o número que a bancada olha entre uma pesagem e outra.
+    if peso.get("peso_atual_g") is not None:
+        filhos_peso.append(html.Div(html.Small(
+            f"Mesa agora: {peso.get('peso_atual_g')} g", className="text-muted",
+        )))
+    card_peso = html.Div(filhos_peso)
 
     # ── Faixa de indicadores ──────────────────────────────────────────────────
     # Os seis números que respondem "o sistema está indo bem?" sem precisar ler

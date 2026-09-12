@@ -24,6 +24,7 @@ simuladores já têm contrato e transporte prontos do lado Python.
 - [A célula por dentro](#a-célula-por-dentro) — layout, câmeras, Triple Check, fluxo
 - [As 10 ordens padrão](#as-10-ordens-padrão)
 - [Subir a stack](#subir-a-stack)
+- [Portas seriais na célula montada](#portas-seriais-na-célula-montada) — ⚠️ leia antes de ligar as placas
 - [Operar](#operar) — console, modo apresentação, injeção, reset, pré-voo
 - [Roteiro de demonstração](#roteiro-de-demonstração)
 - [Testes](#testes)
@@ -78,7 +79,7 @@ ERP Simulator (dispara 1 das 10 ordens padrão, com os_id novo)
 │   • rota CNC em serpentina (duas fileiras)                         │
 │   • carga → visão dispenser → CNC → dispensa → visão mesa →        │
 │     peso → Triple Check                                            │
-│   • trava de erro: bloqueia até admin liberar                      │
+│   • trava de erro: bloqueia até supervisor/admin liberar           │
 │   REST + MySQL + WebSocket /ws + console /console                  │
 └──────┬────────────────┬─────────────────┬───────────────┬──────────┘
        │                │                 │               │
@@ -127,6 +128,11 @@ Painel     :5000  ─ GET (espelho de mão única) → Central
 lado do central. O central **não** depende dos adapters — seria ciclo, e ele
 tolera adapter fora do ar.
 
+**Profiles.** Os três adapters seriais e os quatro simuladores ficam atrás do
+profile `simulado` (`COMPOSE_PROFILES=simulado` no `.env`): na célula montada,
+em Windows, eles não sobem em container — ver
+[Portas seriais na célula montada](#portas-seriais-na-célula-montada).
+
 ### Os adapters têm DOIS transportes
 
 Cada adapter fala com a ponta de baixo por HTTP (o simulador) **ou** por serial
@@ -149,10 +155,18 @@ simulador por firmware não toca em `central-computer/`. Contrato completo em
 `serial_link.py` (cópia idêntica nos três adapters, com teste que cobra a
 igualdade).
 
-Em Linux a porta entra no container pelo `devices:` do compose — o bloco está
-escrito e **comentado** nos três serviços. Em Windows o Docker Desktop não
-repassa COM: o caminho é uma ponte RFC2217 no host e
-`<SUB>_SERIAL_URL=rfc2217://host:porta`.
+Há uma **segunda porta** no dispenser-adapter: as 8 telas TFT
+(`dispenser_tft`, `DISPENSER_TFT_*`), espelho do que cada slot está fazendo.
+Com o default (`http`) não há tela e o adapter é o de sempre.
+
+**Onde a porta é aberta depende do sistema operacional do mini PC.** Em Linux
+a porta entra no container pelo `devices:` do compose — o bloco está escrito e
+**comentado** nos três serviços. **A célula montada roda em Windows**, e lá o
+Docker Desktop não repassa COM para container: os três adapters seriais rodam
+**fora do Docker**, no host, abrindo a COM direto com pyserial — a ponte
+RFC2217 foi avaliada e preterida. O porquê, e o passo a passo, estão em
+[Portas seriais na célula montada](#portas-seriais-na-célula-montada) e em
+[`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md).
 
 ### Fontes de verdade
 
@@ -326,11 +340,18 @@ diagnóstico junto.
 git clone <url-do-repo> && cd valoryapsen
 ```
 
-Crie o `.env` (modelo abaixo) com as **cinco obrigatórias**, e então:
+Crie o `.env` (modelo abaixo) com as **cinco obrigatórias**, e então suba os
+**13 serviços** da planta simulada:
 
 ```bash
-docker compose up -d --build
+docker compose --profile simulado up -d --build
 ```
+
+(ou `make up`, que faz o mesmo). O `--profile simulado` é o que garante os 13
+— sem ele só 7 sobem, o subconjunto que roda em container na célula montada
+com hardware de verdade (ver
+[Portas seriais na célula montada](#portas-seriais-na-célula-montada), mais
+adiante — pode ignorar por enquanto).
 
 A primeira vez leva alguns minutos (build + seed do MySQL). A resposta rápida
 para "subiu certo?" é o **pré-voo**: http://localhost:8000/console/prevoo.
@@ -352,6 +373,12 @@ MYSQL_ROOT_PASS=
 MYSQL_PASS=
 SEED_ADMIN_SENHA=           # senha inicial do admin no app de manutenção
 SEED_MANUT_SENHA=           # senha inicial do técnico
+
+# ── Planta SIMULADA (desenvolvimento, CI, demonstração) ──────────────────────
+# Liga o profile dos adapters seriais e dos simuladores: com esta linha,
+# `docker compose up` sobe os 13 serviços. No mini PC da célula montada ela
+# fica DE FORA — lá os adapters seriais rodam no host (docs/DEPLOY_WINDOWS.md).
+COMPOSE_PROFILES=simulado
 
 # ── Banco ────────────────────────────────────────────────────────────────────
 # Credenciais lidas UMA vez, na criação do volume mysql_data. Trocar depois
@@ -402,7 +429,7 @@ Computador Central APSEN v3.1 iniciado.
 
 | Comando | O que faz |
 |---|---|
-| `make up` | `docker compose up -d` (recusa se faltar o `.env`) |
+| `make up` | `docker compose --profile simulado up -d` (recusa se faltar o `.env`) |
 | `make build` | build incremental |
 | `make rebuild` | **`down -v`** + build sem cache + `up -d` — ⚠️ **APAGA O BANCO** |
 | `make down` | derruba containers e rede, **mantém** o banco |
@@ -416,7 +443,7 @@ Computador Central APSEN v3.1 iniciado.
 > **`make rebuild` não é um `make build` mais forte.** Ele começa com
 > `docker compose down -v`, e o `-v` remove o volume `mysql_data` — catálogo,
 > usuários, ordens e histórico vão junto. Para reconstruir sem perder o banco:
-> `docker compose build --no-cache && docker compose up -d`.
+> `docker compose build --no-cache && docker compose --profile simulado up -d`.
 
 ### Rebuild: o que recriar depois de mudar o quê
 
@@ -424,13 +451,13 @@ A pergunta que decide é **se o banco pode ser perdido**.
 
 | Mudou | Comando | Banco |
 |---|---|---|
-| Só código Python | `docker compose up -d --build` | preservado |
+| Só código Python | `docker compose --profile simulado up -d --build` | preservado |
 | Um serviço só | `docker compose up -d --build central-computer` | preservado |
-| `requirements.txt` | `docker compose build --no-cache <serviço>` + `up -d` | preservado |
-| `.env` (variável de runtime) | `docker compose up -d` | preservado |
-| `.env` (credencial do MySQL) | `docker compose down -v` + `up -d --build` | **APAGADO** |
-| Schema de versão antiga quebrado | `docker compose down -v` + `up -d --build` | **APAGADO** |
-| Nome ou `container_name` | `docker compose down` + `up -d --build` | preservado |
+| `requirements.txt` | `docker compose build --no-cache <serviço>` + `--profile simulado up -d` | preservado |
+| `.env` (variável de runtime) | `docker compose --profile simulado up -d` | preservado |
+| `.env` (credencial do MySQL) | `docker compose down -v` + `--profile simulado up -d --build` | **APAGADO** |
+| Schema de versão antiga quebrado | `docker compose down -v` + `--profile simulado up -d --build` | **APAGADO** |
+| Nome ou `container_name` | `docker compose down` + `--profile simulado up -d --build` | preservado |
 
 `console.html`, `console_login.html` e `console_prevoo.html` são lidos do disco a
 cada requisição: editá-los vale com `docker compose restart central-computer`.
@@ -442,6 +469,17 @@ docker compose stop     # pausa; mantém banco e containers
 docker compose down     # remove containers e rede, MANTÉM o banco
 docker compose down -v  # remove tudo, inclusive o banco
 ```
+
+### Profiles: planta simulada × célula montada
+
+Os três adapters com porta serial (`dispenser`, `cnc`, `weight`) e os quatro
+simuladores estão atrás do profile `simulado`. Com `COMPOSE_PROFILES=simulado`
+no `.env` — a linha está no modelo acima —, `docker compose up` sobe os 13
+serviços, como sempre. **Sem a linha**, sobem só os que rodam em container na
+célula montada (mysql, central, vision-adapter, vision-simulator, erp-simulator,
+dashboard e manut_web): no mini PC Windows os adapters seriais rodam fora do
+Docker. Ver [Portas seriais na célula montada](#portas-seriais-na-célula-montada)
+e [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md).
 
 ### Problemas comuns
 
@@ -455,6 +493,60 @@ docker compose down -v  # remove tudo, inclusive o banco
 | `/console` responde 503 | `CONSOLE_SENHA` vazia | definir no `.env` e reiniciar o central |
 | OS recusada com 429 | fila no teto (`MAX_FILA_OS=5`) | ver `/api/v1/trava` — quase sempre há trava ativa |
 | container órfão depois de renomear serviço | `container_name` mudou | `docker compose down` antes, ou `up -d --remove-orphans` |
+
+---
+
+## Portas seriais na célula montada
+
+> **Só se aplica a quem tem hardware de verdade.** Testando a planta simulada
+> (o caminho da seção anterior, `docker compose --profile simulado up`)? Pule
+> para [Operar](#operar) — nada aqui muda o comportamento com o simulador.
+
+> ⚠️ **No mini PC, toda placa tem que ter o número da COM fixado e a variável
+> de porta preenchida. A varredura automática é só para desenvolvimento sem
+> hardware.** Cinco portas, cinco donos, um processo por porta — nenhum varre.
+
+| Placa | Subsistema | Variável | Processo (no host) |
+|---|---|---|---|
+| mecanismos dos 8 dispensers | `dispenser` | `DISPENSER_SERIAL_URL` | dispenser-adapter |
+| as 8 telas TFT | `dispenser_tft` | `DISPENSER_TFT_SERIAL_URL` | dispenser-adapter (a segunda porta do mesmo processo) |
+| mesa CNC | `cnc` | `CNC_SERIAL_URL` | cnc-adapter |
+| balança HX711 | `weight` | `WEIGHT_SERIAL_URL` | weight-adapter |
+| display de 7" | — | `APSEN_DISPLAY_PORTA` | painel_operador |
+
+**Por que a porta fixa é obrigatória.** Com a variável vazia, cada adapter
+varre todas as portas procurando a sua placa, e em cada candidata gasta
+`PROBE_ASSENTAR_S` (1,5 s) + `PROBE_ESPERA_S` (8 s) = **até 9,5 s**; o painel faz
+o mesmo em `find_display_port`, e repete a cada 3 s, para sempre. A competição
+não é por uma porta compartilhada — cada placa tem a sua. Ela existe porque,
+**durante a busca, cada processo abre as portas dos outros** para descobrir se a
+placa dele está ali: enquanto o dispenser-adapter segura por 9,5 s a COM da CNC
+só para conferir, o cnc-adapter toma `ACCESS_DENIED` na própria porta. A conta é
+**5 processos × até 9,5 s por porta sondada**, e o resultado não é um erro: é um
+boot não-determinístico de dezenas de segundos, em que uma placa às vezes
+simplesmente não é achada no ciclo. Fixar a porta elimina a varredura, e sem
+varredura não há competição. A sondagem continua abrindo com **DTR/RTS
+desligados** (nessa placa esses sinais são o circuito de reset do ESP32-S3) e
+confirmando pelo ping — fixar o número não dispensa conferir a placa.
+
+**Fixar a COM no Windows.** Gerenciador de Dispositivos → *Portas (COM e LPT)*
+→ *Propriedades* → *Configurações de Porta* → *Avançado…* → *Número da Porta
+COM*. O Windows deixa **entradas fantasma** de portas já usadas (aparecem como
+"em uso"): *Exibir → Mostrar dispositivos ocultos* para vê-las e apagá-las.
+Qual placa é qual: o ping de cada uma carrega o `sub` (`{"cmd":"ping","sub":"cnc"}`);
+o display manda `{"cmd":"ping"}` sem `sub`.
+
+**Só um processo pode abrir a porta — e agora são cinco.** O lembrete que
+[`docs/BANCADA.md`](docs/BANCADA.md) já traz para o display vale para as cinco:
+o Serial Monitor do PlatformIO aberto em qualquer uma delas derruba quem deveria
+estar com ela, e o sintoma é só "desconectado" no `/health` do adapter (ou
+`OFFLINE` no display). Feche-o antes de subir os processos.
+
+**Onde cada processo roda, e o resto do deploy** — o que fica em container, as
+variáveis de cada adapter no host (`CENTRAL_URL=http://localhost:8000`, e o
+central os alcança por `http://host.docker.internal:81xx`), o profile
+`simulado` do compose e como subir tudo no boot — está em
+[`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md).
 
 ---
 
@@ -502,7 +594,7 @@ Pausar **não** bloqueia o disparo manual.
 ### Modo apresentação
 
 Dois controles globais no `.env`, válidos para o central e os quatro simuladores
-de uma vez. São env vars: `docker compose up -d` basta, sem rebuild.
+de uma vez. São env vars: `docker compose --profile simulado up -d` basta, sem rebuild.
 
 ```bash
 MODO_APRESENTACAO=1     # planta determinística: nenhuma falha aleatória
@@ -657,7 +749,13 @@ curl -X POST http://localhost:8000/api/v1/admin/liberar-trava \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-A OS retoma de onde parou.
+A OS retoma de onde parou. A role que libera é `admin` **ou** `supervisor`
+(lida do banco a cada requisição, nunca do token); a gestão de usuários
+continua só `admin`. Quando a chamada vem por uma conta de serviço — o painel
+de bancada e o display de 7" autenticam o supervisor por PIN e falam com o
+central com a conta deles —, o corpo opcional `{"em_nome_de": "<nome>"}` faz o
+`liberado_por` gravado virar `"<conta> (em nome de <nome>)"`, e a liberação
+entra em `log_manutencao` com esse nome. Sem o campo, grava só o username.
 
 ---
 
@@ -696,11 +794,19 @@ usa, ao lado da célula, mais uma interface web. Lista as ordens, mostra o estoq
 de cada dispenser, autentica por PIN, registra histórico e abre desvios.
 
 **O espelho é de mão única.** O painel **lê** do central (`/os/historico`,
-`/os/{os_id}`, `/dispensers/estado`, sem autenticação) e **nunca** comanda a
+`/os/{os_id}`, `/dispensers/estado`, sem autenticação) e **não comanda** a
 célula. O caminho de escrita óbvio seria `PUT /ordens/{os_id}/status`, e ele é
 exatamente o errado: só grava a coluna do banco, sem falar com o orquestrador —
 um botão "Iniciar" ali mudaria a linha enquanto a célula faz outra coisa. Um
 espelho que escreve é um espelho que mente.
+
+**A única exceção é liberar a trava do Triple Check**, feita por um Supervisor
+autenticado por PIN (na web ou no display de 7"). Ela é deliberada, mora
+sozinha em `backend/central_comandos.py` — nada mais nesse arquivo escreve no
+central — e sai por uma conta de serviço própria
+(`PAINEL_CENTRAL_USER`/`PAINEL_CENTRAL_SENHA`), nunca pelo login do operador.
+Sem essas duas variáveis, só essa liberação fica desligada; o resto do painel
+sobe normalmente.
 
 Ele roda **fora do Docker**, porque é dono de uma porta USB, e
 `PAINEL_CENTRAL=0` desliga a integração inteira: a bancada precisa funcionar com
@@ -836,7 +942,8 @@ valoryapsen/
 ├── TASKS.md                # backlog
 ├── docs/
 │   ├── PROTOCOLO_SERIAL.md # contrato adapter ↔ firmware (uma linha JSON por mensagem)
-│   └── BANCADA.md          # painel de bancada + display ESP32
+│   ├── BANCADA.md          # painel de bancada + display ESP32
+│   └── DEPLOY_WINDOWS.md   # o mini PC da célula: o que roda onde, COM por placa, boot
 ├── central-computer/
 │   ├── main.py             # FastAPI, handlers de evento, rotas do console
 │   ├── orchestrator.py     # fila, atribuição de slots, rota, Triple Check, trava
@@ -923,6 +1030,8 @@ não existe.
 | `APSEN_DB` | `backend/apsen.db` | caminho do banco |
 | `APSEN_SECRET` | **sem default** | chave de sessão; ausente ou fraca, o painel não sobe |
 | `APSEN_API_TOKEN` | **sem default** | token das rotas `/api/*`; ausente, elas respondem 503 |
+| `PAINEL_CENTRAL_USER` / `PAINEL_CENTRAL_SENHA` | **sem default** | conta de serviço (role `supervisor` no central) com que o painel libera a trava do Triple Check; ausentes, só a liberação fica desligada — ver `central_comandos.py` |
+| `APSEN_DISPLAY_PORTA` | vazia (varre) | a COM do display de 7", **obrigatória na célula montada** — definida, abre só ela e não varre; ver [Portas seriais na célula montada](#portas-seriais-na-célula-montada) |
 | `APSEN_DEBUG` | `0` | `1` liga o Werkzeug e **força o bind em 127.0.0.1** |
 | `APSEN_HOST` / `APSEN_PORTA` | `0.0.0.0` / `5000` | |
 | `APSEN_RELOADER` | `0` | deixe desligado com o display conectado |

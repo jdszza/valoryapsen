@@ -9,10 +9,15 @@ Faz DOIS papeis, e eles sao diferentes:
    INTERVALO — o uso de sempre, para encher a tela sem backend.
 2. RESPONDE aos pedidos que o firmware faz por conta propria (`ping`,
    `get_ordens`, `get_dispensers`, `get_catalogo`, `get_operadores`,
-   `validar_operador`, `set_status`, `sync_dispensers`). Sem isso o display
-   fica OFFLINE e
+   `validar_operador`, `set_status`, `sync_dispensers`, `get_trava`,
+   `liberar_trava`). Sem isso o display fica OFFLINE e
    `fetch_ordens_api` nunca roda — que e justamente o caminho onde o os_id
    longo do computador central e o campo `origem` chegam.
+
+A trava do Triple Check entra nos DOIS papeis: o ciclo de comandos empurra um
+push `trava` (ativa, depois liberada) para exercitar a tela sem placa, e o
+papel de backend responde `get_trava` e confere nome + PIN em `liberar_trava`
+— com o PIN do SUPERVISOR, que e outra pessoa que nao o operador logado.
 
 Por isso ORDENS_CENTRAL abaixo carrega os_id no formato real do central
 ({template_id}-{AAAAMMDDTHHMMSS}-{6 hex}) e cobre os dois valores de `origem`:
@@ -117,6 +122,19 @@ COMANDOS = [
     {"push": "ordem_status",
      "numero_os": "OS-INFECTO-01-20260909T143012-A1B2C3", "status": "Cancelado"},
 
+    # --- Trava do Triple Check (push, so na transicao) ---
+    # O motivo vem no formato real do orquestrador e passa de 200 caracteres
+    # de proposito: o firmware guarda em MAX_MOTIVO_LEN (256) e, quando nao
+    # couber, `copy_trunc` termina em "..." — truncar de proposito e deixar
+    # rastro, nunca cortar em silencio.
+    {"push": "trava", "ativa": True,
+     "os_id": "OS-INFECTO-01-20260909T151145-9F0E7D", "slot_id": 3,
+     "motivo": ("Triple Check FALHOU (2/3 fontes divergentes, limiar=1) — D3: "
+                "dispenser: dispensou 9 de 10 esperados; "
+                "balanca: desvio=10.0%")},
+
+    {"push": "trava", "ativa": False, "os_id": "", "slot_id": None, "motivo": ""},
+
     # --- Consulta de status ---
     {"cmd": "status"},
 ]
@@ -176,12 +194,27 @@ CATALOGO_RESP = sorted({d["nome"] for d in DISPENSERS_RESP})
 # arquivo e quem exercita o protocolo sem placa — deixar o campo aqui faria o
 # firmware continuar compilando contra um contrato que o backend nao serve mais.
 OPERADORES_RESP = [
-    {"nome": "Operador Teste", "perfil": "operador"},
+    {"nome": "Operador Teste", "perfil": "Operador"},
+    # O supervisor e quem libera a trava: outra pessoa, outro PIN. O display
+    # lista os perfis Supervisor/Admin no popup de liberacao.
+    {"nome": "Supervisora Teste", "perfil": "Supervisor"},
 ]
 
-# PIN que este simulador aceita. Existe so aqui, no lado que faz o papel do
+# PINs que este simulador aceita. Existem so aqui, no lado que faz o papel do
 # backend: o display nao guarda PIN nenhum.
 PIN_VALIDO = "1234"
+PIN_SUPERVISOR = "4321"
+
+# Estado da trava que `get_trava` devolve. Comeca ativa para que a tela de trava
+# apareca no primeiro ciclo sem depender do push; `liberar_trava` com o PIN do
+# supervisor a desliga, e o push do ciclo de comandos a religa.
+TRAVA_SIM = {
+    "ativa": True,
+    "os_id": "OS-INFECTO-01-20260909T151145-9F0E7D",
+    "slot_id": 3,
+    "motivo": ("Triple Check FALHOU (2/3 fontes divergentes, limiar=1) — D3: "
+               "dispenser: dispensou 9 de 10 esperados; balanca: desvio=10.0%"),
+}
 
 # cmd de leitura -> (tag do "resp", dados)
 _RESPOSTAS_GET = {
@@ -224,6 +257,15 @@ def responder(msg):
         return {"resp": "ok", "ok": True}
     if cmd in ("sync_dispensers", "set_dispenser_med"):
         return {"resp": "ok", "ok": True}
+    if cmd == "get_trava":
+        return {"resp": "trava", **TRAVA_SIM, "ts": int(time.time())}
+    if cmd == "liberar_trava":
+        # Nome + PIN do SUPERVISOR. A resposta nunca ecoa o PIN.
+        if (msg.get("nome", "") == OPERADORES_RESP[1]["nome"]
+                and msg.get("pin", "") == PIN_SUPERVISOR):
+            TRAVA_SIM.update({"ativa": False, "os_id": "", "slot_id": None, "motivo": ""})
+            return {"resp": "ok", "ok": True, "msg": "trava liberada"}
+        return {"resp": "ok", "ok": False, "msg": "nome ou PIN incorreto"}
     return None
 
 # ============================================================
@@ -306,6 +348,11 @@ def main():
                 print(f"\n[{ts}] >> cmd {idx + 1}/{len(COMANDOS)}  (ciclo {ciclo + 1})")
                 print(f"  >> {linha}")
                 ser.write((linha + "\n").encode("utf-8"))
+                # O push de trava tambem muda o que `get_trava` responde: os
+                # dois papeis tem que contar a mesma historia, senao o display
+                # desfaz o push no proximo poll.
+                if cmd.get("push") == "trava":
+                    TRAVA_SIM.update({k: cmd[k] for k in ("ativa", "os_id", "slot_id", "motivo")})
                 time.sleep(INTERVALO)
             ciclo += 1
             print("\n--- Ciclo completo, reiniciando ---\n")

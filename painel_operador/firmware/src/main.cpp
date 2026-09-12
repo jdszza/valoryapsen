@@ -34,6 +34,15 @@
 // que 8 medicamentos SEMPRE cabem inteiros e o truncamento fica sendo o que
 // deve ser: caminho de excecao, nao o caso normal.
 #define MAX_ITENS_RESUMO_LEN 320
+// Motivo da trava do Triple Check. Dimensionado pela ORIGEM do dado, nao pelo
+// que costuma caber: o orquestrador monta
+//   "Triple Check FALHOU (n/3 fontes divergentes, limiar=x) — Dk: " + ate 3
+//   causas ("dispenser: dispensou 9 de 10 esperados; camera_mesa: detectou 9
+//   de 10; balanca: desvio=10.0%")
+// e o pior caso real passa de 240 caracteres. O que nao couber passa por
+// copy_trunc() e termina em "..." — truncar de proposito e deixar rastro na
+// tela, nunca cortar em silencio.
+#define MAX_MOTIVO_LEN 256
 
 // SD Card (TF slot ESP32-8048S070)
 #define SD_CS 10
@@ -63,11 +72,28 @@ const char *WEB_DASHBOARD_URL = "http://192.168.15.16:5000";
 struct Operador
 {
     char nome[32];
+    // "Admin", "Supervisor", "PCP", "PCM" ou "Operador" — vem em get_operadores.
+    // Decide quem aparece no popup de liberacao da trava; quem PASSA e decidido
+    // pelo backend, que confere o PIN e o perfil de novo.
+    char perfil[16];
     bool ativo;
 };
 
 static Operador operadores[MAX_OPERADORES] = {};
 static int num_operadores = 0;
+
+// Trava do Triple Check, como o backend a espelha do computador central. Chega
+// por push (`trava`, so na transicao) e por get_trava (a cada SYNC_INTERVAL):
+// push e uma linha serial, e linha serial se perde num reset deste ESP32.
+struct Trava
+{
+    bool ativa;
+    char os_id[MAX_OS_ID_LEN];
+    int slot_id; // -1 = sem slot
+    char motivo[MAX_MOTIVO_LEN];
+};
+
+static Trava trava = {false, "", -1, ""};
 
 struct Dispenser
 {
@@ -218,6 +244,13 @@ static void fetch_ordens_api();
 static void api_update_status(const char *numero_os, const char *novo_status);
 static void handle_push_ordem_status(JsonObject doc);
 static void handle_push_dispensers(JsonObject doc);
+static void handle_push_trava(JsonObject doc);
+static void aplicar_trava(JsonObject doc);
+static void fetch_trava_api();
+static bool liberar_trava_backend(const char *nome, const char *pin, char *msg, size_t msg_len);
+static void show_trava_overlay();
+static void hide_trava_overlays();
+static void build_trava_popups();
 static void fetch_catalogo_api();
 static void fetch_operadores_api();
 static void api_update_dispenser_med(int slot, const char *nome);
@@ -311,6 +344,17 @@ static lv_obj_t *disp_pin_title = nullptr;
 static lv_obj_t *disp_med_overlay = nullptr;
 static lv_obj_t *disp_med_list = nullptr;
 static lv_obj_t *disp_med_title = nullptr;
+
+// Trava do Triple Check - tela, badge no cabecalho e popup nome + PIN
+static lv_obj_t *trava_overlay = nullptr;
+static lv_obj_t *trava_os_lbl = nullptr;
+static lv_obj_t *trava_slot_lbl = nullptr;
+static lv_obj_t *trava_motivo_lbl = nullptr;
+static lv_obj_t *trava_pin_overlay = nullptr;
+static lv_obj_t *trava_roller = nullptr;
+static lv_obj_t *trava_pin_ta = nullptr;
+static lv_obj_t *trava_pin_msg = nullptr;
+static lv_obj_t *ui_trava_badge = nullptr;
 
 // Relatorio
 static lv_obj_t *rel_qr = nullptr;
@@ -1466,17 +1510,29 @@ void update_dashboard_ui()
         }
     }
 
-    if (app.maquina_ok)
+    if (trava.ativa)
+    {
+        // A trava manda no status da maquina: a celula esta parada esperando
+        // um supervisor, e e isso que o operador precisa ler primeiro.
+        lv_label_set_text(dash_machine_icon, LV_SYMBOL_WARNING " TRAVA - AGUARDE SUPERVISOR");
+        lv_obj_set_style_text_color(dash_machine_icon, lv_color_hex(0xDC2626), 0);
+        if (trava.slot_id > 0)
+            lv_label_set_text_fmt(dash_machine_msg, "Triple Check divergente em D%d", trava.slot_id);
+        else
+            lv_label_set_text(dash_machine_msg, "Triple Check divergente");
+    }
+    else if (app.maquina_ok)
     {
         lv_label_set_text(dash_machine_icon, LV_SYMBOL_OK " OPERACIONAL");
         lv_obj_set_style_text_color(dash_machine_icon, lv_color_hex(0x166534), 0);
+        lv_label_set_text(dash_machine_msg, app.status_msg);
     }
     else
     {
         lv_label_set_text(dash_machine_icon, LV_SYMBOL_WARNING " ERRO");
         lv_obj_set_style_text_color(dash_machine_icon, lv_color_hex(0xDC2626), 0);
+        lv_label_set_text(dash_machine_msg, app.status_msg);
     }
-    lv_label_set_text(dash_machine_msg, app.status_msg);
 
     for (int i = 0; i < NUM_DISPENSERS; i++)
     {
@@ -1860,6 +1916,309 @@ static void build_disp_med_popup()
 // ============================================================
 // RELATORIO PAGE
 // ============================================================
+// ============================================================
+// TRAVA DO TRIPLE CHECK — tela e liberacao por supervisor
+// ============================================================
+// A celula para a fila inteira quando o Triple Check diverge, e so um humano a
+// solta. O supervisor e OUTRA pessoa que nao o operador logado: chega a
+// bancada, escolhe o proprio nome, digita o PIN e vai embora. Quem confere o
+// PIN e o backend (cmd liberar_trava), pelo mesmo motivo do validar_operador.
+static bool operador_pode_liberar(int i)
+{
+    // Espelha PERMISSOES[perfil]["trava_liberar"] do backend: so Supervisor e
+    // Admin. Esta lista decide quem APARECE no popup; quem passa e decidido
+    // pelo backend, que confere PIN e perfil de novo.
+    return operadores[i].ativo &&
+           (strcmp(operadores[i].perfil, "Supervisor") == 0 ||
+            strcmp(operadores[i].perfil, "Admin") == 0);
+}
+
+static void show_trava_overlay()
+{
+    if (!trava_overlay || !app.logado)
+        return;
+    lv_label_set_text_fmt(trava_os_lbl, "OS: %s", trava.os_id[0] ? trava.os_id : "--");
+    if (trava.slot_id > 0)
+        lv_label_set_text_fmt(trava_slot_lbl, "Slot: D%d", trava.slot_id);
+    else
+        lv_label_set_text(trava_slot_lbl, "Slot: --");
+    lv_label_set_text(trava_motivo_lbl, trava.motivo[0] ? trava.motivo : "(sem motivo informado)");
+    lv_obj_clear_flag(trava_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(trava_overlay);
+}
+
+static void hide_trava_overlays()
+{
+    if (trava_overlay)
+        lv_obj_add_flag(trava_overlay, LV_OBJ_FLAG_HIDDEN);
+    if (trava_pin_overlay)
+        lv_obj_add_flag(trava_pin_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void trava_fechar_cb(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    last_touch_time = millis();
+    // Fechar a tela nao libera nada: a trava continua, e o badge no cabecalho
+    // continua vermelho ate o backend dizer que ela saiu.
+    lv_obj_add_flag(trava_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void trava_badge_cb(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    last_touch_time = millis();
+    if (trava.ativa)
+        show_trava_overlay();
+}
+
+static void trava_liberar_btn_cb(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    last_touch_time = millis();
+    // Roller com os operadores que podem liberar. Vazio = ninguem cadastrado
+    // com esse perfil; a tela diz isso em vez de aceitar um PIN que o backend
+    // vai recusar de qualquer jeito.
+    static char opcoes[MAX_OPERADORES * 33];
+    opcoes[0] = '\0';
+    int n = 0;
+    for (int i = 0; i < num_operadores; i++)
+    {
+        if (!operador_pode_liberar(i))
+            continue;
+        if (n > 0)
+            strlcat(opcoes, "\n", sizeof(opcoes));
+        strlcat(opcoes, operadores[i].nome, sizeof(opcoes));
+        n++;
+    }
+    lv_roller_set_options(trava_roller, n > 0 ? opcoes : "(nenhum supervisor)",
+                          LV_ROLLER_MODE_NORMAL);
+    lv_textarea_set_text(trava_pin_ta, "");
+    lv_label_set_text(trava_pin_msg, n > 0 ? "Escolha o supervisor e digite o PIN"
+                                           : "Nenhum Supervisor/Admin cadastrado");
+    lv_obj_set_style_text_color(trava_pin_msg, lv_color_hex(n > 0 ? 0x64748B : 0xDC2626), 0);
+    lv_obj_clear_flag(trava_pin_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(trava_pin_overlay);
+}
+
+static void trava_pin_numpad_cb(lv_event_t *e)
+{
+    const char *txt = (const char *)lv_event_get_user_data(e);
+    last_touch_time = millis();
+
+    if (strcmp(txt, "OK") == 0)
+    {
+        char nome[32];
+        lv_roller_get_selected_str(trava_roller, nome, sizeof(nome));
+        const char *pin = lv_textarea_get_text(trava_pin_ta);
+        char msg[96];
+        bool ok = liberar_trava_backend(nome, pin, msg, sizeof(msg));
+        lv_textarea_set_text(trava_pin_ta, "");
+        if (ok)
+        {
+            // O backend confirmou; o proximo get_trava (ou push) confirma de
+            // novo. Fechar aqui e o que o supervisor espera ver na hora.
+            trava.ativa = false;
+            hide_trava_overlays();
+            lv_obj_add_flag(ui_trava_badge, LV_OBJ_FLAG_HIDDEN);
+            update_dashboard_ui();
+            return;
+        }
+        lv_label_set_text(trava_pin_msg, msg);
+        lv_obj_set_style_text_color(trava_pin_msg, lv_color_hex(0xDC2626), 0);
+    }
+    else if (strcmp(txt, "C") == 0)
+    {
+        lv_textarea_set_text(trava_pin_ta, "");
+    }
+    else if (strcmp(txt, "X") == 0)
+    {
+        lv_obj_add_flag(trava_pin_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        lv_textarea_add_text(trava_pin_ta, txt);
+    }
+}
+
+static void build_trava_popups()
+{
+    // Tela da trava: sobre tudo, como o alerta de estoque insuficiente.
+    trava_overlay = lv_obj_create(ui_screen);
+    lv_obj_remove_style_all(trava_overlay);
+    lv_obj_set_size(trava_overlay, 800, 480);
+    lv_obj_set_pos(trava_overlay, 0, 0);
+    lv_obj_set_style_bg_color(trava_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(trava_overlay, LV_OPA_50, 0);
+    lv_obj_add_flag(trava_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(trava_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *panel = lv_obj_create(trava_overlay);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_size(panel, 640, 340);
+    lv_obj_set_pos(panel, 80, 70);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(panel, 16, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(0xDC2626), 0);
+    lv_obj_set_style_border_width(panel, 3, 0);
+    lv_obj_set_style_pad_all(panel, 20, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *titulo = lv_label_create(panel);
+    lv_label_set_text(titulo, LV_SYMBOL_WARNING " TRAVA DO TRIPLE CHECK - AGUARDE SUPERVISOR");
+    lv_obj_set_style_text_color(titulo, lv_color_hex(0xDC2626), 0);
+    lv_obj_set_style_text_font(titulo, &lv_font_montserrat_20, 0);
+    lv_obj_set_pos(titulo, 0, 0);
+
+    trava_os_lbl = lv_label_create(panel);
+    lv_label_set_text(trava_os_lbl, "OS: --");
+    lv_obj_set_width(trava_os_lbl, 600);
+    lv_label_set_long_mode(trava_os_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_color(trava_os_lbl, lv_color_hex(0x1E40AF), 0);
+    lv_obj_set_style_text_font(trava_os_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(trava_os_lbl, 0, 36);
+
+    trava_slot_lbl = lv_label_create(panel);
+    lv_label_set_text(trava_slot_lbl, "Slot: --");
+    lv_obj_set_style_text_color(trava_slot_lbl, lv_color_hex(0x0F172A), 0);
+    lv_obj_set_style_text_font(trava_slot_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(trava_slot_lbl, 0, 60);
+
+    // MAX_MOTIVO_LEN (256) em fonte 14 numa largura de 600 px sao ~5 linhas:
+    // cabe inteiro, e o que passou de 256 ja chegou aqui terminado em "...".
+    trava_motivo_lbl = lv_label_create(panel);
+    lv_label_set_text(trava_motivo_lbl, "");
+    lv_obj_set_width(trava_motivo_lbl, 600);
+    lv_label_set_long_mode(trava_motivo_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(trava_motivo_lbl, lv_color_hex(0x334155), 0);
+    lv_obj_set_style_text_font(trava_motivo_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(trava_motivo_lbl, 0, 90);
+
+    lv_obj_t *liberar_btn = lv_btn_create(panel);
+    lv_obj_remove_style_all(liberar_btn);
+    lv_obj_set_size(liberar_btn, 260, 50);
+    lv_obj_add_style(liberar_btn, &sty_btn_warning, 0);
+    lv_obj_set_pos(liberar_btn, 0, 250);
+    lv_obj_add_event_cb(liberar_btn, trava_liberar_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *liberar_lbl = lv_label_create(liberar_btn);
+    lv_label_set_text(liberar_lbl, LV_SYMBOL_OK " Liberar (supervisor)");
+    lv_obj_set_style_text_font(liberar_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(liberar_lbl);
+
+    lv_obj_t *fechar_btn = lv_btn_create(panel);
+    lv_obj_remove_style_all(fechar_btn);
+    lv_obj_set_size(fechar_btn, 160, 50);
+    lv_obj_set_style_bg_color(fechar_btn, lv_color_hex(0xF1F5F9), 0);
+    lv_obj_set_style_bg_opa(fechar_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(fechar_btn, lv_color_hex(0xCBD5E1), 0);
+    lv_obj_set_style_border_width(fechar_btn, 1, 0);
+    lv_obj_set_style_radius(fechar_btn, 10, 0);
+    lv_obj_set_pos(fechar_btn, 440, 250);
+    lv_obj_add_event_cb(fechar_btn, trava_fechar_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *fechar_lbl = lv_label_create(fechar_btn);
+    lv_label_set_text(fechar_lbl, "Fechar");
+    lv_obj_set_style_text_color(fechar_lbl, lv_color_hex(0x475569), 0);
+    lv_obj_set_style_text_font(fechar_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(fechar_lbl);
+
+    // Popup nome + PIN: o MESMO numpad do login e do dispenser (make_numpad_btn),
+    // com um roller dos operadores que podem liberar no lugar de um campo de
+    // nome — o numpad so produz digitos, e o nome vem do cadastro.
+    trava_pin_overlay = lv_obj_create(ui_screen);
+    lv_obj_remove_style_all(trava_pin_overlay);
+    lv_obj_set_size(trava_pin_overlay, 800, 480);
+    lv_obj_set_pos(trava_pin_overlay, 0, 0);
+    lv_obj_set_style_bg_color(trava_pin_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(trava_pin_overlay, LV_OPA_50, 0);
+    lv_obj_add_flag(trava_pin_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(trava_pin_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *pp = lv_obj_create(trava_pin_overlay);
+    lv_obj_remove_style_all(pp);
+    lv_obj_set_size(pp, 580, 330);
+    lv_obj_set_pos(pp, 110, 75);
+    lv_obj_set_style_bg_color(pp, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(pp, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(pp, 16, 0);
+    lv_obj_set_style_border_color(pp, lv_color_hex(0xDC2626), 0);
+    lv_obj_set_style_border_width(pp, 2, 0);
+    lv_obj_set_style_pad_all(pp, 20, 0);
+    lv_obj_clear_flag(pp, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *pt = lv_label_create(pp);
+    lv_label_set_text(pt, LV_SYMBOL_WARNING " Liberar trava - Supervisor");
+    lv_obj_set_style_text_color(pt, lv_color_hex(0xDC2626), 0);
+    lv_obj_set_style_text_font(pt, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(pt, 0, 0);
+
+    trava_roller = lv_roller_create(pp);
+    lv_roller_set_options(trava_roller, "(nenhum supervisor)", LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(trava_roller, 3);
+    lv_obj_set_width(trava_roller, 220);
+    lv_obj_set_pos(trava_roller, 0, 28);
+    lv_obj_set_style_text_font(trava_roller, &lv_font_montserrat_14, 0);
+
+    trava_pin_ta = lv_textarea_create(pp);
+    lv_textarea_set_placeholder_text(trava_pin_ta, "PIN do supervisor...");
+    lv_textarea_set_password_mode(trava_pin_ta, true);
+    lv_textarea_set_one_line(trava_pin_ta, true);
+    lv_textarea_set_max_length(trava_pin_ta, 12);
+    lv_textarea_set_accepted_chars(trava_pin_ta, "0123456789");
+    lv_obj_set_size(trava_pin_ta, 220, 48);
+    lv_obj_set_pos(trava_pin_ta, 0, 130);
+    lv_obj_set_style_border_color(trava_pin_ta, lv_color_hex(0xDC2626), 0);
+    lv_obj_set_style_border_width(trava_pin_ta, 2, 0);
+    lv_obj_set_style_radius(trava_pin_ta, 10, 0);
+    lv_obj_set_style_text_font(trava_pin_ta, &lv_font_montserrat_16, 0);
+
+    trava_pin_msg = lv_label_create(pp);
+    lv_label_set_text(trava_pin_msg, "Escolha o supervisor e digite o PIN");
+    lv_obj_set_width(trava_pin_msg, 220);
+    lv_label_set_long_mode(trava_pin_msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(trava_pin_msg, lv_color_hex(0x64748B), 0);
+    lv_obj_set_style_text_font(trava_pin_msg, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(trava_pin_msg, 0, 185);
+
+    int kx = 280, ky = 0;
+    int bw = 72, bh = 55, gap = 6;
+
+    make_numpad_btn(pp, "1", kx, ky, bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    make_numpad_btn(pp, "2", kx + (bw + gap), ky, bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    make_numpad_btn(pp, "3", kx + 2 * (bw + gap), ky, bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    make_numpad_btn(pp, "4", kx, ky + (bh + gap), bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    make_numpad_btn(pp, "5", kx + (bw + gap), ky + (bh + gap), bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    make_numpad_btn(pp, "6", kx + 2 * (bw + gap), ky + (bh + gap), bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    make_numpad_btn(pp, "7", kx, ky + 2 * (bh + gap), bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    make_numpad_btn(pp, "8", kx + (bw + gap), ky + 2 * (bh + gap), bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    make_numpad_btn(pp, "9", kx + 2 * (bw + gap), ky + 2 * (bh + gap), bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    make_numpad_btn(pp, "C", kx, ky + 3 * (bh + gap), bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    make_numpad_btn(pp, "0", kx + (bw + gap), ky + 3 * (bh + gap), bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+
+    lv_obj_t *ok_btn = make_numpad_btn(pp, "OK", kx + 2 * (bw + gap), ky + 3 * (bh + gap),
+                                       bw, bh, trava_pin_numpad_cb, &lv_font_montserrat_16);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0xDC2626), 0);
+    lv_obj_t *ok_lbl = lv_obj_get_child(ok_btn, 0);
+    lv_obj_set_style_text_color(ok_lbl, lv_color_hex(0xFFFFFF), 0);
+
+    lv_obj_t *cancel_btn = lv_btn_create(pp);
+    lv_obj_remove_style_all(cancel_btn);
+    lv_obj_set_size(cancel_btn, 220, 44);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0xF1F5F9), 0);
+    lv_obj_set_style_bg_opa(cancel_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(cancel_btn, lv_color_hex(0xCBD5E1), 0);
+    lv_obj_set_style_border_width(cancel_btn, 1, 0);
+    lv_obj_set_style_radius(cancel_btn, 10, 0);
+    lv_obj_set_pos(cancel_btn, 0, 240);
+    lv_obj_add_event_cb(cancel_btn, trava_pin_numpad_cb, LV_EVENT_CLICKED, (void *)"X");
+
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancelar");
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_hex(0x475569), 0);
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(cancel_lbl);
+}
+
 static char qr_url[128] = "";
 
 static void build_relatorio_page()
@@ -2188,6 +2547,9 @@ static void menu_item_cb(lv_event_t *e)
         lv_textarea_set_text(login_ta, "");
         lv_label_set_text(login_msg, "Digite a senha de acesso");
         lv_obj_set_style_text_color(login_msg, lv_color_hex(0x64748B), 0);
+        // A tela da trava nao pode ficar por cima do login; ela volta no
+        // proximo login (do_login) se a trava ainda estiver ativa.
+        hide_trava_overlays();
         currentPage = PAGE_LOGIN;
     }
     close_menu();
@@ -2320,6 +2682,17 @@ void build_ui()
     lv_obj_add_style(ui_net_badge, &sty_badge_info, 0);
     lv_obj_set_pos(ui_net_badge, 660, 8);
 
+    // Badge da trava do Triple Check: vermelho, ao lado do ONLINE, enquanto a
+    // trava durar. Tocar nele reabre a tela da trava, que o operador pode ter
+    // fechado para conferir o estoque.
+    ui_trava_badge = lv_label_create(ui_header);
+    lv_label_set_text(ui_trava_badge, LV_SYMBOL_WARNING " TRAVA");
+    lv_obj_add_style(ui_trava_badge, &sty_badge_alert, 0);
+    lv_obj_set_pos(ui_trava_badge, 560, 8);
+    lv_obj_add_flag(ui_trava_badge, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ui_trava_badge, trava_badge_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(ui_trava_badge, LV_OBJ_FLAG_HIDDEN);
+
     ui_time_label = lv_label_create(ui_header);
     lv_label_set_text(ui_time_label, "--:--");
     lv_obj_set_style_text_color(ui_time_label, lv_color_hex(0xFFFFFF), 0);
@@ -2387,6 +2760,9 @@ void build_ui()
     build_disp_pin_popup();
     build_disp_med_popup();
 
+    // Trava do Triple Check: tela + popup nome/PIN do supervisor
+    build_trava_popups();
+
     // Screensaver (top-most layer, shown at boot)
     build_screensaver_page();
     lv_obj_add_flag(page_login, LV_OBJ_FLAG_HIDDEN);
@@ -2441,16 +2817,24 @@ static void timer_update_cb(lv_timer_t *t)
 //   {"cmd":"set_status","numero_os":..,"status":..}  -> {"resp":"ok","ok":bool}
 //   {"cmd":"sync_dispensers","itens":[...]}          -> {"resp":"ok","ok":bool}
 //   {"cmd":"set_dispenser_med","slot":..,"nome":..}  -> {"resp":"ok","ok":bool}
+//   {"cmd":"get_trava"}                              -> {"resp":"trava","ativa":bool,"os_id":..,"slot_id":..,"motivo":..,"ts":..}
+//   {"cmd":"liberar_trava","nome":..,"pin":..}       -> {"resp":"ok","ok":bool,"msg":..}
 //   {"event":"historico", ...} / {"event":"desvio", ...} / {"event":"ordem_concluida", ...}
 //
-// `validar_operador` espera ate 5 s, e nao os 800 ms dos demais: quem confere o
-// PIN e o BACKEND, e conferir hash custa ~300 ms POR OPERADOR ativo de proposito
-// (ver CLAUDE.md). Encurtar o hash para caber no timeout trocaria seguranca por
-// latencia que ninguem percebe.
+// `validar_operador` e `liberar_trava` esperam ate 5 s, e nao os 800 ms dos
+// demais: quem confere o PIN e o BACKEND, e conferir hash custa ~300 ms POR
+// OPERADOR ativo de proposito (ver CLAUDE.md); `liberar_trava` ainda faz o POST
+// no computador central (3 s) antes de responder. Encurtar o hash para caber no
+// timeout trocaria seguranca por latencia que ninguem percebe.
+//
+// `liberar_trava` leva nome + PIN em vez de usar o operador logado: o
+// supervisor e OUTRA pessoa, que chega a bancada, libera e vai embora. A
+// resposta nunca carrega o PIN.
 //
 // Backend -> ESP32 (nao solicitado):
 //   {"push":"ordem_status","numero_os":"OS1","status":"Em Processo"}
 //   {"push":"dispensers","data":[...]}   (estoque de um slot mudou na web)
+//   {"push":"trava","ativa":bool,"os_id":..,"slot_id":..,"motivo":..}   (so quando MUDA)
 //
 // Comandos de debug aceitos do simulador manual (simulador_serial.py):
 //   {"cmd":"nova_ordem","id":"OS001","itens":"Med1|5;Med2|3","destino":"UTI","lote":"LOT001"}
@@ -2681,6 +3065,8 @@ static void handle_serial_line(const char *raw, int len)
             handle_push_ordem_status(doc.as<JsonObject>());
         else if (strcmp(push_type, "dispensers") == 0)
             handle_push_dispensers(doc.as<JsonObject>());
+        else if (strcmp(push_type, "trava") == 0)
+            handle_push_trava(doc.as<JsonObject>());
         return;
     }
 
@@ -2805,6 +3191,10 @@ static void do_login(int op_idx)
     lv_obj_clear_flag(ui_body, LV_OBJ_FLAG_HIDDEN);
     show_page(PAGE_DASHBOARD);
     update_all_ui();
+    // A trava pode ter chegado (push ou get_trava) com ninguem logado: a tela
+    // dela e a primeira coisa que quem entra precisa ver.
+    if (trava.ativa)
+        show_trava_overlay();
     api_log_historico(operadores[op_idx].nome, "Login", "Login via painel");
 }
 
@@ -2926,6 +3316,10 @@ static void fetch_operadores_api()
         const char *nome = obj["nome"] | "";
         strncpy(operadores[num_operadores].nome, nome, sizeof(operadores[0].nome) - 1);
         operadores[num_operadores].nome[sizeof(operadores[0].nome) - 1] = '\0';
+        // O perfil decide quem aparece no popup de liberacao da trava
+        // (Supervisor/Admin). Ausente = "Operador": nao libera nada.
+        copy_trunc(operadores[num_operadores].perfil, sizeof(operadores[0].perfil),
+                   obj["perfil"] | "Operador");
         operadores[num_operadores].ativo = true;
         num_operadores++;
     }
@@ -3017,6 +3411,116 @@ static void fetch_dispensers_api()
 
     int i = aplicar_dispensers(doc["data"].as<JsonArray>());
     Serial.printf("Serial: %d dispensers carregados\n", i);
+}
+
+// ============================================================
+// TRAVA DO TRIPLE CHECK (via Serial)
+// ============================================================
+// O estado chega por DOIS caminhos, de proposito: o push `trava` (na hora, so
+// na transicao) e o get_trava a cada SYNC_INTERVAL_MS. Push e uma linha serial,
+// e linha serial se perde num reset deste ESP32 ou numa reconexao da porta — o
+// mesmo raciocinio de fetch_ordens_api refrescando ordem espelhada que ja
+// conhece.
+static void aplicar_trava(JsonObject doc)
+{
+    bool antes = trava.ativa;
+    trava.ativa = doc["ativa"] | false;
+    copy_trunc(trava.os_id, sizeof(trava.os_id), doc["os_id"] | "");
+    trava.slot_id = doc["slot_id"].isNull() ? -1 : (int)(doc["slot_id"] | -1);
+    // O motivo e montado pelo orquestrador para gente ler e passa de 240
+    // caracteres no pior caso real. MAX_MOTIVO_LEN + copy_trunc: o que nao
+    // couber termina em "...", visivel na tela — nunca cortado em silencio.
+    if (!copy_trunc(trava.motivo, sizeof(trava.motivo), doc["motivo"] | ""))
+        Serial.printf("Trava: motivo maior que %d bytes, truncado com ...\n", MAX_MOTIVO_LEN);
+
+    if (ui_trava_badge)
+    {
+        if (trava.ativa)
+            lv_obj_clear_flag(ui_trava_badge, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(ui_trava_badge, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (trava.ativa && !antes)
+    {
+        Serial.printf("Trava: ATIVA (OS %s, slot %d)\n", trava.os_id, trava.slot_id);
+        show_trava_overlay();
+    }
+    else if (!trava.ativa && antes)
+    {
+        Serial.println("Trava: liberada");
+        hide_trava_overlays();
+    }
+    if (app.logado && currentPage == PAGE_DASHBOARD)
+        update_dashboard_ui();
+}
+
+static void handle_push_trava(JsonObject doc)
+{
+    Serial.println("Serial: push de trava recebido");
+    aplicar_trava(doc);
+}
+
+static void fetch_trava_api()
+{
+    if (!app.online)
+        return;
+    JsonDocument doc;
+    if (!serial_request("{\"cmd\":\"get_trava\"}", "trava", doc))
+    {
+        Serial.println("Serial: get_trava falhou (timeout)");
+        return;
+    }
+    aplicar_trava(doc.as<JsonObject>());
+}
+
+// Pede ao backend para liberar a trava em nome de `nome`, que confere o `pin`
+// la — o display nao guarda PIN nenhum. Devolve true se o backend confirmou;
+// `msg` recebe o texto para a tela.
+static bool liberar_trava_backend(const char *nome, const char *pin, char *msg, size_t msg_len)
+{
+    if (!app.online)
+    {
+        copy_trunc(msg, msg_len, "BACKEND OFFLINE");
+        return false;
+    }
+    size_t n = pin ? strlen(pin) : 0;
+    if (n == 0 || n > 12)
+    {
+        copy_trunc(msg, msg_len, "Digite o PIN");
+        return false;
+    }
+    for (size_t i = 0; i < n; i++)
+    {
+        if (pin[i] < '0' || pin[i] > '9')
+        {
+            copy_trunc(msg, msg_len, "PIN so aceita digitos");
+            return false;
+        }
+    }
+
+    // ArduinoJson, e nao snprintf: o nome vem do cadastro e pode ter acento ou
+    // aspas — montado a mao, uma aspa viraria uma linha JSON quebrada no cabo.
+    JsonDocument doc;
+    doc["cmd"] = "liberar_trava";
+    doc["nome"] = nome;
+    doc["pin"] = pin;
+    char payload[160];
+    serializeJson(doc, payload, sizeof(payload));
+
+    // 5 s, como validar_operador: o backend confere o hash (~300 ms de
+    // proposito) E faz o POST no computador central (CENTRAL_TIMEOUT_S = 3 s)
+    // antes de responder. Com os 800 ms de sempre o display desistiria de uma
+    // liberacao que aconteceu.
+    JsonDocument resp;
+    if (!serial_request(payload, "ok", resp, 5000))
+    {
+        Serial.println("Serial: liberar_trava falhou (timeout)");
+        copy_trunc(msg, msg_len, "SEM RESPOSTA DO BACKEND");
+        return false;
+    }
+    bool ok = resp["ok"] | false;
+    copy_trunc(msg, msg_len, resp["msg"] | (ok ? "Trava liberada" : "Recusado"));
+    return ok;
 }
 
 static unsigned long last_api_fetch = 0;
@@ -3259,6 +3763,7 @@ static void save_operadores_to_sd()
     {
         JsonObject o = arr.add<JsonObject>();
         o["nome"] = operadores[i].nome;
+        o["perfil"] = operadores[i].perfil;
     }
     serializeJson(doc, f);
     f.close();
@@ -3288,6 +3793,8 @@ static void load_operadores_from_sd()
         const char *nome = obj["nome"] | "";
         strncpy(operadores[num_operadores].nome, nome, sizeof(operadores[0].nome) - 1);
         operadores[num_operadores].nome[sizeof(operadores[0].nome) - 1] = '\0';
+        copy_trunc(operadores[num_operadores].perfil, sizeof(operadores[0].perfil),
+                   obj["perfil"] | "Operador");
         operadores[num_operadores].ativo = true;
         num_operadores++;
     }
@@ -3407,6 +3914,7 @@ void setup()
     fetch_operadores_api();
     fetch_dispensers_api();
     fetch_catalogo_api();
+    fetch_trava_api();
 
     Serial.println("=== APSEN Dispensacao Iniciado ===");
 }
@@ -3456,6 +3964,9 @@ void loop()
             {
                 fetch_ordens_api();
                 fetch_dispensers_api();
+                // Rede de seguranca do push `trava`: uma linha serial que se
+                // perde num reset ou numa reconexao da porta.
+                fetch_trava_api();
                 switch (currentPage)
                 {
                 case PAGE_DASHBOARD:

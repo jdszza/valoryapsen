@@ -56,6 +56,24 @@ Integração do painel de bancada:
 > mesmo id. Regravar o firmware é a única pendência dessa rodada — ver o
 > [docs/BANCADA.md](docs/BANCADA.md), seção "O firmware e o `os_id` do central".
 
+Supervisor, telas TFT e portas fixas:
+
+| # | Task | Estado |
+|---|------|--------|
+| 1 | Bugs soltos: `ORDER BY prioridade` por `CASE`, `peso_atual_g` da balança no estado e no banco, `_ate` com prazo por env | ✅ feito |
+| 2 | Perfil `supervisor` no central: portão `_get_supervisor_ou_admin`, role validada, `em_nome_de` na liberação | ✅ feito |
+| 3 | Perfil Supervisor no painel, `central_comandos.py` (a única escrita no central) e a faixa da trava na web | ✅ feito |
+| 4 | Trava no display de 7": `get_trava`, `liberar_trava`, push `trava`, tela + numpad nome/PIN | ✅ feito (falta **regravar o display em campo**) |
+| 5 | Segunda placa do dispenser-adapter: as 8 telas TFT (`dispenser_tft`), `estado_celula`, `trava_resumo` ≤ 48 | ✅ feito |
+| 6 | O central avisa a célula que travou (`/comandos/estado-celula`, uma vez, timeout curto) | ✅ feito |
+| 7 | Portas fixas no mini PC Windows: `APSEN_DISPLAY_PORTA`, profile `simulado`, `docs/DEPLOY_WINDOWS.md` | ✅ feito |
+
+> **Trava do Triple Check no display** saiu de "Decisões adiadas de propósito":
+> a decisão de operação foi tomada — o supervisor libera pelo painel de
+> bancada, autenticado por PIN, na web e no display. O display em campo precisa
+> ser regravado de novo (a pendência acima acumula a tela de trava) — ver o
+> [docs/BANCADA.md](docs/BANCADA.md), seção "A trava do Triple Check no display".
+
 ---
 
 # Backlog aberto
@@ -281,8 +299,10 @@ O que sobrou de pendência real está registrado abaixo e no README:
 
 - **Regravar o display da bancada.** O firmware gravado antes da integração
   trunca o `os_id` do central em 16 bytes, e dois disparos do mesmo template
-  colidem no mesmo id. O passo a passo de gravação está no README, em
-  "Gravar e testar o display físico".
+  colidem no mesmo id — e o display em campo também não conhece a tela de
+  trava (`get_trava`, `liberar_trava`, push `trava`). O passo a passo de
+  gravação está no [docs/BANCADA.md](docs/BANCADA.md), em "Gravar e testar o
+  display físico".
 - **Os itens de higiene do P2**, listados na seção "Itens de higiene" acima.
 
 ---
@@ -291,11 +311,6 @@ O que sobrou de pendência real está registrado abaixo e no README:
 
 Não são pendências esquecidas — cada uma foi deixada de fora por um motivo.
 
-- **Trava do Triple Check no display.** O central expõe `GET /api/v1/trava` e a
-  trava para a fila inteira até um supervisor liberar — é a informação mais útil
-  que o painel poderia mostrar, e é também a que exige decidir se o display
-  ganha um botão de liberar (e, se ganhar, com que autenticação). Decisão de
-  operação, não de código.
 
 - **Estação de visão do pacote.** Ela conta caixas por QR/ArUco em bancada; o
   repo já tem `vision-adapter` e `vision-simulator` para as três câmeras da

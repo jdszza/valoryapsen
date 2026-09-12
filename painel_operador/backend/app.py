@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import central_client
+import central_comandos
 from central_client import CENTRAL_SYNC_S, INTEGRACAO_ATIVA, traduzir_status
 
 app = Flask(__name__)
@@ -219,7 +220,35 @@ def _probe_port(port_name):
     return None
 
 
+def porta_fixa_do_display() -> str:
+    """`APSEN_DISPLAY_PORTA`, lida a CADA tentativa (o `.bat` da bancada e
+    reiniciado com frequencia — ver `_api_token_configurado`)."""
+    return (os.environ.get("APSEN_DISPLAY_PORTA") or "").strip()
+
+
 def find_display_port():
+    """Abre a porta do display: a FIXA, se `APSEN_DISPLAY_PORTA` estiver
+    definida; senao, varre todas as portas procurando o ping.
+
+    A varredura e para desenvolvimento SEM hardware. Na celula montada ela e o
+    problema: cada processo que varre abre, por ate 9,5 s, as portas DOS OUTROS
+    (a do dispenser, a da CNC, a da balanca, a das telas) so para descobrir se
+    o display esta ali — e, enquanto segura uma delas, o dono de verdade toma
+    ACCESS_DENIED na propria porta. Com cinco processos e cinco portas isso nao
+    da erro: da boot nao-deterministico, em que uma placa as vezes simplesmente
+    nao e achada. Porta fixa elimina a varredura, e sem varredura nao ha
+    competicao (README, "Portas seriais na célula montada").
+
+    A porta fixa passa pelo MESMO `_probe_port`: DTR/RTS desligados (o circuito
+    de reset do ESP32-S3) e a confirmacao pelo ping — fixar o numero nao
+    dispensa conferir que ha um display do outro lado.
+    """
+    fixa = porta_fixa_do_display()
+    if fixa:
+        conn = _probe_port(fixa)
+        if conn:
+            print(f"Display encontrado na porta {fixa} (APSEN_DISPLAY_PORTA)")
+        return conn
     for p in serial.tools.list_ports.comports():
         conn = _probe_port(p.device)
         if conn:
@@ -346,6 +375,21 @@ def _handle_serial_message(conn, msg):
             reply = {"resp": "ok", "ok": ok}
             if not ok:
                 reply["msg"] = erro
+        elif cmd == "get_trava":
+            # Tag propria ("trava"), como `validar_operador`: nao devolve `data`,
+            # devolve o estado. Cache de TRAVA_CACHE_S — ver `_trava_para_display`.
+            reply = {"resp": "trava", **_trava_para_display(), "ts": int(time.time())}
+        elif cmd == "liberar_trava":
+            # Nome + PIN, e nao o operador logado no display: o supervisor e
+            # OUTRA pessoa, que chega a bancada, libera e vai embora. Quem
+            # confere o PIN e o backend, pelo mesmo motivo do `validar_operador`.
+            # A resposta NUNCA carrega o PIN.
+            db = get_db()
+            try:
+                ok, texto = _liberar_trava_display(db, msg.get("nome", ""), msg.get("pin", ""))
+            finally:
+                db.close()
+            reply = {"resp": "ok", "ok": ok, "msg": texto}
         elif event == "historico":
             db = get_db()
             try:
@@ -378,6 +422,10 @@ def _handle_serial_message(conn, msg):
         print(f"Erro processando {cmd or event}: {e}")
         if cmd in _GET_RESP_TAG:
             reply = {"resp": _GET_RESP_TAG[cmd], "data": [], "erro": str(e)}
+        elif cmd == "get_trava":
+            # Tag propria, pelo mesmo motivo de `validar_operador` logo abaixo.
+            reply = {"resp": "trava", **TRAVA_DESCONHECIDA, "ts": int(time.time()),
+                     "erro": str(e)}
         elif cmd == "validar_operador":
             # Tag propria: o display espera "operador" e descarta o resto.
             # Responder {"resp":"ok"} aqui o deixaria travado ate o timeout,
@@ -488,12 +536,18 @@ def get_db():
 # ============================================================
 # Perfis e permissões
 # ============================================================
-PERFIS = ["Admin", "PCP", "PCM", "Operador"]
+PERFIS = ["Admin", "Supervisor", "PCP", "PCM", "Operador"]
 
-# Cada chave é uma permissão; True = permitido para o perfil
+# Cada chave é uma permissão; True = permitido para o perfil.
+#
+# `trava_liberar` é a única permissão que ESCREVE no computador central: libera
+# a trava do Triple Check (ver `central_comandos.py`). Só Admin e Supervisor a
+# têm. O Supervisor é quem chega à bancada, libera e vai embora — vê o
+# dashboard (onde a faixa da trava aparece) e as ordens, e nada mais.
 PERMISSOES = {
     "Admin": {
         "dash": True,
+        "trava_liberar": True,
         "ordens_ver": True,  "ordens_criar": True,  "ordens_editar": True,
         "ordens_excluir": True, "ordens_status": True,
         "dispensers_ver": True, "dispensers_editar": True,
@@ -507,8 +561,25 @@ PERMISSOES = {
         "clientes_ver": True, "clientes_editar": True,
         "visao_ver": True, "visao_editar": True,
     },
+    "Supervisor": {
+        "dash": True,
+        "trava_liberar": True,
+        "ordens_ver": True, "ordens_criar": False, "ordens_editar": False,
+        "ordens_excluir": False, "ordens_status": False,
+        "dispensers_ver": False, "dispensers_editar": False,
+        "catalogo_ver": False,   "catalogo_editar": False,
+        "operadores_ver": False, "operadores_editar": False,
+        "historico_ver": False,  "historico_limpar": False,
+        "relatorio_ver": False,
+        "lotes_ver": False, "lotes_editar": False,
+        "desvios_ver": False, "desvios_editar": False,
+        "kpis_ver": False,
+        "clientes_ver": False, "clientes_editar": False,
+        "visao_ver": False, "visao_editar": False,
+    },
     "PCP": {
         "dash": True,
+        "trava_liberar": False,
         "ordens_ver": True, "ordens_criar": True, "ordens_editar": True,
         "ordens_excluir": False, "ordens_status": True,
         "dispensers_ver": True, "dispensers_editar": False,
@@ -524,6 +595,7 @@ PERMISSOES = {
     },
     "PCM": {
         "dash": True,
+        "trava_liberar": False,
         "ordens_ver": True, "ordens_criar": False, "ordens_editar": False,
         "ordens_excluir": False, "ordens_status": False,
         "dispensers_ver": True, "dispensers_editar": True,
@@ -539,6 +611,7 @@ PERMISSOES = {
     },
     "Operador": {  # somente display, sem acesso web
         "dash": False,
+        "trava_liberar": False,
         "ordens_ver": False, "ordens_criar": False, "ordens_editar": False,
         "ordens_excluir": False, "ordens_status": False,
         "dispensers_ver": False, "dispensers_editar": False,
@@ -1089,6 +1162,28 @@ MSG_SLOT_CENTRAL = "slot medido pelo computador central"
 # Toda ordem espelhada nasce com esta prioridade: o central não tem o conceito.
 PRIORIDADE_ESPELHO = "Normal"
 
+# A ordem REAL de prioridade, da mais urgente para a menos. É a fonte do
+# ORDER BY de `/api/resumo` — a query que alimenta a lista de ordens ativas.
+#
+# Ela ordenava por `prioridade DESC`, e `prioridade` é TEXTO: com estes quatro
+# valores o DESC alfabético produz Urgente → Normal → Baixa → Alta, ou seja,
+# "Alta" caía em ÚLTIMO, atrás de "Baixa". A ordem errada chegava ao operador
+# sem erro em lugar nenhum — a lista continuava com as mesmas ordens, só que
+# na sequência errada, e nada no log distingue "ordenado errado" de "ordenado".
+PRIORIDADES = ("Urgente", "Alta", "Normal", "Baixa")
+
+
+def _sql_ordem_prioridade(coluna: str = "prioridade") -> str:
+    """Fragmento `CASE` para um ORDER BY na ordem de `PRIORIDADES`.
+
+    Prioridade que o banco não conheça vai para o FIM, não para o começo: um
+    valor novo, ou digitado errado, não pode furar a fila de quem é urgente.
+    Os valores são os da tupla acima, nunca entrada do usuário — o f-string
+    monta SQL a partir de uma constante deste módulo.
+    """
+    whens = " ".join(f"WHEN '{p}' THEN {i}" for i, p in enumerate(PRIORIDADES))
+    return f"CASE {coluna} {whens} ELSE {len(PRIORIDADES)} END"
+
 
 # ── O vocabulário de status é FECHADO ─────────────────────────────────────────
 #
@@ -1297,6 +1392,11 @@ def central_sync_worker():
             resumo = sincronizar_ordens_central(conn)
             if resumo["novas"] or resumo["atualizadas"]:
                 print(f"[central] espelho: {resumo}")
+            # A trava vai no MESMO ciclo: é uma leitura a mais a cada
+            # CENTRAL_SYNC_S, e não uma thread a mais disputando o central.
+            # `avisar_display=True`: é DAQUI que sai o push `trava` — só na
+            # transição, comparando com o estado anterior.
+            sincronizar_trava_central(avisar_display=True)
         except Exception as exc:
             print(f"[central] sincronizacao falhou: {exc}")
         finally:
@@ -1306,6 +1406,97 @@ def central_sync_worker():
                 except Exception:
                     pass
         time.sleep(CENTRAL_SYNC_S)
+
+
+# -- Trava do Triple Check ----------------------------------------------------
+#
+# Lida no mesmo ciclo do espelho (`central_sync_worker`) e guardada JUNTO com o
+# estado anterior: é a comparação entre os dois que decide quando o display
+# precisa ser avisado — o push `trava` da ponte serial —, na mesma forma do
+# `ordem_status` em `sincronizar_ordens_central`. Estado igual não gera aviso.
+#
+# O dashboard web lê daqui, e não do central: a rota da tela não pode pagar a
+# rede a cada carregamento, e o espelho já roda a cada CENTRAL_SYNC_S.
+TRAVA_CHAVES = ("ativa", "os_id", "slot_id", "motivo")
+_trava_espelho = {"atual": None, "anterior": None, "fonte_ok": False, "lida_em": 0.0}
+_trava_lock = threading.Lock()
+
+# Janela do cache de `get_trava` para o display — o mesmo número e o mesmo
+# motivo de `DISPENSERS_CACHE_S`: o pedido roda DENTRO da ponte serial, o
+# `serial_request` do firmware desiste em 800 ms e `CENTRAL_TIMEOUT_S` é 3 s.
+# Central lento (de pé, mas sem responder) faria o display desistir antes de o
+# backend ter a resposta. A leitura do espelho (a cada CENTRAL_SYNC_S) também
+# renova o cache, então no caso comum o display é servido sem tocar na rede.
+TRAVA_CACHE_S = 2.0
+
+# O que o display recebe quando o backend nunca conseguiu ler a trava. "Sem
+# trava" é o estado de boot da célula; o display não tem o que fazer com
+# "desconhecido", e o push da primeira leitura de verdade corrige em segundos.
+TRAVA_DESCONHECIDA = {"ativa": False, "os_id": "", "slot_id": None, "motivo": ""}
+
+
+def _trava_normalizada(bruto) -> dict | None:
+    """Só as quatro chaves que importam, com tipos previsíveis — ou None."""
+    if not isinstance(bruto, dict):
+        return None
+    slot = bruto.get("slot_id")
+    return {
+        "ativa":   bool(bruto.get("ativa")),
+        "os_id":   str(bruto.get("os_id") or ""),
+        "slot_id": slot if isinstance(slot, int) and not isinstance(slot, bool) else None,
+        "motivo":  str(bruto.get("motivo") or ""),
+    }
+
+
+def sincronizar_trava_central(avisar_display: bool = False) -> tuple:
+    """Uma leitura da trava. Devolve `(estado, mudou)`.
+
+    Central fora do ar devolve `(None, False)` e NÃO apaga o último estado
+    conhecido — ele continua na tela, marcado como tal (`fonte_ok=False`).
+    Apagar faria a faixa vermelha sumir justamente quando o central caiu, que é
+    quando ninguém está olhando por ele; e "mudou" só vale entre duas leituras
+    de verdade, senão uma queda de rede viraria push de "trava liberada".
+
+    `avisar_display=True` (a thread do espelho) empurra `{"push": "trava"}`
+    ao display quando — e só quando — o estado mudou. Push é uma linha serial,
+    e linha serial se perde num reset do ESP32: por isso o display também
+    PERGUNTA (`get_trava`), como já faz com as ordens espelhadas.
+    """
+    estado = _trava_normalizada(central_client.trava_estado())
+    with _trava_lock:
+        _trava_espelho["lida_em"] = time.time()
+        if estado is None:
+            _trava_espelho["fonte_ok"] = False
+            return None, False
+        anterior = _trava_espelho["atual"]
+        mudou = anterior is None or any(anterior[c] != estado[c] for c in TRAVA_CHAVES)
+        if mudou:
+            _trava_espelho["anterior"] = anterior
+            _trava_espelho["atual"] = estado
+        _trava_espelho["fonte_ok"] = True
+    if mudou and avisar_display:
+        push_to_display({"push": "trava", **estado})
+    return dict(estado), mudou
+
+
+def _trava_para_display() -> dict:
+    """Resposta de `get_trava`: o espelho, renovado se tiver mais de
+    `TRAVA_CACHE_S`. Nunca `None` — ver `TRAVA_DESCONHECIDA`."""
+    with _trava_lock:
+        fresco = (time.time() - _trava_espelho["lida_em"]) < TRAVA_CACHE_S
+    if not fresco:
+        sincronizar_trava_central()
+    with _trava_lock:
+        atual = _trava_espelho["atual"]
+    return dict(atual) if atual is not None else dict(TRAVA_DESCONHECIDA)
+
+
+def trava_atual() -> dict | None:
+    """O último estado conhecido, com `fonte_ok` dizendo se ele é fresco."""
+    with _trava_lock:
+        if _trava_espelho["atual"] is None:
+            return None
+        return {**_trava_espelho["atual"], "fonte_ok": _trava_espelho["fonte_ok"]}
 
 
 # -- Slots espelhados ---------------------------------------------------------
@@ -1775,6 +1966,42 @@ def _validar_pin_data(conn, pin: str) -> dict:
     return {"ok": False}
 
 
+def _liberar_trava_display(conn, nome: str, pin: str) -> tuple:
+    """`cmd: liberar_trava` do display — nome + PIN, conferidos AQUI.
+
+    Devolve `(ok, mensagem)`; a mensagem vai para a tela do display e nunca
+    contem o PIN. Tres portas, nesta ordem: o operador existe e esta ativo, o
+    PIN confere (hash, ~300 ms de proposito), e o PERFIL dele libera trava
+    (`PERMISSOES[perfil]["trava_liberar"]`) — um Operador com o PIN certo
+    continua nao liberando. So entao a escrita sai para o central, por
+    `central_comandos`, em nome de quem digitou.
+
+    Custo total: hash + POST ao central (CENTRAL_TIMEOUT_S). E por isso que o
+    firmware espera 5 s neste pedido, e nao os 800 ms de sempre.
+    """
+    nome = (nome or "").strip()
+    pin = (pin or "").strip()
+    if not nome or not pin:
+        return False, "informe nome e PIN"
+    op = conn.execute(
+        "SELECT nome, perfil, pin_hash FROM operadores WHERE nome=? AND ativo=1", (nome,)
+    ).fetchone()
+    if op is None or not conferir_pin(op["pin_hash"], pin):
+        return False, "nome ou PIN incorreto"
+    if not PERMISSOES.get(op["perfil"], {}).get("trava_liberar", False):
+        return False, f"perfil {op['perfil']} nao libera trava (precisa Supervisor ou Admin)"
+
+    ok, texto = central_comandos.liberar_trava(em_nome_de=op["nome"])
+    registrar_historico(conn, op["nome"], op["perfil"],
+                        "Liberar trava (display)" if ok else "Liberar trava recusada (display)",
+                        texto)
+    conn.commit()
+    if ok:
+        # O espelho (e a web) ficam sabendo agora, nao no proximo ciclo.
+        sincronizar_trava_central()
+    return ok, texto
+
+
 def _lote_ativo(conn, medicamento_id):
     if medicamento_id is None:
         return None
@@ -2121,6 +2348,38 @@ def login():
     return render_template("login.html", erro=erro)
 
 
+@app.route("/trava/liberar", methods=["POST"])
+@login_required
+@requer("trava_liberar")
+def web_liberar_trava():
+    """Libera a trava do Triple Check no central, em nome de quem está logado.
+
+    A permissão é conferida AQUI, no servidor, e não só no template: botão
+    escondido não é proteção. O que acontece depois é a única escrita que o
+    painel faz no central, e ela mora em `central_comandos.py` — ver o
+    docstring de lá para o porquê de existir separada do espelho.
+
+    Quem liberou entra no histórico do painel nos dois desfechos: a recusa
+    também é rastro (alguém tentou, e o central disse não, e por quê).
+    """
+    nome = session.get("op_nome", "")
+    perfil = session.get("perfil", "")
+    ok, msg = central_comandos.liberar_trava(em_nome_de=nome)
+    conn = get_db()
+    try:
+        registrar_historico(conn, nome, perfil,
+                            "Liberar trava" if ok else "Liberar trava (recusada)", msg)
+        conn.commit()
+    finally:
+        conn.close()
+    if ok:
+        # O espelho atualiza na hora, sem esperar o próximo ciclo: a faixa
+        # vermelha não pode continuar na tela com a OS já rodando.
+        sincronizar_trava_central()
+    flash(msg, "success" if ok else "danger")
+    return redirect(url_for("dashboard"))
+
+
 @app.route("/logout")
 def logout():
     if "op_id" in session:
@@ -2184,6 +2443,12 @@ def dashboard():
 
     return render_template(
         "dashboard.html",
+        # A trava do Triple Check vem do espelho, não de uma consulta ao
+        # central por carregamento de tela. Sem a conta de serviço, o botão dá
+        # lugar à frase que diz qual variável definir.
+        trava=trava_atual(),
+        trava_msg_desligado=(None if central_comandos.habilitado()
+                             else central_comandos.motivo_desligado()),
         total=total, pendentes=pendentes, em_processo=em_processo,
         pausados=pausados, concluidas=concluidas,
         com_erro=com_erro, canceladas=canceladas,
@@ -3335,8 +3600,11 @@ def api_resumo():
     canceladas = conn.execute(
         "SELECT COUNT(*) as c FROM ordens WHERE status='Cancelado'"
     ).fetchone()["c"]
+    # CASE explícito, não `prioridade DESC`: o DESC ordenava texto e punha
+    # "Alta" atrás de "Baixa" — ver `PRIORIDADES`.
     rows = conn.execute(
-        "SELECT * FROM ordens WHERE status IN ('Pendente','Em Processo','Pausado') ORDER BY prioridade DESC, data_criacao ASC LIMIT 10"
+        "SELECT * FROM ordens WHERE status IN ('Pendente','Em Processo','Pausado') "
+        f"ORDER BY {_sql_ordem_prioridade()}, data_criacao ASC LIMIT 10"
     ).fetchall()
     conn.close()
     ordens_ativas = []

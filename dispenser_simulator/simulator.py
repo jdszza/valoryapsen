@@ -207,6 +207,21 @@ class LimparReq(BaseModel):
     solicitado_por: str = "sistema"
 
 
+class EstadoCelulaReq(BaseModel):
+    """O que o central manda às 8 telas TFT quando a trava muda de estado.
+
+    Este simulador é os MECANISMOS; ele não tem tela. A rota existe para que
+    a perna de cima não saiba qual transporte está embaixo: sem ela, o
+    transporte http tomaria 404 e viraria recusa determinística enquanto o
+    serial (a placa das telas de verdade) funciona — a assimetria que o
+    dispenser-adapter existe para não ter. Ver docs/PROTOCOLO_SERIAL.md §6.
+    """
+    trava_ativa: bool
+    trava_slot_id: Optional[int] = None
+    os_id: str = ""
+    trava_resumo: str = ""
+
+
 # ── Handlers de hardware ───────────────────────────────────────────────────────
 
 def _do_carregar(slot_id: int, medicamento: str, sku: str, categoria: str,
@@ -524,6 +539,16 @@ def executar_limpar(req: LimparReq):
     ).start()
 
     return {"ok": True, "dispenser_id": slot_id, "msg": "Limpeza iniciada"}
+
+
+@app.post("/executar/estado-celula")
+def executar_estado_celula(req: EstadoCelulaReq):
+    """Só loga — ver `EstadoCelulaReq`. Nenhum evento sai daqui: o estado da
+    célula é para pintar tela, e este simulador não tem nenhuma."""
+    logger.info("[TELAS] estado da célula: trava=%s slot=%s os=%s resumo=%r "
+                "(simulador sem telas — só registrado)",
+                req.trava_ativa, req.trava_slot_id, req.os_id, req.trava_resumo)
+    return {"ok": True, "telas": "simulador sem telas"}
 
 
 # ── Telemetria periódica ───────────────────────────────────────────────────────

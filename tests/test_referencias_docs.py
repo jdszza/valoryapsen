@@ -63,9 +63,18 @@ def _ler(caminho: Path) -> str:
 
 
 def _existe(referencia: str, origem: Path) -> bool:
-    """O alvo resolve a partir da raiz do repo OU do diretório de quem cita."""
+    """O alvo resolve a partir da raiz do repo, do diretório de quem cita, ou
+    de `docs/`.
+
+    A terceira base cobre o caminho montado por partes —
+    `RAIZ_REPO / "docs" / "PROTOCOLO_SERIAL.md"` — em que a varredura só enxerga
+    o nome do arquivo. Um nome que exista em `docs/` é um ponteiro que o leitor
+    resolve sozinho; o que este teste caça é o nome que não existe em lugar
+    nenhum.
+    """
     return ((RAIZ_REPO / referencia).is_file()
-            or (origem.parent / referencia).is_file())
+            or (origem.parent / referencia).is_file()
+            or (RAIZ_REPO / "docs" / referencia).is_file())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -77,10 +86,18 @@ def _existe(referencia: str, origem: Path) -> bool:
 _ARQUIVO_MD = re.compile(r"(?<![\w/.-])((?:[\w-]+/)*[\w.-]+\.md)\b")
 
 
+# Este arquivo nomeia os ponteiros mortos de propósito — no docstring e na
+# mutação do bloco 5 —, então ele é o único que a varredura não lê. Lê-lo faria
+# o teste reprovar a si mesmo por citar o erro que existe para pegar.
+_PROPRIO = Path(__file__).resolve()
+
+
 def test_todo_md_citado_no_codigo_existe():
     """`(ver ANALISE_ARQUITETURAL.md)` num docstring foi exatamente isto."""
     mortos = []
     for arquivo in _versionados(".py"):
+        if arquivo.resolve() == _PROPRIO:
+            continue
         for referencia in set(_ARQUIVO_MD.findall(_ler(arquivo))):
             if not _existe(referencia, arquivo):
                 mortos.append(f"{arquivo.relative_to(RAIZ_REPO)} → {referencia}")
@@ -152,7 +169,7 @@ def test_toda_secao_do_readme_citada_por_nome_existe():
     titulos = _titulos(README)
     mortas = []
     for arquivo in _versionados(".py", ".md"):
-        if arquivo == README:
+        if arquivo == README or arquivo.resolve() == _PROPRIO:
             continue
         for secao in set(_CITA_SECAO.findall(_ler(arquivo))):
             if _normalizar(secao) not in titulos:

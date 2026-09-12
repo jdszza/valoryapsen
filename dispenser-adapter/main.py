@@ -22,6 +22,21 @@ Os dispensers atendem por DOIS transportes, e quem escolhe é
 A perna de CIMA não sabe qual dos dois está embaixo: os endpoints, os modelos
 Pydantic, o payload do evento e o `_post_central` são os mesmos nos dois casos.
 É o que permite trocar o simulador por firmware sem tocar no central.
+
+Há uma SEGUNDA placa, numa SEGUNDA porta, e o dono das duas é este adapter:
+as 8 telas TFT (`dispenser_tft`, `DISPENSER_TFT_TRANSPORTE`). Acionar os 8
+mecanismos, desenhar 8 telas e manter a serial não cabe num ESP só. Este
+adapter já vê todo comando que desce e todo evento que sobe do slot — tudo que
+as telas precisam mostrar —, então é ele quem as espelha:
+
+  POST /comandos/estado-celula  → `estado_celula` na placa das telas (só nela)
+  carregar/dispensar/limpar e os eventos carregado/dispensado/limpeza_ok/erro
+                                → `slot` na placa das telas, na TRANSIÇÃO
+
+Falha da placa das telas NUNCA muda o caminho do dispenser: não recusa comando,
+não atrasa ACK, não impede o evento de chegar ao central. Tela errada é
+cosmética; dispensa atrasada não é. E os eventos DELA (`telemetria`, `erro`)
+ficam aqui, em log e no /health — o central não tem endpoint de tela.
 """
 import asyncio
 import logging
@@ -67,8 +82,45 @@ SERIAL_URL           = os.getenv("DISPENSER_SERIAL_URL", "").strip()
 SERIAL_BAUD          = int(os.getenv("DISPENSER_SERIAL_BAUD", "115200"))
 ACK_TIMEOUT_S        = float(os.getenv("DISPENSER_ACK_TIMEOUT_S", "2"))
 
+# ── A segunda placa: as 8 telas TFT (`dispenser_tft`) ─────────────────────────
+#
+# "http" = DESLIGADO, nenhuma tela. A placa das telas só existe por serial, e
+# o default mantém este adapter EXATAMENTE como era antes dela — a suíte, o
+# CI e a demonstração em Docker não mudam de resultado. Com "http",
+# `estado_celula` ainda desce ao simulador (que só loga), para que a perna de
+# cima não saiba qual transporte está embaixo — sem a rota, o http tomaria 404
+# e viraria recusa determinística enquanto o serial funciona; `slot` não vai
+# a lugar nenhum: o simulador É o dispenser e já sabe o que tem em cada slot.
+TFT_SUBSISTEMA       = "dispenser_tft"
+
+
+def _transporte_tft() -> str:
+    escolhido = os.getenv("DISPENSER_TFT_TRANSPORTE", "http").strip().lower()
+    if escolhido not in ("http", "serial"):
+        logger.warning("[CFG] DISPENSER_TFT_TRANSPORTE=%r desconhecido — usando "
+                       "'http' (telas desligadas).", escolhido)
+        return "http"
+    return escolhido
+
+
+TFT_TRANSPORTE       = _transporte_tft()
+TFT_SERIAL_URL       = os.getenv("DISPENSER_TFT_SERIAL_URL", "").strip()
+TFT_SERIAL_BAUD      = int(os.getenv("DISPENSER_TFT_SERIAL_BAUD", "115200"))
+TFT_ACK_TIMEOUT_S    = float(os.getenv("DISPENSER_TFT_ACK_TIMEOUT_S", "2"))
+
+# Teto do `trava_resumo` que vai às telas. Ele sai da CATEGORIA da divergência
+# ("divergência de peso", "contagem divergente"), nunca da string formatada
+# do central, que passa de 240 caracteres: mandá-la acoplaria o formato de
+# mensagem do central à largura de uma tela e criaria um segundo ponto de
+# truncamento para algo cosmético. O motivo completo é do display de 7" e da
+# web, onde o supervisor decide; a tela do slot responde uma pergunta só: é
+# este slot? O adapter corta em 48 também — o teto é do contrato, não de quem
+# chama.
+TRAVA_RESUMO_MAX     = 48
+
 _client: httpx.AsyncClient | None = None
 _link: "serial_link.LinkSerial | None" = None
+_link_tft: "serial_link.LinkSerial | None" = None
 _loop: asyncio.AbstractEventLoop | None = None
 
 
@@ -89,10 +141,11 @@ async def _wait_for_upstream(name: str, url: str, retries: int = 30, interval: f
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _client, _link, _loop
+    global _client, _link, _link_tft, _loop
     _client = httpx.AsyncClient()
     _loop = asyncio.get_running_loop()
-    logger.info("[STARTUP] httpx.AsyncClient criado | transporte=%s", TRANSPORTE)
+    logger.info("[STARTUP] httpx.AsyncClient criado | transporte=%s | telas=%s",
+                TRANSPORTE, TFT_TRANSPORTE)
     if TRANSPORTE == "serial":
         _link = serial_link.LinkSerial(
             subsistema=SUBSISTEMA, url=SERIAL_URL, baud=SERIAL_BAUD,
@@ -104,9 +157,19 @@ async def lifespan(app: FastAPI):
         # Quem conta a verdade sobre a porta é o /health.
     else:
         await _wait_for_upstream("dispenser-simulator", DISPENSER_SIM_URL + "/ping")
+    if TFT_TRANSPORTE == "serial":
+        # A segunda porta. Outro `LinkSerial`, outro `cmd_id` monotônico, outra
+        # thread leitora — e o mesmo `serial_link.py`, sem mudança nenhuma.
+        _link_tft = serial_link.LinkSerial(
+            subsistema=TFT_SUBSISTEMA, url=TFT_SERIAL_URL, baud=TFT_SERIAL_BAUD,
+            ack_timeout_s=TFT_ACK_TIMEOUT_S, ao_receber_evento=_evento_da_placa_tft,
+        )
+        _link_tft.iniciar()
     yield
     if _link is not None:
         _link.parar()
+    if _link_tft is not None:
+        _link_tft.parar()
     await _client.aclose()
     logger.info("[SHUTDOWN] httpx.AsyncClient encerrado")
 
@@ -200,6 +263,159 @@ async def _enviar(comando: str, payload: dict) -> dict:
         raise HTTPException(502, f"Dispensers recusaram '{comando}': {exc}")
     except serial_link.ErroLink as exc:
         raise HTTPException(503, f"Dispensers indisponíveis: {exc}")
+
+
+# ── A placa das telas: comandos, espelho dos slots e eventos que ficam aqui ───
+#
+# `slot` vai SÓ por serial (sem telas, não há o que pintar). `estado_celula`
+# tem rota no simulador para o transporte http não virar 404.
+_COMANDOS_TFT = {
+    "slot":          None,
+    "estado_celula": "/executar/estado-celula",
+}
+
+
+def _resumo_trava(texto) -> str:
+    """`trava_resumo` pronto para a tela: uma linha, no máximo TRAVA_RESUMO_MAX."""
+    limpo = " ".join(str(texto or "").split())
+    return limpo[:TRAVA_RESUMO_MAX]
+
+
+async def _tft_http(rota: str, campos: dict) -> bool:
+    try:
+        r = await _client.post(DISPENSER_SIM_URL + rota, json=campos, timeout=TIMEOUT_CMD)
+        if r.status_code >= 300:
+            logger.warning("[TFT] simulador respondeu %d a %s", r.status_code, rota)
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001 — cosmético: loga e segue
+        logger.warning("[TFT] %s indisponível: %s", rota, exc)
+        return False
+
+
+async def _tft_serial(comando: str, campos: dict) -> bool:
+    try:
+        # `to_thread`, como `_enviar`: `enviar_comando` bloqueia até o ACK e
+        # serial nunca roda no event loop.
+        await asyncio.to_thread(_link_tft.enviar_comando, comando, campos)
+        return True
+    except serial_link.ErroLink as exc:
+        logger.warning("[TFT] '%s' não chegou às telas: %s", comando, exc)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[TFT] '%s' falhou: %s", comando, exc)
+        return False
+
+
+def _enviar_tft(comando: str, campos: dict):
+    """Agenda o envio à placa das telas. Devolve a Task, ou None se não há telas.
+
+    Fire-and-forget DE PROPÓSITO: quem chama está no caminho da dispensa — o
+    handler que acabou de aceitar `dispensar`, ou o que está encaminhando
+    `dispensado` ao central — e a placa das telas não pode segurá-lo nem por
+    um ACK. Tela errada é cosmética; dispensa atrasada não é. O resultado só
+    interessa a quem quiser esperá-lo (o endpoint `estado-celula`), e mesmo
+    esse só o loga.
+    """
+    if TFT_TRANSPORTE != "serial":
+        rota = _COMANDOS_TFT[comando]
+        if rota is None:
+            return None
+        return asyncio.create_task(_tft_http(rota, campos))
+    if _link_tft is None:
+        logger.warning("[TFT] '%s' descartado: porta das telas não iniciada", comando)
+        return None
+    return asyncio.create_task(_tft_serial(comando, campos))
+
+
+# O que cada tela mostra, slot a slot. É a memória que este adapter já tinha
+# de graça — ele vê todo comando e todo evento do slot — e é ela que vira o
+# comando `slot`, só na transição. Nada periódico: o canal é 115200 baud e a
+# regra de não competir com o caminho crítico está no docs/PROTOCOLO_SERIAL.md.
+def _slot_vazio() -> dict:
+    return {"medicamento": "", "sku": "", "categoria": "", "quantidade_alvo": 0,
+            "quantidade_dispensada": 0, "quantidade_residual": 0,
+            "status": "idle", "os_id": ""}
+
+
+_slots: dict[int, dict] = {}
+
+
+def _atualizar_slot(slot_id: int, **campos) -> dict:
+    registro = _slots.setdefault(slot_id, _slot_vazio())
+    registro.update({k: v for k, v in campos.items() if v is not None})
+    return registro
+
+
+def _espelhar_slot(slot_id: int) -> None:
+    s = _slots.get(slot_id) or _slot_vazio()
+    _enviar_tft("slot", {
+        "dispenser_id":          slot_id,
+        "medicamento":           s["medicamento"],
+        "sku":                   s["sku"],
+        "categoria":             s["categoria"],
+        "quantidade_alvo":       s["quantidade_alvo"],
+        "quantidade_dispensada": s["quantidade_dispensada"],
+        "quantidade_residual":   s["quantidade_residual"],
+        "status":                s["status"],
+        "os_id":                 s["os_id"],
+    })
+
+
+def _espelhar_evento_no_slot(payload: dict) -> None:
+    """Transições da placa dos mecanismos que mudam o que a tela mostra.
+
+    `status`/`telemetria` (periódicos) NÃO passam por aqui: o que eles trazem a
+    tela já mostra, e mandá-los seria despejo periódico no canal das telas.
+    """
+    tipo = payload.get("tipo")
+    slot_id = payload.get("dispenser_id")
+    if not isinstance(slot_id, int) or isinstance(slot_id, bool):
+        return
+    if tipo == "carregado":
+        _atualizar_slot(slot_id, status="pronto",
+                        medicamento=payload.get("medicamento"),
+                        sku=payload.get("sku"), categoria=payload.get("categoria"),
+                        quantidade_alvo=payload.get("quantidade_total"),
+                        quantidade_dispensada=0,
+                        quantidade_residual=payload.get("quantidade_residual"),
+                        os_id=payload.get("os_id"))
+    elif tipo == "dispensado":
+        _atualizar_slot(slot_id, status="concluido",
+                        quantidade_dispensada=payload.get("quantidade_dispensada"),
+                        quantidade_alvo=payload.get("quantidade_alvo"),
+                        quantidade_residual=payload.get("quantidade_residual"),
+                        os_id=payload.get("os_id"))
+    elif tipo == "limpeza_ok":
+        _slots[slot_id] = {**_slot_vazio(), "status": "limpo"}
+    elif tipo == "erro":
+        _atualizar_slot(slot_id, status="erro")
+    else:
+        return
+    _espelhar_slot(slot_id)
+
+
+# Eventos DA PLACA DAS TELAS. Não vão ao central: ele não tem endpoint de tela
+# e não decide nada com isso — despejá-los em /api/v1/eventos/dispenser
+# misturaria duas placas num histórico que hoje é de uma. Ficam em log e no
+# /health.
+_tft_estado: dict = {"ultima_telemetria": None, "ultimo_erro": None, "erros": 0}
+
+
+def _evento_da_placa_tft(payload: dict) -> None:
+    """Chamado NA THREAD LEITORA da porta das telas. Nunca chega ao central."""
+    tipo = payload.get("tipo")
+    if tipo == "telemetria":
+        _tft_estado["ultima_telemetria"] = payload
+        logger.info("[TFT] telemetria: %s tela(s) ok, brilho %s%%",
+                    payload.get("telas_ok"), payload.get("brilho_pct"))
+    elif tipo == "erro":
+        _tft_estado["ultimo_erro"] = payload
+        _tft_estado["erros"] += 1
+        logger.warning("[TFT] erro na tela D%s: %s — %s", payload.get("dispenser_id"),
+                       payload.get("codigo_erro"), payload.get("descricao"))
+    else:
+        logger.warning("[TFT] evento desconhecido descartado: %r", tipo)
 
 
 def _resposta(resultado: dict) -> dict:
@@ -300,11 +516,19 @@ async def health():
         except Exception as exc:
             checks[name] = f"erro: {exc}"
 
-    corpo = {"transporte": TRANSPORTE, "checks": checks}
+    corpo = {"transporte": TRANSPORTE, "transporte_tft": TFT_TRANSPORTE, "checks": checks}
     if TRANSPORTE == "serial":
         estado = _link.estado() if _link is not None else {"conectado": False}
         corpo["serial"] = estado
         checks["placa-dispenser"] = "ok" if estado.get("conectado") else "desconectada"
+    # A SEGUNDA porta, separada por subsistema e no mesmo formato de
+    # `link.estado()`. Os eventos da placa das telas moram aqui também — é o
+    # único lugar em que aparecem, porque não vão ao central.
+    if TFT_TRANSPORTE == "serial":
+        estado_tft = _link_tft.estado() if _link_tft is not None else {"conectado": False}
+        corpo["serial_tft"] = estado_tft
+        checks["placa-dispenser-tft"] = "ok" if estado_tft.get("conectado") else "desconectada"
+    corpo["telas"] = dict(_tft_estado)
 
     ok = all(v == "ok" for v in checks.values())
     corpo["status"] = "ok" if ok else "degradado"
@@ -326,6 +550,12 @@ async def cmd_carregar(req: ComandoCarregarReq):
             "os_id":        req.os_id,
         },
     )
+    # Estado que este adapter acabou de comandar: a tela do slot muda AGORA,
+    # sem esperar o `carregado` — que pode levar segundos.
+    _atualizar_slot(req.dispenser_id, status="carregando", medicamento=req.medicamento,
+                    sku=req.sku, categoria=req.categoria, quantidade_alvo=req.quantidade,
+                    quantidade_dispensada=0, os_id=req.os_id)
+    _espelhar_slot(req.dispenser_id)
     return _resposta(resultado)
 
 
@@ -337,6 +567,8 @@ async def cmd_dispensar(req: ComandoDispensarReq):
         {"dispenser_id": req.dispenser_id, "os_id": req.os_id,
          "injetar_falha": req.injetar_falha},
     )
+    _atualizar_slot(req.dispenser_id, status="dispensando", os_id=req.os_id)
+    _espelhar_slot(req.dispenser_id)
     return _resposta(resultado)
 
 
@@ -347,7 +579,46 @@ async def cmd_limpar(req: ComandoLimparReq):
         "limpar",
         {"dispenser_id": req.dispenser_id, "solicitado_por": req.solicitado_por},
     )
+    _atualizar_slot(req.dispenser_id, status="limpando")
+    _espelhar_slot(req.dispenser_id)
     return _resposta(resultado)
+
+
+class EstadoCelulaReq(BaseModel):
+    """O que as 8 telas precisam saber da célula: há trava, e de quem é.
+
+    `trava_resumo` é a CATEGORIA da divergência, com teto de TRAVA_RESUMO_MAX
+    — nunca o motivo formatado do central. O adapter corta em 48 também.
+    """
+    trava_ativa: bool
+    trava_slot_id: Optional[int] = None
+    os_id: str = ""
+    trava_resumo: str = ""
+
+
+@app.post("/comandos/estado-celula")
+async def cmd_estado_celula(req: EstadoCelulaReq):
+    """`estado_celula` vai SÓ para a placa das telas.
+
+    A placa dos mecanismos não tem tela e não precisa saber da trava — quem
+    para a dispensa é o orquestrador, não ela. Responde 200 mesmo com as telas
+    fora do ar: o corpo diz o que aconteceu, e quem chama (o central, uma vez,
+    com timeout curto) só loga. Uma trava não pode ficar mais lenta por causa
+    de uma tela.
+    """
+    resumo = _resumo_trava(req.trava_resumo)
+    logger.info("[CMD] ESTADO-CELULA trava=%s slot=%s os=%s '%s'",
+                req.trava_ativa, req.trava_slot_id, req.os_id, resumo)
+    tarefa = _enviar_tft("estado_celula", {
+        "trava_ativa":   req.trava_ativa,
+        "trava_slot_id": req.trava_slot_id,
+        "os_id":         req.os_id,
+        "trava_resumo":  resumo,
+    })
+    if tarefa is None:
+        return {"ok": True, "telas": "desligadas"}
+    entregue = await tarefa
+    return {"ok": True, "telas": "ok" if entregue else "falha"}
 
 
 # ── Endpoint de Eventos (dispensers → Adapter → Central) ──────────────────────
@@ -368,6 +639,10 @@ async def _encaminhar_evento(req: EventoReq) -> bool:
 
     log_extra = f"| OS {os_id}" if os_id else ""
     logger.info("[EVT] %-12s ← D%s %s", tipo, disp_id, log_extra)
+
+    # As telas primeiro — agendado, não esperado: o `slot` sai em paralelo com
+    # o POST ao central, e uma placa de telas fora do ar não segura o evento.
+    _espelhar_evento_no_slot(payload)
 
     ok = await _post_central(payload)
     if not ok:

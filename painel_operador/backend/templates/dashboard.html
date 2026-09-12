@@ -14,6 +14,36 @@
     {% endif %}
 </div>
 
+<!-- Trava do Triple Check: a célula está parada esperando um supervisor -->
+{% if trava and trava.ativa %}
+<div class="alert alert-danger d-flex align-items-start gap-3 mb-4 rounded-3" role="alert" id="trava-banner">
+    <i class="bi bi-lock-fill fs-4 mt-1 flex-shrink-0"></i>
+    <div class="flex-grow-1">
+        <strong>TRAVA DO TRIPLE CHECK ATIVA</strong> — a célula está parada aguardando um supervisor.
+        <div class="small mt-1">
+            <strong>OS:</strong> {{ trava.os_id }}
+            &nbsp;&nbsp;<strong>Slot:</strong> D{{ trava.slot_id if trava.slot_id is not none else '?' }}
+        </div>
+        <div class="small"><strong>Motivo:</strong> {{ trava.motivo }}</div>
+        {% if not trava.fonte_ok %}
+        <div class="small text-muted">(último estado conhecido — o central não respondeu à última leitura)</div>
+        {% endif %}
+    </div>
+    {% if pode('trava_liberar') %}
+        {% if trava_msg_desligado %}
+        <div class="small text-muted align-self-center" style="max-width:22rem">{{ trava_msg_desligado }}</div>
+        {% else %}
+        <form method="post" action="{{ url_for('web_liberar_trava') }}" class="align-self-center"
+              onsubmit="return confirm('Liberar a trava e retomar a OS? Confira fisicamente o slot antes de prosseguir.');">
+            <button type="submit" class="btn btn-warning fw-semibold" id="btn-liberar-trava">
+                <i class="bi bi-unlock me-1"></i>Liberar trava
+            </button>
+        </form>
+        {% endif %}
+    {% endif %}
+</div>
+{% endif %}
+
 <!-- Alertas de estoque crítico -->
 {% if alertas %}
 <div class="alert alert-danger d-flex align-items-start gap-3 mb-4 rounded-3" role="alert">

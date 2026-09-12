@@ -24,6 +24,17 @@
 #
 # Rebuild completo:
 #   docker compose down -v && docker compose build --no-cache && docker compose up -d
+#
+# PROFILES — o que sobe depende de ONDE a stack está rodando:
+#   `simulado` (COMPOSE_PROFILES=simulado no .env, o default documentado)
+#       sobe a planta simulada INTEIRA, como sempre: os 13 serviços.
+#   sem profile (COMPOSE_PROFILES vazio) é a célula montada no mini PC Windows:
+#       sobe só o que roda em container — mysql, central, vision-adapter,
+#       vision-simulator, erp-simulator, dashboard e manut_web. Os três adapters
+#       com porta serial (dispenser, cnc, weight) e os simuladores que eles
+#       substituem NÃO sobem: no Windows o Docker Desktop não repassa COM para
+#       container, então esses adapters rodam FORA do Docker, no host, abrindo a
+#       COM direto com pyserial (docs/DEPLOY_WINDOWS.md).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Healthcheck: as imagens são python:slim e não têm curl nem wget. O urllib da
@@ -158,7 +169,11 @@ services:
       - apsen-net
 
   # ── Dispenser Adapter ────────────────────────────────────────────────────────
+  # `profiles: [simulado]` nos três adapters com porta serial e nos quatro
+  # simuladores: na célula montada (Windows) eles não sobem em container — os
+  # adapters rodam no host, donos das COM. Ver o cabeçalho e docs/DEPLOY_WINDOWS.md.
   dispenser-adapter:
+    profiles: ["simulado"]
     build: ./dispenser-adapter
     container_name: apsen-dispenser-adapter
     logging: *default-logging
@@ -182,9 +197,17 @@ services:
       # Prazo do ACK ("aceitei"), não da conclusão — esta continua no
       # orquestrador, nos TIMEOUT_* de sempre.
       DISPENSER_ACK_TIMEOUT_S: ${DISPENSER_ACK_TIMEOUT_S:-2}
-    # A porta USB do firmware entra por aqui — SÓ NO LINUX (o Docker Desktop do
-    # Windows não repassa COM; lá o caminho é uma ponte RFC2217 no host e
-    # DISPENSER_SERIAL_URL=rfc2217://host.docker.internal:4001).
+      # A SEGUNDA placa deste adapter: as 8 telas TFT, numa SEGUNDA porta
+      # (subsistema `dispenser_tft`, docs/PROTOCOLO_SERIAL.md §6). "http" =
+      # DESLIGADO, nenhuma tela — e o adapter exatamente como era.
+      DISPENSER_TFT_TRANSPORTE:    ${DISPENSER_TFT_TRANSPORTE:-http}
+      DISPENSER_TFT_SERIAL_URL:    ${DISPENSER_TFT_SERIAL_URL:-}
+      DISPENSER_TFT_SERIAL_BAUD:   ${DISPENSER_TFT_SERIAL_BAUD:-115200}
+      DISPENSER_TFT_ACK_TIMEOUT_S: ${DISPENSER_TFT_ACK_TIMEOUT_S:-2}
+    # A porta USB do firmware entra por aqui — SÓ VALE PARA ALVO LINUX. No mini
+    # PC Windows o Docker Desktop não repassa COM para container: lá este
+    # adapter roda FORA do Docker, no host (docs/DEPLOY_WINDOWS.md) — a ponte
+    # RFC2217 foi avaliada e preterida.
     #
     # Fica COMENTADO: mapear um device que não existe impede o serviço de subir,
     # e o default é o transporte HTTP. Com o serial ligado, o `depends_on` do
@@ -192,6 +215,7 @@ services:
     # grafo é outra decisão, e o compose não sabe condicionar dependência.
     # devices:
     #   - "/dev/ttyUSB0:/dev/ttyUSB0"
+    #   - "/dev/ttyUSB1:/dev/ttyUSB1"   # a segunda porta: as 8 telas TFT
     depends_on:
       # `service_healthy`, não só `service_started`: o adapter fala com o
       # simulador no lifespan e com o central no primeiro evento. O central NÃO
@@ -211,6 +235,7 @@ services:
 
   # ── CNC Adapter ──────────────────────────────────────────────────────────────
   cnc-adapter:
+    profiles: ["simulado"]
     build: ./cnc-adapter
     container_name: apsen-cnc-adapter
     logging: *default-logging
@@ -228,10 +253,11 @@ services:
       CNC_SERIAL_URL:    ${CNC_SERIAL_URL:-}
       CNC_SERIAL_BAUD:   ${CNC_SERIAL_BAUD:-115200}
       CNC_ACK_TIMEOUT_S: ${CNC_ACK_TIMEOUT_S:-2}
-    # Porta USB do firmware da mesa — SÓ NO LINUX, e comentado pelo mesmo motivo
-    # do dispenser-adapter: device inexistente impede o serviço de subir.
+    # Porta USB do firmware da mesa — SÓ VALE PARA ALVO LINUX, e comentado pelo
+    # mesmo motivo do dispenser-adapter: device inexistente impede o serviço de
+    # subir. No Windows, este adapter roda no host (docs/DEPLOY_WINDOWS.md).
     # devices:
-    #   - "/dev/ttyUSB1:/dev/ttyUSB1"
+    #   - "/dev/ttyUSB2:/dev/ttyUSB2"
     depends_on:
       central-computer:
         condition: service_healthy
@@ -273,6 +299,7 @@ services:
 
   # ── Weight Adapter ───────────────────────────────────────────────────────────
   weight-adapter:
+    profiles: ["simulado"]
     build: ./weight-adapter
     container_name: apsen-weight-adapter
     logging: *default-logging
@@ -290,10 +317,11 @@ services:
       WEIGHT_SERIAL_URL:    ${WEIGHT_SERIAL_URL:-}
       WEIGHT_SERIAL_BAUD:   ${WEIGHT_SERIAL_BAUD:-115200}
       WEIGHT_ACK_TIMEOUT_S: ${WEIGHT_ACK_TIMEOUT_S:-2}
-    # Porta USB do firmware da balança — SÓ NO LINUX, e comentado pelo mesmo
-    # motivo do dispenser-adapter: device inexistente impede o serviço de subir.
+    # Porta USB do firmware da balança — SÓ VALE PARA ALVO LINUX, e comentado
+    # pelo mesmo motivo do dispenser-adapter: device inexistente impede o
+    # serviço de subir. No Windows, este adapter roda no host (docs/DEPLOY_WINDOWS.md).
     # devices:
-    #   - "/dev/ttyUSB2:/dev/ttyUSB2"
+    #   - "/dev/ttyUSB3:/dev/ttyUSB3"
     depends_on:
       central-computer:
         condition: service_healthy
@@ -309,6 +337,7 @@ services:
 
   # ── Weight Simulator (HX711) ─────────────────────────────────────────────────
   weight-simulator:
+    profiles: ["simulado"]
     build: ./weight-simulator
     container_name: apsen-weight-sim
     logging: *default-logging
@@ -337,6 +366,10 @@ services:
       - apsen-net
 
   # ── Vision Simulator ──────────────────────────────────────────────────────────
+  # SEM profile, como o vision-adapter: a visão é HTTP (não tem porta serial),
+  # então na célula montada os dois continuam em container — o simulador serve
+  # a bancada até a estação de câmeras real existir, e a decisão de manter a
+  # visão fora do serial está no docs/PROTOCOLO_SERIAL.md.
   vision-simulator:
     build: ./vision-simulator
     container_name: apsen-vision-sim
@@ -375,6 +408,7 @@ services:
 
   # ── Dispenser Simulator ───────────────────────────────────────────────────────
   dispenser-simulator:
+    profiles: ["simulado"]
     build: ./dispenser_simulator
     container_name: apsen-dispenser-sim
     logging: *default-logging
@@ -403,6 +437,7 @@ services:
 
   # ── CNC Simulator ────────────────────────────────────────────────────────────
   cnc-simulator:
+    profiles: ["simulado"]
     build: ./cnc_simulator
     container_name: apsen-cnc-sim
     logging: *default-logging
@@ -471,14 +506,22 @@ services:
       # em timeout de carregamento. Aciclico: erp-simulator → adapters → central.
       central-computer:
         condition: service_healthy
-      dispenser-adapter:
-        condition: service_healthy
-      cnc-adapter:
-        condition: service_healthy
       vision-adapter:
         condition: service_healthy
+      # `required: false` (Compose ≥ 2.20) nos três que ficam atrás do profile
+      # `simulado`: com o profile ligado a condição vale como sempre — o ERP só
+      # sobe depois de eles ficarem healthy; sem o profile (célula montada) eles
+      # não são serviços do compose, rodam no host, e o compose só avisa em vez
+      # de recusar subir o ERP por uma dependência que não é dele gerenciar.
+      dispenser-adapter:
+        condition: service_healthy
+        required: false
+      cnc-adapter:
+        condition: service_healthy
+        required: false
       weight-adapter:
         condition: service_healthy
+        required: false
     networks:
       - apsen-net
 

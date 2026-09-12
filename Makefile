@@ -7,7 +7,7 @@
 # a migração de MQTT para REST/HTTP.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-.PHONY: up down restart build rebuild logs ps status test test-deps lint \
+.PHONY: up up-bancada down restart build rebuild logs ps status test test-deps lint \
         log-central log-dashboard log-manut log-erp \
         log-cnc-sim log-dispenser-sim log-vision-sim log-weight-sim \
         log-cnc-adapter log-dispenser-adapter log-vision-adapter \
@@ -30,11 +30,17 @@ LOG_LINES ?= 100
 # ── Subir / Parar ─────────────────────────────────────────────────────────────
 
 up:
-	@printf "$(GREEN)$(BOLD)▶ Subindo todos os serviços APSEN...$(RESET)\n"
+	@printf "$(GREEN)$(BOLD)▶ Subindo todos os serviços APSEN (planta simulada completa)...$(RESET)\n"
 	@test -f .env || (printf "$(RED)Falta o .env — veja 'Build e deploy' no README$(RESET)\n" && exit 1)
-	docker compose up -d
+	docker compose --profile simulado up -d
 	@printf "$(GREEN)✅ Serviços ativos. Dashboard: http://localhost:8050 | Manutenção: http://localhost:8051$(RESET)\n"
 	@printf "$(GREEN)   Console de operação: http://localhost:8000/console (precisa de CONSOLE_SENHA no .env)$(RESET)\n"
+
+up-bancada:
+	@printf "$(GREEN)$(BOLD)▶ Subindo só o que roda em container na célula montada...$(RESET)\n"
+	@test -f .env || (printf "$(RED)Falta o .env — veja 'Build e deploy' no README$(RESET)\n" && exit 1)
+	COMPOSE_PROFILES= docker compose up -d
+	@printf "$(GREEN)✅ Containers de pé. Os adapters seriais e o painel sobem no host — ver docs/DEPLOY_WINDOWS.md$(RESET)\n"
 
 down:
 	@printf "$(RED)$(BOLD)■ Parando todos os serviços...$(RESET)\n"
@@ -158,7 +164,8 @@ shell-mysql:
 
 help:
 	@printf "$(BOLD)APSEN — Comandos disponíveis$(RESET)\n\n"
-	@printf "  $(GREEN)make up$(RESET)              — sobe todos os serviços (exige .env)\n"
+	@printf "  $(GREEN)make up$(RESET)              — sobe todos os serviços (exige .env com COMPOSE_PROFILES=simulado)\n"
+	@printf "  $(GREEN)make up-bancada$(RESET)      — só o que roda em container no mini PC (docs/DEPLOY_WINDOWS.md)\n"
 	@printf "  $(RED)make down$(RESET)            — para todos os serviços\n"
 	@printf "  $(YELLOW)make restart$(RESET)         — reinicia tudo\n"
 	@printf "  $(CYAN)make rebuild$(RESET)         — rebuild completo sem cache\n"

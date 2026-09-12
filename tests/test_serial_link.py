@@ -21,6 +21,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib.util
+import inspect
+import os
 import re
 import sys
 import threading
@@ -29,17 +31,36 @@ from pathlib import Path
 
 import pytest
 
-from conftest import ADAPTERS, ADAPTERS_SERIAIS
+from conftest import ADAPTERS, ADAPTERS_SERIAIS, PASTA_DO_ADAPTER
 from fakes.placa_cnc import PlacaCNC
 from fakes.placa_dispenser import PlacaDispenser
+from fakes.placa_dispenser_tft import PlacaDispenserTFT
 from fakes.placa_weight import PlacaWeight
 
 RAIZ_REPO = Path(__file__).resolve().parent.parent
-PASTA = {nome: pasta for nome, pasta, _ in ADAPTERS}
-PLACAS = {"cnc": PlacaCNC, "dispenser": PlacaDispenser, "weight": PlacaWeight}
+# O `dispenser_tft` (as 8 telas TFT) é a SEGUNDA porta do dispenser-adapter:
+# mesma pasta, mesmo `main.py`, outro `LinkSerial`. O mapa vem do conftest para
+# que este arquivo e o `test_protocolo_placas.py` não carreguem duas cópias.
+PASTA = PASTA_DO_ADAPTER
+PLACAS = {"cnc": PlacaCNC, "dispenser": PlacaDispenser, "weight": PlacaWeight,
+          "dispenser_tft": PlacaDispenserTFT}
 
 # Prefixo da env var de cada adapter: `CNC_TRANSPORTE`, `DISPENSER_SERIAL_URL`...
-PREFIXO = {"cnc": "CNC", "dispenser": "DISPENSER", "weight": "WEIGHT"}
+PREFIXO = {"cnc": "CNC", "dispenser": "DISPENSER", "weight": "WEIGHT",
+           "dispenser_tft": "DISPENSER_TFT"}
+
+# Como cada subsistema aparece DENTRO do módulo do adapter: o nome da constante
+# de subsistema, da URL, do prazo de ACK, do transporte, do callback de evento
+# e do atributo que guarda o link. As três portas "principais" têm os mesmos
+# nomes; a segunda porta do dispenser-adapter tem os seus, com prefixo TFT_.
+_PRINCIPAL = dict(sub="SUBSISTEMA", url="SERIAL_URL", ack="ACK_TIMEOUT_S",
+                  transporte="TRANSPORTE", callback="_evento_da_placa", link="_link")
+LIGACAO = {
+    "cnc": _PRINCIPAL, "dispenser": _PRINCIPAL, "weight": _PRINCIPAL,
+    "dispenser_tft": dict(sub="TFT_SUBSISTEMA", url="TFT_SERIAL_URL",
+                          ack="TFT_ACK_TIMEOUT_S", transporte="TFT_TRANSPORTE",
+                          callback="_evento_da_placa_tft", link="_link_tft"),
+}
 
 pytest.importorskip("serial", reason="pyserial (tests/requirements-dev.txt)")
 
@@ -48,13 +69,69 @@ pytest.importorskip("serial", reason="pyserial (tests/requirements-dev.txt)")
 # Infraestrutura
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _ate(condicao, timeout: float = 5.0, passo: float = 0.01) -> bool:
-    limite = time.time() + timeout
-    while time.time() < limite:
+# Prazo padrão de `_ate`, em segundos. Vem do ambiente porque o número certo
+# depende da MÁQUINA, não do teste: cada teste deste arquivo levanta threads e
+# sockets TCP, e a suíte inteira (~170 s) roda com dezenas deles competindo
+# pelo escalonador. Dois testes falhavam de forma intermitente sob carga —
+# `test_log_grudado_antes_do_json_e_processado` na suíte completa e
+# `test_transicao_nunca_e_filtrada` no arquivo sozinho — e passavam 5/5
+# isolados: não era o `serial_link`, era o helper desistindo com 5 s antes de a
+# máquina chegar lá. Num CI mais lento, `APSEN_TESTE_ESPERA_S=60`.
+ESPERA_PADRAO_S = float(os.environ.get("APSEN_TESTE_ESPERA_S", "20"))
+
+
+def _descrever(condicao) -> str:
+    """O texto da condição, para a mensagem de falha dizer O QUE se esperava.
+
+    `inspect.getsource` de um lambda devolve a linha inteira em que ele foi
+    escrito (`assert _ate(lambda: len(recebidos) == 1)`), que é exatamente o
+    que quem lê o relatório quer ver. Se o fonte não estiver disponível, o
+    `repr` ainda aponta para o arquivo e a linha.
+    """
+    try:
+        return " ".join(inspect.getsource(condicao).split())
+    except (OSError, TypeError):
+        return repr(condicao)
+
+
+def _ate(condicao, timeout: float | None = None, passo: float = 0.01,
+         esperando: str | None = None) -> bool:
+    """Espera `condicao()` ficar verdadeira. Devolve True; em prazo estourado,
+    levanta `AssertionError` com uma mensagem que diz o que se esperava.
+
+    Levanta em vez de devolver False: todo chamador faz `assert _ate(...)`, e
+    um `assert False` sem texto não distingue "nunca aconteceu" de "demorou
+    mais que o prazo". A mensagem carrega o prazo usado, a condição e — depois
+    de estourar — uma última olhada: se a condição ficou verdadeira enquanto a
+    mensagem era montada, o relato diz "demorou", que manda quem lê ajustar
+    `APSEN_TESTE_ESPERA_S` em vez de procurar bug no transporte.
+
+    `timeout=None` usa `ESPERA_PADRAO_S`. Um prazo explícito MENOR que o padrão
+    é elevado a ele: nenhum teste deste arquivo usa prazo curto para provar que
+    algo NÃO acontece (isso é feito com contadores e `sleep` explícitos), então
+    o número passado é sempre "quanto tempo eu acho que isto leva", e a máquina
+    lenta é quem decide.
+    """
+    prazo = ESPERA_PADRAO_S if timeout is None else max(float(timeout), ESPERA_PADRAO_S)
+    inicio = time.monotonic()
+    limite = inicio + prazo
+    while time.monotonic() < limite:
         if condicao():
             return True
         time.sleep(passo)
-    return False
+
+    texto = esperando or _descrever(condicao)
+    decorrido = time.monotonic() - inicio
+    if condicao():
+        raise AssertionError(
+            f"DEMOROU: `{texto}` só ficou verdadeira depois do prazo de "
+            f"{prazo:.1f}s (medido {decorrido:.1f}s). A máquina está lenta, não "
+            f"o transporte — aumente APSEN_TESTE_ESPERA_S."
+        )
+    raise AssertionError(
+        f"NUNCA ACONTECEU: `{texto}` continuou falsa por {prazo:.1f}s "
+        f"(APSEN_TESTE_ESPERA_S={ESPERA_PADRAO_S:g})."
+    )
 
 
 def _carregar_serial_link(pasta: str = "cnc-adapter"):
@@ -186,13 +263,14 @@ def adapter_serial(carregar_adapter, sl):
         # cargas produzem duas hierarquias — o `except serial_link.AckNegativo`
         # do adapter não pegaria a exceção da outra cópia, e o teste mediria um
         # mapeamento de erro que na bancada não existe.
+        lig = LIGACAO[subsistema]
         link = modulo.serial_link.LinkSerial(
-            subsistema=modulo.SUBSISTEMA, url=modulo.SERIAL_URL,
-            ack_timeout_s=modulo.ACK_TIMEOUT_S,
-            ao_receber_evento=modulo._evento_da_placa,
+            subsistema=getattr(modulo, lig["sub"]), url=getattr(modulo, lig["url"]),
+            ack_timeout_s=getattr(modulo, lig["ack"]),
+            ao_receber_evento=getattr(modulo, lig["callback"]),
             probe_assentar_s=0.0, probe_espera_s=1.0, reconexao_s=0.05,
         )
-        modulo._link = link
+        setattr(modulo, lig["link"], link)
         link.iniciar()
         assert _ate(lambda: link.conectado)
 
@@ -281,6 +359,9 @@ COMANDO_EXEMPLO = {
     "weight": ("pesar", {"os_id": "OS-1", "slot_id": 2,
                          "quantidade_esperada": 10, "quantidade_real": 10,
                          "peso_unitario_g": 50.0}),
+    "dispenser_tft": ("estado_celula", {"trava_ativa": True, "trava_slot_id": 3,
+                                        "os_id": "OS-1",
+                                        "trava_resumo": "divergência de peso"}),
 }
 
 
@@ -602,9 +683,19 @@ EVENTOS_PARA_COMPARAR = {
 }
 
 
+# Os eventos da placa das telas NÃO vão ao central — ficam no adapter, em log e
+# no /health. Os dois testes abaixo medem justamente a chegada ao central, e o
+# caso das telas tem os seus em `test_dispenser_tft.py`.
+def _so_quem_fala_com_o_central(subsistema: str) -> None:
+    if subsistema == "dispenser_tft":
+        pytest.skip("os eventos da placa das telas ficam no adapter — "
+                    "ver test_dispenser_tft.py")
+
+
 @pytest.mark.parametrize("subsistema", ADAPTERS_SERIAIS)
 def test_evento_pelo_serial_e_pelo_http_chegam_iguais(adapter_serial,
                                                       carregar_adapter, subsistema):
+    _so_quem_fala_com_o_central(subsistema)
     payload = EVENTOS_PARA_COMPARAR[subsistema]
 
     # Serial: placa → porta → thread leitora → event loop → _post_central.
@@ -629,6 +720,7 @@ def test_evento_pelo_serial_e_pelo_http_chegam_iguais(adapter_serial,
 def test_evento_fora_do_contrato_e_descartado_sem_derrubar_a_thread(adapter_serial,
                                                                     subsistema):
     """Sem `tipo` não há evento — mas descartar não pode matar a ponte."""
+    _so_quem_fala_com_o_central(subsistema)
     adapter = adapter_serial(subsistema)
     adapter.placa.emitir({"sem_tipo": 1})
     time.sleep(0.2)
@@ -692,7 +784,9 @@ def test_transicao_nunca_e_filtrada(montar_link):
 
 @pytest.mark.parametrize("subsistema", ADAPTERS_SERIAIS)
 def test_o_default_e_http(carregar_adapter, subsistema):
-    assert carregar_adapter(subsistema).TRANSPORTE == "http"
+    """Para as telas, "http" significa "sem telas" — e o adapter como era."""
+    modulo = carregar_adapter(subsistema)
+    assert getattr(modulo, LIGACAO[subsistema]["transporte"]) == "http"
 
 
 @pytest.mark.parametrize("subsistema", ADAPTERS_SERIAIS)
@@ -702,7 +796,7 @@ def test_transporte_desconhecido_cai_no_http_com_aviso(carregar_adapter, caplog,
     modulo = carregar_adapter(subsistema, env={
         f"{PREFIXO[subsistema]}_TRANSPORTE": "seriall"})
 
-    assert modulo.TRANSPORTE == "http"
+    assert getattr(modulo, LIGACAO[subsistema]["transporte"]) == "http"
 
 
 @pytest.mark.parametrize("subsistema", ADAPTERS_SERIAIS)
@@ -716,6 +810,19 @@ def test_comando_http_sai_na_rota_e_no_corpo_de_sempre(carregar_adapter, subsist
         return {"ok": True}
 
     modulo._post_sim = _fake
+
+    if subsistema == "dispenser_tft":
+        # Com http, o único comando das telas que desce é `estado_celula` — ao
+        # simulador, pelo `_client` (não pelo `_post_sim` dos mecanismos), para
+        # o transporte http não virar 404 enquanto o serial funciona.
+        cliente = ClienteHTTPFake()
+        modulo._client = cliente
+        asyncio.run(modulo.cmd_estado_celula(modulo.EstadoCelulaReq(
+            trava_ativa=True, trava_slot_id=3, os_id="OS-1", trava_resumo="SKU errado")))
+        assert enviados == [], "as telas não passam pelo caminho dos mecanismos"
+        assert cliente.posts[0]["url"].endswith("/executar/estado-celula")
+        assert cliente.posts[0]["json"]["trava_resumo"] == "SKU errado"
+        return
 
     if subsistema == "cnc":
         asyncio.run(modulo.cmd_mover(modulo.ComandoMoverReq(
@@ -742,9 +849,9 @@ def test_injetar_falha_atravessa_o_serial_sem_interpretacao(adapter_serial,
                                                             subsistema):
     """A demonstração de falhas do console tem que seguir funcionando com
     hardware real — e o adapter não pode ser quem decide o que ela significa."""
-    if subsistema == "cnc":
-        pytest.skip("a CNC não recebe injeção: os tipos armáveis são de "
-                    "dispensa, visão e peso")
+    if subsistema in ("cnc", "dispenser_tft"):
+        pytest.skip("a CNC e as telas não recebem injeção: os tipos armáveis "
+                    "são de dispensa, visão e peso")
     adapter = adapter_serial(subsistema)
 
     if subsistema == "dispenser":

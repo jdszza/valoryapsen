@@ -10,11 +10,16 @@ Uma porta por firmware, uma linha JSON por mensagem:
 
 | adapter             | firmware                    | porta | subsistema (`sub`) |
 |---------------------|-----------------------------|-------|--------------------|
-| `dispenser-adapter` | os 8 dispensers             | uma   | `dispenser`        |
+| `dispenser-adapter` | os 8 dispensers (mecanismos)| uma   | `dispenser`        |
+| `dispenser-adapter` | as 8 telas TFT              | uma (a SEGUNDA porta do mesmo adapter) | `dispenser_tft` |
 | `cnc-adapter`       | a mesa CNC                  | uma   | `cnc`              |
 | `weight-adapter`    | a balança HX711             | uma   | `weight`           |
 
-O `vision-adapter` **não** entra: a visão continua por HTTP.
+O `vision-adapter` **não** entra: a visão continua por HTTP. E `dispenser` e
+`dispenser_tft` são **duas portas físicas do mesmo adapter**: acionar os 8
+mecanismos, desenhar 8 telas e manter a serial não cabe num ESP só, e quem já
+vê todo comando que desce e todo evento que sobe do slot é o dispenser-adapter
+— ver a seção 6.
 
 ---
 
@@ -192,23 +197,107 @@ esperada, preservando o contrato antigo.
 
 ---
 
-## 6. Execução: onde a porta é aberta
+## 6. `dispenser_tft` — as 8 telas TFT
+
+**A segunda placa do dispenser-adapter, numa segunda porta.** Acionar os 8
+mecanismos, desenhar 8 telas e manter a serial não cabe num ESP só: são DUAS
+placas, em DUAS portas — `dispenser` (os mecanismos, a seção 3, sem mudança) e
+`dispenser_tft` (as telas). O dono das duas é o **mesmo** `dispenser-adapter`,
+com dois `LinkSerial` (`DISPENSER_TFT_TRANSPORTE`, `DISPENSER_TFT_SERIAL_URL`,
+`DISPENSER_TFT_SERIAL_BAUD`, `DISPENSER_TFT_ACK_TIMEOUT_S`). Não entra serviço
+novo: este adapter é um tradutor, e já vê todo comando que desce e todo evento
+que sobe do slot — ou seja, já tem em mãos tudo que as telas precisam mostrar.
+Um tft-adapter separado obrigaria o central a mandar a mesma informação duas
+vezes, e duas cópias divergem.
+
+Com `DISPENSER_TFT_TRANSPORTE=http` (o default) não há tela nenhuma e o
+adapter se comporta exatamente como antes desta placa existir.
+
+### Comandos (adapter → placa)
+
+| `cmd` | campos | efeito |
+|---|---|---|
+| `slot` | `dispenser_id`, `medicamento`, `sku`, `categoria`, `quantidade_alvo`, `quantidade_dispensada`, `quantidade_residual`, `status`, `os_id` | redesenha a tela do slot |
+| `estado_celula` | `trava_ativa`, `trava_slot_id`, `os_id`, `trava_resumo` | há trava na célula, e de que slot é |
+
+**`slot` sai na transição, e só nela:** ao aceitar `carregar`/`dispensar`/
+`limpar` (estado que o adapter acabou de comandar) e ao receber `carregado`,
+`dispensado`, `limpeza_ok` e `erro` da placa dos mecanismos — antes de
+encaminhá-los ao central. Não há laço periódico: o canal é 115200 e a regra de
+não competir com o caminho crítico é a da seção 2.
+
+**`estado_celula` vai SÓ para esta placa.** A placa dos mecanismos não tem
+tela e não precisa saber da trava — quem para a dispensa é o orquestrador, não
+ela. `trava_slot_id` pode vir nulo (trava sem slot), mas a chave vem sempre.
+
+**`trava_resumo` tem TETO DE 48 CARACTERES** e sai da CATEGORIA da divergência
+("divergência de peso", "contagem divergente", "SKU errado", "dispenser
+divergente"), nunca da string formatada. O motivo completo do central passa de
+240 caracteres e **não viaja**: mandá-lo acoplaria o formato de mensagem do
+central à largura de uma tela e criaria um segundo ponto de truncamento para
+algo cosmético. O motivo completo é do display de 7" e da web, onde o
+supervisor decide; a tela do slot responde uma pergunta só: *é este slot?*
+
+**Falha da placa das telas NUNCA muda o caminho do dispenser.** Não recusa
+comando, não atrasa ACK, não impede o encaminhamento do evento ao central. O
+adapter loga e segue. Tela errada é cosmética; dispensa atrasada não é.
+
+### Tabela de pintura
+
+É o que o firmware das telas implementa, e nada além disso:
+
+| estado recebido | a tela do slot mostra |
+|---|---|
+| `trava_ativa=false` | medicamento · SKU · dispensada/alvo · residual · status |
+| `trava_ativa=true` e `trava_slot_id` == meu id | alerta + **AGUARDE SUPERVISOR** + `trava_resumo` |
+| `trava_ativa=true` e outro slot | **PARADO — D{n}**, conteúdo esmaecido |
+
+### Eventos (placa → adapter, dentro de `{"evento":{...}}`)
+
+| `tipo` | campos principais |
+|---|---|
+| `telemetria` | `telas_ok`, `brilho_pct`, `ts` |
+| `erro` | `dispenser_id`, `codigo_erro`, `descricao`, `ts` |
+
+**Nenhum dos dois vai ao central.** Ele não tem endpoint de tela e não decide
+nada com isso; despejá-los em `/api/v1/eventos/dispenser` misturaria duas
+placas num histórico que hoje é de uma. Ficam no adapter: log e `/health`, que
+passa a publicar o estado das DUAS portas, separadas por subsistema
+(`serial` e `serial_tft`), no formato de `link.estado()`.
+
+---
+
+## 7. Execução: onde a porta é aberta
 
 O código **não sabe** em qual sistema operacional está: ele chama
 `serial.serial_for_url()`, que aceita `/dev/ttyUSB0`, `COM4`, `socket://h:p`,
 `rfc2217://h:p` e `loop://` com a mesma API.
 
-* **Alvo — mini PC com Linux.** As portas entram nos containers pelo `devices:`
-  do compose (`/dev/ttyUSB0:/dev/ttyUSB0`). Nenhuma peça nova, o kernel garante
-  dono único da porta, e o mapeamento fica declarado no mesmo arquivo onde o
-  resto da topologia já está. O bloco está escrito e COMENTADO nos três serviços:
-  ligar um device que não existe impede o serviço de subir, e o default é HTTP.
-* **Plano B — Windows.** O Docker Desktop não repassa porta COM para container.
-  Uma ponte RFC2217 no host expõe cada porta como socket TCP e o adapter abre
-  `rfc2217://host:porta`. O custo está registrado no CLAUDE.md e some do código:
-  latência a mais, "cabo caiu" e "ponte morreu" com o mesmo sintoma, e a perda da
-  exclusividade de abertura que o kernel dá — dois processos abrem o mesmo
-  socket sem erro nenhum.
+* **A célula montada roda num mini PC Windows.** O Docker Desktop não repassa
+  porta COM para container, então os três adapters seriais rodam **fora do
+  Docker**, no host, abrindo a COM direto com pyserial — como o painel de
+  bancada já fazia, pelo mesmo motivo. No compose eles (e os simuladores que
+  substituem) estão atrás do profile `simulado`. **Toda placa tem a COM fixada
+  no Windows e a `<SUB>_SERIAL_URL` preenchida**: a varredura é só para
+  desenvolvimento sem hardware, porque cada processo varrendo abre as portas
+  dos outros por até 9,5 s cada e derruba o dono de verdade. O passo a passo
+  está em `docs/DEPLOY_WINDOWS.md` e no README, seção "Portas seriais na célula
+  montada".
+* **Alvo Linux (se um dia houver).** As portas entram nos containers pelo
+  `devices:` do compose (`/dev/ttyUSB0:/dev/ttyUSB0`). Nenhuma peça nova, o
+  kernel garante dono único da porta, e o mapeamento fica declarado no mesmo
+  arquivo onde o resto da topologia já está. O bloco está escrito e COMENTADO
+  nos três serviços — e só vale para alvo Linux: ligar um device que não existe
+  impede o serviço de subir, e o default é HTTP.
+* **A ponte RFC2217 foi avaliada e preterida.** Ela manteria tudo em container
+  expondo cada COM como socket TCP (`rfc2217://host:porta`), e o custo some do
+  código — de dentro do adapter as duas montagens são a mesma chamada. Por isso
+  fica escrito: mais um processo por porta para vigiar; latência a mais
+  em todo comando e evento; "cabo caiu" e "ponte morreu" com o mesmo sintoma; e
+  a perda da exclusividade de abertura — no Windows a COM é exclusiva de um
+  processo (o segundo toma `ACCESS_DENIED`, que é o erro certo), e dois
+  processos abrem o mesmo socket TCP sem erro nenhum, que é o que o item 1 do
+  enquadramento existe para impedir.
 
 ### Configuração, por adapter
 
@@ -219,15 +308,17 @@ O código **não sabe** em qual sistema operacional está: ele chama
 | `<SUB>_SERIAL_BAUD` | `115200` | |
 | `<SUB>_ACK_TIMEOUT_S` | `2` | prazo do ACK, não da conclusão |
 
-`<SUB>` é `CNC`, `DISPENSER` ou `WEIGHT`. Com `http`, o comportamento é
+`<SUB>` é `CNC`, `DISPENSER`, `WEIGHT` ou `DISPENSER_TFT` — as duas últimas no
+mesmo `dispenser-adapter`, uma por porta. Com `http`, o comportamento é
 EXATAMENTE o de antes desta feature — é o default justamente para que a suíte, o
-CI e a demonstração em Docker não mudem de resultado.
+CI e a demonstração em Docker não mudem de resultado (para as telas, `http`
+significa "sem telas").
 
-## 7. Sem placa: as placas falsas
+## 8. Sem placa: as placas falsas
 
-`tests/fakes/placa_dispenser.py`, `placa_cnc.py` e `placa_weight.py` falam este
-contrato inteiro por `socket://`: respondem ping, aceitam comando, devolvem ACK,
-ignoram `cmd_id` repetido e emitem os eventos com atraso configurável (inclusive
-zero). Elas são o que permite exercitar o transporte sem hardware — e são também
+`tests/fakes/placa_dispenser.py`, `placa_dispenser_tft.py`, `placa_cnc.py` e
+`placa_weight.py` falam este contrato inteiro por `socket://`: respondem ping,
+aceitam comando, devolvem ACK, ignoram `cmd_id` repetido e emitem os eventos
+com atraso configurável (inclusive zero). Elas são o que permite exercitar o transporte sem hardware — e são também
 o documento executável contra o qual o firmware vai ser escrito. É o mesmo papel
 que `painel_operador/firmware/simulador_serial.py` já cumpre para o display.

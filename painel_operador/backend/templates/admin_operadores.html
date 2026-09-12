@@ -3,10 +3,11 @@
 
 {% block content %}
 {% set perfil_badge = {
-    "Admin":    "danger",
-    "PCP":      "primary",
-    "PCM":      "success",
-    "Operador": "secondary"
+    "Admin":      "danger",
+    "Supervisor": "warning",
+    "PCP":        "primary",
+    "PCM":        "success",
+    "Operador":   "secondary"
 } %}
 
 <div class="d-flex align-items-center justify-content-between mb-3">
@@ -25,6 +26,12 @@
         <div class="stat-card text-center">
             <div class="stat-value text-danger">{{ total_por_perfil.get("Admin", 0) }}</div>
             <div class="stat-label">Admin</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-2">
+        <div class="stat-card text-center">
+            <div class="stat-value text-warning">{{ total_por_perfil.get("Supervisor", 0) }}</div>
+            <div class="stat-label">Supervisor</div>
         </div>
     </div>
     <div class="col-6 col-md-2">

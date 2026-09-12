@@ -277,13 +277,19 @@ def test_backend_e_simulador_tratam_o_mesmo_conjunto(be, sim):
 # passaria — e o repositório já registra esse formato de bug na seção
 # "Estado terminal novo é slot que ninguém libera".
 
+# A trava do Triple Check entrou com 2 `cmd`, 1 tag de `resp` e 1 `push`:
+# 9/7/2 viraram 11/8/3. `get_trava` existe ALÉM do push pelo mesmo motivo que
+# `fetch_ordens_api` refresca ordem espelhada que já conhece — push é uma linha
+# serial, e linha serial se perde num reset do ESP32.
 CMDS = {
     "ping", "get_ordens", "get_catalogo", "get_operadores", "get_dispensers",
     "validar_operador", "set_status", "sync_dispensers", "set_dispenser_med",
+    "get_trava", "liberar_trava",
 }
-RESPS = {"pong", "ordens", "catalogo", "operadores", "dispensers", "operador", "ok"}
+RESPS = {"pong", "ordens", "catalogo", "operadores", "dispensers", "operador", "ok",
+         "trava"}
 EVENTS = {"historico", "desvio", "ordem_concluida"}
-PUSHES = {"ordem_status", "dispensers"}
+PUSHES = {"ordem_status", "dispensers", "trava"}
 CMDS_DEBUG = {"nova_ordem", "dispenser", "status"}
 
 
@@ -335,17 +341,17 @@ def test_o_bloco_de_documentacao_do_firmware_lista_o_protocolo_real(fw):
 # sempre, inclusive com o protocolo quebrado.
 
 @pytest.mark.parametrize("extrator,minimo", [
-    ("fw_cmds_enviados", 9),
-    ("fw_resps_esperados", 7),
+    ("fw_cmds_enviados", 11),
+    ("fw_resps_esperados", 8),
     ("fw_events_emitidos", 3),
-    ("fw_pushes_tratados", 2),
+    ("fw_pushes_tratados", 3),
     ("fw_cmds_debug_aceitos", 3),
-    ("be_cmds_tratados", 9),
-    ("be_resps_emitidos", 7),
-    ("be_pushes_enviados", 2),
+    ("be_cmds_tratados", 11),
+    ("be_resps_emitidos", 8),
+    ("be_pushes_enviados", 3),
     ("be_events_tratados", 3),
-    ("sim_cmds_tratados", 9),
-    ("sim_resps_emitidos", 7),
+    ("sim_cmds_tratados", 11),
+    ("sim_resps_emitidos", 8),
     ("sim_cmds_debug_enviados", 3),
 ])
 def test_cada_extrator_acha_o_que_deve(fw, be, sim, extrator, minimo):
@@ -501,9 +507,13 @@ def test_cmd_desconhecido_nao_deixa_o_display_esperando(carregar_painel):
         assert bruto.endswith("\n") and json.loads(bruto)
 
 
-def test_pin_nunca_volta_na_resposta(carregar_painel):
-    """O PIN sobe do display para o backend; ele não pode voltar pelo cabo."""
+@pytest.mark.parametrize("cmd", ["validar_operador", "liberar_trava"])
+def test_pin_nunca_volta_na_resposta(carregar_painel, cmd):
+    """O PIN sobe do display para o backend; ele não pode voltar pelo cabo.
+
+    Vale para os DOIS comandos que o carregam: o login do operador e a
+    liberação da trava pelo supervisor.
+    """
     painel = carregar_painel()
-    bruto, _ = _responder(painel, {"cmd": "validar_operador",
-                                   "nome": "Administrador", "pin": "4321"})
+    bruto, _ = _responder(painel, {"cmd": cmd, "nome": "Administrador", "pin": "4321"})
     assert "4321" not in bruto

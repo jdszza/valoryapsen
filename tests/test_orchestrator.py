@@ -18,6 +18,7 @@ As duas metades da correção:
 """
 import asyncio
 import itertools
+import time
 
 import pytest
 
@@ -1354,3 +1355,235 @@ def test_criterio_e_uma_funcao_nomeada(carregar_orquestrador):
 
     assert orq.modulo._vale_retentar(503) is True
     assert orq.modulo._vale_retentar(409) is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# O central avisa a célula que travou — as 8 telas TFT, pelo dispenser-adapter
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `POST /comandos/estado-celula` sai ao ativar E ao liberar a trava (e no reset),
+# com `trava_resumo` derivado da CATEGORIA da divergência — nunca do texto do
+# motivo. UMA vez, com timeout curto, sem `_post`: uma placa de telas fora do ar
+# não pode acrescentar ~32 s ao caminho da trava. E falha aqui nunca muda o
+# fluxo: não aborta, não entra no veredito, não atrasa o broadcast.
+
+class _RespostaTelas:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+    def json(self):
+        return {"ok": True, "telas": "ok"}
+
+
+class _TelasFake:
+    """Duplo do `_client` do orquestrador só para o aviso às telas."""
+
+    def __init__(self, status: int = 200, atraso: float = 0.0, explode: bool = False):
+        self.status = status
+        self.atraso = atraso
+        self.explode = explode
+        self.chamadas: list[dict] = []
+
+    async def post(self, url, json=None, timeout=None):
+        self.chamadas.append({"url": url, "json": json, "timeout": timeout})
+        if self.explode:
+            raise ConnectionError("connection refused")
+        if self.atraso:
+            await asyncio.sleep(self.atraso)
+        return _RespostaTelas(self.status)
+
+    def avisos(self) -> list[dict]:
+        return [c["json"] for c in self.chamadas if c["url"].endswith("/comandos/estado-celula")]
+
+
+def _com_telas(orq, **kw) -> _TelasFake:
+    telas = _TelasFake(**kw)
+    orq.modulo._client = telas
+    return telas
+
+
+async def _deixar_o_aviso_sair():
+    """O aviso é agendado, não esperado: um tique do loop basta para ele sair."""
+    await asyncio.sleep(0.05)
+
+
+# `MESA_DIVERGENTE` e `PESO_DIVERGENTE` são os do bloco do Triple Check, acima.
+
+
+def test_ativar_trava_avisa_as_telas_com_slot_e_resumo(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    telas = _com_telas(orq)
+
+    async def _cenario():
+        await orq.modulo._ativar_trava("OS-1", 3, "Triple Check FALHOU (1/3 ...) — D3: ...",
+                                       resumo="divergência de peso")
+        await _deixar_o_aviso_sair()
+
+    asyncio.run(_cenario())
+
+    (aviso,) = telas.avisos()
+    assert aviso == {"trava_ativa": True, "trava_slot_id": 3, "os_id": "OS-1",
+                     "trava_resumo": "divergência de peso"}
+    assert telas.chamadas[0]["timeout"] == orq.modulo.TIMEOUT_AVISO_TELAS_S
+
+
+def test_liberar_trava_avisa_as_telas_que_a_trava_saiu(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    telas = _com_telas(orq)
+
+    async def _cenario():
+        await orq.modulo._ativar_trava("OS-1", 3, "motivo", resumo="SKU errado")
+        await _deixar_o_aviso_sair()
+        assert orq.modulo.liberar_trava("supervisor") is True
+        await _deixar_o_aviso_sair()
+
+    asyncio.run(_cenario())
+
+    assert [a["trava_ativa"] for a in telas.avisos()] == [True, False]
+    assert telas.avisos()[-1] == {"trava_ativa": False, "trava_slot_id": None,
+                                  "os_id": "", "trava_resumo": ""}
+
+
+def test_reset_da_planta_avisa_as_telas(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    telas = _com_telas(orq)
+
+    async def _cenario():
+        await orq.modulo._ativar_trava("OS-1", 3, "motivo", resumo="SKU errado")
+        await _deixar_o_aviso_sair()
+        await orq.modulo.resetar_planta()
+
+    asyncio.run(_cenario())
+
+    assert telas.avisos()[-1]["trava_ativa"] is False
+    assert orq.modulo.get_trava_estado()["ativa"] is False
+
+
+# ── O resumo vem da categoria, não do texto ──────────────────────────────────
+
+def test_veredito_carrega_a_categoria_de_cada_divergencia(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    veredito = orq.modulo.avaliar_triple_check(10, 9, MESA_DIVERGENTE, PESO_DIVERGENTE,
+                                               min_divergencias=1)
+    assert veredito.categorias == ("dispenser divergente", "contagem divergente",
+                                   "divergência de peso")
+    assert len(veredito.categorias) == len(veredito.divergencias)
+
+
+def test_resumo_da_trava_e_a_primeira_categoria_no_teto_de_48(carregar_orquestrador):
+    """Inclusive no veredito com 3 divergências, cujo motivo formatado passa
+    de 100 caracteres: o resumo não é derivado dele."""
+    orq = carregar_orquestrador()
+    veredito = orq.modulo.avaliar_triple_check(10, 9, MESA_DIVERGENTE, PESO_DIVERGENTE,
+                                               min_divergencias=1)
+    motivo = "; ".join(veredito.divergencias)
+    assert len(motivo) > 48
+
+    resumo = orq.modulo.resumo_da_trava(veredito)
+
+    assert resumo == "dispenser divergente"
+    assert len(resumo) <= 48 == orq.modulo.TRAVA_RESUMO_MAX
+    assert resumo not in motivo          # categoria, não recorte do texto
+
+    so_balanca = orq.modulo.avaliar_triple_check(10, 10, None, PESO_DIVERGENTE,
+                                                 min_divergencias=1)
+    assert orq.modulo.resumo_da_trava(so_balanca) == "divergência de peso"
+
+
+def test_o_aviso_nunca_passa_de_48_mesmo_com_resumo_maior(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    telas = _com_telas(orq)
+
+    async def _cenario():
+        await orq.modulo._ativar_trava("OS-1", 3, "motivo", resumo="x" * 200)
+        await _deixar_o_aviso_sair()
+
+    asyncio.run(_cenario())
+    assert len(telas.avisos()[0]["trava_resumo"]) == 48
+
+
+def test_a_os_travada_pelo_triple_check_manda_a_categoria_as_telas(carregar_orquestrador,
+                                                                     monkeypatch):
+    orq = carregar_orquestrador()
+    telas = _com_telas(orq)
+    orq.adapter.quantidade_dispensada = 9          # dispenser divergente → trava
+
+    def _liberar_quando_aparecer():
+        if orq.estado["trava"]["ativa"]:
+            orq.modulo.liberar_trava("supervisor")
+
+    monkeypatch.setattr(orq.modulo, "_broadcast_fn", _liberar_quando_aparecer)
+
+    async def _cenario():
+        await orq.modulo._processar_os(_payload_os("OS-T", _item("Dipirona", 10)))
+        await _deixar_o_aviso_sair()
+
+    asyncio.run(_cenario())
+
+    ativacoes = [a for a in telas.avisos() if a["trava_ativa"]]
+    assert ativacoes and ativacoes[0]["trava_resumo"] == "dispenser divergente"
+    assert ativacoes[0]["trava_slot_id"] == 1
+    assert telas.avisos()[-1]["trava_ativa"] is False
+
+
+# ── Adapter fora do ar não atrasa nem derruba a ativação ────────────────────
+
+@pytest.mark.parametrize("telas_kw", [dict(explode=True), dict(atraso=2.0), dict(status=503)])
+def test_adapter_fora_do_ar_nao_atrasa_nem_derruba_a_ativacao(carregar_orquestrador,
+                                                              telas_kw):
+    """A ativação tem que continuar na casa de milissegundos — o aviso corre em
+    paralelo, e uma exceção dele nunca chega ao orquestrador."""
+    orq = carregar_orquestrador()
+    telas = _com_telas(orq, **telas_kw)
+    duracao = {}
+
+    async def _cenario():
+        inicio = time.monotonic()
+        await orq.modulo._ativar_trava("OS-1", 3, "motivo", resumo="SKU errado")
+        duracao["ativacao"] = time.monotonic() - inicio
+        await _deixar_o_aviso_sair()
+
+    asyncio.run(_cenario())
+
+    assert duracao["ativacao"] < 0.2, f"ativação levou {duracao['ativacao']:.3f}s"
+    assert orq.modulo.get_trava_estado()["ativa"] is True
+    assert orq.estado["trava"]["ativa"] is True
+    assert len(telas.chamadas) == 1, "o aviso saiu mais de uma vez — retentou"
+
+
+def test_o_aviso_nao_usa_o_post_com_retry(carregar_orquestrador):
+    """`_post` retenta 3× com sleep(1) e timeout de 10 s: ~32 s a mais no
+    caminho da trava com a placa fora. O aviso tem timeout próprio e curto."""
+    import inspect
+
+    orq = carregar_orquestrador()
+    fonte = inspect.getsource(orq.modulo._avisar_telas)
+    assert "_post(" not in fonte
+    assert orq.modulo.TIMEOUT_AVISO_TELAS_S < 10.0
+
+
+def test_o_triple_check_decide_igual_com_e_sem_o_aviso(carregar_orquestrador, monkeypatch):
+    """O veredito é puro e o aviso é cosmético: a OS termina do mesmo jeito com
+    o adapter respondendo, explodindo, ou sem cliente nenhum."""
+    def _rodar(telas_kw):
+        orq = carregar_orquestrador()
+        if telas_kw is not None:
+            _com_telas(orq, **telas_kw)
+        orq.adapter.quantidade_dispensada = 9
+
+        def _liberar_quando_aparecer():
+            if orq.estado["trava"]["ativa"]:
+                orq.modulo.liberar_trava("supervisor")
+
+        monkeypatch.setattr(orq.modulo, "_broadcast_fn", _liberar_quando_aparecer)
+        asyncio.run(orq.modulo._processar_os(_payload_os("OS-T", _item("Dipirona", 10))))
+        veredito = orq.modulo.avaliar_triple_check(10, 9, None, None, min_divergencias=1)
+        return _status_gravados(orq), veredito.travar, veredito.divergencias
+
+    sem_cliente = _rodar(None)
+    respondendo = _rodar(dict())
+    explodindo = _rodar(dict(explode=True))
+
+    assert sem_cliente == respondendo == explodindo
+    assert sem_cliente[0][-1] == ("OS-T", "concluida")
+    assert sem_cliente[1] is True
