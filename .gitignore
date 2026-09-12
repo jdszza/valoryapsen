@@ -24,10 +24,13 @@ env/
 # Docker volumes (nunca commitar dados do banco)
 mysql_data/
 
-# Diretórios legados (MQTT — removidos na Fase 3)
-backend/
-sap_simulator/
-mosquitto/
+# Diretórios legados (MQTT — removidos na Fase 3). ANCORADOS na raiz de
+# propósito: sem a barra inicial, `backend/` casa em QUALQUER profundidade e
+# engolia `painel_operador/backend/` inteiro — o commit levava o firmware e
+# nenhum arquivo do backend do painel, sem aviso nenhum do git.
+/backend/
+/sap_simulator/
+/mosquitto/
 
 # Logs
 *.log
@@ -54,4 +57,6 @@ Desktop.ini
 *.bak
 test_sync*.txt
 CLAUDE.md
-TASKS_EVOLUCAO.md
+
+# Banco da bancada (contem PINs de operador) — nunca versionar
+painel_operador/backend/apsen.db

@@ -814,3 +814,543 @@ def test_orquestrador_nao_chama_o_banco_no_event_loop():
         "chamadas de banco fora de asyncio.to_thread (bloqueiam o event loop): "
         + "; ".join(sincronas)
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Envio de comandos: "em paralelo" era só o comentário
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Os comandos de carregamento e de scan saíam num laço SEQUENCIAL com `await`,
+# sob um comentário que dizia "em paralelo". Isoladamente isso seria só lento;
+# o que o torna um bug é o relógio do lado de lá.
+#
+# `_post` retenta 3x com `sleep(1)` e timeout de 10s — até ~32s por comando com
+# o adapter fora do ar. Com a célula cheia (8 slots), o comando do ÚLTIMO slot
+# só sairia ~4 min depois do primeiro, enquanto o `TIMEOUT_CARREGAMENTO` (180s)
+# do PRIMEIRO já corre desde que o evento foi registrado. A OS abortava por
+# "timeout de carregamento" de um dispenser que nunca tinha sido chamado — e o
+# log apontava para o slot errado, porque o slot que estourou não é o lento.
+#
+# Os dois testes abaixo medem a concorrência de verdade (quantos comandos ficam
+# em voo ao mesmo tempo), e não o tempo de parede: cronômetro em suíte de teste
+# é flaky em máquina carregada, e o que está em jogo aqui é estrutural.
+
+
+class _ContadorDeVoo:
+    """Envolve `_post` contando quantos comandos ficam em voo simultaneamente.
+
+    Cada chamada cede o controle ao event loop (`sleep(0)`) antes de responder:
+    com `gather`, todas as corrotinas chegam ao `sleep` antes de a primeira
+    voltar, e o pico bate no número de slots. Em laço sequencial o pico é 1,
+    sempre — é exatamente essa a diferença que o teste precisa enxergar.
+    """
+
+    def __init__(self, adapter, recusa_sufixo: str | None = None):
+        self.adapter = adapter
+        self.recusa_sufixo = recusa_sufixo
+        self.em_voo = 0
+        self.pico_por_sufixo: dict[str, int] = {}
+
+    async def post(self, url: str, payload: dict, timeout: float = 10.0) -> bool:
+        sufixo = "/" + url.rsplit("/comandos/", 1)[-1]
+        self.em_voo += 1
+        self.pico_por_sufixo[sufixo] = max(self.pico_por_sufixo.get(sufixo, 0),
+                                           self.em_voo)
+        try:
+            await asyncio.sleep(0)
+            if self.recusa_sufixo and url.endswith(self.recusa_sufixo):
+                self.adapter.chamadas.append({"url": url, "payload": payload})
+                return False
+            return await self.adapter.post(url, payload, timeout)
+        finally:
+            self.em_voo -= 1
+
+
+def _os_da_celula_cheia(os_id: str = "OS-PAR") -> dict:
+    """OS que usa TODOS os slots — é onde o laço sequencial dói."""
+    return _payload_os(os_id, *[_item(f"Med{i}") for i in range(1, NUM_SLOTS + 1)])
+
+
+def test_carregamento_sai_com_todos_os_comandos_em_voo(carregar_orquestrador,
+                                                       monkeypatch):
+    """Um `await` por slot, em fila, é o que faz o primeiro slot estourar."""
+    orq = carregar_orquestrador()
+    contador = _ContadorDeVoo(orq.adapter)
+    monkeypatch.setattr(orq.modulo, "_post", contador.post)
+
+    asyncio.run(orq.modulo._processar_os(_os_da_celula_cheia()))
+
+    assert contador.pico_por_sufixo["/carregar"] == NUM_SLOTS
+
+
+def test_scan_de_visao_sai_com_todos_os_comandos_em_voo(carregar_orquestrador,
+                                                        monkeypatch):
+    """O scan tem o mesmo laço e o mesmo relógio — e o mesmo conserto."""
+    orq = carregar_orquestrador()
+    contador = _ContadorDeVoo(orq.adapter)
+    monkeypatch.setattr(orq.modulo, "_post", contador.post)
+
+    asyncio.run(orq.modulo._processar_os(_os_da_celula_cheia()))
+
+    assert contador.pico_por_sufixo["/capturar/dispenser"] == NUM_SLOTS
+
+
+def test_a_cnc_continua_sequencial(carregar_orquestrador, monkeypatch):
+    """O paralelismo é do carregamento, NÃO do ciclo de dispensa.
+
+    A mesa é uma só: paralelizar `mover` mandaria a CNC para dois slots ao
+    mesmo tempo. Este teste existe para que um "otimizar igual ao de cima"
+    futuro não passe calado.
+    """
+    orq = carregar_orquestrador()
+    contador = _ContadorDeVoo(orq.adapter)
+    monkeypatch.setattr(orq.modulo, "_post", contador.post)
+
+    asyncio.run(orq.modulo._processar_os(_os_da_celula_cheia()))
+
+    for sufixo in ("/mover", "/dispensar", "/pesar", "/capturar/mesa"):
+        assert contador.pico_por_sufixo[sufixo] == 1, sufixo
+
+
+def test_envio_de_carregamento_recusado_aborta_sem_esperar_o_timeout(
+    carregar_orquestrador
+):
+    """`ok=False` já é a resposta: esperar 180s por ela não acrescenta nada.
+
+    O timeout fica no valor de produção de propósito — se o abort dependesse
+    dele, o teste levaria três minutos em vez de falhar.
+    """
+    orq = carregar_orquestrador()
+    assert orq.modulo.settings.TIMEOUT_CARREGAMENTO >= 60   # o valor real, não um encurtado
+    orq.adapter.aceita = False
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-11", _item("Dipirona"))))
+
+    assert _status_gravados(orq) == [("OS-11", "em_andamento"), ("OS-11", "erro")]
+    assert [c["args"][1] for c in orq.banco.chamadas_de("salvar_alarme")][0] == \
+        "erro_envio_carregamento"
+    # Nenhum evento da OS morta sobrou para confundir a próxima.
+    assert orq.modulo._pending_events == {}
+
+
+def test_scan_recusado_nao_aborta_a_os_mas_tambem_nao_espera(carregar_orquestrador,
+                                                             monkeypatch):
+    """Câmera é fonte que deixou de confirmar, não fonte que contradisse.
+
+    Por isso o envio recusado aqui NÃO derruba a OS — a regra é a mesma de
+    `leitura_dispenser_falha`. O que muda é a espera: sem o comando na planta o
+    evento nunca chega, então aguardá-lo seria queimar TIMEOUT_VISAO_DISPENSER
+    inteiro por um resultado que já se sabe inexistente.
+
+    A ausência da espera é afirmada pelas CHAVES aguardadas, e não pelo relógio:
+    cronômetro em suíte de teste é flaky, e "demorou menos" não diz qual espera
+    sumiu.
+    """
+    orq = carregar_orquestrador()
+    assert orq.modulo.settings.TIMEOUT_VISAO_DISPENSER >= 10
+    contador = _ContadorDeVoo(orq.adapter, recusa_sufixo="/capturar/dispenser")
+    monkeypatch.setattr(orq.modulo, "_post", contador.post)
+
+    aguardadas: list[str] = []
+    aguardar_real = orq.modulo.aguardar_evento
+
+    async def _espiar(chave, timeout):
+        aguardadas.append(chave)
+        return await aguardar_real(chave, timeout)
+
+    monkeypatch.setattr(orq.modulo, "aguardar_evento", _espiar)
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-12", _item("Dipirona"))))
+
+    assert _status_gravados(orq) == [("OS-12", "em_andamento"), ("OS-12", "concluida")]
+    assert not [c for c in aguardadas if "visao_dispenser" in c], (
+        "esperou um scan que o vision-adapter recusou enviar"
+    )
+    # O restante do ciclo segue aguardando normalmente — a exceção é o scan.
+    assert [c for c in aguardadas if "dispensado" in c]
+    assert orq.modulo._pending_events == {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _abortar_os toca só nos slots DESTA OS
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# O abort varria `_estado["dispensers"]` inteiro, zerando `status` e `os_id` de
+# TODO slot — inclusive os que guardam resíduo de outra OS. O caminho de
+# sucesso sempre iterou sobre `atribuicoes`; era o caminho de erro que
+# generalizava.
+#
+# `os_id` num slot é quem diz de quem é o medicamento parado ali. Apagado, o
+# resíduo vira órfão sem dono aparente: o painel mostra o slot como idle e o
+# `atribuir_slots` seguinte o toma por reaproveitável sem passar pela limpeza
+# que o `precisa_limpeza` obrigaria.
+#
+# Os testes antigos não pegavam isso porque encenavam uma OS por vez: os slots
+# que o abort não devia tocar já estavam idle, e "não mexeu" era
+# indistinguível de "mexeu para o mesmo valor". Aqui há SEMPRE um slot de outra
+# OS na bancada.
+
+def _slot_de_outra_os(orq, slot_id: int, os_id: str = "OS-VIZINHA") -> None:
+    """Resíduo que pertence a outra OS — o que o abort não pode reivindicar."""
+    orq.slot(slot_id).update({
+        "status": "carregado", "os_id": os_id,
+        "medicamento": "Vizinho", "quantidade": 7,
+    })
+
+
+def test_abort_nao_mexe_em_slot_de_outra_os(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    _ocupar(orq, 2, 5)
+    _slot_de_outra_os(orq, 8)
+
+    asyncio.run(orq.modulo._abortar_os("OS-42", "erro_cnc", _atribuicoes(2, 5)))
+
+    assert orq.slot(8)["os_id"] == "OS-VIZINHA"
+    assert orq.slot(8)["status"] == "carregado"
+    assert orq.slot(8)["medicamento"] == "Vizinho"
+
+
+def test_abort_nao_manda_limpar_slot_de_outra_os(carregar_orquestrador):
+    """A limpeza já era por atribuição; o reset da memória é que não era.
+
+    Vale afirmar os dois juntos: um abort que descarta o estoque certo mas
+    apaga o dono do slot errado produz a MESMA divergência entre bancada e
+    painel, só que pelo lado da memória.
+    """
+    orq = carregar_orquestrador()
+    _ocupar(orq, 2, 5)
+    _slot_de_outra_os(orq, 8)
+
+    asyncio.run(orq.modulo._abortar_os("OS-42", "erro_cnc", _atribuicoes(2, 5)))
+
+    limpos = [c["dispenser_id"] for c in orq.adapter.comandos("/comandos/limpar")]
+    assert limpos == [2, 5]
+
+
+def test_abort_e_sucesso_resetam_exatamente_o_mesmo_conjunto(carregar_orquestrador):
+    """As duas saídas da OS deixam a bancada no mesmo estado.
+
+    Se divergirem, a diferença aparece só na OS seguinte — e como um 409 de
+    limpeza, que não aponta para o abort que o causou.
+    """
+    def _bancada_depois(fechamento) -> dict:
+        orq = carregar_orquestrador()
+        _slot_de_outra_os(orq, NUM_SLOTS)
+        asyncio.run(fechamento(orq))
+        return {
+            str(i): (orq.slot(i)["status"], orq.slot(i)["os_id"])
+            for i in range(1, NUM_SLOTS + 1)
+        }
+
+    async def _sucesso(orq):
+        await orq.modulo._processar_os(_payload_os("OS-13", _item("Dipirona")))
+
+    async def _abort(orq):
+        _ocupar(orq, 1)
+        await orq.modulo._abortar_os("OS-13", "erro_cnc", _atribuicoes(1))
+
+    assert _bancada_depois(_abort) == _bancada_depois(_sucesso)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Exceção não tratada é um abort — não meio abort
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# O `except` do `loop_orquestrador` gravava "erro" e zerava `os_ativa`, e parava
+# aí. Três rastros ficavam para trás, e nenhum deles dá erro no momento:
+#
+#   * o medicamento carregado segue FISICAMENTE no dispenser — ninguém mandou
+#     limpar;
+#   * os slots guardam o `os_id` da OS morta;
+#   * as chaves `{os_id}:...` seguem em `_pending_events`.
+#
+# O sintoma nasce na OS SEGUINTE, longe daqui: a etapa 1b manda limpar o slot
+# que ninguém liberou e toma 409. `_abortar_os` já faz as três coisas certas —
+# a correção é chamá-lo.
+
+def _rodar_pelo_loop(orq, *etapas) -> None:
+    """Roda N OS pelo `loop_orquestrador`, que em produção é infinito.
+
+    O caminho importa: é o `loop_orquestrador` que tem o `except`, e chamar
+    `_processar_os` direto (como o resto do arquivo faz) passaria ao lado
+    justamente do bloco em teste.
+
+    Tudo num `asyncio.run()` só, e não um por OS: `_os_queue` é global do
+    módulo e prende seus `Event` internos ao primeiro loop que os tocar — um
+    segundo `asyncio.run()` sobre a mesma fila estoura em "bound to a different
+    event loop", que é falha do aparato de teste e não do código.
+
+    Cada etapa é um payload de OS ou um callable, executado entre as OS (é
+    assim que o teste da OS seguinte devolve a CNC ao normal).
+    """
+    async def _cenario():
+        tarefa = asyncio.ensure_future(orq.modulo.loop_orquestrador())
+        try:
+            for etapa in etapas:
+                if callable(etapa):
+                    etapa()
+                    continue
+                assert await orq.modulo.enfileirar_os(etapa)
+                await orq.modulo._os_queue.join()
+        finally:
+            tarefa.cancel()
+            try:
+                await tarefa
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(_cenario())
+
+
+@pytest.fixture
+def os_que_explode(carregar_orquestrador, monkeypatch):
+    """OS que estoura DEPOIS do carregamento — é onde há estoque a perder.
+
+    `cmd_mover` é o primeiro comando do ciclo da CNC (etapa 4): quando ele
+    levanta, os dispensers já receberam a carga e os slots já estão marcados
+    com o `os_id`. Explodir antes disso testaria o caso fácil, em que não há
+    nada preso na bancada.
+    """
+    orq = carregar_orquestrador()
+
+    async def _explode(*_a, **_kw):
+        raise RuntimeError("falha inesperada no adapter da CNC")
+
+    orq.cmd_mover_real = orq.modulo.cmd_mover      # para a OS seguinte voltar ao normal
+    monkeypatch.setattr(orq.modulo, "cmd_mover", _explode)
+    return orq
+
+
+def test_excecao_nao_tratada_descarta_o_estoque_dos_slots(os_que_explode):
+    """Sem a limpeza, o slot sai de circulação e ninguém fica sabendo."""
+    orq = os_que_explode
+
+    _rodar_pelo_loop(orq, _payload_os("OS-BOOM", _item("Dipirona"),
+                                             _item("Paracetamol")))
+
+    limpos = sorted(c["dispenser_id"]
+                    for c in orq.adapter.comandos("/comandos/limpar"))
+    assert limpos == [1, 2]
+
+
+def test_excecao_nao_tratada_limpa_os_eventos_da_os_morta(os_que_explode):
+    """Chave pendente de OS morta é notificação cruzada esperando acontecer."""
+    orq = os_que_explode
+
+    _rodar_pelo_loop(orq, _payload_os("OS-BOOM", _item("Dipirona")))
+
+    assert orq.modulo._pending_events == {}
+
+
+def test_excecao_nao_tratada_solta_o_os_id_dos_slots(os_que_explode):
+    orq = os_que_explode
+
+    _rodar_pelo_loop(orq, _payload_os("OS-BOOM", _item("Dipirona")))
+
+    assert orq.estado["os_ativa"] is None
+    assert orq.estado["atribuicao_ia"] == []
+    assert orq.slot(1)["os_id"] is None
+    assert orq.slot(1)["status"] == "idle"
+
+
+def test_excecao_nao_tratada_fecha_a_os_em_erro_com_alarme(os_que_explode):
+    """O status terminal já era gravado; o alarme nomeando a causa, não."""
+    orq = os_que_explode
+
+    _rodar_pelo_loop(orq, _payload_os("OS-BOOM", _item("Dipirona")))
+
+    assert _status_gravados(orq)[-1] == ("OS-BOOM", "erro")
+    assert "excecao_nao_tratada" in [
+        c["args"][1] for c in orq.banco.chamadas_de("salvar_alarme")
+    ]
+
+
+def test_a_os_seguinte_comeca_com_a_bancada_limpa(os_que_explode, monkeypatch):
+    """O sintoma real: os rastros só doem na OS SEGUINTE, longe da exceção.
+
+    O que a OS seguinte encontrava no `except` antigo era um slot ainda marcado
+    com o `os_id` da OS morta e as chaves `{os_id}:...` vivas em
+    `_pending_events`. A verificação acontece ENTRE as duas OS, e não depois das
+    duas: a segunda OS completa não distingue os dois mundos — ela conclui do
+    mesmo jeito, e é justamente essa a razão de o bug ser silencioso.
+
+    O loop também tem que sobreviver à exceção: uma OS que o derrubasse pararia
+    a planta inteira, porque o orquestrador é um loop único.
+    """
+    orq = os_que_explode
+    entre: dict = {}
+
+    def _conferir_e_consertar_a_cnc():
+        entre["eventos"] = dict(orq.modulo._pending_events)
+        entre["slot_os_id"] = orq.slot(1)["os_id"]
+        entre["slot_status"] = orq.slot(1)["status"]
+        orq.banco.limpar_chamadas()
+        orq.adapter.chamadas.clear()
+        monkeypatch.setattr(orq.modulo, "cmd_mover", orq.cmd_mover_real)
+
+    _rodar_pelo_loop(
+        orq,
+        _payload_os("OS-BOOM", _item("Dipirona")),
+        _conferir_e_consertar_a_cnc,
+        _payload_os("OS-DEPOIS", _item("Dipirona")),
+    )
+
+    assert entre["eventos"] == {}, "eventos da OS morta sobreviveram ao except"
+    assert entre["slot_os_id"] is None
+    assert entre["slot_status"] == "idle"
+    assert _status_gravados(orq) == [("OS-DEPOIS", "em_andamento"),
+                                     ("OS-DEPOIS", "concluida")]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# `_post`: retry só onde tentar de novo pode dar outro resultado
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `_post` retentava QUALQUER status >= 300 — três tentativas, `sleep(1)` entre
+# elas. Para falha de rede e 5xx isso é exatamente o certo. Para 409 e 422 é
+# desperdício puro: a mesma requisição vai receber a mesma resposta, e o
+# preço são 2s por recusa.
+#
+# O caso concreto é o 409 `limpeza_em_operacao` do dispenser-simulator, e ele
+# aparece justamente onde dói: a etapa 3 do `_processar_os` dispara os comandos
+# de todos os slots em `gather`, e cada recusa determinística segurava um slot
+# por 2s a mais enquanto o `TIMEOUT_CARREGAMENTO` do PRIMEIRO já corria — a
+# mesma forma do bug que "Comando a todos os slots sai em `gather`" registra.
+
+class _RespostaHTTP:
+    def __init__(self, status_code):
+        self.status_code = status_code
+        self.text = ""
+
+
+class _ClienteHTTPFake:
+    """Duplo do `httpx.AsyncClient` que o orquestrador guarda em `_client`.
+
+    Cada item de `respostas` é um status (`int`) ou uma exceção a levantar;
+    esgotada a lista, o último item se repete.
+    """
+
+    def __init__(self, respostas):
+        self.respostas = list(respostas)
+        self.chamadas = []
+
+    async def post(self, url, json=None, timeout=None):
+        self.chamadas.append({"url": url, "json": json})
+        item = (self.respostas[len(self.chamadas) - 1]
+                if len(self.chamadas) <= len(self.respostas)
+                else self.respostas[-1])
+        if isinstance(item, BaseException):
+            raise item
+        return _RespostaHTTP(item)
+
+
+def _postar(orq, monkeypatch, respostas):
+    """Roda o `_post` DE VERDADE (não o duplo do adapter) sobre um cliente fake."""
+    cliente = _ClienteHTTPFake(respostas)
+    monkeypatch.setattr(orq.modulo, "_client", cliente)
+
+    async def _sem_espera(_s):
+        return None
+
+    monkeypatch.setattr(orq.modulo.asyncio, "sleep", _sem_espera)
+    ok = asyncio.run(orq.post_real("http://adapter/comandos/limpar", {"dispenser_id": 1}))
+    return ok, cliente
+
+
+@pytest.mark.parametrize("status", [400, 404, 405, 409, 422])
+def test_recusa_deterministica_nao_e_retentada(carregar_orquestrador, monkeypatch,
+                                               status):
+    """O 409 de limpeza em curso continuará sendo 409 nos próximos 2 segundos.
+
+    A linha é o 500, e não uma lista de códigos: 5xx inteiro é "o lado de lá
+    falhou", inclusive um 501 de rota que o adapter não implementa. Retentar
+    esse é barato e a lista curta é o que mantém a regra igual dos dois lados
+    da ponte.
+    """
+    orq = carregar_orquestrador()
+
+    ok, cliente = _postar(orq, monkeypatch, [status])
+
+    assert ok is False
+    assert len(cliente.chamadas) == 1
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504, 408, 429])
+def test_falha_transitoria_continua_sendo_retentada(carregar_orquestrador,
+                                                    monkeypatch, status):
+    """O que o retry existe para cobrir: adapter subindo, saturado ou caído."""
+    orq = carregar_orquestrador()
+
+    ok, cliente = _postar(orq, monkeypatch, [status, status, 200])
+
+    assert ok is True
+    assert len(cliente.chamadas) == 3
+
+
+def test_falha_de_rede_continua_sendo_retentada(carregar_orquestrador, monkeypatch):
+    """`connection refused` no primeiro ciclo depois de um `up` é o motivo de o
+    retry existir — ver CLAUDE.md, "A ordem de subida é do compose"."""
+    orq = carregar_orquestrador()
+
+    ok, cliente = _postar(orq, monkeypatch,
+                          [ConnectionError("connection refused"), 200])
+
+    assert ok is True
+    assert len(cliente.chamadas) == 2
+
+
+def test_teto_de_tentativas_continua_valendo(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+
+    ok, cliente = _postar(orq, monkeypatch, [TimeoutError("timed out")])
+
+    assert ok is False
+    assert len(cliente.chamadas) == orq.modulo._TENTATIVAS_POST
+
+
+def test_sucesso_de_primeira_nao_dorme(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    dormidas = []
+
+    async def _contar(segundos):
+        dormidas.append(segundos)
+
+    cliente = _ClienteHTTPFake([200])
+    monkeypatch.setattr(orq.modulo, "_client", cliente)
+    monkeypatch.setattr(orq.modulo.asyncio, "sleep", _contar)
+
+    ok = asyncio.run(orq.post_real("http://adapter/comandos/dispensar", {}))
+
+    assert ok is True
+    assert dormidas == []
+
+
+def test_recusa_deterministica_tambem_nao_dorme(carregar_orquestrador, monkeypatch):
+    """O ganho medido: a recusa sai na hora, e não depois de 2s de `sleep`.
+
+    O teste conta as ESPERAS, não o tempo de parede: cronômetro em suíte é
+    flaky, e "demorou menos" não diz qual espera sumiu.
+    """
+    orq = carregar_orquestrador()
+    dormidas = []
+
+    async def _contar(segundos):
+        dormidas.append(segundos)
+
+    cliente = _ClienteHTTPFake([409])
+    monkeypatch.setattr(orq.modulo, "_client", cliente)
+    monkeypatch.setattr(orq.modulo.asyncio, "sleep", _contar)
+
+    asyncio.run(orq.post_real("http://adapter/comandos/limpar", {}))
+
+    assert dormidas == []
+
+
+def test_criterio_e_uma_funcao_nomeada(carregar_orquestrador):
+    """A regra mora em `_vale_retentar`, e não num `if` dentro do laço: é o que
+    permite comparar o critério com o dos adapters (`tests/test_adapters.py`)
+    em vez de confiar que as duas cópias dizem a mesma coisa."""
+    orq = carregar_orquestrador()
+
+    assert orq.modulo._vale_retentar(503) is True
+    assert orq.modulo._vale_retentar(409) is False

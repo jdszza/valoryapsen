@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}Ordens de Servico - Apsen{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h4 class="mb-0"><i class="bi bi-clipboard-data me-2"></i>Ordens de Servico</h4>
+    <a href="{{ url_for('nova_ordem') }}" class="btn btn-primary">
+        <i class="bi bi-plus-lg"></i> Nova Ordem
+    </a>
+</div>
+
+<div class="mb-3">
+    <div class="btn-group">
+        <a href="{{ url_for('listar_ordens') }}" class="btn btn-sm {% if not filtro_status %}btn-dark{% else %}btn-outline-dark{% endif %}">Todas</a>
+        <a href="{{ url_for('listar_ordens', status='Pendente') }}" class="btn btn-sm {% if filtro_status=='Pendente' %}btn-warning{% else %}btn-outline-warning{% endif %}">Pendentes</a>
+        <a href="{{ url_for('listar_ordens', status='Em Processo') }}" class="btn btn-sm {% if filtro_status=='Em Processo' %}btn-primary{% else %}btn-outline-primary{% endif %}">Em Processo</a>
+        <a href="{{ url_for('listar_ordens', status='Pausado') }}" class="btn btn-sm {% if filtro_status=='Pausado' %}btn-warning{% else %}btn-outline-warning{% endif %}" style="{% if filtro_status=='Pausado' %}background:#EA580C;border-color:#EA580C;color:#fff{% endif %}">Pausadas</a>
+        <a href="{{ url_for('listar_ordens', status='Concluido') }}" class="btn btn-sm {% if filtro_status=='Concluido' %}btn-success{% else %}btn-outline-success{% endif %}">Concluidas</a>
+        <a href="{{ url_for('listar_ordens', status='Erro') }}" class="btn btn-sm {% if filtro_status=='Erro' %}btn-danger{% else %}btn-outline-danger{% endif %}">Erro</a>
+        <a href="{{ url_for('listar_ordens', status='Cancelado') }}" class="btn btn-sm {% if filtro_status=='Cancelado' %}btn-secondary{% else %}btn-outline-secondary{% endif %}">Canceladas</a>
+    </div>
+</div>
+
+<div class="table-card">
+    <div class="table-responsive">
+        <table class="table table-hover">
+            <thead>
+                <tr>
+                    <th>OS</th>
+                    <th>Medicamentos</th>
+                    <th>Destino</th>
+                    <th>Prioridade</th>
+                    <th>Status</th>
+                    <th>Data</th>
+                    <th>Acoes</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for o in ordens %}
+                <tr>
+                    <td>
+                        <a href="{{ url_for('ordem_detalhe', id=o.id) }}" class="text-decoration-none">
+                            <strong>{{ o.numero_os }}</strong>
+                        </a>
+                        {% if o.origem == 'central' %}
+                        <span class="badge bg-dark ms-1" title="Ordem do computador central — o painel espelha, nao comanda">
+                            <i class="bi bi-cpu"></i> Central
+                        </span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% for it in parse_itens(o) %}
+                            <span class="badge bg-light text-dark border me-1">{{ it.med }} x{{ it.qtd }}</span>
+                        {% endfor %}
+                    </td>
+                    <td>{{ o.destino }}</td>
+                    <td>
+                        {% if o.prioridade == 'Urgente' %}
+                            <span class="badge badge-urgente">Urgente</span>
+                        {% elif o.prioridade == 'Alta' %}
+                            <span class="badge badge-alta">Alta</span>
+                        {% elif o.prioridade == 'Normal' %}
+                            <span class="badge badge-normal">Normal</span>
+                        {% else %}
+                            <span class="badge badge-baixa">Baixa</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if o.status == 'Pendente' %}
+                            <span class="badge badge-pendente">Pendente</span>
+                        {% elif o.status == 'Em Processo' %}
+                            <span class="badge badge-processo">Em Processo</span>
+                        {% elif o.status == 'Pausado' %}
+                            <span class="badge badge-pausado">Pausado</span>
+                        {% elif o.status == 'Concluido' %}
+                            <span class="badge badge-concluido">Concluido</span>
+                        {% else %}
+                            <span class="badge badge-cancelado">{{ o.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td><small>{{ o.data_criacao[:16] }}</small></td>
+                    <td>
+                        <div class="d-flex gap-1">
+                            {% if o.origem == 'central' %}
+                            <a href="{{ url_for('ordem_detalhe', id=o.id) }}" class="btn btn-sm btn-outline-info" title="Rastreamento / linha do tempo"><i class="bi bi-clock-history"></i></a>
+                            <span class="text-muted small align-self-center ms-1">somente leitura</span>
+                            {% else %}
+                            {% if o.status == 'Pendente' %}
+                            <form method="post" action="{{ url_for('atualizar_status', id=o.id, status='Em Processo') }}">
+                                <button class="btn btn-sm btn-outline-primary" title="Iniciar"><i class="bi bi-play-fill"></i></button>
+                            </form>
+                            {% elif o.status == 'Em Processo' %}
+                            <form method="post" action="{{ url_for('atualizar_status', id=o.id, status='Pausado') }}">
+                                <button class="btn btn-sm btn-outline-warning" title="Pausar"><i class="bi bi-pause-fill"></i></button>
+                            </form>
+                            <form method="post" action="{{ url_for('atualizar_status', id=o.id, status='Concluido') }}">
+                                <button class="btn btn-sm btn-outline-success" title="Concluir"><i class="bi bi-check-lg"></i></button>
+                            </form>
+                            {% elif o.status == 'Pausado' %}
+                            <form method="post" action="{{ url_for('atualizar_status', id=o.id, status='Em Processo') }}">
+                                <button class="btn btn-sm btn-outline-primary" title="Retomar"><i class="bi bi-play-fill"></i></button>
+                            </form>
+                            <form method="post" action="{{ url_for('atualizar_status', id=o.id, status='Concluido') }}">
+                                <button class="btn btn-sm btn-outline-success" title="Concluir"><i class="bi bi-check-lg"></i></button>
+                            </form>
+                            {% endif %}
+                            <a href="{{ url_for('ordem_detalhe', id=o.id) }}" class="btn btn-sm btn-outline-info" title="Rastreamento / linha do tempo"><i class="bi bi-clock-history"></i></a>
+                            <a href="{{ url_for('editar_ordem', id=o.id) }}" class="btn btn-sm btn-outline-secondary" title="Editar"><i class="bi bi-pencil"></i></a>
+                            {% if o.status != 'Concluido' %}
+                            <form method="post" action="{{ url_for('excluir_ordem', id=o.id) }}" onsubmit="return confirm('Excluir esta ordem?')">
+                                <button class="btn btn-sm btn-outline-danger" title="Excluir"><i class="bi bi-trash"></i></button>
+                            </form>
+                            {% endif %}
+                            {% endif %}
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not ordens %}
+                <tr><td colspan="7" class="text-center text-muted py-4">Nenhuma ordem encontrada</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

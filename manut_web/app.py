@@ -4,12 +4,18 @@ APSEN - Aplicativo de Manutenção e Operação v2.1 (porta 8051)
 Painel do GESTOR DA OPERAÇÃO: acompanha as necessidades do sistema
 (manutenção, alarmes, dispensers, visão, trava e ordens) em um lugar só.
 
+A tela inicial é a de NECESSIDADES: uma lista priorizada do que precisa de
+alguém agora, com um botão que leva à aba onde se resolve. As dez abas
+seguintes continuam iguais — o que mudou é não ser mais preciso visitar todas
+para descobrir se há algo a fazer.
+
 Requer autenticação JWT. Usuários padrão: admin / manut1
 (Senhas iniciais em SEED_ADMIN_SENHA e SEED_MANUT_SENHA no .env — troque ambas
 após o primeiro login, pela aba 👥 Usuários. Ver README.)
 
 Funcionalidades:
   • Login / Logout com JWT (role: admin | manutencao)
+  • 🔔 Necessidades — a primeira aba: tudo que precisa de atenção, priorizado
   • 🌡 Temperaturas por componente
   • ⚙  Desgaste / Horas de uso
   • 📋 Log de manutenções
@@ -105,6 +111,10 @@ def _cor_disp(qty: int, cap: int = 100) -> str:
 # própria no CSS: com tudo numa string só, ícones de larguras diferentes
 # desalinham o texto de cada item da sidebar.
 _SIDEBAR_LINKS = [
+    # Primeira de propósito: é a tela que responde "o que precisa de mim
+    # agora?", e o app deixou de ser um painel de consulta de chão de fábrica
+    # para virar o do gestor da operação. Ver `central-computer/necessidades.py`.
+    ("🔔", "Necessidades",     "necessidades"),
     ("🌡", "Temperaturas",     "temp"),
     ("⚙",  "Desgaste / Uso",   "uso"),
     ("📋", "Log Manutenção",   "log"),
@@ -126,7 +136,7 @@ app.layout = dbc.Container(
         dcc.Store(id="jwt-token",  storage_type="session"),
         dcc.Store(id="user-nome",  storage_type="session"),
         dcc.Store(id="user-role",  storage_type="session"),
-        dcc.Store(id="active-tab", data="temp"),
+        dcc.Store(id="active-tab", data="necessidades"),
         dcc.Store(id="os-modal-id", data=None),  # OS selecionada para modal
         # Alvo do download de relatório: o arquivo chega por aqui, em memória,
         # sem o navegador precisar falar com o backend (ver _buscar_relatorio).
@@ -205,7 +215,7 @@ app.layout = dbc.Container(
                             [
                                 dbc.NavLink(
                                     [html.Span(icone, className="ico"), label],
-                                    id=f"nav-{tab_id}", href="#", active=(tab_id == "temp"),
+                                    id=f"nav-{tab_id}", href="#", active=(tab_id == "necessidades"),
                                 )
                                 for icone, label, tab_id in _SIDEBAR_LINKS
                             ],
@@ -289,7 +299,7 @@ def _logout(_):
     prevent_initial_call=True,
 )
 def _nav(*_):
-    triggered = ctx.triggered_id or "nav-temp"
+    triggered = ctx.triggered_id or "nav-necessidades"
     return triggered.replace("nav-", "")
 
 
@@ -305,7 +315,7 @@ def _marcar_aba_ativa(tab):
     as telas — trocar de aba mudava o conteúdo e nada mais, e voltar exigia
     lembrar em qual item se clicou.
     """
-    return [t == (tab or "temp") for _, _l, t in _SIDEBAR_LINKS]
+    return [t == (tab or "necessidades") for _, _l, t in _SIDEBAR_LINKS]
 
 
 # ── Conteúdo principal ────────────────────────────────────────────────────────
@@ -326,6 +336,7 @@ def _render_conteudo(tab, _, token, role):
         return _vazio("🔒", "Faça login para continuar.")
 
     renderers = {
+        "necessidades": lambda: _render_necessidades(token),
         "temp":       lambda: _render_temp(token),
         "uso":        lambda: _render_uso(token),
         "log":        lambda: _render_log(token),
@@ -344,6 +355,97 @@ def _render_conteudo(tab, _, token, role):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Renderizadores de cada aba
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Necessidades ───────────────────────────────────────────────────────────────
+#
+# UMA chamada, não seis. A decisão de o que é pendência, em que ordem e com que
+# limiar mora em `central-computer/necessidades.py`; aqui só se desenha o que
+# veio. Ver a docstring de `GET /manutencao/necessidades` para por que o
+# agregado existe.
+
+# Severidade → (cor do bootstrap, ícone). As três do backend, e só elas: uma
+# quarta chave aqui seria uma cor que o tema não tem.
+_CORES_SEVERIDADE = {
+    "critico": ("danger",  "⛔"),
+    "atencao": ("warning", "⚠"),
+    "info":    ("info",    "ℹ"),
+}
+
+
+def _render_necessidades(token):
+    code, dados = _api("get", "/manutencao/necessidades", token=token)
+    if code != 200 or not isinstance(dados, dict):
+        return html.Div([
+            _titulo("🔔", "Necessidades"),
+            html.P("Erro ao carregar as necessidades.", className="text-danger small"),
+        ])
+
+    itens  = dados.get("itens") or []
+    resumo = dados.get("resumo") or {}
+
+    cabecalho = [_titulo("🔔", "Necessidades")]
+
+    # Banco fora deixa a lista INCOMPLETA — alarmes, componentes e OS em erro
+    # somem. Dizer "tudo em dia" nesse estado seria a afirmação mais perigosa
+    # que esta tela pode fazer.
+    if not dados.get("banco_disponivel", True):
+        cabecalho.append(dbc.Alert(
+            "Lista incompleta: o banco não respondeu. Trava, fila e resíduo dos "
+            "dispensers estão corretos; alarmes, componentes e OS em erro não "
+            "puderam ser lidos.",
+            color="warning", className="py-2",
+        ))
+
+    if not itens:
+        return html.Div(cabecalho + [
+            dbc.Alert(
+                [html.Strong("Nada pendente. "),
+                 "Sem trava, sem alarme aberto, sem componente fora da faixa, "
+                 "sem resíduo parado nos dispensers e nenhuma OS em erro nas "
+                 "últimas horas."],
+                color="success",
+            ),
+        ])
+
+    cabecalho.append(html.Div([
+        dbc.Badge(f"{resumo.get('criticos', 0)} crítico(s)",
+                  color="danger", className="me-2"),
+        dbc.Badge(f"{resumo.get('atencao', 0)} atenção",
+                  color="warning", className="me-2"),
+        dbc.Badge(f"{resumo.get('info', 0)} informativo(s)", color="info"),
+    ], className="mb-3"))
+
+    linhas = []
+    for item in itens:
+        cor, icone = _CORES_SEVERIDADE.get(item.get("severidade", "info"),
+                                           ("secondary", "•"))
+        aba = item.get("aba", "")
+        linhas.append(dbc.ListGroupItem([
+            dbc.Row([
+                dbc.Col([
+                    html.Strong(f"{icone} {item.get('titulo', '')}"),
+                    html.Br(),
+                    html.Span(item.get("detalhe", ""), className="small text-light"),
+                    html.Br(),
+                    # A ação é o que faz desta tela um ponto de PARTIDA. Sem
+                    # ela, "há 3 alarmes" obriga o gestor a descobrir sozinho o
+                    # que fazer — que é a navegação que a tela existe para
+                    # poupar.
+                    html.Small(item.get("acao", ""), className="text-muted"),
+                ], md=9),
+                dbc.Col(
+                    # O botão leva à aba correspondente. `pattern-matching id`
+                    # porque o número de linhas varia a cada render.
+                    dbc.Button("Ir para", size="sm", color=cor, outline=True,
+                               id={"type": "btn-necessidade", "index": aba})
+                    if aba else html.Div(),
+                    md=3, className="d-flex align-items-center justify-content-end",
+                ),
+            ]),
+        ], color=cor, className="mb-1"))
+
+    return html.Div(cabecalho + [dbc.ListGroup(linhas)])
+
 
 # ── Temperaturas ───────────────────────────────────────────────────────────────
 
@@ -932,6 +1034,29 @@ def _render_usuarios(token, role):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Callbacks de ações
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Necessidades: cada linha leva à aba correspondente ─────────────────────────
+
+@callback(
+    Output("active-tab", "data", allow_duplicate=True),
+    Input({"type": "btn-necessidade", "index": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def _ir_para_aba(n_clicks_list):
+    """O clique que transforma a lista em ponto de partida.
+
+    `index` é o ID DA ABA, não um número de linha: a lista muda de tamanho e de
+    ordem a cada render (o polling é de 5s), e um índice posicional mandaria o
+    gestor para a aba errada sempre que uma pendência entrasse ou saísse entre
+    o desenho e o clique.
+    """
+    if not any(n for n in (n_clicks_list or []) if n):
+        return no_update
+    alvo = ctx.triggered_id
+    if isinstance(alvo, dict) and alvo.get("index"):
+        return alvo["index"]
+    return no_update
+
 
 # ── Resolver alarme ────────────────────────────────────────────────────────────
 

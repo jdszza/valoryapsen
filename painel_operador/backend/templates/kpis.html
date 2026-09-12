@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}KPIs de Produção — Apsen{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+    <h4 class="mb-0 fw-bold"><i class="bi bi-graph-up-arrow me-2"></i>KPIs de Produção</h4>
+    <small class="text-muted">Indicadores de desempenho da dispensação</small>
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-stopwatch me-1 text-muted"></i>Tempo médio de separação</div>
+            <div class="stat-value">{{ tempo_medio_min }} <small class="fs-6 text-muted">min</small></div>
+        </div>
+    </div>
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-alarm me-1 text-muted"></i>SLA estourado (&gt;4h pendente)</div>
+            <div class="stat-value {{ 'text-danger' if sla_estourado else '' }}">{{ sla_estourado }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-exclamation-diamond me-1 text-muted"></i>Taxa de desvios</div>
+            <div class="stat-value">{{ taxa_desvio }}<small class="fs-6 text-muted">%</small></div>
+        </div>
+    </div>
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-clipboard-data me-1 text-muted"></i>Total de ordens</div>
+            <div class="stat-value">{{ total_ordens }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-exclamation-octagon me-1 text-muted"></i>Ordens com erro</div>
+            <div class="stat-value {{ 'text-danger' if ordens_erro else '' }}">{{ ordens_erro }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-slash-circle me-1 text-muted"></i>Ordens canceladas</div>
+            <div class="stat-value text-muted">{{ ordens_canceladas }}</div>
+        </div>
+    </div>
+</div>
+
+<div class="row g-3">
+    <div class="col-md-7">
+        <div class="stat-card h-100">
+            <h6 class="fw-semibold mb-3">Ordens concluídas por dia (14 dias)</h6>
+            {% if tem_dados_dia %}
+            <canvas id="chartDia" style="max-height:260px"></canvas>
+            {% else %}
+            <div class="text-center text-muted py-5">
+                <i class="bi bi-bar-chart fs-3 d-block mb-2"></i>
+                Ainda não há ordens concluídas nos últimos 14 dias.
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    <div class="col-md-5">
+        <div class="stat-card h-100">
+            <h6 class="fw-semibold mb-3">Ranking de operadores (ordens concluídas)</h6>
+            {% if tem_dados_ranking %}
+            <canvas id="chartRanking" style="max-height:260px"></canvas>
+            {% else %}
+            <div class="text-center text-muted py-5">
+                <i class="bi bi-people fs-3 d-block mb-2"></i>
+                Ainda não há ordens concluídas para ranquear operadores.
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+    var gDia = {{ grafico_dia|safe }};
+    var gRank = {{ grafico_ranking|safe }};
+    var elDia = document.getElementById('chartDia');
+    var elRank = document.getElementById('chartRanking');
+
+    if (elDia) {
+        new Chart(elDia, {
+            type: 'line',
+            data: {
+                labels: gDia.labels,
+                datasets: [{
+                    label: 'Ordens concluídas', data: gDia.data,
+                    borderColor: '#2563EB', backgroundColor: 'rgba(37,99,235,.12)',
+                    fill: true, tension: .3, pointRadius: 3,
+                }]
+            },
+            options: {
+                plugins: { legend: { display: false } },
+                scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+            }
+        });
+    }
+
+    if (elRank) {
+        new Chart(elRank, {
+            type: 'bar',
+            data: {
+                labels: gRank.labels,
+                datasets: [{
+                    label: 'Ordens concluídas', data: gRank.data,
+                    backgroundColor: '#22C55E', borderRadius: 4,
+                }]
+            },
+            options: {
+                indexAxis: 'y',
+                plugins: { legend: { display: false } },
+                scales: { x: { beginAtZero: true, ticks: { precision: 0 } } }
+            }
+        });
+    }
+})();
+</script>
+{% endblock %}

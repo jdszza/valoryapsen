@@ -26,3 +26,12 @@ dash-bootstrap-components==1.6.0
 
 # test_compose.py lê o docker-compose.yml (healthchecks, ciclos, portas).
 PyYAML==6.0.1
+
+# test_painel_ordens.py importa painel_operador/backend/app.py de verdade — as
+# rotas são exercitadas pelo `app.test_client()` do Flask, sem subir servidor.
+# `pyserial` de propósito NÃO entra: nenhum teste pode tomar posse de uma porta
+# USB, então o conftest o dubla (`SerialFake`). O Flask fica um degrau abaixo do
+# `requirements.txt` do painel (3.1.1) porque o `dash` do app de manutenção
+# ainda exige `<3.1`, e os dois compartilham este venv.
+flask==3.0.3
+qrcode==8.2

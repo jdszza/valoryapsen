@@ -245,7 +245,7 @@ def test_corrida_na_ultima_vaga_fecha_a_os_em_cancelada(api):
 # ── Endpoint de leitura da fila ───────────────────────────────────────────────
 
 def test_endpoint_de_fila_expoe_ocupacao_e_capacidade(api):
-    """É o que o order-generator consulta antes de gerar a próxima OS."""
+    """É o que o erp-simulator consulta antes de gerar a próxima OS."""
     resposta = api.cliente.get("/api/v1/fila")
 
     assert resposta.status_code == 200
@@ -268,10 +268,10 @@ def test_endpoint_de_fila_acompanha_o_enchimento(api):
 # ── Listagem das 10 ordens padrão ─────────────────────────────────────────────
 #
 # O catálogo das ordens fixas mora no central (`os_templates.py`) e não no
-# order-generator, porque o console de operação precisa listá-las. Este
+# erp-simulator, porque o console de operação precisa listá-las. Este
 # endpoint é o que torna isso possível — e o que o gerador consome no boot, em
 # vez de manter uma segunda cópia da lista. O conteúdo dos templates é testado
-# em `test_order_generator.py`; aqui prende-se o CONTRATO da rota.
+# em `test_erp_simulator.py`; aqui prende-se o CONTRATO da rota.
 
 def _catalogo_fake(central):
     """`listar_medicamentos` devolvendo tudo o que os templates citam."""

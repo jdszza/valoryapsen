@@ -8,7 +8,7 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 
 .PHONY: up down restart build rebuild logs ps status test test-deps lint \
-        log-central log-dashboard log-manut log-order-gen \
+        log-central log-dashboard log-manut log-erp \
         log-cnc-sim log-dispenser-sim log-vision-sim log-weight-sim \
         log-cnc-adapter log-dispenser-adapter log-vision-adapter \
         log-weight-adapter log-mysql \
@@ -31,7 +31,7 @@ LOG_LINES ?= 100
 
 up:
 	@printf "$(GREEN)$(BOLD)▶ Subindo todos os serviços APSEN...$(RESET)\n"
-	@test -f .env || (printf "$(RED)Falta o .env — veja o bloco do passo 2 em 'Como rodar', no README$(RESET)\n" && exit 1)
+	@test -f .env || (printf "$(RED)Falta o .env — veja 'Build e deploy' no README$(RESET)\n" && exit 1)
 	docker compose up -d
 	@printf "$(GREEN)✅ Serviços ativos. Dashboard: http://localhost:8050 | Manutenção: http://localhost:8051$(RESET)\n"
 	@printf "$(GREEN)   Console de operação: http://localhost:8000/console (precisa de CONSOLE_SENHA no .env)$(RESET)\n"
@@ -66,7 +66,7 @@ lint:
 	@printf "$(CYAN)$(BOLD)🔎 pyflakes...$(RESET)\n"
 	python -m pyflakes central-computer cnc_simulator dispenser_simulator \
 		vision-simulator weight-simulator cnc-adapter dispenser-adapter \
-		vision-adapter weight-adapter dashboard manut_web order-generator tests
+		vision-adapter weight-adapter dashboard manut_web erp-simulator tests
 
 config:
 	@printf "$(CYAN)$(BOLD)🔎 Validando docker-compose.yml...$(RESET)\n"
@@ -105,9 +105,9 @@ log-manut:
 	@printf "$(MAGENTA)$(BOLD)━━━━ [MANUT] Manutenção e Operação :8051 ━━━━━━━━━━━━━━$(RESET)\n"
 	docker compose logs -f --tail=$(LOG_LINES) manut_web
 
-log-order-gen:
-	@printf "$(YELLOW)$(BOLD)━━━━ [ORDER-GEN] Gerador de OS ━━━━━━━━━━━━━━━━━━━━━━━$(RESET)\n"
-	docker compose logs -f --tail=$(LOG_LINES) order-generator
+log-erp:
+	@printf "$(YELLOW)$(BOLD)━━━━ [ERP-SIM] Origem das ordens ━━━━━━━━━━━━━━━━━━━━━$(RESET)\n"
+	docker compose logs -f --tail=$(LOG_LINES) erp-simulator
 
 log-cnc-sim:
 	@printf "$(CYAN)$(BOLD)━━━━ [CNC-SIM] Simulador CNC :8200 ━━━━━━━━━━━━━━━━━━━━$(RESET)\n"
@@ -172,7 +172,7 @@ help:
 	@printf "  $(BOLD)make log-central$(RESET)           — FastAPI + orquestrador :8000\n"
 	@printf "  $(BOLD)make log-dashboard$(RESET)         — Dash :8050\n"
 	@printf "  $(BOLD)make log-manut$(RESET)             — Manutenção :8051\n"
-	@printf "  $(BOLD)make log-order-gen$(RESET)         — gerador de OS\n"
+	@printf "  $(BOLD)make log-erp$(RESET)               — origem das ordens (ERP)\n"
 	@printf "  $(BOLD)make log-cnc-sim$(RESET)           — simulador CNC :8200\n"
 	@printf "  $(BOLD)make log-dispenser-sim$(RESET)     — simulador dispensers :8201\n"
 	@printf "  $(BOLD)make log-vision-sim$(RESET)        — simulador câmeras :8202\n"

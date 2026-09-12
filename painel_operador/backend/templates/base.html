@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Apsen Farmaceutica{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+    <style>
+        :root { --apsen-blue: #2563EB; --apsen-dark: #0F172A; }
+        body { background: #F1F5F9; }
+
+        /* Barra superior fixa, com botao hamburger que abre o menu (off-canvas) */
+        .topbar {
+            background: var(--apsen-dark);
+            height: 56px; position: sticky; top: 0; z-index: 200;
+            display: flex; align-items: center; padding: 0 1rem; gap: .75rem;
+        }
+        .topbar-toggle {
+            background: transparent; border: 0; color: #fff; font-size: 1.4rem;
+            line-height: 1; padding: .25rem .4rem; border-radius: 8px;
+        }
+        .topbar-toggle:hover { background: rgba(255,255,255,.08); }
+        .topbar .brand-icon {
+            width: 32px; height: 32px; background: var(--apsen-blue);
+            border-radius: 8px; display: inline-flex; align-items: center;
+            justify-content: center; color: #fff; font-size: .95rem; flex-shrink: 0;
+        }
+        .topbar .brand-name { color: #fff; font-weight: 700; font-size: .9rem; line-height: 1.1; }
+        .topbar .brand-sub { color: #64748B; font-size: .68rem; }
+
+        .offcanvas-brand {
+            padding: 1.1rem 1.2rem;
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+        }
+        .offcanvas-brand .brand-name {
+            color: #fff; font-weight: 700; font-size: 1rem; letter-spacing: .02em;
+        }
+        .offcanvas-brand .brand-sub { color: #64748B; font-size: 0.7rem; }
+        .offcanvas-brand .brand-icon {
+            width: 34px; height: 34px; background: var(--apsen-blue);
+            border-radius: 9px; display: inline-flex; align-items: center;
+            justify-content: center; color: #fff; font-size: 1rem; margin-bottom: 6px;
+        }
+        .sidebar-nav { flex: 1; padding: .5rem 0; overflow-y: auto; }
+        .nav-section {
+            color: #475569; font-size: .68rem; font-weight: 700;
+            letter-spacing: .1em; text-transform: uppercase;
+            padding: .8rem 1.2rem .3rem;
+        }
+        #appSidebar .nav-link {
+            color: #94A3B8; padding: .6rem 1.2rem;
+            border-radius: 8px; margin: 1px 8px;
+            transition: all .15s; font-size: .875rem;
+            display: flex; align-items: center; gap: 10px;
+        }
+        #appSidebar .nav-link i { font-size: 1rem; width: 18px; text-align: center; }
+        #appSidebar .nav-link:hover { background: rgba(255,255,255,.07); color: #fff; }
+        #appSidebar .nav-link.active { background: var(--apsen-blue); color: #fff; }
+
+        /* User box no topo (topbar) */
+        .user-name { color: #fff; font-size: .82rem; font-weight: 600; }
+        .user-role { font-size: .7rem; margin-top: 1px; }
+        .role-admin    { color: #FCA5A5; }
+        .role-pcp      { color: #93C5FD; }
+        .role-pcm      { color: #86EFAC; }
+        .role-operador { color: #94A3B8; }
+
+        /* Main content: sem margem lateral, o menu agora e off-canvas */
+        .main-content { padding: 1.5rem; }
+
+        /* Cards */
+        .stat-card {
+            background: #fff; border-radius: 14px;
+            padding: 1.2rem; border: 1px solid #E2E8F0;
+        }
+        .stat-card .stat-value { font-size: 2rem; font-weight: 700; color: var(--apsen-dark); }
+        .stat-card .stat-label { color: #64748B; font-size: .82rem; }
+        .table-card {
+            background: #fff; border-radius: 14px;
+            border: 1px solid #E2E8F0; overflow: hidden;
+        }
+        .table-card .table { margin-bottom: 0; }
+        .table-card .table th {
+            background: #F8FAFC; color: var(--apsen-dark);
+            font-weight: 600; font-size: .82rem;
+            border-bottom: 2px solid #E2E8F0;
+        }
+
+        /* Badges */
+        .badge-pendente  { background: #FEF3C7; color: #92400E; }
+        .badge-processo  { background: #DBEAFE; color: #1D4ED8; }
+        .badge-concluido { background: #DCFCE7; color: #166534; }
+        .badge-cancelado { background: #FEE2E2; color: #991B1B; }
+        .badge-pausado   { background: #FED7AA; color: #9A3412; }
+        .badge-urgente   { background: #FEE2E2; color: #991B1B; }
+        .badge-alta      { background: #FEF3C7; color: #92400E; }
+        .badge-normal    { background: #DBEAFE; color: #1D4ED8; }
+        .badge-baixa     { background: #F1F5F9; color: #64748B; }
+    </style>
+</head>
+<body>
+
+<nav class="topbar">
+    <button class="topbar-toggle" type="button" data-bs-toggle="offcanvas" data-bs-target="#appSidebar"
+            aria-controls="appSidebar" aria-label="Abrir menu">
+        <i class="bi bi-list"></i>
+    </button>
+    <div class="brand-icon"><i class="bi bi-capsule-pill"></i></div>
+    <div class="d-none d-sm-block">
+        <div class="brand-name">APSEN Farmacêutica</div>
+        <div class="brand-sub">Sistema de Dispensação</div>
+    </div>
+    <div class="ms-auto d-flex align-items-center gap-2">
+        <div class="text-end d-none d-sm-block" style="min-width:0">
+            <div class="user-name text-truncate">{{ sess_nome }}</div>
+            <div class="user-role
+                {% if sess_perfil == 'Admin' %}role-admin
+                {% elif sess_perfil == 'PCP' %}role-pcp
+                {% elif sess_perfil == 'PCM' %}role-pcm
+                {% else %}role-operador{% endif %}">
+                {{ sess_perfil }}
+            </div>
+        </div>
+        <a href="{{ url_for('logout') }}" title="Sair" style="color:#94A3B8; font-size:1.2rem;">
+            <i class="bi bi-box-arrow-right"></i>
+        </a>
+    </div>
+</nav>
+
+<!-- Menu off-canvas: fica retraido e abre por cima do conteudo ao clicar no hamburger -->
+<div class="offcanvas offcanvas-start text-bg-dark" tabindex="-1" id="appSidebar">
+    <div class="offcanvas-brand d-flex align-items-center justify-content-between">
+        <div>
+            <div class="brand-icon"><i class="bi bi-capsule-pill"></i></div>
+            <div class="brand-name">APSEN Farmacêutica</div>
+            <div class="brand-sub">Sistema de Dispensação</div>
+        </div>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="offcanvas" aria-label="Fechar"></button>
+    </div>
+
+    <nav class="sidebar-nav">
+        <div class="nav-section">Principal</div>
+
+        <a class="nav-link {% if request.endpoint == 'dashboard' %}active{% endif %}"
+           href="{{ url_for('dashboard') }}">
+            <i class="bi bi-speedometer2"></i> Dashboard
+        </a>
+
+        {% if pode('ordens_ver') %}
+        <a class="nav-link {% if request.endpoint in ['listar_ordens','nova_ordem','editar_ordem'] %}active{% endif %}"
+           href="{{ url_for('listar_ordens') }}">
+            <i class="bi bi-clipboard-data"></i> Ordens de Serviço
+        </a>
+        {% endif %}
+
+        {% if pode('dispensers_ver') %}
+        <a class="nav-link {% if request.endpoint == 'listar_medicamentos' %}active{% endif %}"
+           href="{{ url_for('listar_medicamentos') }}">
+            <i class="bi bi-capsule"></i> Dispensers
+        </a>
+        {% endif %}
+
+        {% if pode('catalogo_ver') %}
+        <a class="nav-link {% if request.endpoint == 'listar_catalogo' %}active{% endif %}"
+           href="{{ url_for('listar_catalogo') }}">
+            <i class="bi bi-journal-medical"></i> Catálogo
+        </a>
+        {% endif %}
+
+        {% if pode('relatorio_ver') %}
+        <a class="nav-link {% if request.endpoint == 'relatorio' %}active{% endif %}"
+           href="{{ url_for('relatorio') }}">
+            <i class="bi bi-file-earmark-bar-graph"></i> Relatório
+        </a>
+        {% endif %}
+
+        {% if pode('kpis_ver') %}
+        <a class="nav-link {% if request.endpoint == 'kpis' %}active{% endif %}"
+           href="{{ url_for('kpis') }}">
+            <i class="bi bi-graph-up-arrow"></i> KPIs
+        </a>
+        {% endif %}
+
+        {% if pode('lotes_ver') %}
+        <a class="nav-link {% if request.endpoint == 'rastreabilidade' %}active{% endif %}"
+           href="{{ url_for('rastreabilidade') }}">
+            <i class="bi bi-search"></i> Rastreabilidade
+        </a>
+        {% endif %}
+
+        {% if pode('lotes_editar') %}
+        <a class="nav-link {% if request.endpoint == 'entrada_lote' %}active{% endif %}"
+           href="{{ url_for('entrada_lote') }}">
+            <i class="bi bi-box-arrow-in-down"></i> Entrada de Lote
+        </a>
+        {% endif %}
+
+        {% if pode('clientes_ver') %}
+        <a class="nav-link {% if request.endpoint == 'listar_clientes' %}active{% endif %}"
+           href="{{ url_for('listar_clientes') }}">
+            <i class="bi bi-building"></i> Clientes
+        </a>
+        {% endif %}
+
+        {% if pode('visao_ver') %}
+        <a class="nav-link {% if request.endpoint == 'visao_estacao' %}active{% endif %}"
+           href="{{ url_for('visao_estacao') }}">
+            <i class="bi bi-camera-video"></i> Estação de Visão
+        </a>
+        {% endif %}
+
+        {% if pode('operadores_ver') or pode('historico_ver') or pode('desvios_ver') %}
+        <div class="nav-section">Administração</div>
+        {% endif %}
+
+        {% if pode('desvios_ver') %}
+        <a class="nav-link {% if request.endpoint == 'admin_desvios' %}active{% endif %}"
+           href="{{ url_for('admin_desvios') }}">
+            <i class="bi bi-exclamation-diamond"></i> Desvios
+        </a>
+        {% endif %}
+
+        {% if pode('operadores_ver') %}
+        <a class="nav-link {% if 'admin_operadores' in request.endpoint or 'admin_editar' in request.endpoint or 'admin_novo' in request.endpoint %}active{% endif %}"
+           href="{{ url_for('admin_operadores') }}">
+            <i class="bi bi-people"></i> Operadores
+        </a>
+        {% endif %}
+
+        {% if pode('historico_ver') %}
+        <a class="nav-link {% if request.endpoint == 'admin_historico' %}active{% endif %}"
+           href="{{ url_for('admin_historico') }}">
+            <i class="bi bi-journal-text"></i> Audit Log
+        </a>
+        {% endif %}
+    </nav>
+</div>
+
+<div class="main-content">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        <div class="mb-3">
+            {% for categoria, msg in messages %}
+            <div class="alert alert-{{ categoria }} alert-dismissible fade show rounded-3 mb-2" role="alert">
+                {{ msg }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    {% endwith %}
+    <div id="page-content">
+        {% block content %}{% endblock %}
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<div id="page-scripts" style="display:none">{% block scripts %}{% endblock %}</div>
+<script>
+(function() {
+    // Páginas com estado só no JS (form de ordem com linhas de medicamento
+    // adicionadas dinamicamente) nunca podem ser sobrescritas pelo auto-refresh —
+    // o HTML "fresco" do servidor sempre viria sem essas linhas e apagaria o que
+    // o usuário estava digitando.
+    var NO_REFRESH_ENDPOINTS = ['nova_ordem', 'editar_ordem'];
+    var refreshDisabled = NO_REFRESH_ENDPOINTS.indexOf('{{ request.endpoint or "" }}') !== -1;
+
+    var isEditing = false;
+    var modalOpen = false;
+    var refreshPending = false;
+
+    // Enquanto um modal Bootstrap estiver aberto (ex: tratativa de desvio),
+    // o auto-refresh nao pode trocar o innerHTML de #page-content — isso
+    // arranca o modal do DOM no meio da interacao, mas o backdrop (que o
+    // Bootstrap anexa direto no <body>, fora de #page-content) fica orfao e
+    // continua bloqueando cliques na tela inteira, mesmo invisivel.
+    document.addEventListener('show.bs.modal', function() { modalOpen = true; });
+    document.addEventListener('hidden.bs.modal', function() {
+        modalOpen = false;
+        if (refreshPending) { refreshPending = false; refreshContent(); }
+    });
+
+    document.addEventListener('focusin', function(e) {
+        if (e.target.matches('input, textarea, select')) isEditing = true;
+    });
+    document.addEventListener('focusout', function(e) {
+        if (e.target.matches('input, textarea, select')) {
+            isEditing = false;
+            if (!modalOpen && refreshPending) { refreshPending = false; refreshContent(); }
+        }
+    });
+
+    function rerunPageScripts(doc) {
+        var freshScripts = doc.getElementById('page-scripts');
+        var current = document.getElementById('page-scripts');
+        if (!freshScripts || !current) return;
+        current.innerHTML = '';
+        freshScripts.querySelectorAll('script').forEach(function(old) {
+            var s = document.createElement('script');
+            s.textContent = old.textContent;
+            current.appendChild(s);
+        });
+    }
+
+    function refreshContent() {
+        if (refreshDisabled) return;
+        if (isEditing || modalOpen) { refreshPending = true; return; }
+        fetch(location.href)
+            .then(function(r) { return r.text(); })
+            .then(function(html) {
+                // Confere de novo: um modal pode ter aberto entre o fetch()
+                // comecar e a resposta chegar.
+                if (modalOpen) { refreshPending = true; return; }
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                var fresh = doc.getElementById('page-content');
+                var current = document.getElementById('page-content');
+                if (fresh && current && fresh.innerHTML !== current.innerHTML) {
+                    // Elementos marcados com data-preserve (ex: <canvas> de
+                    // grafico com uma instancia Chart.js viva) sao movidos pro
+                    // lugar do seu equivalente "fresco" antes da troca, em vez
+                    // de deixar o innerHTML recria-los do zero a cada refresh —
+                    // assim o script da pagina pode so atualizar os dados do
+                    // grafico existente (via Chart.getChart) quando eles
+                    // realmente mudarem, em vez de destruir e redesenhar sempre.
+                    current.querySelectorAll('[data-preserve][id]').forEach(function(live) {
+                        var placeholder = fresh.querySelector('#' + CSS.escape(live.id));
+                        if (placeholder && placeholder.parentNode) {
+                            placeholder.parentNode.replaceChild(live, placeholder);
+                        }
+                    });
+                    while (current.firstChild) current.removeChild(current.firstChild);
+                    while (fresh.firstChild) current.appendChild(fresh.firstChild);
+                    rerunPageScripts(doc);
+                }
+            })
+            .catch(function() {});
+    }
+
+    if (!refreshDisabled) setInterval(refreshContent, 5000);
+
+    try {
+        var client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+            clientId: 'APSEN_WEB_' + Math.random().toString(16).substr(2, 8)
+        });
+        client.on('connect', function() {
+            client.subscribe('apsen/ordens/acoes');
+            client.subscribe('apsen/dispensacao/rastreabilidade');
+        });
+        client.on('message', function() { setTimeout(refreshContent, 500); });
+    } catch(e) {}
+})();
+</script>
+</body>
+</html>

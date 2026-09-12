@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% block title %}Clientes — Apsen{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-center justify-content-between mb-3">
+    <div>
+        <h4 class="mb-0 fw-bold"><i class="bi bi-building me-2"></i>Clientes</h4>
+        <small class="text-muted">Quem recebe as ordens/caixas — cadastre aqui pra rastrear por destino</small>
+    </div>
+    {% if pode('clientes_editar') %}
+    <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalNovoCliente">
+        <i class="bi bi-building-add"></i> Novo Cliente
+    </button>
+    {% endif %}
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+        <div class="stat-card text-center">
+            <div class="stat-value">{{ clientes|length }}</div>
+            <div class="stat-label">Total</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="stat-card text-center">
+            <div class="stat-value text-success">{{ clientes | selectattr('ativo') | list | length }}</div>
+            <div class="stat-label">Ativos</div>
+        </div>
+    </div>
+</div>
+
+<div class="table-card">
+    <table class="table table-hover align-middle mb-0">
+        <thead>
+            <tr>
+                <th style="width:40px">#</th>
+                <th>Nome</th>
+                <th>CNPJ</th>
+                <th>Contato</th>
+                <th>Telefone</th>
+                <th>Ordens recebidas</th>
+                <th>Status</th>
+                {% if pode('clientes_editar') %}<th style="width:100px">Ações</th>{% endif %}
+            </tr>
+        </thead>
+        <tbody>
+        {% for c in clientes %}
+        <tr class="{% if not c.ativo %}table-light text-muted{% endif %}">
+            <td class="text-muted small">{{ c.id }}</td>
+            <td class="fw-semibold"><i class="bi bi-building me-1 text-muted"></i>{{ c.nome }}</td>
+            <td class="small">{{ c.cnpj or '—' }}</td>
+            <td class="small">{{ c.contato or '—' }}</td>
+            <td class="small">{{ c.telefone or '—' }}</td>
+            <td>
+                <a href="{{ url_for('rastreabilidade') }}?cliente={{ c.nome|urlencode }}" class="text-decoration-none">
+                    <span class="badge bg-primary-subtle text-primary">{{ contagem.get(c.id, 0) }} ordem(ns)</span>
+                </a>
+            </td>
+            <td>
+                {% if c.ativo %}
+                <span class="badge bg-success-subtle text-success border border-success-subtle">Ativo</span>
+                {% else %}
+                <span class="badge bg-secondary-subtle text-secondary border border-secondary-subtle">Inativo</span>
+                {% endif %}
+            </td>
+            {% if pode('clientes_editar') %}
+            <td>
+                <button class="btn btn-sm btn-outline-primary me-1" data-bs-toggle="modal" data-bs-target="#modalEditarCliente{{ c.id }}">
+                    <i class="bi bi-pencil"></i>
+                </button>
+                <form method="POST" action="{{ url_for('excluir_cliente', id=c.id) }}" class="d-inline"
+                      onsubmit="return confirm('Excluir {{ c.nome }}?')">
+                    <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+                </form>
+            </td>
+            {% endif %}
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="text-center text-muted py-4">Nenhum cliente cadastrado.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="mt-3 small text-muted">
+    <i class="bi bi-info-circle me-1"></i>
+    O nome do cliente é usado como "Destino" nas Ordens de Serviço — cadastre aqui pra ele aparecer
+    no autocomplete ao criar uma ordem, e pra rastrear todas as ordens que ele recebeu na
+    <a href="{{ url_for('rastreabilidade') }}">Rastreabilidade</a>.
+</div>
+
+<!-- Modais ficam fora da tabela (div dentro de tbody quebra a renderização das linhas seguintes) -->
+{% if pode('clientes_editar') %}
+{% for c in clientes %}
+<div class="modal fade" id="modalEditarCliente{{ c.id }}" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <form method="POST" action="{{ url_for('editar_cliente', id=c.id) }}">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-pencil me-2"></i>Editar — {{ c.nome }}</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Nome</label>
+                        <input type="text" name="nome" class="form-control" value="{{ c.nome }}" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">CNPJ</label>
+                        <input type="text" name="cnpj" class="form-control" value="{{ c.cnpj }}" placeholder="00.000.000/0000-00">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Endereço</label>
+                        <input type="text" name="endereco" class="form-control" value="{{ c.endereco }}">
+                    </div>
+                    <div class="row g-2 mb-3">
+                        <div class="col">
+                            <label class="form-label fw-semibold">Contato</label>
+                            <input type="text" name="contato" class="form-control" value="{{ c.contato }}" placeholder="Nome do responsável">
+                        </div>
+                        <div class="col">
+                            <label class="form-label fw-semibold">Telefone</label>
+                            <input type="text" name="telefone" class="form-control" value="{{ c.telefone }}">
+                        </div>
+                    </div>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" name="ativo" id="ativoCli{{ c.id }}" {% if c.ativo %}checked{% endif %}>
+                        <label class="form-check-label" for="ativoCli{{ c.id }}">Ativo (aparece no autocomplete de novas ordens)</label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-check2"></i> Salvar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endfor %}
+{% endif %}
+
+<div class="modal fade" id="modalNovoCliente" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <form method="POST" action="{{ url_for('novo_cliente') }}">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-building-add me-2"></i>Novo Cliente</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Nome</label>
+                        <input type="text" name="nome" class="form-control" required placeholder="Ex: Farmácia Central">
+                        <div class="form-text">Precisa bater com o texto usado como "Destino" nas ordens.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">CNPJ</label>
+                        <input type="text" name="cnpj" class="form-control" placeholder="00.000.000/0000-00">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label fw-semibold">Endereço</label>
+                        <input type="text" name="endereco" class="form-control">
+                    </div>
+                    <div class="row g-2">
+                        <div class="col">
+                            <label class="form-label fw-semibold">Contato</label>
+                            <input type="text" name="contato" class="form-control" placeholder="Nome do responsável">
+                        </div>
+                        <div class="col">
+                            <label class="form-label fw-semibold">Telefone</label>
+                            <input type="text" name="telefone" class="form-control">
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-check2"></i> Cadastrar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

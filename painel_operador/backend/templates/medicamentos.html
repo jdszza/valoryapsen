@@ -1,0 +1,187 @@
+{% extends "base.html" %}
+{% block title %}Dispensers — Apsen{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <div>
+        <h4 class="mb-0 fw-bold"><i class="bi bi-capsule me-2"></i>Medicamentos / Dispensers</h4>
+        <small class="text-muted">{{ medicamentos|length }} dispensers cadastrados</small>
+    </div>
+    {% if pode('lotes_ver') %}
+    <a href="{{ url_for('rastreabilidade') }}" class="btn btn-outline-primary btn-sm">
+        <i class="bi bi-box-seam me-1"></i>Gerenciar Lotes / Rastreabilidade
+    </a>
+    {% endif %}
+</div>
+
+<div class="row g-3 mb-4">
+    {% if pode('dispensers_editar') %}
+    <div class="col-md-4">
+        <div class="stat-card">
+            <h6 class="fw-semibold mb-3">Adicionar Medicamento</h6>
+            <form method="POST" action="{{ url_for('novo_medicamento') }}">
+                <div class="mb-2">
+                    <label class="form-label small fw-semibold">Nome</label>
+                    <input type="text" name="nome" class="form-control form-control-sm"
+                           placeholder="Ex: Amoxicilina 500mg" required>
+                </div>
+                <div class="row g-2 mb-2">
+                    <div class="col">
+                        <label class="form-label small fw-semibold">Qtd</label>
+                        <input type="number" name="quantidade" class="form-control form-control-sm"
+                               placeholder="60" value="60" min="0">
+                    </div>
+                    <div class="col">
+                        <label class="form-label small fw-semibold">Cap.</label>
+                        <input type="number" name="capacidade" class="form-control form-control-sm"
+                               placeholder="60" value="60" min="1">
+                    </div>
+                    <div class="col">
+                        <label class="form-label small fw-semibold">Mínimo</label>
+                        <input type="number" name="minimo" class="form-control form-control-sm"
+                               placeholder="10" value="10" min="0">
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-primary btn-sm w-100">
+                    <i class="bi bi-plus-circle me-1"></i>Adicionar
+                </button>
+            </form>
+        </div>
+    </div>
+    {% endif %}
+
+    <div class="col-md-{{ '8' if pode('dispensers_editar') else '12' }}">
+        <!-- Stats rápidos de estoque -->
+        <div class="row g-2 h-100 align-content-start">
+            {% set criticos = medicamentos | selectattr('minimo') | list %}
+            {% set qtd_criticos = namespace(n=0) %}
+            {% for m in medicamentos %}
+                {% if m.minimo is not none and m.quantidade <= m.minimo %}
+                    {% set qtd_criticos.n = qtd_criticos.n + 1 %}
+                {% endif %}
+            {% endfor %}
+            <div class="col-6 col-md-4">
+                <div class="stat-card text-center py-3">
+                    <div class="stat-value">{{ medicamentos|length }}</div>
+                    <div class="stat-label">Total</div>
+                </div>
+            </div>
+            <div class="col-6 col-md-4">
+                <div class="stat-card text-center py-3">
+                    <div class="stat-value text-danger">{{ qtd_criticos.n }}</div>
+                    <div class="stat-label">Abaixo do mínimo</div>
+                </div>
+            </div>
+            <div class="col-6 col-md-4">
+                <div class="stat-card text-center py-3">
+                    <div class="stat-value text-success">{{ medicamentos|length - qtd_criticos.n }}</div>
+                    <div class="stat-label">OK</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="table-card">
+    <table class="table table-hover table-sm align-middle mb-0">
+        <thead>
+            <tr>
+                <th style="width:30px">#</th>
+                <th>Nome</th>
+                <th style="width:80px">Qtd</th>
+                <th style="width:80px">Cap.</th>
+                <th style="width:80px">Mínimo</th>
+                <th style="width:150px">Nível</th>
+                {% if pode('dispensers_editar') %}<th style="width:90px">Ações</th>{% endif %}
+            </tr>
+        </thead>
+        <tbody>
+            {% for med in medicamentos %}
+            {% set pct = (med.quantidade * 100 / med.capacidade)|int if med.capacidade > 0 else 0 %}
+            {% set critico = med.minimo is not none and med.quantidade <= med.minimo %}
+            {% set inativo = med.ativo is defined and not med.ativo %}
+            <tr class="{{ 'table-danger' if critico else '' }}{{ ' opacity-50' if inativo else '' }}">
+                <td class="text-muted small">{{ loop.index }}</td>
+                <td>
+                    {% if pode('dispensers_editar') %}
+                    <input type="text" name="nome" value="{{ med.nome }}" form="form-{{ med.id }}"
+                           class="form-control form-control-sm" style="min-width:160px;max-width:220px">
+                    {% else %}
+                    <span class="fw-semibold">{{ med.nome }}</span>
+                    {% if critico %}
+                    <span class="badge bg-danger ms-1 small">Crítico</span>
+                    {% endif %}
+                    {% endif %}
+                    {% if inativo %}
+                    <span class="badge bg-secondary ms-1 small" title="Fora do catálogo. A linha continua aqui porque o slot é numerado por posição e o histórico de lote aponta para ela.">Inativo</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% if pode('dispensers_editar') %}
+                    <input type="number" name="quantidade" value="{{ med.quantidade }}" form="form-{{ med.id }}"
+                           class="form-control form-control-sm" min="0">
+                    {% else %}{{ med.quantidade }}{% endif %}
+                </td>
+                <td>
+                    {% if pode('dispensers_editar') %}
+                    <input type="number" name="capacidade" value="{{ med.capacidade }}" form="form-{{ med.id }}"
+                           class="form-control form-control-sm" min="1">
+                    {% else %}{{ med.capacidade }}{% endif %}
+                </td>
+                <td>
+                    {% if pode('dispensers_editar') %}
+                    <input type="number" name="minimo" value="{{ med.minimo if med.minimo is not none else '' }}" form="form-{{ med.id }}"
+                           class="form-control form-control-sm" min="0" placeholder="—">
+                    {% else %}{{ med.minimo if med.minimo is not none else '—' }}{% endif %}
+                </td>
+                <td>
+                    <div class="d-flex align-items-center gap-2">
+                        <div class="progress flex-fill" style="height:14px">
+                            <div class="progress-bar {% if pct > 50 %}bg-success{% elif pct > 20 %}bg-warning{% else %}bg-danger{% endif %}"
+                                 style="width:{{ pct }}%"></div>
+                        </div>
+                        <span class="small text-muted" style="width:30px">{{ pct }}%</span>
+                    </div>
+                </td>
+                {% if pode('dispensers_editar') %}
+                <td>
+                    <button type="submit" form="form-{{ med.id }}" class="btn btn-sm btn-outline-primary" title="Salvar">
+                        <i class="bi bi-check-lg"></i>
+                    </button>
+                    {% if inativo %}
+                    <form method="POST" action="{{ url_for('reativar_medicamento', id=med.id) }}" class="d-inline">
+                        <button type="submit" class="btn btn-sm btn-outline-success" title="Reativar">
+                            <i class="bi bi-arrow-counterclockwise"></i>
+                        </button>
+                    </form>
+                    {% else %}
+                    <form method="POST" action="{{ url_for('excluir_medicamento', id=med.id) }}" class="d-inline"
+                          onsubmit="return confirm('Retirar {{ med.nome }} do catálogo?')">
+                        <button type="submit" class="btn btn-sm btn-outline-danger" title="Retirar do catálogo">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </form>
+                    {% endif %}
+                </td>
+                {% endif %}
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="7" class="text-center text-muted py-5">
+                    <i class="bi bi-capsule fs-3 d-block mb-2"></i>
+                    Nenhum medicamento cadastrado.
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% if pode('dispensers_editar') %}
+<!-- Um <form> por linha, associado via atributo form="" nos inputs da tabela.
+     Não pode envolver as <td> diretamente (form como filho de <tr> é HTML
+     invalido e quebra a renderização das linhas seguintes no navegador). -->
+{% for med in medicamentos %}
+<form id="form-{{ med.id }}" method="POST" action="{{ url_for('editar_medicamento', id=med.id) }}"></form>
+{% endfor %}
+{% endif %}
+{% endblock %}

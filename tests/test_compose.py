@@ -16,9 +16,9 @@ import yaml
 
 COMPOSE = Path(__file__).resolve().parent.parent / "docker-compose.yml"
 
-# O order-generator é um worker de laço: não expõe porta nem endpoint, e
+# O erp-simulator é um worker de laço: não expõe porta nem endpoint, e
 # ninguém depende dele. Ver o comentário no próprio compose.
-SEM_HEALTHCHECK = {"order-generator"}
+SEM_HEALTHCHECK = {"erp-simulator"}
 
 
 @pytest.fixture(scope="module")

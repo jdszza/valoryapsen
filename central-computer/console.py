@@ -2,7 +2,7 @@
 APSEN — Console de operação: sessão, senha e o flag de pausa do gerador.
 
 Este módulo é a parte SEM FastAPI do console: assinatura do cookie, conferência
-da senha, freio de força bruta e o interruptor do order-generator. As rotas
+da senha, freio de força bruta e o interruptor do erp-simulator. As rotas
 ficam em `main.py`, junto do resto da API — o que mora aqui é o que dá para
 testar chamando função, sem subir aplicação.
 
@@ -41,7 +41,7 @@ não acrescentar dependência ao central sem necessidade real.
 
 O flag de pausa mora aqui, e é de memória
 ─────────────────────────────────────────
-O order-generator é outro container. Fazer o central pará-lo exigiria falar com
+O erp-simulator é outro container. Fazer o central pará-lo exigiria falar com
 o daemon do Docker — socket montado no container, permissão de administrador da
 máquina, e um acoplamento novo entre o central e o runtime que o hospeda, tudo
 para não dispensar medicamento por alguns minutos. O caminho barato é o que já
@@ -75,17 +75,26 @@ COOKIE_PATH = "/console"
 _DIR = Path(__file__).resolve().parent
 _PAGINA_CONSOLE = _DIR / "console.html"
 _PAGINA_LOGIN   = _DIR / "console_login.html"
+_PAGINA_PREVOO  = _DIR / "console_prevoo.html"
 
 # Freio de força bruta: a porta é uma senha só, sem usuário e sem segundo
 # fator. Uma janela curta com poucas tentativas não atrapalha quem digitou
 # errado e derruba a taxa de quem varre.
+#
+# O freio serve DUAS portas: este console e o `POST /auth/login` do central,
+# que também não tinha nenhum — sendo que é ele quem emite o JWT de `admin`. As
+# funções nunca souberam o que é `origem`, então compartilhar não custou
+# parâmetro nenhum: o console usa o IP e o login usa `login:{ip}|{username}`,
+# baldes separados no mesmo dicionário. Um segundo contador para a mesma regra
+# divergiria no primeiro ajuste de janela, e a metade esquecida seria a que
+# ninguém está olhando.
 MAX_TENTATIVAS = 5
 JANELA_TENTATIVAS_S = 60.0
 
 _tentativas: dict[str, list[float]] = {}
 _tentativas_lock = threading.Lock()
 
-# Interruptor do order-generator. Escrito só por `definir_pausa`, lido por
+# Interruptor do erp-simulator. Escrito só por `definir_pausa`, lido por
 # `GET /api/v1/gerador` (o gerador) e publicado em `_estado` (o console).
 _pausado = False
 _pausado_desde: float | None = None
@@ -198,7 +207,7 @@ def bloqueado(origem: str, agora: float | None = None) -> float:
         return max(JANELA_TENTATIVAS_S - (momento - min(recentes)), 1.0)
 
 
-# ── Pausa do order-generator ──────────────────────────────────────────────────
+# ── Pausa do erp-simulator ──────────────────────────────────────────────────
 
 def gerador_status() -> dict:
     """O que `GET /api/v1/gerador` devolve — o gerador só lê `pausado`."""
@@ -218,7 +227,7 @@ def definir_pausa(pausado: bool) -> dict:
         _pausado_desde = time.time() if _pausado else None
         estado = {"pausado": _pausado, "desde": _pausado_desde}
     if mudou:
-        logger.warning("[CONSOLE] Order-generator %s pelo console.",
+        logger.warning("[CONSOLE] Emissão automática de OS %s pelo console.",
                        "PAUSADO" if pausado else "RETOMADO")
     return estado
 
@@ -239,6 +248,11 @@ def resetar_pausa() -> None:
 
 def pagina_console() -> str:
     return _PAGINA_CONSOLE.read_text(encoding="utf-8")
+
+
+def pagina_prevoo() -> str:
+    """Tela de conferência pré-apresentação. Mesma sessão do console."""
+    return _PAGINA_PREVOO.read_text(encoding="utf-8")
 
 
 def pagina_login(erro: str = "") -> str:

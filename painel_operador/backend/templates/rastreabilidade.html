@@ -1,0 +1,352 @@
+{% extends "base.html" %}
+{% block title %}Rastreabilidade — Apsen{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+    <h4 class="mb-0 fw-bold"><i class="bi bi-search me-2"></i>Rastreabilidade</h4>
+    <small class="text-muted">Cadastro de lotes, controle de validade e consulta de consumo — tudo num só lugar</small>
+</div>
+
+<ul class="nav nav-pills mb-4" id="rastreioTabs" role="tablist">
+    <li class="nav-item" role="presentation">
+        <button class="nav-link {{ 'active' if not termo and not termo_cliente else '' }}" data-bs-toggle="pill" data-bs-target="#tab-lotes" type="button">
+            <i class="bi bi-box-seam me-1"></i>Gestão de Lotes
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link {{ 'active' if termo else '' }}" data-bs-toggle="pill" data-bs-target="#tab-busca" type="button">
+            <i class="bi bi-search me-1"></i>Buscar Consumo por Lote
+        </button>
+    </li>
+    <li class="nav-item" role="presentation">
+        <button class="nav-link {{ 'active' if termo_cliente else '' }}" data-bs-toggle="pill" data-bs-target="#tab-cliente" type="button">
+            <i class="bi bi-building me-1"></i>Por Cliente / Destino
+        </button>
+    </li>
+</ul>
+
+<div class="tab-content">
+<!-- ===================== ABA: GESTÃO DE LOTES ===================== -->
+<div class="tab-pane fade {{ 'show active' if not termo and not termo_cliente else '' }}" id="tab-lotes" role="tabpanel">
+
+    <div class="alert alert-info d-flex align-items-start gap-3 mb-4 rounded-3" role="alert">
+        <i class="bi bi-info-circle fs-5 mt-1 flex-shrink-0"></i>
+        <div class="small">
+            <strong>Como funciona:</strong> cada medicamento pode ter vários lotes (fornecedor, nota fiscal,
+            fabricação, validade, quantidade). Clique no nome do medicamento abaixo pra abrir/fechar o
+            cadastro dele. Ao concluir uma ordem, o sistema desconta automaticamente do lote mais próximo
+            de vencer primeiro (FEFO).
+        </div>
+    </div>
+
+    {% if proximos_vencer %}
+    <div class="alert alert-warning d-flex align-items-start gap-3 mb-4 rounded-3" role="alert">
+        <i class="bi bi-calendar-x fs-5 mt-1 flex-shrink-0"></i>
+        <div>
+            <strong>{{ proximos_vencer|length }} lote(s) vencendo em até 30 dias:</strong>
+            {% for l in proximos_vencer %}
+            <span class="badge bg-warning text-dark ms-1">{{ l.medicamento_nome[:16] }} — lote {{ l.lote }} ({{ l.validade }})</span>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <div class="row g-3 mb-4">
+        <div class="col-6 col-md-4">
+            <div class="stat-card text-center py-3">
+                <div class="stat-value">{{ medicamentos|length }}</div>
+                <div class="stat-label">Medicamentos</div>
+            </div>
+        </div>
+        <div class="col-6 col-md-4">
+            <div class="stat-card text-center py-3">
+                <div class="stat-value {{ 'text-warning' if sem_lote else 'text-success' }}">{{ total_lotes }}</div>
+                <div class="stat-label">Lotes ativos {% if sem_lote %}({{ sem_lote }} medicamento(s) sem lote){% endif %}</div>
+            </div>
+        </div>
+        <div class="col-6 col-md-4">
+            <div class="stat-card text-center py-3">
+                <div class="stat-value text-danger">{{ proximos_vencer|length }}</div>
+                <div class="stat-label">Vencendo em 30 dias</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="accordion" id="acordeaoLotes">
+        {% for med in medicamentos %}
+        {% set lotes_med = lotes_por_med.get(med.id, []) %}
+        {% set lotes_ativos = lotes_med | selectattr('status','equalto','Ativo') | selectattr('quantidade','gt',0) | list %}
+        <div class="accordion-item mb-2 border rounded-3 overflow-hidden" id="med-{{ med.id }}">
+            <h2 class="accordion-header">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#colapso-{{ med.id }}">
+                    <div class="d-flex justify-content-between align-items-center w-100 me-3">
+                        <span class="fw-semibold">{{ med.nome }}</span>
+                        <span>
+                            {% if lotes_ativos %}
+                            <span class="badge bg-success-subtle text-success me-2">{{ lotes_ativos|length }} lote(s) ativo(s)</span>
+                            {% else %}
+                            <span class="badge bg-danger-subtle text-danger me-2"><i class="bi bi-exclamation-circle"></i> sem lote cadastrado</span>
+                            {% endif %}
+                        </span>
+                    </div>
+                </button>
+            </h2>
+            <div id="colapso-{{ med.id }}" class="accordion-collapse collapse" data-bs-parent="#acordeaoLotes">
+                <div class="accordion-body">
+                    <div class="table-responsive">
+                        <table class="table table-sm align-middle">
+                            <thead>
+                                <tr>
+                                    <th>Lote</th><th>Validade</th><th>Fabricação</th><th>Saldo</th>
+                                    <th>Qtd. inicial</th><th>Fornecedor</th><th>NF</th><th>Status</th><th>Entrada</th>
+                                    {% if pode('lotes_editar') %}<th></th>{% endif %}
+                                </tr>
+                            </thead>
+                            <tbody>
+                            {% for l in lotes_med %}
+                                <tr>
+                                    <td class="fw-semibold">{{ l.lote }}</td>
+                                    <td>{{ l.validade or '—' }}</td>
+                                    <td class="small">{{ l.data_fabricacao or '—' }}</td>
+                                    <td>{{ l.quantidade }}</td>
+                                    <td>{{ l.quantidade_inicial }}</td>
+                                    <td class="small">{{ l.fornecedor or '—' }}</td>
+                                    <td class="small">{{ l.nota_fiscal or '—' }}</td>
+                                    <td>
+                                        {% if l.status == 'Ativo' %}<span class="badge bg-success-subtle text-success">Ativo</span>
+                                        {% elif l.status == 'Esgotado' %}<span class="badge bg-secondary-subtle text-secondary">Esgotado</span>
+                                        {% elif l.status == 'Baixado' %}<span class="badge bg-dark-subtle text-dark">Baixado</span>
+                                        {% else %}<span class="badge bg-danger-subtle text-danger">Bloqueado</span>{% endif %}
+                                    </td>
+                                    <td class="small text-muted">{{ l.data_entrada[:10] }}</td>
+                                    {% if pode('lotes_editar') %}
+                                    <td class="text-nowrap">
+                                        <form method="POST" action="{{ url_for('bloquear_lote', id=l.id) }}" class="d-inline">
+                                            <button class="btn btn-sm btn-outline-warning" title="Bloquear/Desbloquear">
+                                                <i class="bi bi-shield-exclamation"></i>
+                                            </button>
+                                        </form>
+                                        {% if l.status != 'Baixado' and l.quantidade > 0 %}
+                                        <form method="POST" action="{{ url_for('baixa_lote', id=l.id) }}" class="d-inline"
+                                              onsubmit="var m=prompt('Motivo da baixa (vencido, avariado, perda...):'); if(!m) return false; this.querySelector('[name=motivo]').value=m;">
+                                            <input type="hidden" name="motivo" value="">
+                                            <button type="submit" class="btn btn-sm btn-outline-danger" title="Baixa (vencido/avariado/perda)">
+                                                <i class="bi bi-trash3"></i>
+                                            </button>
+                                        </form>
+                                        {% endif %}
+                                    </td>
+                                    {% endif %}
+                                </tr>
+                            {% else %}
+                                <tr><td colspan="9" class="text-center text-muted py-3">Nenhum lote cadastrado ainda.</td></tr>
+                            {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    {% if pode('lotes_editar') %}
+                    <form method="POST" action="{{ url_for('novo_lote', id=med.id) }}" class="row g-2 align-items-end border-top pt-3">
+                        <div class="col-md-3">
+                            <label class="form-label small fw-semibold">Nº do lote</label>
+                            <input type="text" name="lote" class="form-control form-control-sm" required placeholder="Ex: 7896004703596">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label small fw-semibold">Fabricação</label>
+                            <input type="date" name="data_fabricacao" class="form-control form-control-sm">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label small fw-semibold">Validade</label>
+                            <input type="date" name="validade" class="form-control form-control-sm">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label small fw-semibold">Quantidade</label>
+                            <input type="number" name="quantidade" class="form-control form-control-sm" min="1" required>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label small fw-semibold">Fornecedor</label>
+                            <input type="text" name="fornecedor" class="form-control form-control-sm" placeholder="Ex: Distribuidora XYZ">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label small fw-semibold">Nota fiscal</label>
+                            <input type="text" name="nota_fiscal" class="form-control form-control-sm" placeholder="Ex: NF-12345">
+                        </div>
+                        <div class="col-md-3 offset-md-6">
+                            <button type="submit" class="btn btn-primary btn-sm w-100">
+                                <i class="bi bi-plus-circle me-1"></i>Registrar entrada
+                            </button>
+                        </div>
+                    </form>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        {% else %}
+        <div class="text-center text-muted py-5">
+            <i class="bi bi-capsule fs-3 d-block mb-2"></i>
+            Nenhum medicamento cadastrado ainda. Cadastre em Dispensers primeiro.
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- ===================== ABA: BUSCA POR LOTE ===================== -->
+<div class="tab-pane fade {{ 'show active' if termo else '' }}" id="tab-busca" role="tabpanel">
+    <div class="table-card p-3 mb-3">
+        <form method="GET" class="row g-2 align-items-end">
+            <div class="col-md-6">
+                <label class="form-label small fw-semibold mb-1">Número do lote</label>
+                <input type="text" name="lote" class="form-control" placeholder="Ex: 7896004703596" value="{{ termo }}">
+            </div>
+            <div class="col-md-3">
+                <button type="submit" class="btn btn-primary w-100">
+                    <i class="bi bi-search"></i> Buscar
+                </button>
+            </div>
+        </form>
+    </div>
+
+    {% if termo %}
+    <div class="table-card">
+        <div class="p-3 border-bottom">
+            <h6 class="mb-0 fw-semibold">{{ consumos|length }} consumo(s) encontrado(s) para "{{ termo }}"</h6>
+        </div>
+        <table class="table table-hover table-sm align-middle mb-0">
+            <thead>
+                <tr>
+                    <th>Data</th>
+                    <th>Ordem (OS)</th>
+                    <th>Medicamento</th>
+                    <th>Lote</th>
+                    <th>Quantidade consumida</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for c in consumos %}
+            <tr>
+                <td class="small text-muted font-monospace">{{ c.data }}</td>
+                <td>
+                    {% if c.ordem_id %}
+                    <a href="{{ url_for('ordem_detalhe', id=c.ordem_id) }}" class="text-decoration-none"><strong>{{ c.numero_os }}</strong></a>
+                    {% else %}
+                    <strong>{{ c.numero_os }}</strong>
+                    {% endif %}
+                </td>
+                <td>{{ c.medicamento_nome }}</td>
+                <td>
+                    {% if c.lote == 'SEM LOTE REGISTRADO' %}
+                    <span class="badge bg-secondary-subtle text-secondary">{{ c.lote }}</span>
+                    {% else %}
+                    <span class="badge bg-primary-subtle text-primary">{{ c.lote }}</span>
+                    {% endif %}
+                </td>
+                <td>{{ c.quantidade }}</td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="5" class="text-center text-muted py-5">
+                    <i class="bi bi-inbox fs-3 d-block mb-2"></i>
+                    Nenhum consumo registrado para esse lote.
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+
+<!-- ===================== ABA: POR CLIENTE / DESTINO ===================== -->
+<div class="tab-pane fade {{ 'show active' if termo_cliente else '' }}" id="tab-cliente" role="tabpanel">
+    <div class="table-card p-3 mb-3">
+        <form method="GET" class="row g-2 align-items-end">
+            <div class="col-md-6">
+                <label class="form-label small fw-semibold mb-1">Cliente / Destino</label>
+                <input type="text" name="cliente" class="form-control" list="listaClientesRastreio"
+                       placeholder="Ex: Farmácia Central" value="{{ termo_cliente }}">
+                <datalist id="listaClientesRastreio">
+                    {% for c in clientes %}
+                    <option value="{{ c }}">
+                    {% endfor %}
+                </datalist>
+            </div>
+            <div class="col-md-3">
+                <button type="submit" class="btn btn-primary w-100">
+                    <i class="bi bi-search"></i> Buscar
+                </button>
+            </div>
+            <div class="col-md-3">
+                <a href="{{ url_for('listar_clientes') }}" class="btn btn-outline-secondary w-100">
+                    <i class="bi bi-building"></i> Gerenciar Clientes
+                </a>
+            </div>
+        </form>
+    </div>
+
+    {% if termo_cliente %}
+    <div class="table-card">
+        <div class="p-3 border-bottom">
+            <h6 class="mb-0 fw-semibold">{{ ordens_cliente|length }} ordem(ns) encontrada(s) para "{{ termo_cliente }}"</h6>
+        </div>
+        <table class="table table-hover table-sm align-middle mb-0">
+            <thead>
+                <tr>
+                    <th>OS</th>
+                    <th>Destino</th>
+                    <th>Itens</th>
+                    <th>Status</th>
+                    <th>Criada em</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for o in ordens_cliente %}
+            <tr>
+                <td>
+                    <a href="{{ url_for('ordem_detalhe', id=o.id) }}" class="text-decoration-none"><strong>{{ o.numero_os }}</strong></a>
+                </td>
+                <td class="small">{{ o.destino }}</td>
+                <td class="small">{{ itens_resumo(o) }}</td>
+                <td>
+                    {% if o.status == 'Pendente' %}<span class="badge badge-pendente">Pendente</span>
+                    {% elif o.status == 'Em Processo' %}<span class="badge badge-processo">Em Processo</span>
+                    {% elif o.status == 'Pausado' %}<span class="badge badge-pausado">Pausado</span>
+                    {% elif o.status == 'Concluido' %}<span class="badge badge-concluido">Concluído</span>
+                    {% else %}<span class="badge badge-cancelado">{{ o.status }}</span>{% endif %}
+                </td>
+                <td class="small text-muted">{{ o.data_criacao }}</td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="5" class="text-center text-muted py-5">
+                    <i class="bi bi-inbox fs-3 d-block mb-2"></i>
+                    Nenhuma ordem encontrada para esse cliente.
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+</div>
+
+<script>
+// Roda no "load" (nao na primeira execucao do script) porque o bundle do
+// Bootstrap e carregado depois deste bloco no HTML — em DOMContentLoaded/load
+// ele ja esta disponivel em window.bootstrap.
+window.addEventListener('load', function() {
+    // Se a URL tiver #med-N (redirecionado de uma acao de lote), abre a
+    // aba de Gestao de Lotes e expande o acordeao do medicamento certo.
+    if (location.hash.indexOf('#med-') === 0) {
+        var alvo = document.querySelector(location.hash);
+        if (alvo) {
+            var colapso = alvo.querySelector('.accordion-collapse');
+            if (colapso && window.bootstrap) {
+                new bootstrap.Collapse(colapso, { show: true });
+            }
+            setTimeout(function() { alvo.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 250);
+        }
+    }
+});
+</script>
+{% endblock %}

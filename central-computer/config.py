@@ -132,6 +132,103 @@ def _num_slots() -> int:
     return valor
 
 
+def _mysql_pool_max() -> int:
+    """Quantas conexões MySQL o central guarda abertas. Faixa válida: 1..64.
+
+    Antes não havia pool: cada operação abria TCP + handshake + autenticação e
+    fechava. Um evento de adapter faz de 1 a 3 escritas, e a telemetria dos
+    slots sozinha são `NUM_SLOTS` gravações a cada 15s — a maior latência
+    evitável do central estava aí.
+
+    O teto vale por dois lados. Pequeno demais, as threads do `to_thread` se
+    atropelam e a conexão extra é aberta do jeito antigo; grande demais,
+    o central sozinho encosta no `max_connections` do MySQL (151 por padrão) e
+    o erro que aparece — 1040, "too many connections" — é justamente o que o
+    `init_db` classifica como transitório, ou seja, 30 retries no boot
+    seguinte. 8 cobre o paralelismo real (`asyncio.to_thread` + as rotas
+    síncronas do FastAPI) com folga.
+    """
+    bruto = os.getenv("MYSQL_POOL_MAX", "8")
+    try:
+        valor = int(bruto)
+    except ValueError:
+        valor = 0
+    if not 1 <= valor <= 64:
+        _cfg_logger.warning("MYSQL_POOL_MAX=%r fora da faixa 1..64 — usando 8.", bruto)
+        return 8
+    return valor
+
+
+# ── Controles globais de demonstração ─────────────────────────────────────────
+# As duas funções abaixo existem IDÊNTICAS aqui e nos quatro simuladores. A
+# duplicação é deliberada: simulador não importa módulo do central (imagens
+# separadas, mesmo motivo de `os_templates.novo_os_id` × `simulator._novo_os_id`
+# — ver CLAUDE.md). O que a torna segura é `tests/test_modo_apresentacao.py`,
+# que compara as cinco cópias entre si tabela de entradas por tabela de
+# entradas: "liguei o modo apresentação" valendo em quatro serviços e não no
+# quinto produz exatamente a surpresa que o modo existe para eliminar.
+
+def _modo_apresentacao() -> bool:
+    """Modo demonstração: o acaso é desligado, o sistema roda determinístico.
+
+    Aceita as grafias que alguém digita no `.env` sem pensar ("1", "true",
+    "sim", "on"); qualquer outra coisa é falso. Nunca levanta: um valor
+    estranho aqui não pode impedir o central de subir.
+
+    O central não sorteia falha nenhuma — quem sorteia são os simuladores. Ele
+    lê a variável para publicá-la (`/api/v1/estado`, log de boot, tela de
+    pré-voo): operar a planta sem saber qual modo está em vigor é o que faz
+    alguém confundir demo sem imprevisto com hardware perfeito.
+    """
+    return os.getenv("MODO_APRESENTACAO", "0").strip().lower() in (
+        "1", "true", "yes", "sim", "on",
+    )
+
+
+def _fator_velocidade() -> float:
+    """Multiplicador de TODOS os tempos simulados. Faixa válida: 0.1..10.
+
+    0.5 roda a demo no dobro da velocidade; 2.0, na metade, para explicar cada
+    etapa com calma. Fora da faixa cai em 1.0 com warning, em vez de virar
+    comportamento silencioso: 0 faria toda etapa terminar instantaneamente
+    (sem nada para mostrar) e um valor enorme travaria a apresentação inteira
+    em cima do primeiro slot.
+    """
+    bruto = os.getenv("FATOR_VELOCIDADE", "1.0")
+    try:
+        valor = float(bruto)
+    except ValueError:
+        valor = 0.0
+    if not 0.1 <= valor <= 10.0:
+        _cfg_logger.warning(
+            "FATOR_VELOCIDADE=%r fora da faixa 0.1..10 — usando 1.0.", bruto)
+        return 1.0
+    return valor
+
+
+def _folga_timeout() -> float:
+    """Fator aplicado aos TIMEOUT_* do orquestrador. Nunca menor que 1.0.
+
+    Este é o ponto em que a task de modo apresentação mais tinha como dar
+    errado: desacelerar a célula sem desacelerar o teto de espera faz a OS
+    abortar por `timeout_carregamento` no meio da demonstração — e o log
+    culparia o dispenser, que estava fazendo exatamente o que se pediu.
+
+    O `max(1.0, ...)` não é conservadorismo distraído, é a assimetria real dos
+    dois lados:
+
+    - **Acelerar** (fator < 1) não ganha nada com timeout menor. O timeout é
+      teto de espera por um adapter travado, não parte do ciclo: encolhê-lo não
+      torna a demo mais rápida em um segundo sequer. O que ele encolhe junto é a
+      folga para o custo FIXO, que não escala com fator nenhum — `_post`
+      retentando 3× com `sleep(1)` chega a ~32 s por comando, e o MySQL e a rede
+      levam o que levam. Com `TIMEOUT_PESO` (15 s) a 0.1, o teto viraria 1,5 s e
+      a OS abortaria com a planta inteira saudável.
+    - **Desacelerar** (fator > 1) precisa do aumento, e é aí que ele vem.
+    """
+    return max(1.0, _fator_velocidade())
+
+
 def _console_senha() -> str:
     """Senha do console de operação. Vazia = console DESABILITADO.
 
@@ -176,6 +273,9 @@ class Settings:
     MYSQL_DB:   str = os.getenv("MYSQL_DB",   "apsen_db")
     MYSQL_USER: str = os.getenv("MYSQL_USER", "apsen")
     MYSQL_PASS: str = os.getenv("MYSQL_PASS", "apsen_pass_2024")
+    # Conexões reaproveitadas em vez de uma nova por operação. Ver `_conn` em
+    # database.py.
+    MYSQL_POOL_MAX: int = field(default_factory=_mysql_pool_max)
 
     # ── Ambiente ──────────────────────────────────────────────────────────────
     # "dev" afrouxa a validação de segredo (ver `validar_secret_key`). Qualquer
@@ -206,13 +306,24 @@ class Settings:
     WEIGHT_ADAPTER_URL:    str = os.getenv("WEIGHT_ADAPTER_URL",    "http://weight-adapter:8103")
 
     # ── Timeouts de orquestração (segundos) ───────────────────────────────────
-    TIMEOUT_CARREGAMENTO:        float = float(os.getenv("TIMEOUT_CARREGAMENTO",        "180"))
-    TIMEOUT_POSICIONAMENTO:      float = float(os.getenv("TIMEOUT_POSICIONAMENTO",      "120"))
-    TIMEOUT_DISPENSA:            float = float(os.getenv("TIMEOUT_DISPENSA",            "120"))
-    TIMEOUT_VISAO_DISPENSER:     float = float(os.getenv("TIMEOUT_VISAO_DISPENSER",     "30"))
-    TIMEOUT_VISAO_MESA:          float = float(os.getenv("TIMEOUT_VISAO_MESA",          "30"))
-    TIMEOUT_PESO:                float = float(os.getenv("TIMEOUT_PESO",                "15"))
-    TIMEOUT_LIMPEZA:             float = float(os.getenv("TIMEOUT_LIMPEZA",             "60"))
+    # Todos escalados por `_folga_timeout()`: com a célula desacelerada para
+    # narrar a demo, um teto fixo abortaria a OS por timeout de um passo que
+    # está apenas demorando o que se pediu. Ver a docstring de `_folga_timeout`
+    # para por que o fator só aumenta, nunca reduz.
+    TIMEOUT_CARREGAMENTO:        float = float(os.getenv("TIMEOUT_CARREGAMENTO",        "180")) * _folga_timeout()
+    TIMEOUT_POSICIONAMENTO:      float = float(os.getenv("TIMEOUT_POSICIONAMENTO",      "120")) * _folga_timeout()
+    TIMEOUT_DISPENSA:            float = float(os.getenv("TIMEOUT_DISPENSA",            "120")) * _folga_timeout()
+    TIMEOUT_VISAO_DISPENSER:     float = float(os.getenv("TIMEOUT_VISAO_DISPENSER",     "30"))  * _folga_timeout()
+    TIMEOUT_VISAO_MESA:          float = float(os.getenv("TIMEOUT_VISAO_MESA",          "30"))  * _folga_timeout()
+    TIMEOUT_PESO:                float = float(os.getenv("TIMEOUT_PESO",                "15"))  * _folga_timeout()
+    TIMEOUT_LIMPEZA:             float = float(os.getenv("TIMEOUT_LIMPEZA",             "60"))  * _folga_timeout()
+
+    # ── Modo de demonstração ──────────────────────────────────────────────────
+    # O central não sorteia falha; estes dois campos existem para PUBLICAR o
+    # que está em vigor (log de boot, `/api/v1/estado`, tela de pré-voo) e,
+    # no caso do fator, para escalar os timeouts acima.
+    MODO_APRESENTACAO: bool  = field(default_factory=_modo_apresentacao)
+    FATOR_VELOCIDADE:  float = field(default_factory=_fator_velocidade)
 
     # ── Triple Check ──────────────────────────────────────────────────────────
     TRIPLE_CHECK_MIN_DIVERGENCIAS: int = _limiar_triple_check()

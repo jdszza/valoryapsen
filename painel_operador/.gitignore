@@ -1,0 +1,16 @@
+# ambientes virtuais e caches
+.venv/
+__pycache__/
+*.pyc
+
+# build do PlatformIO
+.pio/
+
+# artefatos do empacotamento do backend
+backend/build/
+backend/dist/
+*.log
+
+# dados gerados em execucao
+backend/apsen.db-wal
+backend/apsen.db-shm

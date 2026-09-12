@@ -16,7 +16,8 @@
 #   vision-simulator    → simula as 3 câmeras: uma por fileira de dispensers e
 #                         a da mesa/balança (porta 8202)
 #   weight-simulator    → simula célula de carga HX711 na mesa (porta 8203)
-#   order-generator     → dispara 1 das 10 ordens padrão (os_templates.py) por ciclo
+#   erp-simulator       → dispara 1 das 10 ordens padrão (os_templates.py) por ciclo;
+#                         faz o papel do ERP que, no mundo real, emite as ordens de saída
 #   dashboard           → Plotly Dash: monitoramento read-only (porta 8050)
 #   manut_web           → Plotly Dash: app de manutenção e operação com auth
 #                         (porta 8051)
@@ -59,7 +60,7 @@ services:
       - "3306:3306"
     environment:
       # Credenciais vêm do .env (não versionado). O modelo do arquivo está no
-      # README, em "Como rodar" — não há .env.example no repositório.
+      # README, em "Build e deploy" — não há .env.example no repositório.
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASS:?defina MYSQL_ROOT_PASS no .env}
       MYSQL_DATABASE:      ${MYSQL_DB:-apsen_db}
       MYSQL_USER:          ${MYSQL_USER:-apsen}
@@ -95,6 +96,9 @@ services:
       MYSQL_DB:               apsen_db
       MYSQL_USER:             ${MYSQL_USER:-apsen}
       MYSQL_PASS:             ${MYSQL_PASS:?defina MYSQL_PASS no .env}
+      # Conexões MySQL guardadas abertas entre operações (faixa 1..64). É teto
+      # do que fica GUARDADO, não do que pode abrir: pool vazio abre mais.
+      MYSQL_POOL_MAX:         ${MYSQL_POOL_MAX:-8}
       # Segredos: todos do .env, nenhum versionado. O central RECUSA subir com
       # SECRET_KEY default fora de APSEN_ENV=dev — ver README.
       APSEN_ENV:              ${APSEN_ENV:-prod}
@@ -115,6 +119,14 @@ services:
       CNC_ADAPTER_URL:        http://cnc-adapter:8101
       VISION_ADAPTER_URL:     http://vision-adapter:8102
       WEIGHT_ADAPTER_URL:     http://weight-adapter:8103
+      # Controles globais de demonstração — uma variável para toda a stack.
+      # MODO_APRESENTACAO=1 zera TODA probabilidade de falha aleatória dos
+      # simuladores; FATOR_VELOCIDADE multiplica os tempos simulados (0.5 = dobro
+      # da velocidade, 2.0 = metade). Ver CLAUDE.md e README.
+      MODO_APRESENTACAO:  ${MODO_APRESENTACAO:-0}
+      FATOR_VELOCIDADE:   ${FATOR_VELOCIDADE:-1.0}
+      # Os TIMEOUT_* abaixo são os valores BASE: o central os multiplica por
+      # max(1, FATOR_VELOCIDADE). Ver `config._folga_timeout`.
       TIMEOUT_CARREGAMENTO:   180
       TIMEOUT_POSICIONAMENTO: 120
       TIMEOUT_DISPENSA:       120
@@ -270,6 +282,12 @@ services:
       PROB_ERRO_SENSOR:  0.01   # probabilidade de falha do sensor HX711
       T_LEITURA:         1.5    # tempo de estabilização da leitura (s)
       RUIDO_G:           2.0    # ruído gaussiano simulado (g)
+      # Controles globais de demonstração — uma variável para toda a stack.
+      # MODO_APRESENTACAO=1 zera TODA probabilidade de falha aleatória dos
+      # simuladores; FATOR_VELOCIDADE multiplica os tempos simulados (0.5 = dobro
+      # da velocidade, 2.0 = metade). Ver CLAUDE.md e README.
+      MODO_APRESENTACAO:  ${MODO_APRESENTACAO:-0}
+      FATOR_VELOCIDADE:   ${FATOR_VELOCIDADE:-1.0}
     healthcheck:
       <<: *healthcheck-padrao
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8203/ping', timeout=3)"]
@@ -301,6 +319,12 @@ services:
       PROB_FALHA_LEITURA_MESA:       0.02   # 2% câmera mesa não detecta
       PROB_DIVERGENCIA_MESA:         0.02   # 2% contagem errada na mesa
       T_SCAN_MESA:                   2.0    # segundos processamento scan mesa
+      # Controles globais de demonstração — uma variável para toda a stack.
+      # MODO_APRESENTACAO=1 zera TODA probabilidade de falha aleatória dos
+      # simuladores; FATOR_VELOCIDADE multiplica os tempos simulados (0.5 = dobro
+      # da velocidade, 2.0 = metade). Ver CLAUDE.md e README.
+      MODO_APRESENTACAO:  ${MODO_APRESENTACAO:-0}
+      FATOR_VELOCIDADE:   ${FATOR_VELOCIDADE:-1.0}
     healthcheck:
       <<: *healthcheck-padrao
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8202/ping', timeout=3)"]
@@ -323,6 +347,12 @@ services:
       T_CARGA_UNID:       0.3
       T_DISPENSA_UNID:    0.5
       PROB_ERRO_MECANICO: 0.01   # falha mecânica (atolamento) — CV movido para vision-adapter
+      # Controles globais de demonstração — uma variável para toda a stack.
+      # MODO_APRESENTACAO=1 zera TODA probabilidade de falha aleatória dos
+      # simuladores; FATOR_VELOCIDADE multiplica os tempos simulados (0.5 = dobro
+      # da velocidade, 2.0 = metade). Ver CLAUDE.md e README.
+      MODO_APRESENTACAO:  ${MODO_APRESENTACAO:-0}
+      FATOR_VELOCIDADE:   ${FATOR_VELOCIDADE:-1.0}
     healthcheck:
       <<: *healthcheck-padrao
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8201/ping', timeout=3)"]
@@ -347,20 +377,29 @@ services:
       HOME_Y:      0
       VEL_MM_S:    80
       INTERVALO:   0.5
+      # Controles globais de demonstração — uma variável para toda a stack.
+      # MODO_APRESENTACAO=1 zera TODA probabilidade de falha aleatória dos
+      # simuladores; FATOR_VELOCIDADE multiplica os tempos simulados (0.5 = dobro
+      # da velocidade, 2.0 = metade). Ver CLAUDE.md e README.
+      MODO_APRESENTACAO:  ${MODO_APRESENTACAO:-0}
+      FATOR_VELOCIDADE:   ${FATOR_VELOCIDADE:-1.0}
     healthcheck:
       <<: *healthcheck-padrao
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8200/ping', timeout=3)"]
     networks:
       - apsen-net
 
-  # ── Order Generator ───────────────────────────────────────────────────────────
+  # ── ERP Simulator ─────────────────────────────────────────────────────────────
+  # O sistema que, na planta real, EMITE as ordens de saída. Aqui ele escolhe uma
+  # das dez ordens padrão e a despacha — não monta o conteúdo dela (isso vive em
+  # `central-computer/os_templates.py`). Ver CLAUDE.md para o rename.
   # Sem healthcheck de propósito: é um worker de laço, não expõe porta nem
   # endpoint, e nenhum serviço depende dele. Um teste artificial (pgrep) só
   # diria que o processo existe, que é o que o `restart: unless-stopped` já
   # cobre. Ver tests/test_compose.py, que registra a exceção.
-  order-generator:
-    build: ./order-generator
-    container_name: apsen-order-gen
+  erp-simulator:
+    build: ./erp-simulator
+    container_name: apsen-erp-sim
     logging: *default-logging
     restart: unless-stopped
     environment:
@@ -372,7 +411,7 @@ services:
       ESPERA_FILA_CHEIA:   20
       MAX_ESPERAS_FILA:    15
       # Intervalo entre consultas a GET /api/v1/gerador enquanto o console
-      # mantém a geração automática pausada. É o atraso entre clicar em
+      # mantém a emissão automática pausada. É o atraso entre clicar em
       # "retomar" no console e a planta voltar a produzir.
       ESPERA_PAUSA:        10
       # Teto de itens por ordem padrão: mais itens que dispensers viraria uma
@@ -387,7 +426,7 @@ services:
       # sobem depois que o central fica healthy — ou seja, em paralelo com
       # este gerador. Sem esperá-los, a primeira OS do boot saía antes de o
       # dispenser-adapter estar ouvindo, tomava `connection refused` e morria
-      # em timeout de carregamento. Aciclico: gerador → adapters → central.
+      # em timeout de carregamento. Aciclico: erp-simulator → adapters → central.
       central-computer:
         condition: service_healthy
       dispenser-adapter:

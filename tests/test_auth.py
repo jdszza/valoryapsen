@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import requisicao
+
 CENTRAL_DIR = Path(__file__).resolve().parent.parent / "central-computer"
 
 
@@ -83,7 +85,8 @@ def test_login_com_hash_corrompido_responde_401(carregar_central, monkeypatch):
 
     with pytest.raises(HTTPException) as exc:
         central.modulo.login(
-            central.modulo.LoginReq(username="admin", senha="x" * 200)
+            central.modulo.LoginReq(username="admin", senha="x" * 200),
+            requisicao(),
         )
 
     assert exc.value.status_code == 401

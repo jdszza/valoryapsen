@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Audit Log — Apsen{% endblock %}
+
+{% block content %}
+{% set acao_badge = {
+    "Login":            "primary",
+    "Logout":           "secondary",
+    "Iniciar Ordem":    "success",
+    "Pausar Ordem":     "warning",
+    "Concluir Ordem":   "success",
+    "Trocar Medicamento": "info",
+} %}
+
+<div class="d-flex align-items-center justify-content-between mb-3">
+    <div>
+        <h4 class="mb-0 fw-bold">Audit Log — Histórico de Ações</h4>
+        <small class="text-muted">{{ total }} registros no total</small>
+    </div>
+    <form method="POST" action="{{ url_for('admin_limpar_historico') }}"
+          onsubmit="return confirm('Limpar TODO o histórico? Esta ação não pode ser desfeita.')">
+        <button class="btn btn-outline-danger btn-sm">
+            <i class="bi bi-trash"></i> Limpar Log
+        </button>
+    </form>
+</div>
+
+<!-- Mini stats por ação -->
+{% if acoes_count %}
+<div class="row g-2 mb-4">
+    {% for row in acoes_count %}
+    <div class="col-6 col-md-2">
+        <div class="stat-card text-center py-2">
+            <div class="fw-bold" style="font-size:1.4rem">{{ row.c }}</div>
+            <div class="text-muted" style="font-size:0.72rem">{{ row.acao }}</div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+
+<!-- Filtros -->
+<div class="table-card p-3 mb-3">
+    <form method="GET" class="row g-2 align-items-end">
+        <div class="col-md-3">
+            <label class="form-label small fw-semibold mb-1">Perfil</label>
+            <select name="perfil" class="form-select form-select-sm">
+                <option value="">Todos os perfis</option>
+                {% for p in perfis %}
+                <option value="{{ p }}" {% if filtro_perfil == p %}selected{% endif %}>{{ p }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="col-md-3">
+            <label class="form-label small fw-semibold mb-1">Operador</label>
+            <input type="text" name="operador" class="form-control form-control-sm"
+                   placeholder="Nome do operador…" value="{{ filtro_op }}">
+        </div>
+        <div class="col-md-3">
+            <label class="form-label small fw-semibold mb-1">Ação</label>
+            <input type="text" name="acao" class="form-control form-control-sm"
+                   placeholder="Ex: Login, Concluir…" value="{{ filtro_acao }}">
+        </div>
+        <div class="col-md-3 d-flex gap-2">
+            <button type="submit" class="btn btn-primary btn-sm flex-fill">
+                <i class="bi bi-funnel"></i> Filtrar
+            </button>
+            <a href="{{ url_for('admin_historico') }}" class="btn btn-light btn-sm">
+                <i class="bi bi-x"></i>
+            </a>
+        </div>
+    </form>
+</div>
+
+<!-- Log Table -->
+<div class="table-card">
+    <table class="table table-hover table-sm align-middle mb-0">
+        <thead>
+            <tr>
+                <th style="width:150px">Data / Hora</th>
+                <th>Operador</th>
+                <th style="width:100px">Perfil</th>
+                <th style="width:160px">Ação</th>
+                <th>Detalhes</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for log in logs %}
+        {% set badge_color = acao_badge.get(log.acao, "secondary") %}
+        <tr>
+            <td class="small text-muted font-monospace">{{ log.timestamp }}</td>
+            <td class="fw-semibold small">
+                <i class="bi bi-person-circle me-1 text-muted"></i>{{ log.operador }}
+            </td>
+            <td>
+                {% if log.perfil %}
+                <span class="badge bg-light text-dark border small">{{ log.perfil }}</span>
+                {% else %}<span class="text-muted">—</span>{% endif %}
+            </td>
+            <td>
+                <span class="badge bg-{{ badge_color }}-subtle text-{{ badge_color }} border border-{{ badge_color }}-subtle small">
+                    {{ log.acao }}
+                </span>
+            </td>
+            <td class="small text-muted">{{ log.detalhes or '—' }}</td>
+        </tr>
+        {% else %}
+        <tr>
+            <td colspan="5" class="text-center text-muted py-5">
+                <i class="bi bi-journal-x fs-3 d-block mb-2"></i>
+                Nenhum registro encontrado.
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% if logs | length >= 300 %}
+<div class="mt-2 small text-muted text-center">
+    Exibindo os 300 registros mais recentes. Use os filtros para refinar.
+</div>
+{% endif %}
+{% endblock %}

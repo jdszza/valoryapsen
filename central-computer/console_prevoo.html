@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>APSEN · Pré-voo</title>
+<style>
+/* ============================================================================
+   Mesma paleta do console de operação (que por sua vez copia a dos dois apps
+   Dash). Copiada e não importada pelo mesmo motivo: esta página é servida pelo
+   central, que não monta os assets de nenhum dos dois.
+   ========================================================================== */
+:root{
+  --ap-gold:#D9B45B; --ap-gold-bright:#F0D07A;
+  --ap-blue:#4A90D9;
+  --ap-bg:#000000; --ap-surface:#17171B; --ap-surface-2:#1F1F24;
+  --ap-line:#33333B; --ap-line-soft:#26262C;
+  --ap-text:#C9C9D0; --ap-muted:#8C8C95; --ap-faint:#6A6A73;
+  --ap-ok:#3E8E5A; --ap-warn:#D9B45B; --ap-err:#C0392B;
+  --ap-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--ap-bg); color:var(--ap-text);
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; font-size:14px;
+}
+button{font-family:inherit}
+a{color:var(--ap-gold); text-decoration:none}
+a:hover{color:var(--ap-gold-bright)}
+
+.topo{
+  display:flex; align-items:center; gap:18px; flex-wrap:wrap;
+  padding:10px 18px; background:var(--ap-surface);
+  border-bottom:1px solid var(--ap-line); position:sticky; top:0; z-index:20;
+}
+.marca{font-size:15px; font-weight:700; letter-spacing:1px; color:var(--ap-gold)}
+.marca small{display:block; font-size:10px; font-weight:400; letter-spacing:1.4px;
+             color:var(--ap-faint); text-transform:uppercase}
+.acoes{display:flex; gap:10px; margin-left:auto; align-items:center}
+
+.btn{
+  padding:8px 14px; font-size:12.5px; font-weight:600; letter-spacing:.4px;
+  border-radius:8px; border:1px solid var(--ap-line); background:var(--ap-surface-2);
+  color:var(--ap-text); cursor:pointer;
+}
+.btn:hover:not(:disabled){border-color:var(--ap-gold); color:var(--ap-gold-bright)}
+.btn:disabled{opacity:.45; cursor:not-allowed}
+.btn-ouro{background:var(--ap-gold); color:#111; border-color:var(--ap-gold)}
+.btn-ouro:hover:not(:disabled){background:var(--ap-gold-bright); color:#111}
+
+/* ── Veredito ──────────────────────────────────────────────────────────────── */
+/* A resposta à pergunta, em cima e em uma linha. Quem abre esta tela cinco
+   minutos antes da banca precisa do "sim" ou do "não" antes da lista. */
+.veredito{
+  display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+  margin:14px 18px 0; padding:14px 16px; border-radius:12px;
+  border:1px solid var(--ap-line); background:var(--ap-surface);
+}
+.veredito .frase{font-size:17px; font-weight:700; letter-spacing:.4px}
+.veredito .contagem{margin-left:auto; display:flex; gap:14px; flex-wrap:wrap;
+                    font-family:var(--ap-mono); font-size:12px}
+.veredito.pronto{border-color:rgba(62,142,90,.55); background:rgba(62,142,90,.10)}
+.veredito.pronto .frase{color:#8FD3A6}
+.veredito.parado{border-color:var(--ap-err); background:rgba(192,57,43,.12)}
+.veredito.parado .frase{color:#F2A093}
+.veredito.medindo .frase{color:var(--ap-muted)}
+.cont{display:inline-flex; gap:6px; align-items:center}
+.cont b{font-size:14px}
+.cont.ok b{color:var(--ap-ok)}
+.cont.alerta b{color:var(--ap-warn)}
+.cont.falha b{color:var(--ap-err)}
+
+/* ── Grupos e itens ────────────────────────────────────────────────────────── */
+.corpo{display:grid; grid-template-columns:repeat(auto-fit,minmax(390px,1fr));
+       gap:14px; padding:14px 18px 26px; align-items:start}
+.grupo{background:var(--ap-surface); border:1px solid var(--ap-line);
+       border-radius:12px; overflow:hidden}
+.grupo > h2{
+  margin:0; padding:9px 14px; font-size:11px; font-weight:700; letter-spacing:1.4px;
+  text-transform:uppercase; color:var(--ap-gold); background:var(--ap-surface-2);
+  border-bottom:1px solid var(--ap-line); display:flex; gap:10px; align-items:center;
+}
+.grupo > h2 .nota{margin-left:auto; font-weight:400; letter-spacing:.4px;
+                  text-transform:none; color:var(--ap-faint); font-size:11px}
+.lista{margin:0; padding:0; list-style:none}
+.lista li{
+  padding:9px 14px; border-bottom:1px solid var(--ap-line-soft);
+  border-left:3px solid var(--ap-faint);
+}
+.lista li:last-child{border-bottom:none}
+.lista li.ok{border-left-color:var(--ap-ok)}
+.lista li.alerta{border-left-color:var(--ap-warn)}
+.lista li.falha{border-left-color:var(--ap-err)}
+.lista li.info{border-left-color:var(--ap-blue)}
+.item .cab{display:flex; gap:10px; align-items:baseline}
+.item .titulo{font-size:12.5px; font-weight:600; color:var(--ap-text);
+              font-family:var(--ap-mono)}
+.item .selo{
+  margin-left:auto; font-size:9.5px; letter-spacing:1px; text-transform:uppercase;
+  padding:1px 8px; border-radius:999px; border:1px solid var(--ap-line);
+  color:var(--ap-muted);
+}
+.lista li.ok .selo{color:var(--ap-ok); border-color:rgba(62,142,90,.45)}
+.lista li.alerta .selo{color:var(--ap-warn); border-color:rgba(217,180,91,.45)}
+.lista li.falha .selo{color:#E08C82; border-color:rgba(192,57,43,.5)}
+.item .detalhe{font-size:11.5px; line-height:1.5; color:var(--ap-muted); margin-top:2px}
+/* A ação é o que distingue esta tela de um relatório: item vermelho diz o que
+   FAZER, e por isso ela tem tratamento próprio em vez de virar mais uma linha
+   cinza. */
+.item .acao{
+  margin-top:6px; padding:6px 9px; border-radius:7px; font-size:11.5px;
+  line-height:1.55; color:#F6DFA8;
+  background:rgba(196,154,58,.12); border:1px solid rgba(217,180,91,.4);
+}
+.item .acao code{font-family:var(--ap-mono); font-size:11px; color:var(--ap-gold-bright)}
+.vazio{padding:22px 18px; color:var(--ap-faint); font-size:12.5px}
+.rodape{padding:0 18px 26px; font-size:11.5px; line-height:1.6; color:var(--ap-faint)}
+</style>
+</head>
+<body>
+
+<header class="topo">
+  <div class="marca">APSEN<small>Pré-voo</small></div>
+  <div class="acoes">
+    <a class="btn" href="/console">← Console de operação</a>
+    <button class="btn btn-ouro" id="btnVerificar">Verificar de novo</button>
+  </div>
+</header>
+
+<section class="veredito medindo" id="veredito">
+  <span class="frase" id="frase">Verificando…</span>
+  <span class="contagem" id="contagem"></span>
+</section>
+
+<main class="corpo" id="corpo">
+  <div class="vazio" id="vazio">Consultando os serviços da planta…</div>
+</main>
+
+<p class="rodape">
+  As sondas correm em paralelo, com timeout curto por item: um serviço morto
+  produz um item vermelho, não uma página travada — que é justamente o caso em
+  que esta tela é mais necessária. O <code>erp-simulator</code> não tem porta
+  (é um worker de laço), então ele aparece como informação, e não como sonda.
+</p>
+
+<script>
+"use strict";
+
+var $ = function (id) { return document.getElementById(id); };
+
+/* A ordem dos grupos na tela é a ordem em que se investiga um problema: sem
+   serviço de pé, nada mais importa; sem banco, nem o catálogo existe; e o modo
+   em vigor é a última coisa a conferir, porque não impede nada — só muda o que
+   você vai dizer. */
+var ORDEM_GRUPOS = ["Serviços", "Banco", "Ordens", "Célula", "Modo"];
+
+function escapar(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/* `código entre crases` vira <code> — as ações são quase todas comandos de
+   shell, e monoespaçado é o que faz um comando parecer um comando. */
+function comCodigo(texto) {
+  return escapar(texto).replace(/`([^`]+)`/g, "<code>$1</code>");
+}
+
+async function verificar() {
+  var btn = $("btnVerificar");
+  btn.disabled = true;
+  btn.textContent = "VERIFICANDO…";
+  $("veredito").className = "veredito medindo";
+  $("frase").textContent = "Verificando…";
+  $("contagem").textContent = "";
+
+  var inicio = Date.now();
+  try {
+    var resp = await fetch("/console/api/prevoo", { credentials: "same-origin" });
+    if (resp.status === 401) {
+      location.href = "/console/login";
+      return;
+    }
+    var corpo = await resp.json();
+    desenhar(corpo, Date.now() - inicio);
+  } catch (erro) {
+    $("veredito").className = "veredito parado";
+    $("frase").textContent = "Não foi possível falar com o central.";
+    $("contagem").textContent = String(erro);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Verificar de novo";
+  }
+}
+
+function desenhar(corpo, ms) {
+  var itens = corpo.itens || [];
+  var r = corpo.resumo || {};
+  var c = r.contagem || {};
+
+  $("veredito").className = "veredito " + (r.pronto ? "pronto" : "parado");
+  $("frase").textContent = r.pronto
+    ? "Pronto para apresentar."
+    : (c.falha || 0) + " item(ns) impedem a apresentação.";
+
+  /* Alerta NÃO entra no veredito, só na contagem: alerta é informação que o
+     operador precisa ter, não impedimento. Um veredito que responde "não" por
+     causa do modo apresentação — que foi ligado de propósito — deixaria de ser
+     lido em duas demonstrações. */
+  $("contagem").innerHTML =
+    '<span class="cont ok"><b>' + (c.ok || 0) + "</b> ok</span>" +
+    '<span class="cont alerta"><b>' + (c.alerta || 0) + "</b> atenção</span>" +
+    '<span class="cont falha"><b>' + (c.falha || 0) + "</b> falha</span>" +
+    '<span class="cont"><b>' + (ms / 1000).toFixed(1) + "s</b></span>";
+
+  var porGrupo = {};
+  itens.forEach(function (i) {
+    (porGrupo[i.grupo] = porGrupo[i.grupo] || []).push(i);
+  });
+
+  var grupos = ORDEM_GRUPOS.filter(function (g) { return porGrupo[g]; })
+    .concat(Object.keys(porGrupo).filter(function (g) {
+      return ORDEM_GRUPOS.indexOf(g) === -1;
+    }));
+
+  var html = "";
+  grupos.forEach(function (nome) {
+    var lista = porGrupo[nome];
+    var falhas = lista.filter(function (i) { return i.estado === "falha"; }).length;
+    html += '<section class="grupo"><h2>' + escapar(nome) +
+            '<span class="nota">' +
+            (falhas ? falhas + " com falha" : lista.length + " itens") +
+            "</span></h2><ul class=\"lista\">";
+    lista.forEach(function (i) {
+      html += '<li class="' + escapar(i.estado) + '"><div class="item">' +
+                '<div class="cab"><span class="titulo">' + escapar(i.titulo) +
+                  '</span><span class="selo">' + escapar(i.estado) + "</span></div>" +
+                (i.detalhe ? '<div class="detalhe">' + escapar(i.detalhe) + "</div>" : "") +
+                (i.acao ? '<div class="acao">' + comCodigo(i.acao) + "</div>" : "") +
+              "</div></li>";
+    });
+    html += "</ul></section>";
+  });
+
+  $("corpo").innerHTML = html || '<div class="vazio">Nada a verificar.</div>';
+}
+
+$("btnVerificar").addEventListener("click", verificar);
+verificar();
+</script>
+</body>
+</html>

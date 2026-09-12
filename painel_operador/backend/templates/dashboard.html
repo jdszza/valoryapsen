@@ -1,0 +1,344 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Apsen{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <div>
+        <h4 class="mb-0 fw-bold">Dashboard</h4>
+        <small class="text-muted">Visão geral do sistema de dispensação</small>
+    </div>
+    {% if pode('ordens_criar') %}
+    <a href="{{ url_for('nova_ordem') }}" class="btn btn-primary">
+        <i class="bi bi-plus-lg me-1"></i>Nova Ordem
+    </a>
+    {% endif %}
+</div>
+
+<!-- Alertas de estoque crítico -->
+{% if alertas %}
+<div class="alert alert-danger d-flex align-items-start gap-3 mb-4 rounded-3" role="alert">
+    <i class="bi bi-exclamation-triangle-fill fs-5 mt-1 flex-shrink-0"></i>
+    <div>
+        <strong>{{ alertas|length }} dispenser(s) abaixo do mínimo:</strong>
+        {% for a in alertas %}
+        <span class="badge bg-danger ms-1">{{ a.nome[:20] }} ({{ a.quantidade }}/{{ a.minimo }})</span>
+        {% endfor %}
+        {% if pode('dispensers_editar') %}
+        <a href="{{ url_for('listar_medicamentos') }}" class="ms-2 alert-link small">Gerenciar →</a>
+        {% endif %}
+    </div>
+</div>
+{% endif %}
+
+{% if alertas_validade %}
+<div class="alert alert-warning d-flex align-items-start gap-3 mb-4 rounded-3" role="alert">
+    <i class="bi bi-calendar-x fs-5 mt-1 flex-shrink-0"></i>
+    <div>
+        <strong>{{ alertas_validade|length }} lote(s) vencendo em até 30 dias:</strong>
+        {% for l in alertas_validade %}
+        <span class="badge bg-warning text-dark ms-1">{{ l.medicamento_nome[:16] }} — lote {{ l.lote }} ({{ l.validade }})</span>
+        {% endfor %}
+        {% if pode('lotes_ver') %}
+        <a href="{{ url_for('listar_medicamentos') }}" class="ms-2 alert-link small">Gerenciar →</a>
+        {% endif %}
+    </div>
+</div>
+{% endif %}
+
+{% if desvios_abertos and pode('desvios_ver') %}
+<div class="alert alert-danger d-flex align-items-center gap-3 mb-4 rounded-3" role="alert">
+    <i class="bi bi-exclamation-diamond fs-5 flex-shrink-0"></i>
+    <div>
+        <strong>{{ desvios_abertos }} desvio(s) em aberto</strong> aguardando tratativa.
+        <a href="{{ url_for('admin_desvios') }}" class="ms-2 alert-link small">Ver desvios →</a>
+    </div>
+</div>
+{% endif %}
+
+<!-- Cards de estatísticas -->
+<div class="row g-3 mb-4">
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-clipboard-data me-1 text-muted"></i>Total de Ordens</div>
+            <div class="stat-value">{{ total }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-hourglass-split me-1 text-muted"></i>Pendentes</div>
+            <div class="stat-value text-warning">{{ pendentes }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-play-circle me-1 text-muted"></i>Em Processo</div>
+            <div class="stat-value" style="color:#2563EB">{{ em_processo }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-exclamation-octagon me-1 text-muted"></i>Com Erro</div>
+            <div class="stat-value text-danger">{{ com_erro }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-slash-circle me-1 text-muted"></i>Canceladas</div>
+            <div class="stat-value text-muted">{{ canceladas }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-xl-3">
+        <div class="stat-card">
+            <div class="stat-label mb-1"><i class="bi bi-check-circle me-1 text-muted"></i>Concluídas</div>
+            <div class="stat-value text-success">{{ concluidas }}</div>
+        </div>
+    </div>
+</div>
+
+<!-- Gráficos -->
+<div class="row g-3 mb-4">
+    <div class="col-md-5">
+        <div class="stat-card h-100">
+            <h6 class="fw-semibold mb-3">Ordens por Status</h6>
+            <canvas id="chartStatus" data-preserve style="max-height:220px"></canvas>
+        </div>
+    </div>
+    <div class="col-md-7">
+        <div class="stat-card h-100">
+            <h6 class="fw-semibold mb-3">Nível dos Dispensers</h6>
+            <canvas id="chartDisp" data-preserve style="max-height:220px"></canvas>
+        </div>
+    </div>
+</div>
+
+<!-- Ordens recentes + Audit log -->
+<div class="row g-3">
+    <div class="col-lg-8">
+        <div class="table-card">
+            <div class="p-3 border-bottom d-flex justify-content-between align-items-center">
+                <h6 class="mb-0 fw-semibold"><i class="bi bi-clock-history me-2"></i>Ordens Recentes</h6>
+                {% if pode('ordens_ver') %}
+                <a href="{{ url_for('listar_ordens') }}" class="text-decoration-none small">
+                    Ver todas <i class="bi bi-arrow-right"></i>
+                </a>
+                {% endif %}
+            </div>
+            <div class="table-responsive">
+                <table class="table table-hover table-sm align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th>OS</th>
+                            <th>Destino</th>
+                            <th>Prioridade</th>
+                            <th>Status</th>
+                            {% if pode('ordens_status') %}<th>Ação</th>{% endif %}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for o in recentes %}
+                        <tr>
+                            <td><strong>{{ o.numero_os }}</strong></td>
+                            <td class="text-muted small">{{ o.destino }}</td>
+                            <td>
+                                {% if o.prioridade == 'Urgente' %}
+                                    <span class="badge badge-urgente">Urgente</span>
+                                {% elif o.prioridade == 'Alta' %}
+                                    <span class="badge badge-alta">Alta</span>
+                                {% elif o.prioridade == 'Normal' %}
+                                    <span class="badge badge-normal">Normal</span>
+                                {% else %}
+                                    <span class="badge badge-baixa">Baixa</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if o.status == 'Pendente' %}
+                                    <span class="badge badge-pendente">Pendente</span>
+                                {% elif o.status == 'Em Processo' %}
+                                    <span class="badge badge-processo">Em Processo</span>
+                                {% elif o.status == 'Pausado' %}
+                                    <span class="badge badge-pausado">Pausado</span>
+                                {% elif o.status == 'Concluido' %}
+                                    <span class="badge badge-concluido">Concluído</span>
+                                {% else %}
+                                    <span class="badge badge-cancelado">{{ o.status }}</span>
+                                {% endif %}
+                            </td>
+                            {% if pode('ordens_status') %}
+                            <td>
+                                {% if o.origem == 'central' %}
+                                <span class="badge bg-dark" title="Ordem do computador central — o painel espelha, nao comanda">
+                                    <i class="bi bi-cpu"></i> Central
+                                </span>
+                                {% else %}
+                                {% if o.status == 'Pendente' %}
+                                <form method="post" action="{{ url_for('atualizar_status', id=o.id, status='Em Processo') }}" class="d-inline">
+                                    <button class="btn btn-sm btn-outline-primary" title="Iniciar"><i class="bi bi-play-fill"></i></button>
+                                </form>
+                                {% elif o.status == 'Em Processo' %}
+                                <form method="post" action="{{ url_for('atualizar_status', id=o.id, status='Pausado') }}" class="d-inline">
+                                    <button class="btn btn-sm btn-outline-warning" title="Pausar"><i class="bi bi-pause-fill"></i></button>
+                                </form>
+                                <form method="post" action="{{ url_for('atualizar_status', id=o.id, status='Concluido') }}" class="d-inline">
+                                    <button class="btn btn-sm btn-outline-success" title="Concluir"><i class="bi bi-check-lg"></i></button>
+                                </form>
+                                {% elif o.status == 'Pausado' %}
+                                <form method="post" action="{{ url_for('atualizar_status', id=o.id, status='Em Processo') }}" class="d-inline">
+                                    <button class="btn btn-sm btn-outline-primary" title="Retomar"><i class="bi bi-play-fill"></i></button>
+                                </form>
+                                <form method="post" action="{{ url_for('atualizar_status', id=o.id, status='Concluido') }}" class="d-inline">
+                                    <button class="btn btn-sm btn-outline-success" title="Concluir"><i class="bi bi-check-lg"></i></button>
+                                </form>
+                                {% endif %}
+                                {% if pode('ordens_editar') %}
+                                <a href="{{ url_for('editar_ordem', id=o.id) }}" class="btn btn-sm btn-outline-secondary" title="Editar">
+                                    <i class="bi bi-pencil"></i>
+                                </a>
+                                {% endif %}
+                                {% endif %}
+                            </td>
+                            {% endif %}
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="5" class="text-center text-muted py-4">
+                                <i class="bi bi-inbox fs-4 d-block mb-1"></i>Nenhuma ordem cadastrada
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    {% if pode('historico_ver') and ultimas_acoes %}
+    <div class="col-lg-4">
+        <div class="table-card">
+            <div class="p-3 border-bottom d-flex justify-content-between align-items-center">
+                <h6 class="mb-0 fw-semibold"><i class="bi bi-journal-text me-2"></i>Últimas Ações</h6>
+                <a href="{{ url_for('admin_historico') }}" class="text-decoration-none small">
+                    Ver log <i class="bi bi-arrow-right"></i>
+                </a>
+            </div>
+            <div style="max-height: 380px; overflow-y: auto;">
+                {% for log in ultimas_acoes %}
+                <div class="d-flex align-items-start gap-2 px-3 py-2 border-bottom">
+                    <div class="mt-1">
+                        {% if log.acao in ['Login Web', 'Login'] %}
+                            <i class="bi bi-box-arrow-in-right text-success"></i>
+                        {% elif log.acao in ['Logout Web', 'Logout'] %}
+                            <i class="bi bi-box-arrow-right text-secondary"></i>
+                        {% elif 'Concluir' in log.acao %}
+                            <i class="bi bi-check-circle text-success"></i>
+                        {% elif 'Pausar' in log.acao %}
+                            <i class="bi bi-pause-circle text-warning"></i>
+                        {% elif 'Iniciar' in log.acao %}
+                            <i class="bi bi-play-circle text-primary"></i>
+                        {% else %}
+                            <i class="bi bi-activity text-muted"></i>
+                        {% endif %}
+                    </div>
+                    <div style="min-width:0">
+                        <div class="small fw-semibold text-truncate">{{ log.operador }}</div>
+                        <div class="small text-muted">{{ log.acao }}</div>
+                        <div class="text-muted" style="font-size:.7rem">{{ log.timestamp[-8:] }}</div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+    // O <canvas> tem data-preserve: o auto-refresh (base.html) mantem o
+    // mesmo elemento entre atualizacoes em vez de recria-lo, entao o mesmo
+    // <canvas> pode chegar aqui com um Chart.js ja anexado. Nesse caso so
+    // atualizamos os dados (e so se realmente mudaram) em vez de destruir e
+    // redesenhar o grafico do zero a cada refresh.
+    var gStatus = {{ grafico_status|safe }};
+    var gDisp   = {{ grafico_disp|safe }};
+
+    var elStatus = document.getElementById('chartStatus');
+    var existingStatus = Chart.getChart(elStatus);
+    if (existingStatus) {
+        var novoStatusData = JSON.stringify(gStatus.data);
+        if (novoStatusData !== JSON.stringify(existingStatus.data.datasets[0].data)) {
+            existingStatus.data.labels = gStatus.labels;
+            existingStatus.data.datasets[0].data = gStatus.data;
+            existingStatus.data.datasets[0].backgroundColor = gStatus.cores;
+            existingStatus.update();
+        }
+    } else {
+        new Chart(elStatus, {
+            type: 'doughnut',
+            data: {
+                labels: gStatus.labels,
+                datasets: [{ data: gStatus.data, backgroundColor: gStatus.cores, borderWidth: 2, borderColor: '#fff' }]
+            },
+            options: {
+                cutout: '65%',
+                plugins: {
+                    legend: { position: 'bottom', labels: { boxWidth: 12, padding: 14, font: { size: 12 } } }
+                }
+            }
+        });
+    }
+
+    if (gDisp.labels.length > 0) {
+        var elDisp = document.getElementById('chartDisp');
+        var existingDisp = Chart.getChart(elDisp);
+        var dispColors = gDisp.atual.map(function(v, i) {
+            var pct = gDisp.cap[i] > 0 ? v / gDisp.cap[i] : 0;
+            return pct > 0.5 ? '#22C55E' : pct > 0.2 ? '#EAB308' : '#EF4444';
+        });
+        if (existingDisp) {
+            var mudou = JSON.stringify(gDisp.atual) !== JSON.stringify(existingDisp.data.datasets[0].data) ||
+                        JSON.stringify(gDisp.minimo) !== JSON.stringify(existingDisp.data.datasets[1].data);
+            if (mudou) {
+                existingDisp.data.labels = gDisp.labels;
+                existingDisp.data.datasets[0].data = gDisp.atual;
+                existingDisp.data.datasets[0].backgroundColor = dispColors;
+                existingDisp.data.datasets[1].data = gDisp.minimo;
+                existingDisp.update();
+            }
+        } else {
+            new Chart(elDisp, {
+                type: 'bar',
+                data: {
+                    labels: gDisp.labels,
+                    datasets: [
+                        {
+                            label: 'Atual',
+                            data: gDisp.atual,
+                            backgroundColor: dispColors,
+                            borderRadius: 4, borderSkipped: false,
+                        },
+                        {
+                            label: 'Mínimo',
+                            data: gDisp.minimo,
+                            type: 'line',
+                            borderColor: '#EF4444', borderDash: [4, 3],
+                            borderWidth: 1.5, pointRadius: 0, fill: false,
+                            yAxisID: 'y',
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: true,
+                    plugins: { legend: { labels: { boxWidth: 12, font: { size: 11 } } } },
+                    scales: {
+                        y: { beginAtZero: true, grid: { color: 'rgba(0,0,0,.05)' } },
+                        x: { grid: { display: false }, ticks: { font: { size: 10 } } }
+                    }
+                }
+            });
+        }
+    }
+})();
+</script>
+{% endblock %}
