@@ -2,3 +2,7 @@ fastapi==0.111.0
 uvicorn[standard]==0.29.0
 httpx==0.27.0
 pydantic==2.7.1
+# Transporte serial (`<SUB>_TRANSPORTE=serial`, ver serial_link.py). Entra na
+# imagem mesmo com o default "http": trocar de transporte na bancada tem que
+# ser mudar uma env var, nao reconstruir a imagem com a placa ja montada.
+pyserial==3.5

@@ -400,8 +400,9 @@ def _aguardar_retomada() -> None:
 def _enviar_os(os_payload: dict) -> bool:
     """Envia OS ao central-computer via HTTP POST. Retorna True se aceita.
 
-    Recusa NÃO é retentada, de propósito. O central recusa em dois casos
-    (ANALISE_ARQUITETURAL §4.1): 409 quando a OS já está registrada e 503
+    Recusa NÃO é retentada, de propósito. O central recusa em dois casos (o
+    contrato está no `responses=` do `POST /api/v1/ordens` e no README, seção
+    "Contrato de entrada de uma OS"): 409 quando a OS já está registrada e 503
     quando não consegue persistir. Reenviar a mesma OS daria 409 para sempre;
     no 503, encheria o log enquanto o banco está fora. Cada disparo nasce com
     `os_id` próprio, então o próximo ciclo já é outra OS — mesmo quando repete o

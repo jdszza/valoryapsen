@@ -20,21 +20,11 @@ Nenhum teste faz HTTP: os adapters guardam o `httpx.AsyncClient` em `_client`,
 criado na `lifespan`, e é ele que os testes substituem.
 """
 import asyncio
-import importlib.util
-import sys
-from pathlib import Path
 
 import pytest
 
-RAIZ_REPO = Path(__file__).resolve().parent.parent
+from conftest import ADAPTERS
 
-# (nome do adapter, diretório, rota de evento no central)
-ADAPTERS = [
-    ("dispenser", "dispenser-adapter", "/api/v1/eventos/dispenser"),
-    ("cnc",       "cnc-adapter",       "/api/v1/eventos/cnc"),
-    ("vision",    "vision-adapter",    "/api/v1/eventos/visao"),
-    ("weight",    "weight-adapter",    "/api/v1/eventos/peso"),
-]
 NOMES = [nome for nome, _, _ in ADAPTERS]
 
 
@@ -65,41 +55,6 @@ class ClienteFake:
         if isinstance(item, BaseException):
             raise item
         return RespostaHTTPFake(item)
-
-
-@pytest.fixture
-def carregar_adapter(monkeypatch):
-    """Importa `<adapter>/main.py` por caminho, sem subir a `lifespan`.
-
-    Os diretórios têm hífen no nome e não são pacotes — a mesma razão pela qual
-    o `conftest` carrega o central e os simuladores assim. O import não abre
-    conexão nenhuma: o `httpx.AsyncClient` só nasce na `lifespan`, que nenhum
-    teste executa.
-    """
-    modulos_antes = set(sys.modules)
-    carregados: list[Path] = []
-
-    def _carregar(nome: str):
-        pasta = next(p for n, p, _ in ADAPTERS if n == nome)
-        caminho = RAIZ_REPO / pasta / "main.py"
-        spec = importlib.util.spec_from_file_location(f"apsen_adapter_{nome}", caminho)
-        modulo = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, f"apsen_adapter_{nome}", modulo)
-        spec.loader.exec_module(modulo)
-        # Sem sleep de verdade: o retry dorme 1s entre tentativas, e três
-        # adapters × três tentativas seriam 8s de suíte parada sem medir nada.
-        async def _sem_espera(_s):
-            return None
-        monkeypatch.setattr(modulo.asyncio, "sleep", _sem_espera)
-        carregados.append(caminho.parent)
-        return modulo
-
-    yield _carregar
-
-    for nome in set(sys.modules) - modulos_antes:
-        origem = getattr(sys.modules[nome], "__file__", None)
-        if origem and Path(origem).parent in carregados:
-            del sys.modules[nome]
 
 
 def _enviar(modulo, respostas):

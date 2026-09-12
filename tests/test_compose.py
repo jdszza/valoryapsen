@@ -203,3 +203,65 @@ def test_manut_web_constroi_do_diretorio_manut_web(servicos):
 
 def test_container_de_manutencao_se_chama_apsen_manut(servicos):
     assert servicos["manut_web"]["container_name"] == "apsen-manut"
+
+
+# ── Transporte serial dos três adapters com firmware ──────────────────────────
+# O dispenser, a CNC e a balança ganharam um segundo transporte (a porta USB do
+# firmware). O default continua sendo o simulador HTTP, e é isso que estes
+# testes prendem: ligar o serial tem que ser uma decisão explícita de quem opera
+# a bancada, nunca o efeito colateral de um merge.
+
+ADAPTERS_SERIAIS = {
+    "dispenser-adapter": "DISPENSER",
+    "cnc-adapter":       "CNC",
+    "weight-adapter":    "WEIGHT",
+}
+
+
+@pytest.mark.parametrize("servico,prefixo", sorted(ADAPTERS_SERIAIS.items()))
+def test_adapter_serial_declara_as_quatro_variaveis(servicos, servico, prefixo):
+    """As quatro andam juntas: sem a URL não há porta, sem o baud a linha vira
+    lixo, e sem o prazo do ACK o endpoint não sabe quando desistir."""
+    ambiente = servicos[servico]["environment"]
+    for sufixo in ("TRANSPORTE", "SERIAL_URL", "SERIAL_BAUD", "ACK_TIMEOUT_S"):
+        assert f"{prefixo}_{sufixo}" in ambiente, f"{servico}: falta {sufixo}"
+
+
+@pytest.mark.parametrize("servico,prefixo", sorted(ADAPTERS_SERIAIS.items()))
+def test_o_default_do_transporte_e_http(servicos, servico, prefixo):
+    """"http" é o default para que a suíte, o CI e a demonstração em Docker não
+    mudem de resultado por causa desta feature."""
+    valor = str(servicos[servico]["environment"][f"{prefixo}_TRANSPORTE"])
+    assert valor.endswith(":-http}"), (
+        f"{servico}: o transporte default deveria ser http, e é {valor}"
+    )
+
+
+def test_nenhum_servico_mapeia_device_de_verdade(servicos):
+    """`devices:` fica COMENTADO até a placa existir.
+
+    Mapear `/dev/ttyUSB0` sem a placa plugada impede o serviço de subir — e
+    serviço que não sobe trava, por `depends_on`, tudo que espera por ele. O
+    default é o transporte HTTP, então o bloco não tem o que fazer ativo.
+    """
+    com_device = [nome for nome, s in servicos.items() if s.get("devices")]
+    assert not com_device, (
+        f"serviços com `devices:` ativo: {com_device}. O exemplo fica comentado."
+    )
+
+
+@pytest.mark.parametrize("servico", sorted(ADAPTERS_SERIAIS))
+def test_o_exemplo_de_devices_esta_escrito_no_bloco_do_servico(servico):
+    """Comentado, mas PRESENTE: quem for ligar a placa no mini PC não deveria
+    ter de descobrir a sintaxe em outro lugar — e o comentário é onde fica
+    escrito que ele só vale no Linux."""
+    texto = COMPOSE.read_text(encoding="utf-8")
+    bloco = texto.split(f"\n  {servico}:", 1)[1].split("\n  # ──", 1)[0]
+    assert "# devices:" in bloco, f"{servico}: sem o exemplo de devices"
+    assert "ttyUSB" in bloco and "LINUX" in bloco.upper()
+
+
+def test_o_vision_adapter_ficou_fora_da_migracao_serial(servicos):
+    """A visão continua por HTTP, e a ausência é decisão registrada."""
+    ambiente = servicos["vision-adapter"]["environment"]
+    assert not [c for c in ambiente if "SERIAL" in c or "TRANSPORTE" in c]

@@ -54,7 +54,7 @@ Integração do painel de bancada:
 > O display que está na bancada foi gravado antes da integração: ele trunca o
 > `os_id` do central em 16 bytes e dois disparos do mesmo template colidem no
 > mesmo id. Regravar o firmware é a única pendência dessa rodada — ver o
-> README, seção "O firmware e o `os_id` do central".
+> [docs/BANCADA.md](docs/BANCADA.md), seção "O firmware e o `os_id` do central".
 
 ---
 

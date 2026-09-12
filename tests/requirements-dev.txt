@@ -29,9 +29,19 @@ PyYAML==6.0.1
 
 # test_painel_ordens.py importa painel_operador/backend/app.py de verdade — as
 # rotas são exercitadas pelo `app.test_client()` do Flask, sem subir servidor.
-# `pyserial` de propósito NÃO entra: nenhum teste pode tomar posse de uma porta
-# USB, então o conftest o dubla (`SerialFake`). O Flask fica um degrau abaixo do
-# `requirements.txt` do painel (3.1.1) porque o `dash` do app de manutenção
-# ainda exige `<3.1`, e os dois compartilham este venv.
+# O Flask fica um degrau abaixo do `requirements.txt` do painel (3.1.1) porque o
+# `dash` do app de manutenção ainda exige `<3.1`, e os dois compartilham venv.
 flask==3.0.3
 qrcode==8.2
+
+# test_serial_link.py exercita o transporte serial dos adapters de ponta a
+# ponta, e para isso precisa do `serial_for_url` de verdade — é ele o ponto que
+# faz o código não saber em qual sistema operacional está.
+#
+# A regra "nenhum teste abre porta física" continua valendo, e agora ela é mais
+# do que promessa: as placas falsas de `tests/fakes/` falam por `socket://`, um
+# handler de URL do PRÓPRIO pyserial, servido por um socket TCP em localhost.
+# Nenhuma COM, nenhum /dev/tty. O painel de bancada segue com o duplo
+# (`SerialFake` no conftest): lá o caminho que tocaria a porta é uma thread que
+# nenhum teste sobe, e dublar continua sendo mais barato que encenar.
+pyserial==3.5

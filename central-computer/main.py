@@ -406,7 +406,7 @@ async def _handle_evento_dispenser(payload: dict):
     Escrita em DB é assíncrona (asyncio.to_thread) — não bloqueia o loop.
     Tipos: status, carregado, dispensado, erro, limpeza_ok, telemetria
 
-    Divisão de responsabilidade (ver ANALISE_ARQUITETURAL.md):
+    Divisão de responsabilidade (README, "Fontes de verdade"):
       - o simulador é fonte de verdade sobre HARDWARE/ESTOQUE
         (medicamento, sku, categoria, quantidade);
       - o orquestrador é fonte de verdade sobre FLUXO
@@ -1162,8 +1162,7 @@ async def receber_ordem(req: NovaOSReq):
 
       - `salvar_ordem` devolvendo False (INSERT IGNORE não inseriu) significa
         OS já registrada. Enfileirar de novo processa a MESMA OS duas vezes —
-        dose dobrada no leito. Vira 409 `os_duplicada`, o contrato da
-        ANALISE_ARQUITETURAL §4.1.
+        dose dobrada no leito. Vira 409 `os_duplicada`.
       - `salvar_ordem` levantando significa banco fora do ar. Antes isso só era
         logado e a OS seguia para a fila: os medicamentos sairiam do dispenser
         sem linha em `ordens`/`os_itens`, então `atualizar_item_os` e
@@ -1174,6 +1173,10 @@ async def receber_ordem(req: NovaOSReq):
 
     Os corpos seguem a forma `{"erro": ..., "os_id": ...}` do contrato, e por
     isso são `JSONResponse` — `HTTPException` embrulharia tudo em `detail`.
+    O contrato inteiro (200/409/429/503) está declarado no `responses=` logo
+    acima — é dali que ele sai no Swagger — e explicado no README, seção
+    "Contrato de entrada de uma OS". Esta função é a ÚNICA porta de entrada:
+    o disparo manual do console chama ela, não uma cópia.
     Em todos os casos o erp-simulator apenas loga e segue para a próxima OS
     no ciclo seguinte (`_enviar_os` devolve False e ninguém retenta), então não
     há laço de reenvio nem processo derrubado.

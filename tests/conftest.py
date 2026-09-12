@@ -6,7 +6,7 @@ diretórios têm hífen no nome (`weight-simulator`, `central-computer`) e os
 módulos sobem o uvicorn no bloco `__main__`. Por isso o carregamento é feito
 por CAMINHO, via `importlib.util.spec_from_file_location`.
 
-Cinco fábricas são oferecidas:
+Seis fábricas são oferecidas:
 
   `carregar_simulador` — importa um simulador com `requests` substituído por um
   duplo que grava as chamadas em memória em vez de fazer HTTP. É assim que os
@@ -41,6 +41,13 @@ Cinco fábricas são oferecidas:
           painel = carregar_painel(ordens_central=[...])
           with painel.conexao() as conn:
               painel.modulo.sincronizar_ordens_central(conn)
+
+  `carregar_adapter` — importa `<adapter>/main.py` (FastAPI) sem subir a
+  `lifespan`. Nenhum cliente HTTP e nenhuma porta serial nascem no import.
+
+      def test_transporte(carregar_adapter):
+          adapter = carregar_adapter("cnc", env={"CNC_TRANSPORTE": "serial"})
+          assert adapter.TRANSPORTE == "serial"
 
   `carregar_orquestrador` — importa `central-computer/orchestrator.py` sozinho,
   com banco duplado e `_post` trocado por um adapter fake que grava os comandos
@@ -93,6 +100,22 @@ SIMULADORES = {
     "vision":    "vision-simulator/simulator.py",
     "weight":    "weight-simulator/simulator.py",
 }
+
+# (nome do adapter, diretório, rota de evento no central). Tabela ÚNICA: ela é
+# usada por `test_adapters.py` (a política de retry dos quatro `_post_central`)
+# e por `test_serial_link.py` (o transporte serial dos três que falam com
+# firmware). Duas cópias divergiriam no dia em que um adapter mudasse de rota, e
+# a que ficasse para trás passaria verde.
+ADAPTERS = [
+    ("dispenser", "dispenser-adapter", "/api/v1/eventos/dispenser"),
+    ("cnc",       "cnc-adapter",       "/api/v1/eventos/cnc"),
+    ("vision",    "vision-adapter",    "/api/v1/eventos/visao"),
+    ("weight",    "weight-adapter",    "/api/v1/eventos/peso"),
+]
+
+# Os três que ganharam firmware. O `vision-adapter` ficou de fora da migração
+# serial: a visão continua por HTTP.
+ADAPTERS_SERIAIS = ["dispenser", "cnc", "weight"]
 
 
 # ── Duplo de `requests` ────────────────────────────────────────────────────────
@@ -240,6 +263,62 @@ def carregar_simulador(monkeypatch):
         return SimuladorCarregado(modulo, requests_fake)
 
     return _carregar
+
+
+# ── Adapters (FastAPI) ────────────────────────────────────────────────────────
+
+@pytest.fixture
+def carregar_adapter(monkeypatch):
+    """Importa `<adapter>/main.py` por caminho, sem subir a `lifespan`.
+
+    Os diretórios têm hífen no nome e não são pacotes — a mesma razão pela qual
+    o central e os simuladores são carregados assim. O import não abre conexão
+    nenhuma: o `httpx.AsyncClient` e o `LinkSerial` só nascem na `lifespan`, que
+    nenhum teste executa.
+
+    O diretório do adapter entra no `sys.path` porque `main.py` faz
+    `import serial_link`, o módulo vizinho. Em produção isso já vale de graça
+    (o uvicorn roda com `WORKDIR /app`); aqui é a fixture que reproduz a
+    condição, em vez de o código de produção carregar um `sys.path.insert` que
+    só existe por causa da suíte.
+    """
+    modulos_antes = set(sys.modules)
+    carregados: list[Path] = []
+
+    def _carregar(nome: str, env: dict[str, str] | None = None):
+        pasta = next(p for n, p, _ in ADAPTERS if n == nome)
+        diretorio = RAIZ_REPO / pasta
+        caminho = diretorio / "main.py"
+
+        for chave, valor in (env or {}).items():
+            monkeypatch.setenv(chave, valor)
+
+        monkeypatch.syspath_prepend(str(diretorio))
+        # Os três `serial_link.py` são cópias idênticas, mas todas se chamam
+        # `serial_link`: sem este descarte, o segundo adapter carregado neste
+        # teste reusaria o módulo do primeiro e um teste de identidade mediria
+        # a coisa errada.
+        sys.modules.pop("serial_link", None)
+
+        spec = importlib.util.spec_from_file_location(f"apsen_adapter_{nome}", caminho)
+        modulo = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, f"apsen_adapter_{nome}", modulo)
+        spec.loader.exec_module(modulo)
+        # Sem sleep de verdade: o retry do evento dorme 1s entre tentativas, e
+        # quatro adapters × três tentativas seriam 8s de suíte parada sem medir
+        # nada.
+        async def _sem_espera(_s):
+            return None
+        monkeypatch.setattr(modulo.asyncio, "sleep", _sem_espera)
+        carregados.append(diretorio)
+        return modulo
+
+    yield _carregar
+
+    for nome in set(sys.modules) - modulos_antes:
+        origem = getattr(sys.modules[nome], "__file__", None)
+        if origem and Path(origem).parent in carregados:
+            del sys.modules[nome]
 
 
 # ── App de manutenção e operação (Dash) ───────────────────────────────────────

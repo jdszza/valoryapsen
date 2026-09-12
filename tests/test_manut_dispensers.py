@@ -1,11 +1,12 @@
 """O botão 🧹 Limpar do app de manutenção: os ids do render têm que casar com o
 Input do callback.
 
-O botão é a única forma de o operador descartar estoque encalhado num slot, e
-já esteve inoperante por três motivos independentes (ver AUDITORIA.md 2, 3 e 4):
-o simulador recusava limpar slot `concluido`, a telemetria reescrevia o status
-de volta e o central bloqueava por `os_id` residual. Esses três já têm teste em
-`test_dispenser_simulator.py` e `test_central_eventos.py`.
+O botão é a única forma de o operador descartar estoque encalhado num slot, e já
+esteve inoperante por três motivos independentes: o simulador recusava limpar
+slot `concluido`, a telemetria reescrevia o status de volta e o central
+bloqueava por `os_id` residual. Esses três já têm teste em
+`test_dispenser_simulator.py` e `test_central_eventos.py` — é lá que eles estão
+descritos, e não num documento à parte.
 
 Falta o quarto modo de falha, que nenhum deles pega: o clique não chegar ao
 callback porque o id do botão renderizado não casa com o `Input` registrado.

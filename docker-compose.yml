@@ -170,6 +170,28 @@ services:
       DISPENSER_SIM_URL: http://dispenser-simulator:8201
       TIMEOUT_CMD:       15
       TIMEOUT_EVENT:     5
+      # Transporte da ponta de baixo: "http" (o simulador) ou "serial" (o
+      # firmware dos 8 dispensers, uma porta só). Default http de propósito — a
+      # suíte, o CI e a demonstração em Docker não podem mudar de resultado por
+      # causa desta variável. Contrato em docs/PROTOCOLO_SERIAL.md.
+      DISPENSER_TRANSPORTE:   ${DISPENSER_TRANSPORTE:-http}
+      # Vazia = varre as portas e aceita a primeira que emitir o ping do
+      # subsistema `dispenser`. Preenchida, ela manda e não há varredura.
+      DISPENSER_SERIAL_URL:   ${DISPENSER_SERIAL_URL:-}
+      DISPENSER_SERIAL_BAUD:  ${DISPENSER_SERIAL_BAUD:-115200}
+      # Prazo do ACK ("aceitei"), não da conclusão — esta continua no
+      # orquestrador, nos TIMEOUT_* de sempre.
+      DISPENSER_ACK_TIMEOUT_S: ${DISPENSER_ACK_TIMEOUT_S:-2}
+    # A porta USB do firmware entra por aqui — SÓ NO LINUX (o Docker Desktop do
+    # Windows não repassa COM; lá o caminho é uma ponte RFC2217 no host e
+    # DISPENSER_SERIAL_URL=rfc2217://host.docker.internal:4001).
+    #
+    # Fica COMENTADO: mapear um device que não existe impede o serviço de subir,
+    # e o default é o transporte HTTP. Com o serial ligado, o `depends_on` do
+    # dispenser-simulator continua valendo — ele sobe e fica ocioso; tirá-lo do
+    # grafo é outra decisão, e o compose não sabe condicionar dependência.
+    # devices:
+    #   - "/dev/ttyUSB0:/dev/ttyUSB0"
     depends_on:
       # `service_healthy`, não só `service_started`: o adapter fala com o
       # simulador no lifespan e com o central no primeiro evento. O central NÃO
@@ -200,6 +222,16 @@ services:
       CNC_SIM_URL:  http://cnc-simulator:8200
       TIMEOUT_CMD:  15
       TIMEOUT_EVENT: 5
+      # Ver o bloco equivalente no dispenser-adapter: mesma semântica, mesma
+      # razão para o default ser "http". Contrato em docs/PROTOCOLO_SERIAL.md.
+      CNC_TRANSPORTE:    ${CNC_TRANSPORTE:-http}
+      CNC_SERIAL_URL:    ${CNC_SERIAL_URL:-}
+      CNC_SERIAL_BAUD:   ${CNC_SERIAL_BAUD:-115200}
+      CNC_ACK_TIMEOUT_S: ${CNC_ACK_TIMEOUT_S:-2}
+    # Porta USB do firmware da mesa — SÓ NO LINUX, e comentado pelo mesmo motivo
+    # do dispenser-adapter: device inexistente impede o serviço de subir.
+    # devices:
+    #   - "/dev/ttyUSB1:/dev/ttyUSB1"
     depends_on:
       central-computer:
         condition: service_healthy
@@ -252,6 +284,16 @@ services:
       WEIGHT_SIM_URL: http://weight-simulator:8203
       TIMEOUT_CMD:    10
       TIMEOUT_EVENT:  5
+      # Ver o bloco equivalente no dispenser-adapter: mesma semântica, mesma
+      # razão para o default ser "http". Contrato em docs/PROTOCOLO_SERIAL.md.
+      WEIGHT_TRANSPORTE:    ${WEIGHT_TRANSPORTE:-http}
+      WEIGHT_SERIAL_URL:    ${WEIGHT_SERIAL_URL:-}
+      WEIGHT_SERIAL_BAUD:   ${WEIGHT_SERIAL_BAUD:-115200}
+      WEIGHT_ACK_TIMEOUT_S: ${WEIGHT_ACK_TIMEOUT_S:-2}
+    # Porta USB do firmware da balança — SÓ NO LINUX, e comentado pelo mesmo
+    # motivo do dispenser-adapter: device inexistente impede o serviço de subir.
+    # devices:
+    #   - "/dev/ttyUSB2:/dev/ttyUSB2"
     depends_on:
       central-computer:
         condition: service_healthy

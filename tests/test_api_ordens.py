@@ -6,7 +6,8 @@ dispensado. O endpoint aceitava uma sem a outra nos dois sentidos:
   * `salvar_ordem` usa INSERT IGNORE e devolvia `None` em silêncio quando a OS
     já existia. O endpoint enfileirava assim mesmo e respondia
     `{"aceita": true}` — a mesma OS processada duas vezes, dose dobrada no
-    leito. O contrato (ANALISE_ARQUITETURAL §4.1) manda 409 `os_duplicada`.
+    leito. O contrato manda 409 `os_duplicada` (README, "Contrato de entrada de
+    uma OS"; a declaração executável é o `responses=` do endpoint).
   * a falha de banco era capturada, logada e ignorada: a OS ia para a fila sem
     linha em `ordens`/`os_itens`, então nada tinha o que atualizar e o
     relatório saía vazio — dispensa sem rastro.

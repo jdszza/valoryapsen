@@ -1,13 +1,24 @@
 """
-APSEN - CNC Adapter v1.0
-Bridge bidirecional entre o Computador Central e o CNC Simulator.
+APSEN - CNC Adapter v1.1
+Bridge bidirecional entre o Computador Central e a mesa CNC.
 
 Fluxo entrada (← Central):
-  POST /comandos/mover    → repassa para cnc-simulator POST /executar/mover
-  POST /comandos/homing   → repassa para cnc-simulator POST /executar/homing
+  POST /comandos/mover    → `mover`  na mesa CNC
+  POST /comandos/homing   → `homing` na mesa CNC
 
-Fluxo saída (← CNC Simulator):
+Fluxo saída (← mesa CNC):
   POST /eventos           → normaliza e encaminha para central-computer POST /api/v1/eventos/cnc
+
+A mesa CNC atende por DOIS transportes, e quem escolhe é `CNC_TRANSPORTE`:
+
+  "http"   (default) — o `cnc-simulator`, como sempre. É o que roda no Docker,
+                       no CI e em qualquer máquina sem hardware.
+  "serial" — o firmware da mesa, por uma porta USB (`CNC_SERIAL_URL`). Ver
+             `docs/PROTOCOLO_SERIAL.md` e `serial_link.py`.
+
+A perna de CIMA não sabe qual dos dois está embaixo: os endpoints, os modelos
+Pydantic, o payload do evento e o `_post_central` são os mesmos nos dois casos.
+É o que permite trocar o simulador por firmware sem tocar no central.
 """
 import asyncio
 import logging
@@ -20,6 +31,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 
+import serial_link
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [CNC-ADAPTER] %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -29,7 +42,31 @@ CNC_SIM_URL      = os.getenv("CNC_SIM_URL",      "http://cnc-simulator:8200")
 TIMEOUT_CMD      = float(os.getenv("TIMEOUT_CMD",   "15"))
 TIMEOUT_EVENT    = float(os.getenv("TIMEOUT_EVENT", "5"))
 
+SUBSISTEMA       = "cnc"
+
+
+def _transporte() -> str:
+    """Valor desconhecido cai no default COM aviso, nunca em silêncio.
+
+    "http" é o default de propósito: a suíte, o CI e a demonstração em Docker
+    não podem mudar de resultado por causa desta feature.
+    """
+    escolhido = os.getenv("CNC_TRANSPORTE", "http").strip().lower()
+    if escolhido not in ("http", "serial"):
+        logger.warning("[CFG] CNC_TRANSPORTE=%r desconhecido — usando 'http'.",
+                       escolhido)
+        return "http"
+    return escolhido
+
+
+TRANSPORTE       = _transporte()
+SERIAL_URL       = os.getenv("CNC_SERIAL_URL", "").strip()
+SERIAL_BAUD      = int(os.getenv("CNC_SERIAL_BAUD", "115200"))
+ACK_TIMEOUT_S    = float(os.getenv("CNC_ACK_TIMEOUT_S", "2"))
+
 _client: httpx.AsyncClient | None = None
+_link: "serial_link.LinkSerial | None" = None
+_loop: asyncio.AbstractEventLoop | None = None
 
 
 async def _wait_for_upstream(name: str, url: str, retries: int = 30, interval: float = 2.0):
@@ -48,16 +85,29 @@ async def _wait_for_upstream(name: str, url: str, retries: int = 30, interval: f
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _client
+    global _client, _link, _loop
     _client = httpx.AsyncClient()
-    logger.info("[STARTUP] httpx.AsyncClient criado")
-    await _wait_for_upstream("cnc-simulator", CNC_SIM_URL + "/ping")
+    _loop = asyncio.get_running_loop()
+    logger.info("[STARTUP] httpx.AsyncClient criado | transporte=%s", TRANSPORTE)
+    if TRANSPORTE == "serial":
+        _link = serial_link.LinkSerial(
+            subsistema=SUBSISTEMA, url=SERIAL_URL, baud=SERIAL_BAUD,
+            ack_timeout_s=ACK_TIMEOUT_S, ao_receber_evento=_evento_da_placa,
+        )
+        _link.iniciar()
+        # Sem `_wait_for_upstream`: a placa pode não estar plugada, e o adapter
+        # tem que subir assim mesmo para o /ping do healthcheck responder.
+        # Quem conta a verdade sobre a porta é o /health.
+    else:
+        await _wait_for_upstream("cnc-simulator", CNC_SIM_URL + "/ping")
     yield
+    if _link is not None:
+        _link.parar()
     await _client.aclose()
     logger.info("[SHUTDOWN] httpx.AsyncClient encerrado")
 
 
-app = FastAPI(title="APSEN CNC Adapter v1.0", lifespan=lifespan)
+app = FastAPI(title="APSEN CNC Adapter v1.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -100,6 +150,56 @@ async def _post_sim(path: str, payload: dict, timeout: float = TIMEOUT_CMD) -> d
         return r.json()
     except httpx.RequestError as exc:
         raise HTTPException(503, f"CNC simulator indisponível: {exc}")
+
+
+# ── Uma porta de saída, dois transportes ──────────────────────────────────────
+#
+# O NOME do comando é o mesmo nos dois caminhos — é o `cmd` da linha serial e a
+# chave desta tabela —, e os campos do payload são os mesmos que o simulador já
+# recebe. Renomear qualquer um deles no serial obrigaria o adapter a traduzir, e
+# uma tradução é o lugar onde os dois lados divergem depois; é a mesma razão
+# pela qual o evento atravessa daqui para o central sem interpretação.
+
+_ROTAS_SIM = {
+    "mover":  "/executar/mover",
+    "homing": "/executar/homing",
+}
+
+
+async def _enviar(comando: str, payload: dict) -> dict:
+    """Despacha o comando pelo transporte configurado.
+
+    O erro que sobe é o MESMO nos dois: o orquestrador não distingue firmware de
+    simulador, e não deveria. Recusa da ponta de lá é 502, ponta de lá
+    inalcançável é 503 — exatamente o que `_post_sim` sempre levantou.
+    """
+    if TRANSPORTE != "serial":
+        return await _post_sim(_ROTAS_SIM[comando], payload)
+    if _link is None:
+        raise HTTPException(503, "Mesa CNC: transporte serial não iniciado")
+    try:
+        # `enviar_comando` BLOQUEIA até o ACK, e `Serial.write`/`read` são
+        # síncronos: chamá-los no event loop congelaria o adapter inteiro,
+        # inclusive o /ping que o healthcheck do compose usa como portão. É a
+        # mesma regra que o central aplica ao banco ("Nada de banco no event
+        # loop"), e `tests/test_serial_link.py` a cobra por AST.
+        return await asyncio.to_thread(_link.enviar_comando, comando, payload)
+    except serial_link.AckNegativo as exc:
+        raise HTTPException(502, f"Mesa CNC recusou '{comando}': {exc}")
+    except serial_link.ErroLink as exc:
+        raise HTTPException(503, f"Mesa CNC indisponível: {exc}")
+
+
+def _resposta(resultado: dict) -> dict:
+    """Corpo devolvido ao orquestrador.
+
+    Ele só lê o status HTTP (`_post` do orquestrador devolve True/False e ignora
+    o corpo), então isto é para quem lê o log — e por isso a chave diz de ONDE
+    veio a confirmação. O caminho HTTP continua respondendo exatamente o que
+    respondia antes desta feature.
+    """
+    chave = "placa" if TRANSPORTE == "serial" else "simulador"
+    return {"ok": True, chave: resultado}
 
 
 # ── Encaminhamento do evento ao Central ───────────────────────────────────────
@@ -170,19 +270,33 @@ def ping():
 
 @app.get("/health")
 async def health():
-    """Verifica conectividade com cnc-simulator e central-computer."""
-    checks = {}
-    for name, url in [
-        ("cnc-simulator",    CNC_SIM_URL + "/ping"),
-        ("central-computer", CENTRAL_URL + "/ping"),
-    ]:
+    """Diagnóstico: conectividade com o central e com a ponta de baixo.
+
+    É AQUI que o estado da porta serial aparece — nunca no /ping. O /ping diz
+    que este processo está de pé, e é isso que o compose usa como portão;
+    atrelá-lo ao hardware faria um cabo solto marcar o serviço como unhealthy e
+    derrubar em cascata quem depende dele.
+    """
+    checks: dict[str, str] = {}
+    alvos = [("central-computer", CENTRAL_URL + "/ping")]
+    if TRANSPORTE != "serial":
+        alvos.insert(0, ("cnc-simulator", CNC_SIM_URL + "/ping"))
+    for name, url in alvos:
         try:
             r = await _client.get(url, timeout=3.0)
             checks[name] = "ok" if r.status_code < 300 else f"http_{r.status_code}"
         except Exception as exc:
             checks[name] = f"erro: {exc}"
+
+    corpo = {"transporte": TRANSPORTE, "checks": checks}
+    if TRANSPORTE == "serial":
+        estado = _link.estado() if _link is not None else {"conectado": False}
+        corpo["serial"] = estado
+        checks["placa-cnc"] = "ok" if estado.get("conectado") else "desconectada"
+
     ok = all(v == "ok" for v in checks.values())
-    return {"status": "ok" if ok else "degradado", "checks": checks}
+    corpo["status"] = "ok" if ok else "degradado"
+    return corpo
 
 
 @app.post("/comandos/mover")
@@ -190,8 +304,8 @@ async def cmd_mover(req: ComandoMoverReq):
     logger.info("[CMD] MOVER → D%d (%.1f, %.1f) ciclo %d/%d OS %s",
                 req.dispenser_alvo, req.posicao_x, req.posicao_y,
                 req.ciclo_atual, req.total_ciclos, req.os_id)
-    resultado = await _post_sim(
-        "/executar/mover",
+    resultado = await _enviar(
+        "mover",
         {
             "dispenser_alvo": req.dispenser_alvo,
             "os_id":          req.os_id,
@@ -201,28 +315,34 @@ async def cmd_mover(req: ComandoMoverReq):
             "total_ciclos":   req.total_ciclos,
         },
     )
-    return {"ok": True, "simulador": resultado}
+    return _resposta(resultado)
 
 
 @app.post("/comandos/homing")
 async def cmd_homing(req: ComandoHomingReq):
     logger.info("[CMD] HOMING ← OS %s", req.os_id)
-    resultado = await _post_sim(
-        "/executar/homing",
+    resultado = await _enviar(
+        "homing",
         {k: v for k, v in req.model_dump().items() if v is not None},
     )
-    return {"ok": True, "simulador": resultado}
+    return _resposta(resultado)
 
 
-# ── Endpoint de Eventos (Simulator → Adapter → Central) ───────────────────────
+# ── Endpoint de Eventos (mesa CNC → Adapter → Central) ────────────────────────
 
-@app.post("/eventos")
-async def receber_evento(req: EventoReq):
-    """Recebe eventos do cnc-simulator e repassa ao Central."""
-    payload    = req.model_dump()
-    tipo       = payload.get("tipo", "?")
-    disp_alvo  = payload.get("dispenser_alvo", "?")
-    os_id      = payload.get("os_id", "")
+async def _encaminhar_evento(req: EventoReq) -> bool:
+    """Porta ÚNICA de saída do evento — os dois transportes passam por aqui.
+
+    O payload atravessa o MESMO modelo Pydantic vindo do simulador e vindo da
+    placa, e é isso que garante que o central receba de um firmware exatamente o
+    byte que recebe hoje do simulador. Normalizar de um lado só abriria a
+    divergência que este adapter existe para não ter — e o central não mudaria
+    para acomodá-la, porque o sintoma seria um campo faltando, não um erro.
+    """
+    payload   = req.model_dump()
+    tipo      = payload.get("tipo", "?")
+    disp_alvo = payload.get("dispenser_alvo", "?")
+    os_id     = payload.get("os_id", "")
 
     log_extra = f"| OS {os_id}" if os_id else ""
     logger.info("[EVT] %-12s ← D%s %s", tipo, disp_alvo, log_extra)
@@ -230,5 +350,30 @@ async def receber_evento(req: EventoReq):
     ok = await _post_central(payload)
     if not ok:
         logger.warning("[FWD] Evento '%s' não chegou ao Central.", tipo)
+    return ok
 
+
+def _evento_da_placa(payload: dict) -> None:
+    """Chamado NA THREAD LEITORA do `serial_link` — nunca no event loop.
+
+    O salto para o loop é `run_coroutine_threadsafe`: é o que deixa o
+    `_post_central` (httpx async, com o retry que a suíte cobra) ser o mesmo dos
+    dois transportes, em vez de ganhar uma segunda implementação síncrona.
+    """
+    try:
+        req = EventoReq(**payload)
+    except Exception as exc:  # noqa: BLE001 — ValidationError
+        logger.warning("[SERIAL] evento fora do contrato, descartado: %s", exc)
+        return
+    loop = _loop
+    if loop is None:
+        logger.warning("[SERIAL] evento chegou antes do event loop — descartado.")
+        return
+    asyncio.run_coroutine_threadsafe(_encaminhar_evento(req), loop)
+
+
+@app.post("/eventos")
+async def receber_evento(req: EventoReq):
+    """Recebe eventos do cnc-simulator e repassa ao Central."""
+    ok = await _encaminhar_evento(req)
     return {"ok": True, "encaminhado": ok}
