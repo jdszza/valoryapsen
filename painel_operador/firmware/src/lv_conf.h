@@ -781,7 +781,7 @@
 
 #define LV_USE_MSGBOX     0
 
-#define LV_USE_ROLLER     0   /**< Requires: lv_label */
+#define LV_USE_ROLLER     1   /**< Requires: lv_label */
 
 #define LV_USE_SCALE      0
 

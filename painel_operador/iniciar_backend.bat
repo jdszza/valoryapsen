@@ -11,7 +11,7 @@ if "%APSEN_SECRET%"=="" (
     echo.
     echo     python -c "import secrets; print(secrets.token_hex(32))"
     echo     setx APSEN_SECRET ^<a chave gerada^>
-    echo.
+    echo.echo 
     echo Depois FECHE e reabra esta janela: setx so vale para processos novos.
     echo.
     pause
