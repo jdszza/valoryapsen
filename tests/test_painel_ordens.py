@@ -220,14 +220,56 @@ def test_itens_do_central_viram_o_formato_do_painel(painel):
                      {"med": "Dipirona 500mg", "qtd": 4}]
 
 
-def test_data_do_central_perde_o_T(painel):
+def test_data_do_central_perde_o_T_e_ganha_o_fuso(painel):
     """`data_criacao` é ordenada e comparada como TEXTO no painel inteiro.
 
-    Guardar o ISO com 'T' faria a ordem espelhada ordenar depois de qualquer
-    ordem local do mesmo dia, e nunca estourar o SLA de 4h dos KPIs.
+    Duas coisas, e as duas produzem relatório errado sem dar erro:
+
+    * guardar o ISO com 'T' faria a ordem espelhada ordenar depois de qualquer
+      ordem local do mesmo dia (texto, e `'T' > ' '`), e nunca estourar o SLA
+      de 4h dos KPIs;
+    * o central carimba em **UTC**, e a coluna guarda hora **local**. Numa
+      bancada no Brasil, toda OS espelhada nascia três horas no passado: ela
+      ordenava antes de ordens locais mais velhas, e o SLA lhe creditava três
+      horas a mais de duração.
+
+    O esperado é CALCULADO, não escrito: um literal amarraria o teste ao fuso
+    da máquina que o escreveu.
     """
+    from datetime import datetime, timezone
+
+    esperado = (datetime(2026, 9, 9, 14, 30, 12, tzinfo=timezone.utc)
+                .astimezone().strftime("%Y-%m-%d %H:%M:%S"))
     _sincronizar(painel)
-    assert painel.ordem(OS_A)["data_criacao"] == "2026-09-09 14:30:12"
+
+    gravado = painel.ordem(OS_A)["data_criacao"]
+    assert "T" not in gravado
+    assert gravado == esperado
+
+
+def test_data_com_offset_explicito_e_respeitada(painel, monkeypatch):
+    """Sem offset o valor é UTC (é o que o central manda); COM offset, ele
+    manda. A regra não pode ser "some o fuso e assume o meu"."""
+    from datetime import datetime, timezone
+
+    normalizar = painel.modulo._normalizar_data
+    esperado = (datetime(2026, 9, 9, 14, 30, 12, tzinfo=timezone.utc)
+                .astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+
+    assert normalizar("2026-09-09T14:30:12+00:00") == esperado
+    assert normalizar("2026-09-09T14:30:12Z") == esperado
+    assert normalizar("2026-09-09T14:30:12") == esperado
+
+
+def test_data_irreconhecivel_nao_para_o_espelho(painel):
+    """Carimbo torto não pode levantar dentro do laço de sincronização: o
+    espelho é uma thread, e a exceção dela não derruba "a sincronização" —
+    derruba a thread."""
+    normalizar = painel.modulo._normalizar_data
+
+    assert normalizar("nao-e-data", "padrao") == "nao-e-data"
+    assert normalizar("", "padrao") == "padrao"
+    assert normalizar(None, "") != ""       # cai no agora
 
 
 def test_ordem_sumida_do_central_nao_e_apagada(painel):
@@ -280,7 +322,7 @@ def test_web_recusa_editar_e_excluir_ordem_espelhada(painel):
     editar = painel.cliente.get(f"/ordens/{oid}/editar", follow_redirects=True)
     assert "computador central" in editar.get_data(as_text=True)
 
-    excluir = painel.cliente.post(f"/ordens/{oid}/excluir", follow_redirects=True)
+    excluir = painel.post_form(f"/ordens/{oid}/excluir", follow_redirects=True)
     assert "computador central" in excluir.get_data(as_text=True)
     assert painel.ordem(OS_A) is not None
 

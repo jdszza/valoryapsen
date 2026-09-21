@@ -58,8 +58,8 @@ def _parse_ddl(ddl: str) -> tuple[str, set[str]]:
     achado = _RE_CREATE.search(ddl)
     assert achado, f"DDL não reconhecido: {ddl[:70]!r}"
     colunas = set()
-    for linha in achado.group(2).splitlines():
-        linha = linha.strip().rstrip(",")
+    for bruta in achado.group(2).splitlines():
+        linha = bruta.strip().rstrip(",")
         if not linha:
             continue
         primeiro = linha.split()[0].strip("`").lower()

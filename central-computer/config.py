@@ -206,6 +206,47 @@ def _fator_velocidade() -> float:
     return valor
 
 
+def _cronograma_s(nome: str, default: float, minimo: float, maximo: float) -> float:
+    """Um dos quatro números do relógio do ciclo, já com a folga aplicada.
+
+    Eles eram os ÚNICOS deste arquivo lidos com `float(os.getenv(...))` cru —
+    todos os outros passam por um leitor com faixa, warning e queda no default.
+    E o comentário ao lado deles diz, com todas as letras, que um cronograma
+    errado é a única forma de esta feature derrubar comprimido no chão.
+
+    Os dois modos de falhar eram silenciosos do jeito errado:
+
+    - **texto não numérico** — `2,5` com vírgula, que é como se digita em
+      pt-BR, ou a variável vazia. O `float()` levantava `ValueError` na
+      avaliação do `dataclass`, ou seja, no import: o central não subia e o
+      traceback apontava para `config.py`, não para o `.env` de quem digitou;
+    - **zero ou negativo** — `cronograma_do_ciclo` devolvia prazo ≤ 0 e
+      `_dormir_ou_cancelar` retornava NA HORA dizendo que o prazo foi cumprido
+      (`asyncio.wait(timeout=-1)` acorda imediatamente com `feitos` vazio, que
+      é exatamente o sinal de "venceu"). O `dispensar` saía com a mesa ainda
+      andando.
+
+    O teto existe pelo motivo oposto e é generoso: um número absurdamente alto
+    não derruba nada, só faz cada ciclo esperar minutos — mas aí a demonstração
+    parece travada e ninguém sabe por quê.
+    """
+    bruto = os.getenv(nome, str(default))
+    try:
+        valor = float(bruto)
+    except (TypeError, ValueError):
+        _cfg_logger.warning(
+            "%s=%r não é número — usando %s. (Decimal com PONTO: 2.5, não 2,5.)",
+            nome, bruto, default,
+        )
+        valor = default
+    if not minimo <= valor <= maximo:
+        _cfg_logger.warning(
+            "%s=%r fora da faixa %s..%s — usando %s.", nome, bruto, minimo, maximo, default
+        )
+        valor = default
+    return valor * _folga_timeout()
+
+
 def _folga_timeout() -> float:
     """Fator aplicado aos TIMEOUT_* do orquestrador. Nunca menor que 1.0.
 
@@ -311,12 +352,68 @@ class Settings:
     # está apenas demorando o que se pediu. Ver a docstring de `_folga_timeout`
     # para por que o fator só aumenta, nunca reduz.
     TIMEOUT_CARREGAMENTO:        float = float(os.getenv("TIMEOUT_CARREGAMENTO",        "180")) * _folga_timeout()
+    # Estes dois NÃO governam mais o ciclo da mesa — o ciclo agora é por
+    # RELÓGIO (ver `cronograma_do_ciclo` no orquestrador), e o evento da placa
+    # registra ou cancela, nunca autoriza o passo seguinte.
+    #
+    # Eles continuam existindo, e continuam configuráveis, pelo que ainda
+    # governam: `TIMEOUT_POSICIONAMENTO` é o teto do HOMING (passos 4-inicial e
+    # 5), que segue sendo handshake — o homing não tem duração previsível,
+    # porque depende de quão longe do fim de curso a mesa estava, e pode levar
+    # `HOMING_TIMEOUT_MS` por eixo. `TIMEOUT_DISPENSA` é o teto de espera do
+    # `limpeza_ok` e dos comandos que ainda confirmam.
+    #
+    # Deixá-los aqui com o comentário trocado é deliberado: um timeout que
+    # ninguém usa mas continua no `.env` é uma alavanca que o operador vai
+    # girar esperando efeito, e depois vai procurar o problema em outro lugar.
     TIMEOUT_POSICIONAMENTO:      float = float(os.getenv("TIMEOUT_POSICIONAMENTO",      "120")) * _folga_timeout()
     TIMEOUT_DISPENSA:            float = float(os.getenv("TIMEOUT_DISPENSA",            "120")) * _folga_timeout()
     TIMEOUT_VISAO_DISPENSER:     float = float(os.getenv("TIMEOUT_VISAO_DISPENSER",     "30"))  * _folga_timeout()
     TIMEOUT_VISAO_MESA:          float = float(os.getenv("TIMEOUT_VISAO_MESA",          "30"))  * _folga_timeout()
     TIMEOUT_PESO:                float = float(os.getenv("TIMEOUT_PESO",                "15"))  * _folga_timeout()
     TIMEOUT_LIMPEZA:             float = float(os.getenv("TIMEOUT_LIMPEZA",             "60"))  * _folga_timeout()
+
+    # ── O cronograma do ciclo da mesa (segundos) ──────────────────────────────
+    #
+    # O ciclo `mover` → `dispensar` deixou de esperar confirmação: o central
+    # calcula QUANDO cada peça acontece e dispara no relógio. Estes quatro
+    # números são esse relógio, e escalam por `_folga_timeout()` como os
+    # TIMEOUT_* — desacelerar a demo sem desacelerar o cronograma faria o
+    # `dispensar` sair com a mesa ainda em trânsito, que é a única forma de esta
+    # feature derrubar comprimido no chão.
+    #
+    # `CNC_TETO_TRAJETO_S` é um TETO de QUALQUER deslocamento, e a conta que o
+    # justifica é a da mesa montada:
+    #
+    #     FEED 750 mm/min = 12,5 mm/s = 1000 passos/s (STEPS_PER_MM = 80)
+    #     CoreXY: max_p = max(|dx+dy|, |dx−dy|) × 80
+    #     pior trajeto da célula = HOME(0,0) → D8(7,18)
+    #         max_p = max(|7+18|, |7−18|) × 80 = 25 × 80 = 2000 passos
+    #         ≈ 2016 ms somando o meio-período real de cada pulso da rampa
+    #
+    # 2,5 s é isso mais folga. **Ele precisa ser MAIOR que o trajeto real, não
+    # IGUAL a ele** — e é essa assimetria que o mantém fora da regra do mapa
+    # duplicado (CLAUDE.md, "A cópia do mapa no cnc_simulator não existe mais").
+    # Uma cópia da geometria teria de CONCORDAR com a placa, e passaria a mentir
+    # no dia em que alguém regravasse um waypoint na bancada; um limite superior
+    # continua verdadeiro enquanto a mesa couber embaixo dele.
+    #
+    # O que o quebra é subir o FEED sem subir o teto — por isso a conta está
+    # escrita aqui, e por isso o `cnc/README.md` a repete na lista de bancada.
+    CNC_TETO_TRAJETO_S:     float = field(
+        default_factory=lambda: _cronograma_s("CNC_TETO_TRAJETO_S", 2.5, 0.1, 60.0))
+    # Serial + ACK + salto de thread do adapter + latência do `loop()` da placa.
+    # É o que separa "a mesa chegou" de "o central soube que ela chegou", e é
+    # estimativa — a medida de bancada está pendente no `cnc/README.md`.
+    CNC_MARGEM_CHEGADA_S:   float = field(
+        default_factory=lambda: _cronograma_s("CNC_MARGEM_CHEGADA_S", 0.75, 0.1, 60.0))
+    # O mecanismo solta uma unidade por ciclo de servo. MESMO número que o
+    # `WP()` do firmware usa para gravar o dwell das receitas — ver
+    # `cronograma_do_ciclo`.
+    DISPENSA_S_POR_UNIDADE: float = field(
+        default_factory=lambda: _cronograma_s("DISPENSA_S_POR_UNIDADE", 1.0, 0.05, 30.0))
+    DISPENSA_FOLGA_S:       float = field(
+        default_factory=lambda: _cronograma_s("DISPENSA_FOLGA_S", 1.0, 0.05, 30.0))
 
     # ── Modo de demonstração ──────────────────────────────────────────────────
     # O central não sorteia falha; estes dois campos existem para PUBLICAR o

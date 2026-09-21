@@ -114,12 +114,53 @@ if FATOR_VELOCIDADE != 1.0:
         "FATOR_VELOCIDADE=%.2f — CNC a %.1f mm/s (base %.1f).",
         FATOR_VELOCIDADE, VELOCIDADE_MM_S, VEL_MM_S_BASE)
 
-# O simulador NÃO tem mapa de posições. Ele valida a faixa do slot e se move
-# para o (x, y) que vem no comando — o mapa é do central (`orchestrator.
-# POSICOES`), que já mandava `posicao_x`/`posicao_y` em todo /executar/mover.
-# A cópia que existia aqui era um segundo dicionário mantido à mão, num serviço
-# que nunca precisou dele para nada além da validação de faixa abaixo.
 NUM_SLOTS = int(os.getenv("NUM_SLOTS", "8"))
+
+# ── O ROTEIRO DA BANCADA ──────────────────────────────────────────────────────
+# O simulador continua SEM cópia do mapa do central — e agora por uma razão
+# mais forte que antes. A mesa de verdade não recebe coordenadas: ela executa
+# um roteiro MEDIDO nela, gravado waypoint a waypoint na bancada, e REPORTA
+# onde parou. Este simulador faz o mesmo: tem a própria bancada e reporta a
+# posição que alcançou.
+#
+# Os números abaixo são deliberadamente DIFERENTES dos de `orchestrator.
+# POSICOES`, e é isso que os torna úteis. Se fossem iguais, toda asserção sobre
+# a posição passaria por concordância acidental: o central compararia o seu
+# número com uma cópia do seu número, e continuaria passando no dia em que ele
+# voltasse a ignorar o que a máquina informa. Diferentes, qualquer volta atrás
+# aparece na primeira leitura do histórico.
+#
+# Nenhum número daqui precisa CONCORDAR com o central — é justamente o ponto da
+# decisão. O que precisa concordar (quantos slots existem) continua vindo do
+# `NUM_SLOTS` declarado uma vez no compose.
+_BANCADA_X0_MM   = float(os.getenv("BANCADA_X0_MM", "37.5"))
+_BANCADA_PASSO_MM = float(os.getenv("BANCADA_PASSO_MM", "95.0"))
+_BANCADA_Y_MM    = float(os.getenv("BANCADA_Y_MM", "128.0"))
+
+
+def _bancada() -> dict[int, tuple[float, float]]:
+    """Slot → posição medida. Determinístico: a bancada não muda entre boots."""
+    fileira = max(1, NUM_SLOTS // 2)
+    pontos: dict[int, tuple[float, float]] = {}
+    for slot in range(1, NUM_SLOTS + 1):
+        coluna = (slot - 1) % fileira
+        lado = -1.0 if slot <= fileira else 1.0
+        pontos[slot] = (_BANCADA_X0_MM + coluna * _BANCADA_PASSO_MM,
+                        lado * _BANCADA_Y_MM)
+    return pontos
+
+
+BANCADA: dict[int, tuple[float, float]] = _bancada()
+
+# Quais receitas estão GRAVADAS nesta "placa". Configurável para que a
+# demonstração possa encenar a ordem cuja receita ninguém gravou — que é
+# justamente o modo novo de a apresentação falhar, e o que o pré-voo pergunta.
+RECEITAS_GRAVADAS = {
+    letra.strip().upper()
+    for letra in os.getenv("CNC_RECEITAS_GRAVADAS", "ABCDEFGHIJ").split(",")
+    for letra in letra
+    if letra.strip()
+}
 
 # HOME idem: o central manda as coordenadas no /executar/homing. Este par é só
 # o fallback de quem chamar o endpoint sem elas (contrato antigo) e a posição
@@ -158,10 +199,35 @@ def _evento(payload: dict) -> bool:
         return False
 
 
+def _recusar(os_id: str, dispenser_alvo: int, codigo: str, descricao: str) -> None:
+    """Recusa que o orquestrador consegue LER.
+
+    O 4xx sozinho aborta a OS na hora (é o que o `_post` do orquestrador faz com
+    status que não vale retentar), mas não deixa rastro de POR QUÊ. O evento
+    `erro` é o que vira alarme e fica no histórico — a mesma divisão de trabalho
+    que o firmware faz entre o ACK negativo e o evento.
+    """
+    logger.warning("[CNC] mover recusado (%s): %s", codigo, descricao)
+    _evento({
+        "tipo":           "erro",
+        "os_id":          os_id,
+        "dispenser_alvo": dispenser_alvo,
+        "codigo_erro":    codigo,
+        "descricao":      descricao,
+        "ts":             _ts(),
+    })
+
+
 # ── Estado da CNC ──────────────────────────────────────────────────────────────
 _lock = threading.Lock()
 _em_movimento = threading.Event()  # set=True enquanto CNC está em movimento
 _movimento_lock = threading.Lock()  # protege check-and-set atômico de _em_movimento
+
+# Trava do Triple Check, vinda do central por `/executar/estado-celula`. Enquanto
+# ativa, `mover` é recusado com o mesmo `codigo_erro` que o firmware usa —
+# vocabulário divergente aqui não daria erro, daria um alarme que ninguém sabe
+# ler, e a diferença só apareceria com a placa montada.
+_travada = False
 
 _cnc_state = {
     "status":         "idle",
@@ -185,8 +251,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 class MoverReq(BaseModel):
     dispenser_alvo: int
     os_id: str
-    posicao_x: float
-    posicao_y: float
+    receita: str
     ciclo_atual: int = 0
     total_ciclos: int = 0
 
@@ -195,6 +260,14 @@ class HomingReq(BaseModel):
     os_id: str
     posicao_x: Optional[float] = None
     posicao_y: Optional[float] = None
+
+
+class EstadoCelulaReq(BaseModel):
+    """A trava do Triple Check chegando à mesa — mesmos campos do firmware."""
+    trava_ativa: bool
+    trava_slot_id: Optional[int] = None
+    os_id: str = ""
+    trava_resumo: str = ""
 
 
 # ── Lógica de movimento ────────────────────────────────────────────────────────
@@ -391,9 +464,63 @@ def status():
         return dict(_cnc_state) | {"ts": _ts()}
 
 
+@app.post("/executar/estado-celula")
+def executar_estado_celula(req: EstadoCelulaReq):
+    """Guarda o estado e age só na TRANSIÇÃO, como o firmware.
+
+    Receber `trava_ativa=true` duas vezes é inofensivo — a segunda não refaz
+    nada. É o contrato do §6, e existe porque o central reenvia o aviso sempre
+    que a trava muda, sem saber o que a placa já sabe.
+    """
+    global _travada
+    anterior = _travada
+    _travada = bool(req.trava_ativa)
+    if _travada == anterior:
+        return {"ok": True, "msg": "estado inalterado", "trava_ativa": _travada}
+
+    if _travada:
+        logger.warning("[CNC] TRAVA ATIVA (slot %s, OS %s): %s — mover recusado "
+                       "ate a liberacao.", req.trava_slot_id, req.os_id,
+                       req.trava_resumo)
+    else:
+        logger.info("[CNC] Trava liberada — mover aceito de novo.")
+    return {"ok": True, "trava_ativa": _travada}
+
+
 @app.post("/executar/mover")
 def executar_mover(req: MoverReq):
+    # A trava vem ANTES de tudo: com ela ativa a mesa não vai a lugar nenhum, e
+    # o motivo da recusa é a trava, não a faixa nem a receita. Recusar aqui com
+    # o mesmo `codigo_erro` do firmware é o que faz o alarme ser o mesmo com e
+    # sem placa montada.
+    if _travada:
+        _recusar(req.os_id, req.dispenser_alvo, "travado",
+                 "trava do Triple Check ativa: aguardando liberacao")
+        raise HTTPException(409, "travado: trava do Triple Check ativa")
+
+    # As recusas usam o MESMO `codigo_erro` do firmware (a tabela do topo de
+    # `cnc/receitas_manuais.ino` e do §4 do protocolo). Vocabulário divergente
+    # aqui não daria erro: daria um alarme que ninguém sabe ler, e a diferença
+    # só apareceria com a placa montada, que é quando ninguém quer descobrir.
+    #
+    # Era o que estava acontecendo: este arquivo dizia "o MESMO codigo_erro" e
+    # emitia `dispenser_sem_waypoint` onde o firmware emite `dispenser_invalido`.
+    # O comentário foi escrito antes de o firmware existir, e ninguém conferiu
+    # depois — é exatamente o modo de falhar que ele descreve.
+    receita = (req.receita or "").strip().upper()
+    if receita not in RECEITAS_GRAVADAS:
+        # `receita_desconhecida` é o ÚNICO código que só existe deste lado, e
+        # está documentado no §4 como tal. O firmware aceita qualquer receita
+        # (ela é log, não endereço — quem acha a posição é `dispenser_pos`);
+        # o simulador a valida porque é ele que encena, para a demonstração, a
+        # ordem cujo roteiro ninguém gravou.
+        _recusar(req.os_id, req.dispenser_alvo, "receita_desconhecida",
+                 f"receita '{req.receita}' nao esta gravada nesta placa")
+        raise HTTPException(400, f"receita_desconhecida: {req.receita}")
+
     if not 1 <= req.dispenser_alvo <= NUM_SLOTS:
+        _recusar(req.os_id, req.dispenser_alvo, "dispenser_invalido",
+                 f"dispenser_alvo {req.dispenser_alvo} fora da faixa 1-{NUM_SLOTS}")
         raise HTTPException(
             400, f"dispenser_alvo deve ser 1-{NUM_SLOTS}, recebido: {req.dispenser_alvo}"
         )
@@ -404,9 +531,10 @@ def executar_mover(req: MoverReq):
             raise HTTPException(409, "CNC em movimento — aguarde posicionamento atual")
         _em_movimento.set()
 
+    alvo_x, alvo_y = BANCADA[req.dispenser_alvo]
     threading.Thread(
         target=_thread_mover,
-        args=(req.dispenser_alvo, req.posicao_x, req.posicao_y,
+        args=(req.dispenser_alvo, alvo_x, alvo_y,
               req.os_id, req.ciclo_atual, req.total_ciclos),
         daemon=True,
         name=f"cnc-mover-D{req.dispenser_alvo}",
@@ -414,8 +542,8 @@ def executar_mover(req: MoverReq):
 
     return {
         "ok": True,
-        "msg": f"Movendo para D{req.dispenser_alvo}",
-        "destino": {"x": req.posicao_x, "y": req.posicao_y},
+        "msg": f"Movendo para D{req.dispenser_alvo} (receita {receita})",
+        "destino": {"x": alvo_x, "y": alvo_y},
     }
 
 

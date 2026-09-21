@@ -84,7 +84,22 @@ os.environ.setdefault("SECRET_KEY", "t" * 64)
 # `test_painel_seguranca.py`, que passa o ambiente pela fábrica.
 PAINEL_API_TOKEN = "token-de-teste-do-painel"
 os.environ.setdefault("APSEN_SECRET", "p" * 64)
-os.environ.setdefault("APSEN_API_TOKEN", PAINEL_API_TOKEN)
+
+# Atribuição, e NÃO `setdefault`: aqui a suíte é dona dos DOIS lados da
+# comparação — o `app.py` lê o token do ambiente e `PainelCarregado.api()` manda
+# `PAINEL_API_TOKEN` no header, que é uma constante deste arquivo. Deixar o
+# ambiente ditar um dos lados garante divergência, e o resultado é 401 em toda
+# rota /api/*.
+#
+# Não é hipótese: numa máquina de bancada a variável está exportada de verdade
+# — o `painel_operador/iniciar_backend.bat` manda gravá-la com `setx`, que é
+# permanente. A suíte passava para quem nunca tinha configurado o painel e
+# falhava para quem tinha, sem nada no repositório ter mudado.
+#
+# Compare com o `NUM_SLOTS` logo abaixo, onde o `setdefault` continua certo: lá
+# a suíte LÊ o valor de volta e se adapta a ele, então exportar outro número é
+# experimentar outra célula de propósito.
+os.environ["APSEN_API_TOKEN"] = PAINEL_API_TOKEN
 
 # Nº de dispensers da célula. Fixado aqui pelo mesmo motivo da SECRET_KEY: os
 # módulos leem `NUM_SLOTS` uma vez, em constante de módulo, no primeiro import
@@ -462,16 +477,29 @@ class PainelCarregado:
         """Conexão nova no banco temporário — a mesma que as rotas abrem."""
         return self.modulo.get_db()
 
-    def logar(self, perfil: str = "Admin") -> None:
+    def logar(self, perfil: str = "Admin", pin_provisorio: bool = False) -> None:
         """Põe uma sessão válida no cliente de teste.
 
         As rotas web são protegidas por `login_required` + `requer(...)`, que
         leem a `session` do Flask. Gravá-la direto evita depender do PIN do seed.
+
+        `pin_provisorio=False` é o padrão porque é o estado de uma bancada
+        configurada: o operador já trocou o PIN de fábrica. Sem isso TODA rota
+        web deste arquivo cairia no `_obrigar_troca_de_pin` e responderia 302
+        para `/trocar-pin` — os testes passariam a medir o guarda, não a rota.
+        Quem testa o guarda pede `pin_provisorio=True`.
         """
         with self.cliente.session_transaction() as sessao:
             sessao["op_id"] = 1
             sessao["op_nome"] = "Teste"
             sessao["perfil"] = perfil
+        conn = self.conexao()
+        try:
+            conn.execute("UPDATE operadores SET pin_provisorio=? WHERE id=1",
+                         (1 if pin_provisorio else 0,))
+            conn.commit()
+        finally:
+            conn.close()
 
     def api(self, metodo: str, caminho: str, **kwargs):
         """Requisição a uma rota /api/* já com o `X-API-Token`.
@@ -482,6 +510,26 @@ class PainelCarregado:
         """
         headers = {"X-API-Token": PAINEL_API_TOKEN, **kwargs.pop("headers", {})}
         return getattr(self.cliente, metodo)(caminho, headers=headers, **kwargs)
+
+    def post_form(self, caminho: str, **kwargs):
+        """POST num formulário do painel, já com o token CSRF da sessão.
+
+        Existe pela mesma razão do `api()` logo acima: o token aparece em UM
+        lugar. Sem ele as rotas destrutivas respondem 400, e um teste que o
+        esquecesse falharia por um motivo que não é o dele. Quem testa a
+        AUSÊNCIA do token chama `cliente` direto.
+        """
+        dados = {self.modulo.CSRF_CAMPO: self.token_csrf(), **kwargs.pop("data", {})}
+        return self.cliente.post(caminho, data=dados, **kwargs)
+
+    def token_csrf(self) -> str:
+        """O token que o template poria no form, para a sessão deste cliente."""
+        with self.modulo.app.test_request_context():
+            with self.cliente.session_transaction() as sessao:
+                dados = dict(sessao)
+            from flask import session as sessao_flask
+            sessao_flask.update(dados)
+            return self.modulo._token_csrf()
 
     def ordem(self, numero_os: str):
         conn = self.conexao()
@@ -521,9 +569,10 @@ def carregar_painel(monkeypatch, tmp_path):
     * `central_client._get` — duplado pelo `CentralFake`, que é onde os testes
       encenam o central respondendo, respondendo diferente, ou não respondendo.
 
-    O banco vai para `tmp_path` por `APSEN_DB`; `init_db()` roda no import e
-    cria o schema lá. As threads de fundo NÃO sobem: elas moram em
-    `iniciar_workers()`, que só o bloco de execução e o `desktop.py` chamam.
+    O banco vai para `tmp_path` por `APSEN_DB`, e é a fábrica que chama
+    `preparar_banco()` — o import deixou de tocar em disco. As threads de fundo
+    NÃO sobem: elas moram em `iniciar_workers()`, que só o bloco de execução e
+    o `desktop.py` chamam.
     """
     modulos_antes = set(sys.modules)
 
@@ -556,6 +605,10 @@ def carregar_painel(monkeypatch, tmp_path):
         modulo = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, "apsen_painel_app", modulo)
         spec.loader.exec_module(modulo)
+        # O import deixou de criar o banco (ver `preparar_banco`): quem o cria
+        # agora são os entrypoints, e a suíte é um deles. Semeia porque a maior
+        # parte dos testes do painel parte do catálogo do seed.
+        modulo.preparar_banco()
 
         central = CentralFake(ordens_central, detalhes_central, dispensers_central,
                               trava_central)
@@ -574,6 +627,22 @@ def carregar_painel(monkeypatch, tmp_path):
 
 # ── Ordens padrão ──────────────────────────────────────────────────────────────
 
+def _carregar_os_templates():
+    caminho = RAIZ_REPO / "central-computer" / "os_templates.py"
+    spec = importlib.util.spec_from_file_location("apsen_os_templates", caminho)
+    modulo = importlib.util.module_from_spec(spec)
+    sys.modules["apsen_os_templates"] = modulo
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+# O `template_id` de uma ordem padrão de VERDADE, para os payloads de OS dos
+# testes. Fixar "OS-URO-01" à mão em cada arquivo seria uma cópia a mais da
+# lista das dez ordens — e a que ficaria para trás no dia em que alguém
+# renomeasse a primeira. Vem do módulo, como tudo o mais.
+TEMPLATE_PADRAO = _carregar_os_templates().TEMPLATES[0]["template_id"]
+
+
 @pytest.fixture(scope="session")
 def os_templates():
     """`central-computer/os_templates.py` importado por caminho.
@@ -582,12 +651,7 @@ def os_templates():
     precisa do aparato de `carregar_central`: basta o caminho. `scope="session"`
     porque ele não tem estado mutável e o import roda o autoteste de estrutura.
     """
-    caminho = RAIZ_REPO / "central-computer" / "os_templates.py"
-    spec = importlib.util.spec_from_file_location("apsen_os_templates", caminho)
-    modulo = importlib.util.module_from_spec(spec)
-    sys.modules["apsen_os_templates"] = modulo
-    spec.loader.exec_module(modulo)
-    return modulo
+    return _carregar_os_templates()
 
 
 # ── Computador central ─────────────────────────────────────────────────────────
@@ -758,6 +822,23 @@ def _estado_zerado() -> dict:
     }
 
 
+def _POSICAO_MEDIDA(slot: int) -> dict:
+    """A posição que a MÁQUINA reporta ter alcançado.
+
+    Deliberadamente DIFERENTE de `orchestrator.POSICOES`, e os números são
+    absurdos de propósito. Antes, a placa falsa devolvia no evento as mesmas
+    coordenadas que tinha acabado de receber no comando — o que fazia toda
+    asserção sobre a posição ser circular: o central comparava o seu número
+    com o seu próprio número, e passaria igual se ele ignorasse a máquina.
+
+    Hoje a mesa executa um roteiro MEDIDO nela e reporta onde parou. Números
+    que não podem ser confundidos com os do modelo são o que faz um teste
+    falhar alto no dia em que alguém voltar a preencher o histórico com o
+    mapa lógico em vez da medição.
+    """
+    return {"posicao_x": 1000.0 + slot, "posicao_y": 2000.0 + slot}
+
+
 class AdapterFake:
     """Duplo de `orchestrator._post`: grava os comandos e responde pela planta.
 
@@ -793,11 +874,39 @@ class AdapterFake:
         self.confirma_limpeza = True
         self.quantidade_dispensada: int | None = None   # None = dispensa o alvo
         self.capturas_divergentes = 0                   # scans com SKU errado
+        # A placa informa onde parou. False encena a que confirma a chegada
+        # sem a medida — e o central tem de cair no modelo, avisando.
+        self.posicao_medida = True
         self._carga: dict[int, int] = {}                # slot → quantidade carregada
+
+        # ── O silêncio, que o ciclo por relógio tornou encenável ─────────────
+        # Antes do modelo por relógio não havia o que encenar aqui: o
+        # orquestrador ficava bloqueado em `aguardar_evento` e a OS abortava por
+        # timeout. Hoje o prazo vence, a OS SEGUE, e é isso que precisa de
+        # duplo — o que não chega é o caso normal desta feature, não a exceção.
+        self.responder_cnc = True         # False = mesa muda (nem chegada, nem erro)
+        self.responder_dispenser = True   # False = dispenser mudo
+        self.erro_cnc_em: int | None = None   # slot em que a mesa emite `erro`
+        # `posicionado` que sai DEPOIS do `dispensar`: o evento atrasado que o
+        # veto não pega a tempo, mas que a colheita não pode perder.
+        self.atrasar_posicionado = False
+        self._posicionado_pendente: tuple | None = None
+        self.posicao_reportada: tuple = (None, None)
+
+        # Recusa por ROTA, e não `aceita=False` para tudo. O adapter que não
+        # aceita UM comando é o caso real — 404 de rota que a versão de lá não
+        # tem, 502 de placa muda —, e é o único jeito de provar que o
+        # orquestrador confere o retorno DAQUELE comando em vez de morrer no
+        # primeiro. Cada item é um sufixo de URL.
+        self.recusar_rotas: set[str] = set()
+        # Os N próximos scans de câmera de dispenser não emitem evento NENHUM.
+        # Diferente de `aceita=False`: aqui o comando foi aceito e a resposta é
+        # que não vem — que é o que o re-scan da trava tratava como "corrigido".
+        self.scans_mudos = 0
 
     async def post(self, url: str, payload: dict, timeout: float = 10.0) -> bool:
         self.chamadas.append({"url": url, "payload": payload})
-        if not self.aceita:
+        if not self.aceita or any(url.endswith(r) for r in self.recusar_rotas):
             return False
         self._responder(url, payload)
         return True
@@ -820,6 +929,11 @@ class AdapterFake:
 
         elif url.endswith("/comandos/capturar/dispenser"):
             slot = payload["slot_id"]
+            if self.scans_mudos > 0:
+                # Comando aceito, evento que nunca chega. O orquestrador vai
+                # esperar `TIMEOUT_VISAO_DISPENSER` e receber None.
+                self.scans_mudos -= 1
+                return
             injetada = payload.get("injetar_falha")
             if injetada == "falha_leitura_dispenser":
                 self._evento(f"{os_id}:visao_dispenser:{slot}",
@@ -849,11 +963,47 @@ class AdapterFake:
 
         elif url.endswith("/comandos/mover"):
             slot = payload["dispenser_alvo"]
-            self._evento(f"{os_id}:posicionado:{slot}", tipo="posicionado",
-                         posicao_x=payload["posicao_x"], posicao_y=payload["posicao_y"])
+            if self.erro_cnc_em == slot:
+                # A mesa não chegou, e DIZ isso. É o único evento que veta o
+                # cronograma: sem ele, o relógio dispara o `dispensar` e o
+                # medicamento cai fora da célula.
+                self._evento(f"{os_id}:posicionado:{slot}", tipo="erro",
+                             codigo_erro="limit_disparado",
+                             descricao="fim de curso disparou durante o movimento")
+            elif not self.responder_cnc:
+                # A mesa MUDA — nem chegada, nem erro. É o caso que define o
+                # modelo por relógio: pode ser a placa parada, pode ser um
+                # evento perdido no encaminhamento, e daqui não dá para saber.
+                pass
+            else:
+                # `posicao_medida=False` encena a placa que confirmou a chegada
+                # sem informar onde parou — contrato antigo, ou firmware de
+                # outra versão. O central precisa ter uma resposta para isso que
+                # não seja o silêncio, e é o que o teste do fallback cobra.
+                medida = _POSICAO_MEDIDA(slot) if self.posicao_medida else {}
+                self.posicao_reportada = (medida.get("posicao_x"),
+                                          medida.get("posicao_y"))
+                if self.atrasar_posicionado:
+                    # O `posicionado` que atravessa o adapter DEPOIS de o
+                    # `dispensar` já ter saído. Guardado aqui e entregue no
+                    # comando seguinte: é o atraso que o modelo tem de tolerar
+                    # sem perder a posição medida.
+                    self._posicionado_pendente = (
+                        f"{os_id}:posicionado:{slot}", dict(medida))
+                else:
+                    self._evento(f"{os_id}:posicionado:{slot}",
+                                 tipo="posicionado", **medida)
 
         elif url.endswith("/comandos/dispensar"):
             slot = payload["dispenser_id"]
+            # O `posicionado` atrasado chega AGORA, com o dispensar já a
+            # caminho — tarde para o veto, a tempo para o registro.
+            if self._posicionado_pendente is not None:
+                chave, medida = self._posicionado_pendente
+                self._posicionado_pendente = None
+                self._evento(chave, tipo="posicionado", **medida)
+            if not self.responder_dispenser:
+                return
             qtd = (self._carga.get(slot, 0) if self.quantidade_dispensada is None
                    else self.quantidade_dispensada)
             if payload.get("injetar_falha") == "falha_mecanica_dispenser":
@@ -946,6 +1096,35 @@ def carregar_orquestrador(monkeypatch):
     """
     modulos_antes = set(sys.modules)
 
+    # O ciclo da mesa passou a correr por RELÓGIO, e o relógio é de verdade: com
+    # os defaults de produção, uma OS de 8 paradas dorme 3,25 s por trajeto mais
+    # `quantidade + 1` s por dispensa — minutos de suíte parada, medindo nada.
+    #
+    # Zerar aqui é a mesma escolha do `ENV_RAPIDO` dos simuladores: o que está
+    # em teste é a SEQUÊNCIA (quem é chamado, em que ordem, com que desfecho),
+    # não a duração. Quem testa a duração pede os valores de verdade no `env` e
+    # usa um relógio falso — ver `test_orchestrator.py`, o teste do cronograma.
+    #
+    # **Escrito direto no `settings`, e não por env var, e a diferença é a
+    # feature.** `config._cronograma_s` passou a RECUSAR zero: prazo ≤ 0 faz
+    # `_dormir_ou_cancelar` retornar na hora dizendo que o prazo foi cumprido
+    # (`asyncio.wait(timeout=0)` acorda com `feitos` vazio, que é o sinal de
+    # "venceu"), e o `dispensar` sairia com a mesa ainda andando. Um fixture que
+    # pedisse `"0"` pelo ambiente cairia no DEFAULT DE PRODUÇÃO com warning —
+    # 3,25 s por trajeto — e a suíte passaria a medir o relógio de verdade sem
+    # que nada ficasse vermelho para contar: só o relógio de parede subiria.
+    #
+    # Escrever no objeto é o que separa as duas coisas. A validação existe para
+    # o que vem do `.env` de quem opera; aqui não há `.env`, e o zero é o valor
+    # que torna a suíte uma medida de SEQUÊNCIA. Quem cobra a faixa é
+    # `tests/test_config_cronograma.py`, que lê pelo ambiente como a planta lê.
+    CRONOGRAMA_INSTANTANEO = {
+        "CNC_TETO_TRAJETO_S":     0.0,
+        "CNC_MARGEM_CHEGADA_S":   0.0,
+        "DISPENSA_S_POR_UNIDADE": 0.0,
+        "DISPENSA_FOLGA_S":       0.0,
+    }
+
     def _carregar(env: dict[str, str] | None = None) -> OrquestradorCarregado:
         for chave, valor in (env or {}).items():
             monkeypatch.setenv(chave, valor)
@@ -964,6 +1143,13 @@ def carregar_orquestrador(monkeypatch):
         modulo = importlib.util.module_from_spec(spec)
         sys.modules["apsen_central_orchestrator"] = modulo
         spec.loader.exec_module(modulo)
+
+        # Depois do exec: `settings` é o objeto que `cronograma_do_ciclo` lê a
+        # cada chamada. Quem pedir os valores de verdade pelo `env` os
+        # sobrescreve de volta no próprio teste.
+        for campo, valor in CRONOGRAMA_INSTANTANEO.items():
+            if campo not in (env or {}):
+                monkeypatch.setattr(modulo.settings, campo, valor)
 
         banco = BancoFake()
         banco.instalar(modulo, monkeypatch)

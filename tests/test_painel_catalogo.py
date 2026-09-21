@@ -85,7 +85,7 @@ def _com_lote(painel, med_id: int) -> int:
 
 def _excluir(painel, med_id: int):
     painel.logar()
-    return painel.cliente.post(f"/medicamentos/{med_id}/excluir")
+    return painel.post_form(f"/medicamentos/{med_id}/excluir")
 
 
 # ── A FK passou a valer ───────────────────────────────────────────────────────

@@ -8,12 +8,23 @@ num slot que o operador vai procurar na bancada.
 
 Uma porta por firmware, uma linha JSON por mensagem:
 
-| adapter             | firmware                    | porta | subsistema (`sub`) |
-|---------------------|-----------------------------|-------|--------------------|
-| `dispenser-adapter` | os 8 dispensers (mecanismos)| uma   | `dispenser`        |
-| `dispenser-adapter` | as 8 telas TFT              | uma (a SEGUNDA porta do mesmo adapter) | `dispenser_tft` |
-| `cnc-adapter`       | a mesa CNC                  | uma   | `cnc`              |
-| `weight-adapter`    | a balança HX711             | uma   | `weight`           |
+| adapter             | firmware                    | porta | subsistema (`sub`) | código |
+|---------------------|-----------------------------|-------|--------------------|--------|
+| `dispenser-adapter` | os 8 dispensers (mecanismos)| uma   | `dispenser`        | [`dispenser/servos_hub/`](../dispenser/README.md) |
+| `dispenser-adapter` | as 8 telas TFT              | uma (a SEGUNDA porta do mesmo adapter) | `dispenser_tft` | [`dispenser/telas_tft/`](../dispenser/README.md) |
+| `cnc-adapter`       | a mesa CNC                  | uma   | `cnc`              | — |
+| `weight-adapter`    | a balança HX711             | uma   | `weight`           | [`weight/balanca2_3/`](../weight/README.md) |
+
+Três dos quatro firmwares estão escritos. A balança foi a primeira
+(`weight/balanca2_3/`, manual em `weight/README.md`) e as duas placas do
+dispenser vieram depois (`dispenser/`, manual em `dispenser/README.md`). **A
+mesa CNC continua sem código no repositório**, e para ela este documento segue
+sendo o que alguém vai ler para escrevê-la.
+
+O contrato **não mudou** quando o firmware apareceu: ele deixou de ser promessa,
+que é coisa diferente. Quem confronta as cópias é `tests/test_protocolo_placas.py`
+(documento × adapter × placa falsa) e, do lado do firmware,
+`tests/test_balanca_serial.py` e `tests/test_dispenser_firmware.py`.
 
 O `vision-adapter` **não** entra: a visão continua por HTTP. E `dispenser` e
 `dispenser_tft` são **duas portas físicas do mesmo adapter**: acionar os 8
@@ -43,8 +54,8 @@ vê todo comando que desce e todo evento que sobe do slot é o dispenser-adapter
 | direção | mensagem | quando |
 |---|---|---|
 | placa → adapter | `{"cmd":"ping","sub":"<subsistema>"}` | no boot e periodicamente |
-| adapter → placa | `{"resp":"pong","epoch":<unix>}` | resposta ao ping |
-| adapter → placa | `{"cmd":"<nome>","cmd_id":<n>,...campos}` | comando |
+| adapter → placa | `{"resp":"pong","epoch":<unix>,"sessao":<unix>}` | resposta ao ping |
+| adapter → placa | `{"cmd":"<nome>","cmd_id":<n>,"sessao":<unix>,...campos}` | comando |
 | placa → adapter | `{"resp":"ok","cmd_id":<n>}` | ACK positivo |
 | placa → adapter | `{"resp":"erro","cmd_id":<n>,"msg":"..."}` | ACK negativo |
 | placa → adapter | `{"evento":{...payload...}}` | resultado e telemetria |
@@ -56,6 +67,9 @@ conversor USB-serial é o mesmo em placas de fabricantes diferentes, e casar por
 ele acha a placa errada, que aqui significa mandar `dispensar` para a balança.
 
 O `epoch` do pong é como a placa acerta o relógio sem NTP.
+
+`sessao` é o epoch de BOOT do processo do adapter, e ela não muda enquanto ele
+vive. Ver "`sessao` — o contador nasce de novo, e a placa precisa saber".
 
 ### ACK não é conclusão
 
@@ -81,6 +95,39 @@ sobreviva a um reenvio de qualquer origem (um restart do adapter, um operador
 repetindo a ação, uma versão futura que decida retentar). É a parte do protocolo
 que não dá para acrescentar depois sem trocar as duas pontas ao mesmo tempo.
 
+### `sessao` — o contador nasce de novo, e a placa precisa saber
+
+O `cmd_id` é monotônico **dentro de uma sessão do adapter**: ele nasce em 1 a
+cada `LinkSerial` novo. A regra de idempotência acima, sozinha, transforma isso
+num modo de falhar: um restart de 2 a 5 s do processo (o `.bat` da bancada
+reinicia sozinho) faz o contador voltar a 1 com a placa ainda em
+`ultimoCmdId = 47`, e **todo comando até 47 recebe ACK POSITIVO sem executar**.
+
+Com o ciclo por relógio o sintoma mudou de lugar: não é só timeout — o central
+segue o cronograma e dispara o `dispensar` de um `mover` que a mesa nunca fez.
+
+Por isso o adapter manda `sessao` — o epoch de boot do processo dele — no pong
+**e em todo comando**. A placa guarda a última que viu e, quando ela MUDA, zera
+`ultimoCmdId`.
+
+Três detalhes que são contrato, não implementação:
+
+* **a comparação é de DIFERENÇA, não de ordem.** Relógio do host que ande para
+  trás (NTP, fuso, máquina sem RTC) continua sendo uma sessão nova, que é o que
+  importa;
+* **`sessao` ausente ou zero significa "ainda não sei"**, e a primeira que a
+  placa vê é adotada sem zerar nada. Zerar na primeira faria todo boot da placa
+  descartar o primeiro comando legítimo;
+* **a adoção vem ANTES da checagem de idempotência**, no caminho do comando. O
+  pong também a carrega, mas o primeiro comando depois de um restart pode chegar
+  antes do primeiro pong — e é justamente ele que não pode ser respondido como
+  repetido.
+
+A heurística anterior continua no firmware como rede de segurança: silêncio de
+mais de `SESSAO_SILENCIO_MS` (10 s) sem pong também zera o contador. Ela cobre o
+adapter que ficou fora por muito tempo; o que ela **não** cobre é o restart
+rápido, que é o comum — 2 s de queda não chegam perto de três pings perdidos.
+
 ### Telemetria periódica não pode encher o canal
 
 O dispenser emite status dos 8 slots a cada 15 s e a balança tem leitura
@@ -103,6 +150,12 @@ qualquer sorteio, e valor desconhecido é ignorado **com aviso**.
 ---
 
 ## 3. `dispenser` — os 8 dispensers
+
+**Firmware escrito:** `dispenser/servos_hub/servos_hub.ino` (ESP32 + PCA9685 +
+8 servos + 8 TCRT5000). O [`dispenser/README.md`](../dispenser/README.md) é o
+manual dele — as duas vozes na mesma porta, a contagem por IR, o terminal de
+calibração que continua valendo e os pontos a confirmar na bancada. O que está
+aqui é o contrato; o que está lá é a placa.
 
 ### Comandos (adapter → placa)
 
@@ -135,19 +188,40 @@ está carregando ou dispensando.
 
 ## 4. `cnc` — a mesa CNC
 
+**Firmware escrito:** `cnc/receitas_manuais/receitas_manuais.ino` (ESP32 +
+CoreXY). O [`cnc/README.md`](../cnc/README.md) é o manual dele — as duas vozes
+da porta, as receitas de bancada, os trajetos medidos e o que falta conferir na
+bancada. O que está aqui é o contrato; o que está lá é a placa.
+
+**O central agenda, a mesa avisa, ninguém espera o aviso.** É a frase que
+resume o modelo, e ela inverte o que este documento dizia antes. O ciclo
+`mover` → `dispensar` não é mais um handshake: o central calcula QUANDO cada
+peça acontece e dispara na hora marcada, tenha o evento chegado ou não. O
+evento da placa serve para **registrar** — a posição medida, a contagem — e, no
+máximo, para **cancelar**. Ver "Por que o relógio e não a confirmação", abaixo.
+
 ### Comandos (adapter → placa)
 
 | `cmd` | campos | efeito |
 |---|---|---|
-| `mover` | `dispenser_alvo`, `os_id`, `posicao_x`, `posicao_y`, `ciclo_atual`, `total_ciclos` | move a mesa até o slot |
+| `mover` | `dispenser_alvo`, `os_id`, `receita`, `ciclo_atual`, `total_ciclos` | move a mesa até o slot |
 | `homing` | `os_id`, `posicao_x` (opcional), `posicao_y` (opcional) | volta ao HOME |
+| `estado_celula` | `trava_ativa`, `trava_slot_id` (opcional), `os_id` (opcional), `trava_resumo` (opcional) | trava do Triple Check |
 
-**As coordenadas vêm no comando.** A geometria da célula tem UM dono, e é o
-central (ver CLAUDE.md, "A cópia do mapa no cnc_simulator não existe mais"). O
-firmware valida a faixa (`1 <= dispenser_alvo <= NUM_SLOTS`) e se move para o par
-de coordenadas que recebeu — nunca para uma tabela própria. Uma cópia do mapa no
-firmware não daria erro: a mesa iria para onde a cópia DELA diz que D7 fica, e o
-sintoma seria divergência num slot só, indistinguível de falha mecânica.
+**A coordenada NÃO vem no comando — o endereço é o dispenser.** O roteiro é
+medido na bancada e gravado na placa, waypoint a waypoint, indexado pelo
+DISPENSER; o firmware valida a faixa (`1 <= dispenser_alvo <= NUM_SLOTS`) e vai
+ao waypoint dele. Em troca, é a placa que REPORTA onde parou, no `posicionado`,
+e é essa medida que o central registra.
+
+O waypoint é por dispenser e não por posição na receita porque a rota é decidida
+no central em tempo de execução (serpentina) e muda quando um slot sai da OS:
+"vá ao ponto 3" seria outro dispenser no dia seguinte, a mesa iria ao lugar
+errado, e o sintoma chegaria como divergência de SKU num slot só —
+indistinguível de uma falha mecânica.
+
+`receita` é a letra A–J do slot da NVS: ela diz QUAL ordem está em execução, vai
+para o log da placa, e **não** é usada para achar a posição.
 
 ### Eventos (placa → adapter)
 
@@ -156,17 +230,142 @@ sintoma seria divergência num slot só, indistinguível de falha mecânica.
 | `posicionado` | `os_id`, `dispenser_alvo`, `posicao_x`, `posicao_y`, `ciclo_atual`, `total_ciclos`, `ts` |
 | `concluido` | `os_id`, `posicao_x`, `posicao_y`, `ts` |
 | `erro` | `os_id`, `dispenser_alvo`, `codigo_erro`, `descricao`, `ts` |
-| `movendo` | `os_id`, `dispenser_alvo`, `posicao_x`, `posicao_y`, `passo`, `total_passos`, `progresso_pct`, `ts` |
-| `retornando` | `os_id`, `posicao_x`, `posicao_y`, `ts` |
 | `telemetria` | `componente`, `tipo_leitura`, `valor`, `unidade`, `ts` |
 
-`movendo` e `retornando` são a trajetória ao vivo: periódicos, e por isso
-sujeitos ao filtro de repetição. Só `posicionado`, `concluido` e `erro` viram
-linha em `cnc_eventos` no central (CLAUDE.md, "Só transição vira linha").
+Os três primeiros são transição, e os três viram linha em `cnc_eventos` no
+central (CLAUDE.md, "Só transição vira linha").
+
+**`estado_celula` PRODUZ evento na mesa**, e é a diferença dela para a placa das
+telas, onde o mesmo comando só pinta. A tabela acima não dizia isso, e o
+silêncio custou dois defeitos que ficaram de pé com a suíte verde.
+
+Na transição para TRAVADA, e só na transição:
+
+| a mesa estava… | o que sai |
+|---|---|
+| andando | `erro` com `codigo_erro: travado`, e depois o retorno ao HOME |
+| parada | só o retorno ao HOME |
+
+Com um `mover` em curso, quem emite o `erro` é o próprio comando interrompido —
+é lá que se sabe qual OS e qual dispenser esperavam a chegada. A mesa vai ao HOME
+nos dois casos porque é onde o supervisor espera encontrá-la para mexer na
+bancada.
+
+**O retorno ao HOME segue a regra do `homing`:** falhou, sai `erro` com
+`homing_falhou` e **não** sai `concluido`. Um `concluido` ali afirmaria que a
+mesa está no HOME quando ela está onde o eixo travou — e, pior que no `cmdHoming`,
+`ja_fez_homing` fica `false` e todo `mover` seguinte é recusado com `sem_homing`:
+o supervisor libera a trava e a OS SEGUINTE aborta com um erro que aponta para o
+lugar errado.
+
+**O `concluido` do retorno leva o `os_id` da OS que travou**, e quem decide o
+que fazer com isso é o central: ele NÃO fecha OS travada (CLAUDE.md, a guarda em
+`_handle_evento_cnc`). A mesa reporta o que ela fez; ela não diz o que a OS
+virou.
+
+A LIBERAÇÃO não produz evento nenhum e não refaz homing: a mesa já está no HOME
+desde a ativação, e um segundo homing custaria segundos no exato momento em que
+o supervisor acabou de liberar a produção.
+
+**Nada de periódico durante o movimento — no SERIAL.** `movendo` e `retornando`
+continuam existindo no `cnc_simulator`, que fala HTTP e alimenta a trajetória
+ao vivo do dashboard; o FIRMWARE não os emite, e a diferença não é
+esquecimento. Uma linha de ~200 B a 115200 baud custa ~17 ms, o curso mais
+longo da célula dura ~2,0 s, e o central dispara o `dispensar` por relógio:
+cada linha emitida no caminho empurra a chegada real para **depois** da hora
+agendada — ou seja, comprimido caindo com a mesa ainda em trânsito. Por HTTP,
+com uma conexão por evento, esse custo não existe.
+
+| `tipo` | campos principais | quem emite |
+|---|---|---|
+| `movendo` | `os_id`, `dispenser_alvo`, `posicao_x`, `posicao_y`, `passo`, `total_passos`, `progresso_pct`, `ts` | só o `cnc_simulator` (HTTP) |
+| `retornando` | `os_id`, `posicao_x`, `posicao_y`, `ts` | só o `cnc_simulator` (HTTP) |
+
+### `codigo_erro` — vocabulário FECHADO
+
+Todo evento `erro` da mesa carrega um destes, e nenhum outro. A lista é fechada
+porque quem lê o outro lado é código: o central agrupa alarme por `codigo_erro`,
+e a tela de necessidades manda o técnico à peça a partir dele. Um código
+inventado na hora não dá erro em lugar nenhum — vira uma linha que ninguém sabe
+ler.
+
+| `codigo_erro` | comando | quando |
+|---|---|---|
+| `dispenser_invalido` | `mover` | `dispenser_alvo` fora de 1..`NUM_SLOTS` |
+| `fora_do_envelope` | `mover` | o waypoint calibrado caiu fora dos limites da mesa |
+| `sem_homing` | `mover` | origem nunca estabelecida — mande `homing` antes |
+| `limit_disparado` | `mover` | fim de curso acionado, antes ou durante o movimento |
+| `travado` | `mover` | trava do Triple Check ativa |
+| `homing_falhou` | `homing` | um dos eixos não achou o fim de curso no prazo |
+| `receita_desconhecida` | `mover` | **só o `cnc_simulator`** — a receita não está entre as gravadas |
+
+`receita_desconhecida` é o único código que não vem do firmware, e a exceção
+está aqui em vez de escondida: a placa ACEITA qualquer `receita` (ela é log, não
+endereço — quem acha a posição é o waypoint do dispensador), enquanto o
+simulador a valida para encenar, na demonstração, a ordem cujo roteiro ninguém
+gravou. Os dois lados emitem `dispenser_invalido` para a mesma condição.
+
+**Recusa é ACK negativo E evento `erro`, sempre os dois** — e eles vão para
+leitores diferentes. O ACK negativo vira 502 no adapter e chega ao orquestrador
+como `cmd_mover` falso: é ele que cancela o cronograma ANTES da hora do
+`dispensar`. O evento vira alarme e linha de histórico, com o código que diz
+onde ir. Só o ACK deixaria a recusa sem rastro; só o evento deixaria o central
+seguindo o relógio até despejar medicamento numa mesa que não chegou.
+
+A única falha que acontece DEPOIS do ACK positivo é o fim de curso disparando
+com a mesa andando — aí não há ACK a corrigir, e o evento é o aviso. Tudo que
+dá para conferir antes é conferido antes, por isso.
+
+`homing` que estoura o prazo **não** emite `concluido`: emite `erro` com
+`homing_falhou` e a placa fica sem origem, recusando todo `mover` seguinte. Um
+`concluido` ali afirmaria que a mesa está no HOME, e ela está onde o eixo
+travou.
+
+### Por que o relógio e não a confirmação
+
+O modelo anterior era um handshake: o `dispensar` só saía depois de o
+`posicionado` chegar, e o ciclo só fechava com o `dispensado`. Ele foi trocado,
+e o que se ganhou é previsibilidade — o tempo de uma OS passa a ser a soma de um
+cronograma que o central calcula, em vez de depender de quantos eventos se
+perderam no caminho.
+
+**O que custa, e este parágrafo existe para que o custo não seja redescoberto
+daqui a seis meses:**
+
+* **Um `dispensado` que não chega não para nada na hora.** O prazo vence, o
+  ciclo é marcado `sem_confirmacao`, e a OS segue para o próximo slot. Quem
+  reconcilia é o Triple Check no fim de cada ciclo, onde o dispenser entra como
+  **fonte que não mediu** — não como fonte que divergiu. Com limiar 1, basta
+  uma das outras duas discordar para a OS travar.
+* **A ausência do `posicionado` não cancela nada.** É a parte que quem mexer
+  aqui vai querer "consertar", pondo um `await` de volta no meio do ciclo — e
+  isso é o handshake de volta. Um evento perdido no encaminhamento (o
+  `_post_central` do adapter desiste depois de 3 tentativas) chega ao central
+  idêntico à mesa parada. Tratar os dois como iguais aborta OS com o hardware
+  intacto, que é o custo que o modelo antigo pagava.
+* **O que veta é só um `erro` EXPLÍCITO**, ou o ACK negativo do `mover`. São as
+  duas únicas defesas antes do `dispensar`, e é por isso que o firmware recusa
+  com ACK negativo em vez de apenas emitir evento.
+* **O cronograma tem de acompanhar a máquina.** `DISPENSA_S_POR_UNIDADE` no
+  central e o `(qty + 1) × 1000 ms` do `WP()` no firmware descrevem o MESMO
+  mecanismo físico visto de dois lugares. Ajustar um só faz o central cortar a
+  dispensa no meio: a OS termina "completa" com menos comprimido no leito, que
+  é o pior desfecho possível desta frente.
 
 ---
 
 ## 5. `weight` — a balança HX711
+
+**Firmware escrito:** `weight/balanca2_3/balanca2_3.ino`
+(ESP32 + 4 × HX711), o primeiro desta célula a sair do papel. O
+[`weight/README.md`](../weight/README.md) é o manual dele — tabela de eventos,
+comandos aceitos pela serial, os dois comandos que o PC **não** pode mandar, e
+o aviso do DTR. O que está aqui é o contrato; o que está lá é a placa.
+
+A balança é uma **balança de bancada antes de ser um periférico da célula**:
+ela conta por peso, calibra canal a canal e sempre foi configurada pelo Monitor
+Serial. Daí a seção ter duas famílias de mensagem, e a linha entre elas ser o
+destino: o que é da OS sobe ao central, o que é da bancada para no adapter.
 
 ### Comandos (adapter → placa)
 
@@ -182,6 +381,43 @@ que a mesa efetivamente ganha). A divergência emerge da diferença entre as dua
 é o que uma célula de carga mede na vida real. `quantidade_real` ausente cai na
 esperada, preservando o contrato antigo.
 
+**`tara` move o zero LÓGICO da mesa, e não toca no hardware.** O offset do HX711
+é calibração, gravada na NVS, e só muda com o operador presente — é o
+`tara_canais` da bancada. Tarar o hardware no meio de uma OS levaria junto o
+peso que já estava na mesa, e a balança passaria a mentir para sempre, sem erro
+em lugar nenhum.
+
+**O `pesar` espera a mesa parar antes de medir** (até 3 s), e essa espera cabe
+DEPOIS do ACK: o relógio que corre nela é o `TIMEOUT_PESO` do orquestrador
+(15 s), nunca o `ack_timeout_s` (2 s). É a razão de o ACK existir separado.
+
+### Comandos de bancada (só no serial)
+
+Estes **não estão em `_ROTAS_SIM`** e **não existem no `weight-simulator`** —
+são da PLACA, e só existem quando há placa. Uma entrada em `_ROTAS_SIM`
+prometeria as duas pernas, e a perna HTTP daria 404 no transporte que é o
+default. O adapter os expõe em `POST /bancada/*` e responde **503** com o
+transporte `http`.
+
+Eles existem porque, com `WEIGHT_TRANSPORTE=serial`, o adapter é o **dono** da
+porta: ninguém mais abre o Monitor Serial. Sem eles, definir o peso unitário
+passaria a exigir parar o adapter.
+
+| `cmd` | campos | efeito | equivale a digitar |
+|---|---|---|---|
+| `peso_unitario` | `valor_g` | define o peso de uma unidade e grava na NVS | `g<valor>` |
+| `tara_recipiente` | — | mede o pote vazio e o desconta da contagem | `k` |
+| `tara_canais` | — | zera os offsets do HX711 (**calibração**, grava na NVS) | `t` |
+| `contar` | — | espera estabilizar e conta por peso | `x` |
+| `config` | — | publica a configuração gravada | `C` |
+| `stream` | `on` (bool, ausente = liga) | liga/desliga o stream periódico de peso | `j` |
+
+**O PC nunca manda `u` nem `c0`..`c3`.** Esses dois são interativos: o firmware
+bloqueia em `readSerialLine()` por até 15 s esperando alguém digitar, e durante
+esse tempo a placa não lê comando nem responde ACK. O equivalente não
+bloqueante de `u` é `peso_unitario`; calibrar canal é operação de bancada, com
+peso padrão na mão, e não tem equivalente remoto de propósito.
+
 ### Eventos (placa → adapter)
 
 | `tipo` | campos principais |
@@ -191,9 +427,57 @@ esperada, preservando o contrato antigo.
 | `peso_divergencia` | os mesmos campos do peso_ok acima |
 | `erro_sensor` | `os_id`, `slot_id`, `descricao`, `ts` |
 | `telemetria` | `componente`, `temperatura_c`, `peso_atual_g`, `ts` |
+| `boot` | `fw`, `canais_ativos`, `uw_g`, `ts` |
+| `peso` | `total_g`, `canais_g`, `sat`, `estavel`, `ts` |
+| `contagem` | `total_g`, `liquido_g`, `exata`, `contagem`, `status`, `aceite`, `ts` |
+| `cfg` | `uw_g`, `tara_g`, `tol_g`, `min`, `max`, `sreads`, `sthres_g`, `ts` |
+| `estado` | `estado`, `ts` |
+| `tara_balanca` | `alvo`, `valor_g`, `ts` |
+| `erro_balanca` | `msg`, `cmd`, `ts` |
 
 `peso_ok` é a maior mensagem do contrato e é ela que dimensiona
 `MAX_LINHA_BYTES`.
+
+**Os cinco primeiros sobem ao central. Os sete últimos PARAM no adapter** e
+saem por `GET /balanca` (`_EVENTOS_BANCADA` em `weight-adapter/main.py`). O
+central não tem endpoint para eles e não decide nada com eles; despejá-los em
+`/api/v1/eventos/peso` misturaria duas conversas num histórico que hoje é só de
+pesagem de OS — e como o evento atravessa sem interpretação, o central gravaria
+o buraco sem erro. É a mesma divisão que a seção 6 faz com os eventos das telas.
+
+O corolário é o que torna a lista verificável: um `tipo` fora de
+`_EVENTOS_BANCADA` **é** encaminhado. Esquecer de acrescentar um evento novo
+falha para o lado visível — uma linha estranha no central —, nunca para o mudo.
+
+**`boot` é o único evento que muda o comportamento do adapter.** Ele marca a
+tara como não confiável (`/balanca`, `tara_confiavel`), e o motivo é o item 7
+deste documento ao contrário: abrir a porta **não** reinicia a placa, porque
+DTR/RTS saem desligados antes do `open()`. Então um `boot` que chega aqui é um
+boot que ninguém pediu — queda de energia, botão de reset, ou outro processo
+abrindo a porta —, e o `setup()` da balança **tara sozinho** depois de 5 s: se
+havia peso na mesa, a tara levou o peso junto. Não bloqueia nada; quem decide é
+quem lê. Um `POST /comandos/tara` aceito devolve a confiança, porque é
+exatamente o ato que o boot invalidou.
+
+**Vocabulário fechado**, e ele é do firmware:
+
+* `estado` ∈ `IDLE`, `AWAITING_TARA`, `AWAITING_DEPOSIT`, `TRANSIENT`,
+  `COUNTING`, `DONE` (o `CountState` do sketch);
+* `status` da contagem ∈ `OK`, `UNDER_TOLERANCE`, `OVER_TOLERANCE`, `UNSTABLE`,
+  `INVALID_WEIGHT`, `NO_UNIT_WEIGHT` (o `CountResult`);
+* `alvo` da tara ∈ `canais` (hardware) ou `recipiente` (o pote).
+
+Nome divergente aqui não dá erro: dá uma tela que nunca sai de "desconhecido".
+
+**`canais_g` traz `null` no canal inativo**, e não zero — zero é uma leitura, e
+a bancada tem um canal desligado de propósito. Pela mesma razão todo float é
+protegido contra `NaN`/`inf` na origem: emiti-los como `nan` faria o
+`json.loads` do adapter descartar a linha INTEIRA, e um campo estragado levaria
+junto os quinze que estavam certos.
+
+**Só o stream é periódico**, a 5 Hz. `contagem`, `cfg`, `estado` e
+`tara_balanca` saem na transição, como manda a seção 2 — e `estado` sai de
+`setCountState()`, o único lugar do firmware que atribui `countState`.
 
 ---
 
@@ -212,6 +496,13 @@ vezes, e duas cópias divergem.
 
 Com `DISPENSER_TFT_TRANSPORTE=http` (o default) não há tela nenhuma e o
 adapter se comporta exatamente como antes desta placa existir.
+
+**Firmware escrito:** `dispenser/telas_tft/telas_tft.ino`. Ele compartilha com
+a placa dos mecanismos o núcleo do protocolo (`apsen_serial.h`, cópia idêntica
+nas duas pastas, com teste cobrando a igualdade) e não implementa nada além do
+que esta seção descreve. O painel ainda não foi escolhido, e por isso a camada
+de desenho fica atrás de quatro funções finas — ver
+[`dispenser/README.md`](../dispenser/README.md).
 
 ### Comandos (adapter → placa)
 
@@ -309,7 +600,9 @@ O código **não sabe** em qual sistema operacional está: ele chama
 | `<SUB>_ACK_TIMEOUT_S` | `2` | prazo do ACK, não da conclusão |
 
 `<SUB>` é `CNC`, `DISPENSER`, `WEIGHT` ou `DISPENSER_TFT` — as duas últimas no
-mesmo `dispenser-adapter`, uma por porta. Com `http`, o comportamento é
+mesmo `dispenser-adapter`, uma por porta. Para a balança, que é a que já tem
+placa, isso quer dizer `WEIGHT_TRANSPORTE=serial` e `WEIGHT_SERIAL_URL=COM<n>`
+com a COM fixada no Windows (`weight/README.md`). Com `http`, o comportamento é
 EXATAMENTE o de antes desta feature — é o default justamente para que a suíte, o
 CI e a demonstração em Docker não mudem de resultado (para as telas, `http`
 significa "sem telas").
@@ -320,5 +613,12 @@ significa "sem telas").
 `placa_weight.py` falam este contrato inteiro por `socket://`: respondem ping,
 aceitam comando, devolvem ACK, ignoram `cmd_id` repetido e emitem os eventos
 com atraso configurável (inclusive zero). Elas são o que permite exercitar o transporte sem hardware — e são também
-o documento executável contra o qual o firmware vai ser escrito. É o mesmo papel
+o documento executável contra o qual o firmware foi escrito. É o mesmo papel
 que `painel_operador/firmware/simulador_serial.py` já cumpre para o display.
+
+Para os três subsistemas que já têm placa, a comparação fechou o círculo:
+`tests/test_balanca_serial.py` e `tests/test_dispenser_firmware.py` confrontam
+o FIRMWARE com a placa falsa e com este documento, campo por campo. Os dois
+leem C++ por texto — não há AST para ele —, e por isso cada extrator tem um
+piso de quantos símbolos precisa achar: um extrator que pare de casar deixaria
+tudo verde para sempre, inclusive com o protocolo quebrado.

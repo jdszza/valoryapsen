@@ -156,6 +156,7 @@
                     {% else %}
                     <form method="POST" action="{{ url_for('excluir_medicamento', id=med.id) }}" class="d-inline"
                           onsubmit="return confirm('Retirar {{ med.nome }} do catálogo?')">
+                        {{ campo_csrf() }}
                         <button type="submit" class="btn btn-sm btn-outline-danger" title="Retirar do catálogo">
                             <i class="bi bi-trash"></i>
                         </button>

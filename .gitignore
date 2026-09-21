@@ -59,5 +59,6 @@ test_sync*.txt
 CLAUDE.md
 
 # Banco da bancada (contem PINs de operador) — nunca versionar
+TASKS.md
 painel_operador/backend/apsen.db
 TASKS*.md

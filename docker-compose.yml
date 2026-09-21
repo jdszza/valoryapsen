@@ -68,7 +68,17 @@ services:
     logging: *default-logging
     restart: unless-stopped
     ports:
-      - "3306:3306"
+      # 127.0.0.1 e nao 0.0.0.0. `"3306:3306"` publica o MySQL em TODA interface
+      # da maquina — na bancada, isso e o banco da planta exposto a rede da
+      # fabrica, com as credenciais do `.env` como unica barreira. Os servicos
+      # do compose NAO passam por aqui: eles falam pelo nome `mysql` dentro da
+      # rede `apsen-net`, e essa rota nao depende de publicacao nenhuma.
+      #
+      # O mapeamento fica porque ele serve a uma coisa so, e ela e legitima:
+      # abrir o banco num cliente SQL do proprio mini PC para conferir uma
+      # tabela. Quem precisar de acesso de outra maquina abre um tunel SSH, em
+      # vez de deixar a porta aberta para todo mundo o tempo todo.
+      - "127.0.0.1:3306:3306"
     environment:
       # Credenciais vêm do .env (não versionado). O modelo do arquivo está no
       # README, em "Build e deploy" — não há .env.example no repositório.
@@ -126,10 +136,17 @@ services:
       # Nº de dispensers da célula (par: duas fileiras frente a frente).
       # Uma variável só para todos os serviços — ver CLAUDE.md.
       NUM_SLOTS:          ${NUM_SLOTS:-8}
-      DISPENSER_ADAPTER_URL:  http://dispenser-adapter:8100
-      CNC_ADAPTER_URL:        http://cnc-adapter:8101
-      VISION_ADAPTER_URL:     http://vision-adapter:8102
-      WEIGHT_ADAPTER_URL:     http://weight-adapter:8103
+      # Os quatro são sobrescrevíveis pelo `.env`, e isso NÃO é enfeite: um
+      # adapter com porta serial roda FORA do Docker (o Docker Desktop não
+      # repassa COM para container), e o central o alcança por
+      # `host.docker.internal:<porta>`. Fixar o valor aqui fazia o `.env` ser
+      # ignorado em silêncio — o passo a passo de `docs/DEPLOY_WINDOWS.md`
+      # seguido à risca, e o central ainda falando com um container que não
+      # existe. O default é o nome DNS de sempre, então sem `.env` nada muda.
+      DISPENSER_ADAPTER_URL:  ${DISPENSER_ADAPTER_URL:-http://dispenser-adapter:8100}
+      CNC_ADAPTER_URL:        ${CNC_ADAPTER_URL:-http://cnc-adapter:8101}
+      VISION_ADAPTER_URL:     ${VISION_ADAPTER_URL:-http://vision-adapter:8102}
+      WEIGHT_ADAPTER_URL:     ${WEIGHT_ADAPTER_URL:-http://weight-adapter:8103}
       # Controles globais de demonstração — uma variável para toda a stack.
       # MODO_APRESENTACAO=1 zera TODA probabilidade de falha aleatória dos
       # simuladores; FATOR_VELOCIDADE multiplica os tempos simulados (0.5 = dobro
@@ -183,6 +200,7 @@ services:
     environment:
       CENTRAL_URL:       http://central-computer:8000
       DISPENSER_SIM_URL: http://dispenser-simulator:8201
+      NUM_SLOTS:         ${NUM_SLOTS:-8}
       TIMEOUT_CMD:       15
       TIMEOUT_EVENT:     5
       # Transporte da ponta de baixo: "http" (o simulador) ou "serial" (o
@@ -309,6 +327,7 @@ services:
     environment:
       CENTRAL_URL:    http://central-computer:8000
       WEIGHT_SIM_URL: http://weight-simulator:8203
+      NUM_SLOTS:      ${NUM_SLOTS:-8}
       TIMEOUT_CMD:    10
       TIMEOUT_EVENT:  5
       # Ver o bloco equivalente no dispenser-adapter: mesma semântica, mesma
@@ -481,16 +500,21 @@ services:
     restart: unless-stopped
     environment:
       CENTRAL_URL:         http://central-computer:8000
-      INTERVALO_OS:        90
-      RELOAD_CATALOGO_MIN: 30
+      # `INTERVALO_OS` alto é como se silencia o gerador durante uma
+      # integração: sem os adapters de dispenser e CNC, toda OS automática
+      # aborta em `erro_envio_carregamento` e enche o banco e o badge de
+      # alarmes de falha que ninguém provocou. O console continua disparando à
+      # mão, que é o que se quer nessa fase.
+      INTERVALO_OS:        ${INTERVALO_OS:-90}
+      RELOAD_CATALOGO_MIN: ${RELOAD_CATALOGO_MIN:-30}
       # Backpressure: espera entre consultas quando a fila do central está
       # cheia, e quantas esperas antes de pular o ciclo. Ver README.
-      ESPERA_FILA_CHEIA:   20
-      MAX_ESPERAS_FILA:    15
+      ESPERA_FILA_CHEIA:   ${ESPERA_FILA_CHEIA:-20}
+      MAX_ESPERAS_FILA:    ${MAX_ESPERAS_FILA:-15}
       # Intervalo entre consultas a GET /api/v1/gerador enquanto o console
       # mantém a emissão automática pausada. É o atraso entre clicar em
       # "retomar" no console e a planta voltar a produzir.
-      ESPERA_PAUSA:        10
+      ESPERA_PAUSA:        ${ESPERA_PAUSA:-10}
       # Teto de itens por ordem padrão: mais itens que dispensers viraria uma
       # OS abortada com `sem_slot` depois de já ter ocupado vaga na fila.
       # O conteúdo das ordens NÃO está aqui — as dez são definidas em

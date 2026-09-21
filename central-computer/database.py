@@ -1228,6 +1228,41 @@ def cancelar_ordens_pendentes(os_ids: list) -> int:
             return cur.rowcount
 
 
+def fechar_os_orfas(motivo_status: str = "erro") -> list:
+    """Fecha as OS que ficaram em `em_andamento` de um processo que já morreu.
+
+    Devolve os `os_id` fechados, para quem chamar abrir um alarme por linha.
+
+    **É seguro porque o orquestrador é um loop ÚNICO.** No boot não existe OS em
+    execução por definição — o consumidor da fila ainda nem começou —, então
+    toda linha `em_andamento` no banco é de um central que caiu no meio do
+    ciclo. Não há corrida a proteger: quem chama é a `lifespan`, antes de
+    `loop_orquestrador` existir.
+
+    Sem isso a órfã não some sozinha, e o estrago é em `get_ordem_ativa`: ela
+    prefere `em_andamento ORDER BY criado_em ASC`, então a órfã MAIS ANTIGA
+    vira "a OS ativa" para sempre — para `GET /os/ativa`, para o app de
+    manutenção e para o espelho do painel de bancada. Na bancada isso já
+    aconteceu: três ordens paradas desde 11/09, e o endpoint anunciando a
+    primeira delas desde então.
+
+    `erro` e não `cancelada`: cancelada é decisão de alguém (o reset da planta
+    usa essa palavra), e ninguém cancelou estas. O que houve foi uma OS que
+    começou e não terminou, que é o que `erro` diz — e é o status que a tela de
+    necessidades lista como "OS em erro recentes".
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT os_id FROM ordens WHERE status='em_andamento'")
+            orfas = [linha["os_id"] for linha in (cur.fetchall() or [])]
+            if orfas:
+                cur.execute(
+                    "UPDATE ordens SET status=%s WHERE status=%s",
+                    (motivo_status, "em_andamento"),
+                )
+            return orfas
+
+
 def semear_historico_demo(dados: dict) -> dict:
     """Grava o histórico FABRICADO por `seed_demo.gerar_historico`.
 

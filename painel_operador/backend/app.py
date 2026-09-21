@@ -11,7 +11,7 @@ import time
 import qrcode
 import serial
 import serial.tools.list_ports
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -72,6 +72,200 @@ def resolver_secret_key(chave=None, ambiente=None):
 
 
 app.secret_key = resolver_secret_key()
+
+# ── O cookie de sessao ───────────────────────────────────────────────────────
+#
+# `/trava/liberar`, `/ordens/<id>/excluir`, `/admin/historico/limpar` e
+# `/medicamentos/<id>/excluir` dependiam SO do cookie: qualquer pagina aberta no
+# mesmo browser podia POSTar neles em nome de quem estivesse logado. E a
+# primeira dessas rotas escreve no computador central.
+#
+# `SameSite=Lax` e a metade que nao custa nada: o browser deixa de mandar o
+# cookie em POST vindo de outra origem, e a navegacao normal (GET, link, form do
+# proprio painel) continua igual. `Strict` quebraria voltar ao painel por um
+# link externo, que e como o atalho da bancada abre.
+#
+# `Secure` so quando ha https: numa bancada em http o flag faria o browser
+# DESCARTAR o cookie e ninguem conseguiria logar — o sintoma seria "o login nao
+# funciona", sem nada no log. Quem publica atras de https liga
+# `APSEN_COOKIE_SECURE=1`.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("APSEN_COOKIE_SECURE", "0") == "1",
+)
+
+
+# ============================================================
+# Freio de forca bruta — a MESMA regra do central (console.py)
+# ============================================================
+# O `/login` do painel nao tinha nenhum: PIN de 4 digitos, 10 mil candidatos, e
+# nada limitando as tentativas. O central ja tinha o freio no console e no
+# `POST /auth/login`; a bancada, que e onde o PIN realmente esta, nao.
+#
+# Copia e nao import, pelo mesmo motivo do segredo de sessao logo acima: o
+# painel roda FORA do Docker e nao compartilha pacote com o central. Os numeros
+# sao os de la de proposito — dois freios com janelas diferentes para o mesmo
+# problema e o que faz alguem "consertar" um copiando o habito do outro.
+#
+# **A chave e IP _e_ nome, e isso e escolha.** So o IP puniria o turno inteiro
+# por causa de um operador que erra o PIN — a bancada fala por um NAT so, e
+# atras de proxy todos caem no mesmo `remote_addr`. So o nome deixaria qualquer
+# um trancar a conta alheia de fora, que e negacao de servico disfarcada de
+# protecao. O par NAO cobre varredura de muitos nomes a partir de um IP; o que
+# ele resolve e adivinhar o PIN de uma conta conhecida, que e o caso real aqui
+# (os nomes do seed estao no README).
+LOGIN_MAX_TENTATIVAS = 5
+LOGIN_JANELA_S = 60.0
+
+_login_tentativas: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _login_origem(nome: str) -> str:
+    return f"{request.remote_addr or '?'}|{(nome or '').strip().lower()}"
+
+
+def login_registrar_falha(origem: str, agora: float = None) -> None:
+    momento = agora if agora is not None else time.monotonic()
+    with _login_lock:
+        # Varre TODOS os baldes: a chave e escolhida por quem tenta, entao uma
+        # varredura com um nome novo por tentativa deixaria uma entrada
+        # permanente por tentativa. O custo e O(nº de baldes) por tentativa
+        # FALHA, e e ele mesmo que mantem o numero pequeno.
+        for chave in [k for k, ts in _login_tentativas.items()
+                      if all(momento - t >= LOGIN_JANELA_S for t in ts)]:
+            del _login_tentativas[chave]
+        recentes = [t for t in _login_tentativas.get(origem, [])
+                    if momento - t < LOGIN_JANELA_S]
+        recentes.append(momento)
+        _login_tentativas[origem] = recentes
+
+
+def login_limpar_falhas(origem: str) -> None:
+    """PIN certo zera o contador — quem sabe o PIN nao e varredura."""
+    with _login_lock:
+        _login_tentativas.pop(origem, None)
+
+
+def login_bloqueado(origem: str, agora: float = None) -> float:
+    """Segundos que faltam para a origem poder tentar de novo. 0 = liberada."""
+    momento = agora if agora is not None else time.monotonic()
+    with _login_lock:
+        recentes = [t for t in _login_tentativas.get(origem, [])
+                    if momento - t < LOGIN_JANELA_S]
+        if recentes:
+            _login_tentativas[origem] = recentes
+        else:
+            _login_tentativas.pop(origem, None)
+        if len(recentes) < LOGIN_MAX_TENTATIVAS:
+            return 0.0
+        return max(LOGIN_JANELA_S - (momento - min(recentes)), 1.0)
+
+
+# ============================================================
+# Token CSRF — para os POST que destroem
+# ============================================================
+# `SameSite=Lax` (acima) ja recusa o cookie num POST de outra origem, e nos
+# browsers atuais ele sozinho resolveria. O token existe porque a suposicao
+# "todo browser da bancada e atual" e justamente a que ninguem confere: o painel
+# roda no Windows do mini PC, e um atalho num navegador antigo nao da erro
+# nenhum — so deixa de proteger.
+#
+# **Nao e um CSRF para o app inteiro, e isso e escolha.** Cobrir os ~30
+# formularios exigiria tocar todos os templates, e um esquecido vira um 400 na
+# cara do operador no meio do turno. O que entra aqui sao os POST que DESTROEM
+# ou que saem da maquina, um por um e com o `{{ campo_csrf() }}` no form.
+#
+# O token e derivado da SESSAO, nao guardado nela: assim ele sobrevive a um
+# restart do processo (a sessao e um cookie assinado, nao ha estado de servidor)
+# e nao precisa de tabela nenhuma.
+CSRF_CAMPO = "_csrf"
+
+
+def _token_csrf() -> str:
+    """HMAC do id da sessao com a chave do app — vazio se ninguem esta logado."""
+    op_id = session.get("op_id")
+    if op_id is None:
+        return ""
+    return hmac.new(
+        str(app.secret_key).encode("utf-8"),
+        f"csrf:{op_id}:{session.get('op_nome', '')}".encode("utf-8"),
+        "sha256",
+    ).hexdigest()
+
+
+@app.context_processor
+def _injetar_csrf():
+    """`{{ campo_csrf() }}` monta o input escondido dentro do form."""
+    from markupsafe import Markup
+
+    def campo_csrf() -> str:
+        return Markup(
+            f'<input type="hidden" name="{CSRF_CAMPO}" value="{_token_csrf()}">'
+        )
+
+    return {"campo_csrf": campo_csrf, "token_csrf": _token_csrf}
+
+
+def csrf_protegido(f):
+    """Recusa o POST cujo token nao bate com o da sessao.
+
+    Escrito ABAIXO de `login_required`, para RODAR depois dele — decorator
+    aplica de baixo para cima e executa de cima para baixo. Sem sessao nao ha
+    token a comparar, e o redirect para o login e a resposta certa: 400 ali
+    mandaria quem so perdeu a sessao caçar um problema que nao existe.
+
+    O marcador `_csrf_protegido` sobe pela pilha porque `functools.wraps` copia
+    o `__dict__` do embrulhado — a mesma mecanica com que
+    `tests/test_painel_seguranca.py` ja varre o `api_token_required`.
+
+    `hmac.compare_digest` e nao `==`: a comparacao byte a byte de `==` vaza o
+    prefixo correto pelo tempo, e o token e a unica coisa que separa este POST
+    de um vindo de fora.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        esperado = _token_csrf()
+        enviado = request.form.get(CSRF_CAMPO, "")
+        if not esperado or not hmac.compare_digest(esperado, enviado):
+            return render_template(
+                "403.html", perfil=session.get("perfil"),
+                motivo="Formulário expirado ou vindo de outra origem. "
+                       "Recarregue a página e tente de novo.",
+            ), 400
+        return f(*args, **kwargs)
+    decorated._csrf_protegido = True
+    return decorated
+
+
+# ============================================================
+# `next=` do login — so caminho do proprio painel
+# ============================================================
+
+
+def destino_seguro(bruto: str, padrao: str) -> str:
+    """O `next=` do login, reduzido a um caminho relativo deste app.
+
+    `redirect(request.args.get("next"))` mandava o browser para qualquer lugar:
+    bastava um link para `/login?next=https://...` para a pagina de login
+    legitima do painel virar o trampolim de uma copia dela. O operador digita o
+    PIN na tela certa e sai do outro lado sem ver nada estranho.
+
+    A regra e por FORMA, nao por lista de bloqueio: aceita-se um caminho que
+    comece com uma barra e nao com duas — `//outro.host/x` e um URL de esquema
+    relativo, que o browser segue para fora. Funcao pura, para o teste chamar
+    sem requisicao.
+    """
+    bruto = (bruto or "").strip()
+    if not bruto.startswith("/") or bruto.startswith("//"):
+        return padrao
+    # Barra invertida em QUALQUER posicao: alguns browsers a normalizam para
+    # barra, entao `/\outro.host/x` chega la fora sem nunca ter tido duas
+    # barras — e um caminho legitimo deste painel nunca tem uma.
+    if "\\" in bruto:
+        return padrao
+    return bruto
 
 
 # ============================================================
@@ -226,6 +420,20 @@ def porta_fixa_do_display() -> str:
     return (os.environ.get("APSEN_DISPLAY_PORTA") or "").strip()
 
 
+def varredura_permitida() -> bool:
+    """A varredura de portas e OPT-IN desde que a celula ganhou cinco placas.
+
+    Ela continua sendo o caminho de quem desenvolve SEM hardware ou com uma
+    placa so na mesa — `APSEN_DISPLAY_VARRER=1` a devolve. O que ela deixou de
+    ser e o DEFAULT, porque na bancada montada ela e o problema, nao a
+    conveniencia.
+
+    Lida a cada tentativa, como `porta_fixa_do_display` e pelo mesmo motivo: o
+    `.bat` da bancada e reiniciado com frequencia.
+    """
+    return (os.environ.get("APSEN_DISPLAY_VARRER") or "").strip() == "1"
+
+
 def find_display_port():
     """Abre a porta do display: a FIXA, se `APSEN_DISPLAY_PORTA` estiver
     definida; senao, varre todas as portas procurando o ping.
@@ -249,6 +457,24 @@ def find_display_port():
         if conn:
             print(f"Display encontrado na porta {fixa} (APSEN_DISPLAY_PORTA)")
         return conn
+
+    if not varredura_permitida():
+        # **Aviso, e nao recusa de boot** — a diferenca para os adapters e
+        # deliberada, e e a mesma do `APSEN_API_TOKEN`. Os adapters existem para
+        # falar com UMA porta, e sem ela nao fazem nada: recusar subir e honesto
+        # la. Este processo tem DOIS trabalhos, e o outro e servir a tela que o
+        # gestor esta olhando — derruba-lo por causa de uma variavel de serial
+        # trocaria um display offline por um painel inteiro fora do ar.
+        #
+        # O que se ganha e o mesmo: sem varredura nao ha competicao pelas portas
+        # dos outros quatro processos. O display fica OFFLINE, e a linha abaixo
+        # diz exatamente o que definir.
+        print("[serial] APSEN_DISPLAY_PORTA nao definida e a varredura esta "
+              "desligada (APSEN_DISPLAY_VARRER=1 a religa). Com cinco placas na "
+              "celula, varrer faz este processo abrir as portas dos outros e "
+              "vice-versa. Fixe a COM do display e defina APSEN_DISPLAY_PORTA.")
+        return None
+
     for p in serial.tools.list_ports.comports():
         conn = _probe_port(p.device)
         if conn:
@@ -260,7 +486,6 @@ def find_display_port():
 def push_to_display(payload: dict):
     """Envia uma mensagem nao solicitada ao display (ex: status de ordem
     mudou no dashboard web). Silencioso se o display estiver desconectado."""
-    global _serial_conn
     with _serial_lock:
         if _serial_conn is None:
             print(f"[push] '{payload.get('push')}' descartado: display desconectado")
@@ -741,7 +966,8 @@ def init_db():
             pin_hash TEXT NOT NULL DEFAULT '',
             perfil TEXT NOT NULL DEFAULT 'Operador',
             ativo INTEGER NOT NULL DEFAULT 1,
-            data_criacao TEXT NOT NULL
+            data_criacao TEXT NOT NULL,
+            pin_provisorio INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS historico (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -907,6 +1133,37 @@ def init_db():
         # repara tabela que ja existe.
         conn.execute("ALTER TABLE operadores ADD COLUMN pin_hash TEXT NOT NULL DEFAULT ''")
 
+    op_cols = [r[1] for r in
+               conn.execute("PRAGMA table_info(operadores)").fetchall()]
+    # Migration: `pin_provisorio` — o PIN que veio do seed precisa ser trocado.
+    #
+    # O hash sempre esteve certo; o problema era o SEGREDO. Os PINs do seed
+    # estão neste repositório, e na bancada os TRÊS operadores ainda estavam com
+    # eles — incluindo o **Supervisor**, que é o perfil que libera a trava do
+    # Triple Check. Somado a um `/login` que não tinha freio, eram 4 dígitos com
+    # o valor publicado e tentativas ilimitadas.
+    #
+    # `DEFAULT 0` no ALTER, e não 1: um banco que já está na bancada pode ter
+    # PINs trocados há meses, e marcar todo mundo como provisório trancaria o
+    # turno inteiro numa tela de troca. Quem nasce provisório é quem o SEED
+    # cria — a linha abaixo trata do banco que já existe com os PINs de fábrica.
+    if "pin_provisorio" not in op_cols:
+        conn.execute(
+            "ALTER TABLE operadores ADD COLUMN pin_provisorio INTEGER NOT NULL DEFAULT 0")
+        op_cols.append("pin_provisorio")
+        # Um banco de versão anterior não tem como saber quem trocou o PIN. O
+        # que dá para saber é quem ainda está com o PIN DE FÁBRICA, e isso se
+        # confere com o hash que já está gravado.
+        # Contra TODOS os PINs do seed, e não contra o do operador de mesmo
+        # nome: na bancada havia um "Supervisor" — perfil que libera a trava —
+        # com o PIN do Administrador, e ele não está em `OPERADORES_DEFAULT`.
+        # Casar por nome deixaria de fora exatamente a conta mais perigosa.
+        pins_de_fabrica = {pin for _, pin, _ in OPERADORES_DEFAULT}
+        for linha in conn.execute("SELECT id, pin_hash FROM operadores").fetchall():
+            if any(conferir_pin(linha["pin_hash"], pin) for pin in pins_de_fabrica):
+                conn.execute("UPDATE operadores SET pin_provisorio=1 WHERE id=?",
+                             (linha["id"],))
+
     # Migration: integração com a estação de visão.
     #   dispenser_visao   -> numero da zona em visao_dispensers/config/zonas.json
     #   sku_visao         -> conteudo do QR/ArUco (ex: MED-001), chave alternativa
@@ -952,8 +1209,12 @@ def init_db():
     if op_existing == 0:
         agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for nome, pin, perfil in OPERADORES_DEFAULT:
+            # `pin_provisorio=1`: o PIN está escrito neste repositório. Nascer
+            # marcado é o que faz a primeira entrada de cada operador exigir a
+            # troca, em vez de depender de alguém lembrar.
             conn.execute(
-                "INSERT INTO operadores (nome, pin_hash, perfil, ativo, data_criacao) VALUES (?,?,?,1,?)",
+                "INSERT INTO operadores (nome, pin_hash, perfil, ativo, data_criacao, "
+                "pin_provisorio) VALUES (?,?,?,1,?,1)",
                 (nome, gerar_pin_hash(pin), perfil, agora),
             )
 
@@ -975,7 +1236,7 @@ def get_clientes_list():
     return [r["nome"] for r in rows]
 
 
-init_db()
+# `init_db()` NAO roda aqui. Ver `preparar_banco`, junto de `iniciar_workers`.
 # Com debug=True o Werkzeug sobe 2 processos (monitor do reloader + worker
 # real) que executam este modulo inteiro desde o topo. app.debug so vira True
 # depois que app.run() e chamado la embaixo, entao nao da pra checar isso
@@ -990,6 +1251,52 @@ init_db()
 # nao consegue abrir, e o display fica OFFLINE sem nada no log explicando.
 # Ligue com APSEN_RELOADER=1 durante desenvolvimento sem hardware conectado.
 USAR_RELOADER = os.environ.get("APSEN_RELOADER", "0") == "1"
+
+def preparar_banco(semear: bool = True) -> None:
+    """Cria o schema e (se pedido) semeia a demonstracao. NAO roda no import.
+
+    As duas chamadas moravam no topo do modulo, e isso significa que IMPORTAR
+    `app.py` criava um banco no disco e o populava com dado fabricado —
+    `waitress-serve app:app`, um linter, um `python -c "import app"`, qualquer
+    coisa servia. E a regra que o central ja tem escrita para o `seed_demo.py`
+    dele: um seed que roda sozinho transforma a primeira subida de uma
+    instalacao DE VERDADE em dado inventado no banco de producao.
+
+    O que NAO muda e o comportamento de quem opera: os tres entrypoints
+    (`python app.py`, o waitress e o `desktop.py`) passam por `iniciar_workers`,
+    e e de la que esta funcao e chamada. O `seed_demo_data` continua com a
+    guarda dele — so popula com `lotes` vazia.
+    """
+    init_db()
+    if semear:
+        seed_demo_data()
+
+
+def _expirar_lotes_no_boot() -> None:
+    """A varredura de lotes vencidos, com transação e log próprios.
+
+    Nunca levanta: este processo é o dono da porta serial do display, e uma
+    falha de SQLite aqui derrubaria a tela que o operador está olhando por
+    causa de uma manutenção de estoque. O `consumir_fefo` e o
+    `verificar_estoque_ordem` varrem de novo, cada um na própria transação.
+    """
+    try:
+        conn = get_db()
+        try:
+            vencidos = expirar_lotes_vencidos(conn)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:                       # noqa: BLE001
+        print(f"[estoque] varredura de lotes vencidos falhou: {exc}")
+        return
+
+    if vencidos:
+        print(f"[estoque] {len(vencidos)} lote(s) vencido(s) saíram do saldo "
+              f"dispensável: " +
+              ", ".join(f"{l['lote']} (venceu {l['validade']}, {l['quantidade']} un.)"
+                        for l in vencidos))
+
 
 def iniciar_workers():
     """Sobe as threads de fundo: a ponte serial com o display e o espelho do
@@ -1006,6 +1313,18 @@ def iniciar_workers():
     processo so, e a checagem da env var nunca seria verdadeira: dai a segunda
     condicao.
     """
+    # Lote vence pela passagem do TEMPO, e o painel pode ter ficado desligado —
+    # na bancada foram dois meses. Sem esta passada, a primeira ordem depois de
+    # um fim de semana longo seria liberada contra um agregado que ainda conta
+    # estoque que não pode sair.
+    #
+    # Aqui e não no `init_db`: aquele roda no IMPORT do módulo, antes de
+    # `expirar_lotes_vencidos` existir. Este é o ponto em que o painel de fato
+    # começa a servir, e é por onde passam os três entrypoints (`python
+    # app.py`, o waitress e o `desktop.py`).
+    preparar_banco()
+    _expirar_lotes_no_boot()
+
     if (not USAR_RELOADER) or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         threading.Thread(target=serial_worker, daemon=True).start()
         if INTEGRACAO_ATIVA:
@@ -1042,6 +1361,126 @@ def itens_total_qtd(row):
 # ============================================================
 # Rastreabilidade de lote — consumo FEFO (First-Expire-First-Out)
 # ============================================================
+# Este bloco mora ACIMA de `consumir_fefo` de propósito: `seed_demo_data()`
+# roda no IMPORT do módulo e chama `consumir_fefo`, que varre os lotes
+# vencidos antes de escolher. Definido lá embaixo, o import morria com
+# `NameError` — e o lugar certo dele é junto de quem depende da invariante.
+
+# ============================================================
+# Lotes — rastreabilidade de estoque (lote + validade, FEFO)
+# ============================================================
+#
+# ── A invariante: `medicamentos.quantidade` conta saldo DISPENSÁVEL ──────────
+#
+# Lote bloqueado NÃO entra nesse número. Sem a regra escrita, bloquear um lote
+# mexia só em `lotes.status` e o agregado seguia contando o saldo bloqueado —
+# `verificar_estoque_ordem` liberava a ordem, `consumir_fefo` não achava lote
+# 'Ativo' para abater, caía no ramo do resíduo e gravava "SEM LOTE REGISTRADO"
+# debitando o agregado assim mesmo. Ou seja: o medicamento saía, sem
+# genealogia, exatamente do lote que a tela dizia ter bloqueado.
+#
+# ── Por que não derivar `quantidade` de SUM(lotes WHERE status='Ativo') ──────
+#
+# Seria a forma de ter UM número só, e é o que este repositório faz em toda
+# parte (ver CLAUDE.md, "A cópia do mapa no cnc_simulator não existe mais").
+# Aqui ela não cabe, por duas razões concretas:
+#
+# 1. `medicamentos.quantidade` não é uma soma de lotes — é um número MEDIDO.
+#    A estação de visão o reescreve (`_aplicar_visao_*`), o espelho do central
+#    o reescreve (`_sync_dispensers_data`), a troca de medicamento do slot o
+#    reescreve, e o cadastro permite corrigi-lo à mão. Nenhum desses caminhos
+#    tem lote para escrever: derivar obrigaria cada um a inventar uma linha em
+#    `lotes` — dado de rastreabilidade fabricado — ou a ter sua medição
+#    silenciosamente descartada na leitura seguinte.
+# 2. Estoque sem lote cadastrado existe e é legítimo (é o que o ramo
+#    "SEM LOTE REGISTRADO" de `consumir_fefo` cobre). Derivado, todo
+#    medicamento sem lote leria zero e `verificar_estoque_ordem` recusaria
+#    toda ordem numa bancada fisicamente cheia.
+#
+# Então os dois números coexistem — e o que criou o bug não foi a coexistência,
+# foi ela não ter invariante declarada nem um dono. O dono é
+# `_mover_saldo_lote`: TODA transição que muda a dispensabilidade de um lote
+# passa por ela, e ela move os dois números na mesma transação. Quem
+# acrescentar um status novo de lote acrescenta aqui, não em mais uma rota.
+
+# Status de lote cujo saldo CONTA no agregado do medicamento. 'Esgotado' fica
+# de fora por ter quantidade 0 — incluí-lo não mudaria soma nenhuma, mas
+# esconderia que a lista é sobre dispensabilidade, não sobre histórico.
+LOTE_STATUS_DISPENSAVEL = "Ativo"
+
+
+def _mover_saldo_lote(conn, lote_row, dispensavel: bool) -> None:
+    """Põe (ou tira) o saldo de um lote no agregado do medicamento.
+
+    `dispensavel=True` devolve o saldo ao agregado (desbloqueio),
+    `False` o remove (bloqueio). Chamar com o lote JÁ no estado pedido é
+    proibido pelos chamadores, e não por acaso: esta função soma e subtrai, não
+    reconcilia — invocá-la duas vezes no mesmo sentido duplicaria o saldo.
+    """
+    saldo = lote_row["quantidade"] or 0
+    if saldo <= 0:
+        return
+    if dispensavel:
+        conn.execute(
+            "UPDATE medicamentos SET quantidade = quantidade + ? WHERE id=?",
+            (saldo, lote_row["medicamento_id"]),
+        )
+    else:
+        conn.execute(
+            "UPDATE medicamentos SET quantidade = MAX(0, quantidade - ?) WHERE id=?",
+            (saldo, lote_row["medicamento_id"]),
+        )
+
+
+# Status de quem venceu. Ele existe para o saldo SAIR do agregado — e é por
+# isso que é um status, e não um filtro nas consultas: `medicamentos.quantidade`
+# é o número que `verificar_estoque_ordem` consulta para liberar uma ordem, e um
+# filtro não o corrige.
+LOTE_STATUS_VENCIDO = "Vencido"
+
+
+def _hoje() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def expirar_lotes_vencidos(conn) -> list:
+    """Tira do agregado o saldo de todo lote 'Ativo' cuja validade já passou.
+
+    Devolve as linhas afetadas (antes da mudança), para quem chamar abrir
+    desvio. **Idempotente**: a segunda passada não acha mais nenhum, porque o
+    status deixou de ser 'Ativo' — e isso importa, porque `_mover_saldo_lote`
+    soma e subtrai, não reconcilia.
+
+    Um lote não vence por um EVENTO: vence pela passagem do tempo, e é a única
+    transição de dispensabilidade que ninguém dispara. Sem esta varredura o
+    agregado seguia contando o saldo vencido, e a cadeia inteira funcionava sem
+    erro em lugar nenhum: `verificar_estoque_ordem` liberava a ordem →
+    `consumir_fefo` achava o lote 'Ativo' → e o consumia PREFERENCIALMENTE, por
+    construção, porque FEFO é "vence primeiro, sai primeiro" e um lote já
+    vencido é o que vence primeiro de todos.
+
+    Na bancada isso durou dois meses: seis lotes vencidos em 26/07, 286
+    unidades ainda dispensáveis, e o único freio era manual — o alerta de
+    `lotes_proximos_vencimento` no dashboard, esperando alguém lembrar de dar
+    baixa.
+    """
+    vencidos = conn.execute(
+        """SELECT * FROM lotes
+           WHERE status=? AND quantidade>0
+             AND validade IS NOT NULL AND validade != '' AND validade < ?""",
+        (LOTE_STATUS_DISPENSAVEL, _hoje()),
+    ).fetchall()
+
+    for lote in vencidos:
+        # A ordem é a de sempre: o dono do agregado primeiro, o status depois.
+        # Invertida, uma exceção no meio deixaria o lote fora de 'Ativo' com o
+        # saldo ainda contado — e a varredura seguinte não o acharia mais.
+        _mover_saldo_lote(conn, lote, dispensavel=False)
+        conn.execute("UPDATE lotes SET status=? WHERE id=?",
+                     (LOTE_STATUS_VENCIDO, lote["id"]))
+    return vencidos
+
+
 def consumir_fefo(conn, medicamento_nome, qtd, ordem_id, numero_os):
     """Abate `qtd` unidades dos lotes ativos do medicamento (mais próximo
     de vencer primeiro) e registra a genealogia ordem -> lote em
@@ -1056,10 +1495,21 @@ def consumir_fefo(conn, medicamento_nome, qtd, ordem_id, numero_os):
     restante = qtd
     agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # O que venceu sai do agregado ANTES da escolha, e a varredura é a metade
+    # que faltava: sem ela o lote vencido não só era aceito — era PREFERIDO.
+    # FEFO é "vence primeiro, sai primeiro", e um lote já vencido é, por
+    # construção, o que vence primeiro de todos.
+    expirar_lotes_vencidos(conn)
+
+    # E o `WHERE` repete a condição em vez de confiar só na varredura acima.
+    # Não é redundância: a varredura roda no começo desta transação, e uma
+    # ordem que atravesse a virada do dia teria o lote vencendo entre as duas
+    # linhas. Custa uma comparação de texto e fecha a janela.
     lotes = conn.execute(
-        """SELECT * FROM lotes WHERE medicamento_id=? AND status='Ativo' AND quantidade>0
+        """SELECT * FROM lotes WHERE medicamento_id=? AND status=? AND quantidade>0
+             AND (validade IS NULL OR validade='' OR validade >= ?)
            ORDER BY (validade IS NULL OR validade=''), validade ASC, id ASC""",
-        (medicamento_id,),
+        (medicamento_id, LOTE_STATUS_DISPENSAVEL, _hoje()),
     ).fetchall()
 
     for lote in lotes:
@@ -1088,6 +1538,17 @@ def consumir_fefo(conn, medicamento_nome, qtd, ordem_id, numero_os):
                VALUES (?,?,?,?,NULL,?,?,?)""",
             (ordem_id, numero_os, medicamento_id, medicamento_nome, "SEM LOTE REGISTRADO", restante, agora),
         )
+        # E agora vira PENDÊNCIA. Consumir sem lote válido sempre foi legítimo
+        # (estoque anterior ao cadastro de lotes existe), mas num painel cuja
+        # razão de existir é rastreabilidade ele não pode passar calado — e,
+        # desde que o vencido deixou de ser escolhido, ele é também o sintoma
+        # de "só restava lote vencido na prateleira".
+        registrar_desvio(
+            conn, numero_os or "", "Consumo sem lote válido",
+            f"{medicamento_nome}: {restante} de {qtd} unidade(s) saíram sem lote "
+            f"rastreável. Verifique se há lote vencido ou bloqueado no estoque.",
+            "sistema",
+        )
 
     conn.execute(
         "UPDATE medicamentos SET quantidade = MAX(0, quantidade - ?) WHERE id=?",
@@ -1100,6 +1561,15 @@ def verificar_estoque_ordem(conn, ordem_row):
     pode ter quantidade pedida maior que o estoque atual do medicamento.
     Sem essa checagem no backend, o app web deixava iniciar uma ordem que o
     display corretamente bloqueava por falta de estoque."""
+    # Uma função que se chama "verificar" e ESCREVE. É deliberado, e a
+    # alternativa é pior: o agregado que ela consulta conta o saldo de lote
+    # vencido até alguém varrer, e os dois chamadores (a rota web e o
+    # `_set_status_by_numero_os`, que cobre a API e o display) teriam de
+    # lembrar de varrer antes — é a forma exata do bug que o CLAUDE.md
+    # registra em "todo caminho que contorna a função canônica herda os
+    # efeitos dela". A varredura é idempotente e não faz nada no dia a dia.
+    expirar_lotes_vencidos(conn)
+
     itens = parse_itens(ordem_row)
     faltas = []
     for it in itens:
@@ -1233,20 +1703,54 @@ def ordem_e_do_central(row) -> bool:
     return (origem or ORIGEM_LOCAL) == ORIGEM_CENTRAL
 
 
+# ── A escala de tempo do painel é LOCAL E INGÊNUA, e isso é convenção ────────
+#
+# Todo carimbo gravado aqui (`historico.timestamp`, `ordens.data_criacao`,
+# `lotes.data_entrada`, …) é `"%Y-%m-%d %H:%M:%S"` em hora local, sem fuso. As
+# telas o exibem cru, as consultas o ORDENAM como texto e o KPI de SLA o compara
+# com outro `strftime` local — as três coisas só funcionam porque a escala é uma
+# só. Trocar para UTC agora não seria uma correção: deslocaria toda data exibida
+# em três horas e deixaria as linhas ANTIGAS incomparáveis com as novas, na mesma
+# coluna e sem nada marcando qual é qual.
+#
+# O que importa, então, não é o fuso escolhido: é NÃO MISTURAR. E havia um lugar
+# onde se misturava — `_normalizar_data`, logo abaixo.
 def _agora() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _normalizar_data(bruto, padrao=""):
-    """ISO do central -> o formato que o painel usa em TODA a tabela `ordens`.
+    """Carimbo do central (UTC) -> a escala do painel (local, ingênua).
 
-    O central serializa DATETIME como `2026-09-09T14:30:12`; o painel ordena
-    `data_criacao` como texto e o KPI de SLA a compara com um `strftime`
-    `%Y-%m-%d %H:%M:%S`. Guardar o 'T' faria a ordem espelhada ordenar depois
-    de qualquer ordem local do mesmo dia e nunca estourar o SLA.
+    O 'T' já era tratado: o central serializa DATETIME como
+    `2026-09-09T14:30:12`, e guardar o 'T' faria a ordem espelhada ordenar
+    depois de qualquer ordem local do mesmo dia — texto, e 'T' > ' '.
+
+    **O que faltava era o FUSO.** O central carimba em UTC (`database._ts` e
+    `orchestrator._ts`), e o valor entrava direto numa coluna cujas outras
+    linhas são hora local. Numa bancada no Brasil, toda OS espelhada nascia três
+    horas no passado: ela ordenava antes de ordens locais mais velhas, e o KPI
+    de SLA lhe creditava três horas a mais de duração. Nada disso dá erro — dá
+    um relatório errado.
+
+    Sem offset explícito, o valor é tratado como UTC, porque é o que o central
+    manda. Com offset, ele manda. Valor irreconhecível cai no padrão, em vez de
+    levantar dentro do laço do espelho.
     """
-    texto = str(bruto or "").strip().replace("T", " ")[:19]
-    return texto or padrao or _agora()
+    texto = str(bruto or "").strip()
+    if not texto:
+        return padrao or _agora()
+
+    try:
+        momento = datetime.fromisoformat(texto.replace("Z", "+00:00"))
+    except ValueError:
+        # Formato que não é ISO: mantém o comportamento anterior (troca o 'T'
+        # e corta), porque um carimbo torto não pode parar a sincronização.
+        return texto.replace("T", " ")[:19] or padrao or _agora()
+
+    if momento.tzinfo is None:
+        momento = momento.replace(tzinfo=timezone.utc)
+    return momento.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _itens_do_central(detalhe: dict) -> list:
@@ -1959,10 +2463,17 @@ def _validar_pin_data(conn, pin: str) -> dict:
     if not pin:
         return {"ok": False}
     for op in conn.execute(
-        "SELECT nome, perfil, pin_hash FROM operadores WHERE ativo=1 ORDER BY id"
+        "SELECT nome, perfil, pin_hash, pin_provisorio FROM operadores "
+        "WHERE ativo=1 ORDER BY id"
     ).fetchall():
         if conferir_pin(op["pin_hash"], pin):
-            return {"ok": True, "nome": op["nome"], "perfil": op["perfil"]}
+            # `pin_provisorio` vai junto, e o display NÃO é bloqueado por ele:
+            # a troca acontece na web, onde há teclado. Bloquear aqui deixaria
+            # a bancada sem operador até alguém achar um computador — e o PIN
+            # de fábrica continua sendo o de fábrica nos dois lugares, então o
+            # que falta ao display é AVISAR, não impedir.
+            return {"ok": True, "nome": op["nome"], "perfil": op["perfil"],
+                    "pin_provisorio": bool(op["pin_provisorio"])}
     return {"ok": False}
 
 
@@ -2142,14 +2653,38 @@ def _sync_dispensers_data(conn, itens):
     manda no número é quem o mede. A estação de visão, para o dispenser sob a
     câmera; o computador central, para todo slot que ele espelha.
     """
+    # O corpo chega de fora (`PUT /api/dispensers/sync` e o `cmd` do display) e
+    # nada o conferia: `None` derruba o `for` com TypeError, um dicionário solto
+    # itera as CHAVES e `i.get` estoura, e um item sem `quantidade` chegava ao
+    # `UPDATE` com KeyError. Todos viram 500 na rota que ESCREVE estoque — e é
+    # a rota pela qual o display reporta o que contou.
+    #
+    # Item torto é IGNORADO, não recusa o lote inteiro: quem manda aqui é uma
+    # ponte serial, e derrubar dez slots bons por causa de um campo faltando num
+    # deles deixaria o estoque do display e o do painel divergindo, sem ninguém
+    # saber qual está certo.
+    if not isinstance(itens, list):
+        return False, "corpo deve ser uma lista de {slot, quantidade}"
+
+    def _inteiro(v):
+        # `bool` é subclasse de `int` em Python: `True` passaria por slot 1.
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    validos = [
+        {"slot": i["slot"], "quantidade": i["quantidade"]}
+        for i in itens
+        if isinstance(i, dict) and _inteiro(i.get("slot"))
+        and _inteiro(i.get("quantidade")) and i["quantidade"] >= 0
+    ]
+
     espelhados = _slots_espelhados()
-    recusados = [i.get("slot") for i in itens if i.get("slot") in espelhados]
+    recusados = [i["slot"] for i in validos if i["slot"] in espelhados]
     if recusados:
         return False, MSG_SLOT_CENTRAL
 
     mapa = _slot_para_id(conn)
-    for item in itens:
-        med_id = mapa.get(item.get("slot"))
+    for item in validos:
+        med_id = mapa.get(item["slot"])
         if med_id is None:
             continue
         row = conn.execute(
@@ -2183,15 +2718,19 @@ def _set_dispenser_med_data(conn, slot, nome):
 
 def lotes_proximos_vencimento(conn, dias=30):
     limite = (datetime.now() + timedelta(days=dias)).strftime("%Y-%m-%d")
-    hoje = datetime.now().strftime("%Y-%m-%d")
     return conn.execute(
+        # 'Vencido' entra JUNTO com 'Ativo', e não é detalhe: desde que a
+        # varredura passou a tirar o vencido de circulação, filtrar só por
+        # 'Ativo' faria o lote SUMIR desta lista no dia seguinte ao vencimento
+        # — exatamente quando ele mais precisa de alguém. O saldo já não conta
+        # no agregado; o que falta é a baixa, e ela é manual.
         """SELECT lotes.*, medicamentos.nome as medicamento_nome
            FROM lotes JOIN medicamentos ON medicamentos.id = lotes.medicamento_id
-           WHERE lotes.status='Ativo' AND lotes.quantidade>0
+           WHERE lotes.status IN (?, ?) AND lotes.quantidade>0
              AND lotes.validade IS NOT NULL AND lotes.validade != ''
              AND lotes.validade <= ?
            ORDER BY lotes.validade ASC""",
-        (limite,),
+        (LOTE_STATUS_DISPENSAVEL, LOTE_STATUS_VENCIDO, limite),
     ).fetchall()
 
 
@@ -2297,7 +2836,7 @@ def seed_demo_data():
     print("Seed: dados ficticios de demonstracao criados (lotes/ordens/historico/desvios)")
 
 
-seed_demo_data()
+# `seed_demo_data()` NAO roda aqui. Ver `preparar_banco`.
 
 
 app.jinja_env.globals.update(
@@ -2318,6 +2857,23 @@ def login():
     if request.method == "POST":
         nome = request.form.get("nome", "").strip()
         pin  = request.form.get("pin",  "").strip()
+
+        # O freio ANTES de tocar no banco: conferir hash custa ~300 ms de
+        # proposito (ver `gerar_pin_hash`), e esse custo e de quem defende, nao
+        # de quem tenta. Sem o freio aqui, cada tentativa ainda ocupava uma
+        # conexao e 300 ms de CPU do processo que e dono da porta serial.
+        origem = _login_origem(nome)
+        espera = login_bloqueado(origem)
+        if espera:
+            resposta = render_template(
+                "login.html",
+                erro=(f"Muitas tentativas. Aguarde {int(espera)} segundo(s) "
+                      f"antes de tentar de novo."),
+            )
+            # 429 com `Retry-After`: a tela diz a mesma coisa que o header, e o
+            # header e o que um cliente automatico entende.
+            return resposta, 429, {"Retry-After": str(int(espera) or 1)}
+
         conn = get_db()
         # Duas etapas porque o PIN virou hash: o SQL acha o operador pelo nome,
         # e a conferencia e do `check_password_hash`. Nao ha mais consulta que
@@ -2336,20 +2892,32 @@ def login():
             conn.commit()
         conn.close()
         if not op:
+            login_registrar_falha(origem)
             erro = "Nome ou PIN incorreto."
         elif op["perfil"] == "Operador":
+            # PIN CERTO: o freio some. A recusa aqui e de autorizacao, não de
+            # autenticação — punir por ela trancaria um operador legítimo que
+            # tentasse a tela errada.
+            login_limpar_falhas(origem)
             erro = "Perfil Operador não tem acesso ao sistema web. Use o display."
         else:
+            login_limpar_falhas(origem)
             session["op_id"]   = op["id"]
             session["op_nome"] = op["nome"]
             session["perfil"]  = op["perfil"]
-            next_url = request.args.get("next") or url_for("dashboard")
-            return redirect(next_url)
+            if op["pin_provisorio"]:
+                # O PIN com que esta pessoa acabou de entrar está escrito no
+                # repositório. Mandar para a troca é o único ponto do fluxo em
+                # que se tem certeza de que ela está na frente do teclado.
+                return redirect(url_for("trocar_pin"))
+            return redirect(destino_seguro(request.args.get("next"),
+                                           url_for("dashboard")))
     return render_template("login.html", erro=erro)
 
 
 @app.route("/trava/liberar", methods=["POST"])
 @login_required
+@csrf_protegido
 @requer("trava_liberar")
 def web_liberar_trava():
     """Libera a trava do Triple Check no central, em nome de quem está logado.
@@ -2378,6 +2946,99 @@ def web_liberar_trava():
         sincronizar_trava_central()
     flash(msg, "success" if ok else "danger")
     return redirect(url_for("dashboard"))
+
+
+# ── Troca de PIN provisório ──────────────────────────────────────────────────
+#
+# Rotas que o operador pode acessar COM o PIN provisório de pé. Sem a lista, o
+# guarda abaixo mandaria a própria tela de troca de volta para si mesma —
+# redirect infinito na primeira entrada de todo mundo.
+_LIVRES_COM_PIN_PROVISORIO = {"trocar_pin", "logout", "login", "static"}
+
+
+def _pin_provisorio_na_sessao() -> bool:
+    op_id = session.get("op_id")
+    if op_id is None:
+        return False
+    conn = get_db()
+    try:
+        linha = conn.execute(
+            "SELECT pin_provisorio FROM operadores WHERE id=?", (op_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return bool(linha and linha["pin_provisorio"])
+
+
+@app.before_request
+def _obrigar_troca_de_pin():
+    """Enquanto o PIN for o de fábrica, o painel só serve a tela de troca.
+
+    O redirect no login sozinho não bastaria: quem já tem sessão aberta (de
+    antes desta versão, ou porque digitou a URL direto) continuaria navegando
+    com o PIN publicado. A porta é uma só, e ela fica aqui.
+
+    A consulta é por requisição, e é de propósito: marcar a sessão no login
+    deixaria quem trocou o PIN preso na tela até deslogar, e quem foi RESETADO
+    por um admin continuaria solto até a sessão expirar. O custo é um SELECT
+    por id num SQLite local.
+    """
+    if request.endpoint in _LIVRES_COM_PIN_PROVISORIO or request.endpoint is None:
+        return None
+    if request.path.startswith("/api/"):
+        # O bloco `/api/*` autentica por token de máquina, não por sessão: o
+        # PIN de um operador não diz nada sobre ele.
+        return None
+    if "op_id" not in session:
+        return None
+    if _pin_provisorio_na_sessao():
+        return redirect(url_for("trocar_pin"))
+    return None
+
+
+@app.route("/trocar-pin", methods=["GET", "POST"])
+@login_required
+def trocar_pin():
+    erro = None
+    if request.method == "POST":
+        atual = request.form.get("pin_atual", "").strip()
+        novo = request.form.get("pin_novo", "").strip()
+        confirma = request.form.get("pin_confirma", "").strip()
+
+        conn = get_db()
+        try:
+            op = conn.execute(
+                "SELECT * FROM operadores WHERE id=? AND ativo=1",
+                (session["op_id"],),
+            ).fetchone()
+            if not op or not conferir_pin(op["pin_hash"], atual):
+                erro = "PIN atual incorreto."
+            elif not novo.isdigit() or len(novo) != 4:
+                erro = "O PIN novo precisa ter 4 dígitos."
+            elif novo != confirma:
+                erro = "A confirmação não bate com o PIN novo."
+            elif any(conferir_pin(op["pin_hash"], p) for p in [novo]):
+                # Trocar pelo mesmo PIN é não trocar — e sairia daqui com
+                # `pin_provisorio=0` sobre o valor publicado.
+                erro = "O PIN novo é igual ao atual."
+            elif novo in {p for _, p, _ in OPERADORES_DEFAULT}:
+                # O outro jeito de não trocar nada: sair do PIN de fábrica de
+                # um para o PIN de fábrica de outro.
+                erro = "Esse PIN é um dos PINs de fábrica. Escolha outro."
+            else:
+                conn.execute(
+                    "UPDATE operadores SET pin_hash=?, pin_provisorio=0 WHERE id=?",
+                    (gerar_pin_hash(novo), op["id"]),
+                )
+                registrar_historico(conn, op["nome"], op["perfil"],
+                                    "Troca de PIN", "PIN alterado pelo próprio operador")
+                conn.commit()
+                return redirect(url_for("dashboard"))
+        finally:
+            conn.close()
+
+    return render_template("trocar_pin.html", erro=erro,
+                           provisorio=_pin_provisorio_na_sessao())
 
 
 @app.route("/logout")
@@ -2524,10 +3185,16 @@ def nova_ordem():
         meds = request.form.getlist("med[]")
         qtds = request.form.getlist("qtd[]")
         itens = []
-        for m, q in zip(meds, qtds):
-            m = m.strip()
-            if m and q:
-                itens.append({"med": m, "qtd": int(q)})
+        # `strict=False` EXPLÍCITO, e o motivo é o oposto do dos outros `zip`
+        # deste repositório: os dois lados vêm de campos de formulário, e um
+        # POST montado à mão pode trazer contagens diferentes. `strict=True`
+        # levantaria `ValueError` no meio de uma rota web — 500 na cara do
+        # operador por um corpo torto. Ignorar o excedente é o que já
+        # acontecia; o `strict=` só torna a decisão visível.
+        for med_bruto, qtd in zip(meds, qtds, strict=False):
+            med = med_bruto.strip()
+            if med and qtd:
+                itens.append({"med": med, "qtd": int(qtd)})
         if not itens:
             numero_os = gerar_numero_os()
             return render_template(
@@ -2587,10 +3254,16 @@ def editar_ordem(id):
         meds = request.form.getlist("med[]")
         qtds = request.form.getlist("qtd[]")
         itens = []
-        for m, q in zip(meds, qtds):
-            m = m.strip()
-            if m and q:
-                itens.append({"med": m, "qtd": int(q)})
+        # `strict=False` EXPLÍCITO, e o motivo é o oposto do dos outros `zip`
+        # deste repositório: os dois lados vêm de campos de formulário, e um
+        # POST montado à mão pode trazer contagens diferentes. `strict=True`
+        # levantaria `ValueError` no meio de uma rota web — 500 na cara do
+        # operador por um corpo torto. Ignorar o excedente é o que já
+        # acontecia; o `strict=` só torna a decisão visível.
+        for med_bruto, qtd in zip(meds, qtds, strict=False):
+            med = med_bruto.strip()
+            if med and qtd:
+                itens.append({"med": med, "qtd": int(qtd)})
         conn.execute(
             """UPDATE ordens SET itens=?,
             destino=?, prioridade=?, status=?, data_atualizacao=?
@@ -2622,6 +3295,7 @@ def editar_ordem(id):
 
 @app.route("/ordens/<int:id>/excluir", methods=["POST"])
 @login_required
+@csrf_protegido
 @requer("ordens_excluir")
 def excluir_ordem(id):
     conn = get_db()
@@ -2822,6 +3496,7 @@ def _tem_historico(conn, medicamento_id):
 
 @app.route("/medicamentos/<int:id>/excluir", methods=["POST"])
 @login_required
+@csrf_protegido
 @requer("dispensers_editar")
 def excluir_medicamento(id):
     """Retira o medicamento do catalogo. DELETE so quando nao ha o que perder.
@@ -2884,72 +3559,6 @@ def reativar_medicamento(id):
     finally:
         conn.close()
     return redirect(url_for("listar_medicamentos"))
-
-
-# ============================================================
-# Lotes — rastreabilidade de estoque (lote + validade, FEFO)
-# ============================================================
-#
-# ── A invariante: `medicamentos.quantidade` conta saldo DISPENSÁVEL ──────────
-#
-# Lote bloqueado NÃO entra nesse número. Sem a regra escrita, bloquear um lote
-# mexia só em `lotes.status` e o agregado seguia contando o saldo bloqueado —
-# `verificar_estoque_ordem` liberava a ordem, `consumir_fefo` não achava lote
-# 'Ativo' para abater, caía no ramo do resíduo e gravava "SEM LOTE REGISTRADO"
-# debitando o agregado assim mesmo. Ou seja: o medicamento saía, sem
-# genealogia, exatamente do lote que a tela dizia ter bloqueado.
-#
-# ── Por que não derivar `quantidade` de SUM(lotes WHERE status='Ativo') ──────
-#
-# Seria a forma de ter UM número só, e é o que este repositório faz em toda
-# parte (ver CLAUDE.md, "A cópia do mapa no cnc_simulator não existe mais").
-# Aqui ela não cabe, por duas razões concretas:
-#
-# 1. `medicamentos.quantidade` não é uma soma de lotes — é um número MEDIDO.
-#    A estação de visão o reescreve (`_aplicar_visao_*`), o espelho do central
-#    o reescreve (`_sync_dispensers_data`), a troca de medicamento do slot o
-#    reescreve, e o cadastro permite corrigi-lo à mão. Nenhum desses caminhos
-#    tem lote para escrever: derivar obrigaria cada um a inventar uma linha em
-#    `lotes` — dado de rastreabilidade fabricado — ou a ter sua medição
-#    silenciosamente descartada na leitura seguinte.
-# 2. Estoque sem lote cadastrado existe e é legítimo (é o que o ramo
-#    "SEM LOTE REGISTRADO" de `consumir_fefo` cobre). Derivado, todo
-#    medicamento sem lote leria zero e `verificar_estoque_ordem` recusaria
-#    toda ordem numa bancada fisicamente cheia.
-#
-# Então os dois números coexistem — e o que criou o bug não foi a coexistência,
-# foi ela não ter invariante declarada nem um dono. O dono é
-# `_mover_saldo_lote`: TODA transição que muda a dispensabilidade de um lote
-# passa por ela, e ela move os dois números na mesma transação. Quem
-# acrescentar um status novo de lote acrescenta aqui, não em mais uma rota.
-
-# Status de lote cujo saldo CONTA no agregado do medicamento. 'Esgotado' fica
-# de fora por ter quantidade 0 — incluí-lo não mudaria soma nenhuma, mas
-# esconderia que a lista é sobre dispensabilidade, não sobre histórico.
-LOTE_STATUS_DISPENSAVEL = "Ativo"
-
-
-def _mover_saldo_lote(conn, lote_row, dispensavel: bool) -> None:
-    """Põe (ou tira) o saldo de um lote no agregado do medicamento.
-
-    `dispensavel=True` devolve o saldo ao agregado (desbloqueio),
-    `False` o remove (bloqueio). Chamar com o lote JÁ no estado pedido é
-    proibido pelos chamadores, e não por acaso: esta função soma e subtrai, não
-    reconcilia — invocá-la duas vezes no mesmo sentido duplicaria o saldo.
-    """
-    saldo = lote_row["quantidade"] or 0
-    if saldo <= 0:
-        return
-    if dispensavel:
-        conn.execute(
-            "UPDATE medicamentos SET quantidade = quantidade + ? WHERE id=?",
-            (saldo, lote_row["medicamento_id"]),
-        )
-    else:
-        conn.execute(
-            "UPDATE medicamentos SET quantidade = MAX(0, quantidade - ?) WHERE id=?",
-            (saldo, lote_row["medicamento_id"]),
-        )
 
 
 def _registrar_entrada_lote(conn, medicamento_id, lote, validade, quantidade, fornecedor, nota_fiscal,
@@ -3631,14 +4240,19 @@ def api_resumo():
 @app.route("/api/dispensers/sync", methods=["PUT"])
 @api_token_required
 def api_sync_dispensers():
-    data = request.get_json()
+    # `silent=True`: sem ele, corpo que não é JSON vira 400 do Werkzeug com uma
+    # pagina HTML — numa rota que so fala JSON e cujo cliente e um processo.
+    data = request.get_json(silent=True)
     conn = get_db()
     try:
         ok, erro = _sync_dispensers_data(conn, data)
     finally:
         conn.close()
     if not ok:
-        return jsonify({"ok": False, "erro": erro}), 409
+        # 409 continua para a recusa de SLOT ESPELHADO (conflito de dono);
+        # corpo malformado e 400, que e quem errou.
+        codigo = 409 if erro == MSG_SLOT_CENTRAL else 400
+        return jsonify({"ok": False, "erro": erro}), codigo
     return jsonify({"ok": True})
 
 
@@ -3943,6 +4557,7 @@ def admin_historico():
 
 @app.route("/admin/historico/limpar", methods=["POST"])
 @login_required
+@csrf_protegido
 @requer("historico_limpar")
 def admin_limpar_historico():
     conn = get_db()

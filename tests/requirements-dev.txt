@@ -4,6 +4,14 @@
 pytest==9.1.1
 pyflakes==3.4.0
 
+# O `ruff` não é rodado pela suíte — ele é a varredura que se passa à mão antes
+# de commitar. Fica aqui porque os achados dele já viraram correção uma vez
+# (`zip()` sem `strict=`, `global` sem atribuição, closure que não liga a
+# variável do laço), e sem a versão fixada a próxima passada acusa um conjunto
+# diferente por causa da versão instalada, não do código.
+#   python -m ruff check --select B905,B007,PLW2901,F841,F401,F541,PLW0602,B023 .
+ruff==0.16.8
+
 # Os simuladores importam fastapi/pydantic no topo do módulo; o conftest só
 # substitui `requests`, então estas duas precisam existir de verdade no venv.
 fastapi==0.111.0

@@ -145,6 +145,29 @@ class _Espera:
         self.resposta: Optional[dict] = None
 
 
+# ── A sessão deste processo ──────────────────────────────────────────────────
+#
+# O `cmd_id` é monotônico DENTRO de uma sessão do adapter: `_proximo_id` nasce
+# em 0 a cada `LinkSerial` novo. A placa guarda o último executado e ignora id
+# menor ou igual — que é o certo contra reenvio, e errado contra RESTART.
+#
+# Um restart de 2 a 5 s do processo (o `.bat` da bancada reinicia sozinho) fazia
+# o contador nascer em 1 com a placa ainda em `ultimoCmdId = 47`: todo comando
+# até 47 recebia `ackOk(repetido)` SEM EXECUTAR. Com o ciclo por relógio o
+# sintoma deixou de ser só timeout — o central segue o cronograma e dispara o
+# `dispensar` de um `mover` que a mesa nunca fez.
+#
+# Havia uma heurística do lado da placa (silêncio de vários pings = adapter
+# fora), e ela continua lá como rede de segurança. Ela não cobre o restart
+# RÁPIDO: 2 s de queda não chegam perto dos 10 s de silêncio que ela exige.
+#
+# `sessao` é o epoch de boot DESTE processo, e viaja no pong e em todo comando.
+# A placa compara com a que tem guardada: mudou, zera `ultimoCmdId`. É um
+# inteiro que já existe (não há relógio novo a manter), e a comparação é de
+# DIFERENÇA, não de ordem — relógio que anda para trás não quebra a regra.
+SESSAO = int(time.time())
+
+
 class LinkSerial:
     """Dono ÚNICO de uma porta serial.
 
@@ -195,6 +218,7 @@ class LinkSerial:
         self._linhas_truncadas = 0
         self._eventos_descartados = 0
         self._sub_divergente_avisado = False
+        self._porta_fixa_avisada = False
         self._ultima_periodica: dict[tuple, str] = {}
 
     # ── Ciclo de vida ─────────────────────────────────────────────────────────
@@ -284,7 +308,10 @@ class LinkSerial:
 
         prazo = self.ack_timeout_s if ack_timeout_s is None else float(ack_timeout_s)
         try:
-            self._escrever({"cmd": nome, "cmd_id": cmd_id, **campos})
+            # `sessao` em TODO comando, e não só no pong: é ela que diz à
+            # placa que o contador começou de novo. Ver `SESSAO`.
+            self._escrever({"cmd": nome, "cmd_id": cmd_id,
+                            "sessao": SESSAO, **campos})
             if not espera.evento.wait(prazo):
                 raise SemAck(
                     f"{self.subsistema}: placa não confirmou '{nome}' "
@@ -443,7 +470,8 @@ class LinkSerial:
             )
         self._ultimo_ping_placa = time.time()
         try:
-            self._escrever({"resp": "pong", "epoch": int(time.time())})
+            self._escrever({"resp": "pong", "epoch": int(time.time()),
+                            "sessao": SESSAO})
         except ErroLink as exc:
             logger.warning("[%s] pong não saiu: %s", self.subsistema, exc)
 
@@ -510,13 +538,42 @@ class LinkSerial:
         responde pong.
         """
         if self.url:
-            return self._abrir(self.url)
+            conn = self._abrir(self.url)
+            if conn is None:
+                self._avisar_porta_fixa_fechada()
+            return conn
 
         for porta in _portas_disponiveis():
             conn = self._sondar(porta)
             if conn is not None:
                 return conn
         return None
+
+    def _avisar_porta_fixa_fechada(self) -> None:
+        """URL configurada e porta que não abre é erro de CONFIGURAÇÃO.
+
+        Sem isto o processo sobe, anuncia "startup complete" e fica em laço de
+        reconexão sem dizer nada — a falha de `_abrir` é `debug`, e os adapters
+        rodam em INFO. Quem está na bancada vê um terminal parado e não tem como
+        saber se o problema é a COM, o cabo ou o firmware.
+
+        O `debug` de `_abrir` continua: na varredura ele é chamado em toda porta
+        candidata e falha na maioria: subir o nível lá seria ruído.
+
+        Uma linha por TRANSIÇÃO, não por tentativa — o laço tenta para sempre.
+        """
+        if self._porta_fixa_avisada:
+            return
+        self._porta_fixa_avisada = True
+        logger.warning(
+            "[%s] a porta %s NÃO abriu, e com %s_SERIAL_URL preenchida não há "
+            "varredura para cair. Confira, nesta ordem: (1) o número da COM no "
+            "Gerenciador de Dispositivos; (2) a placa plugada num cabo de DADOS; "
+            "(3) nenhum outro processo com a porta — no Windows ela é exclusiva, "
+            "e o Monitor Serial da Arduino IDE é o suspeito nº 1. Tentando de "
+            "novo a cada %.0fs.",
+            self.subsistema, self.url, self.subsistema.upper(), self._reconexao_s,
+        )
 
     def _abrir(self, url: str):
         """`serial_for_url` aceita `/dev/ttyUSB0`, `COM4`, `socket://h:p`,
@@ -575,7 +632,8 @@ class LinkSerial:
                     if (mensagem and mensagem.get("cmd") == "ping"
                             and mensagem.get("sub") == self.subsistema):
                         conn.write(
-                            (json.dumps({"resp": "pong", "epoch": int(time.time())})
+                            (json.dumps({"resp": "pong", "epoch": int(time.time()),
+                                         "sessao": SESSAO})
                              + "\n").encode("utf-8")
                         )
                         conn.flush()
@@ -594,6 +652,7 @@ class LinkSerial:
         self._url_aberta = str(getattr(conn, "port", "") or self.url)
         self._conectado_desde = time.time()
         self._sub_divergente_avisado = False
+        self._porta_fixa_avisada = False
         del self._buffer[:]
         self._descartando = False
         # O log tem que dizer QUAL porta este processo tomou: com três adapters
@@ -647,6 +706,16 @@ def _portas_disponiveis() -> list[str]:
 
 
 def _iso(momento: Optional[float]) -> Optional[str]:
+    """Instante em UTC, com o `Z` dizendo isso.
+
+    Era hora LOCAL, e o resto do sistema carimba UTC (`orchestrator._ts`,
+    `database._ts`). Os dois campos que passam por aqui — `conectado_desde` e
+    `ultimo_ping_placa` — saem no `/health` do adapter, que é o endpoint que se
+    abre ao lado do log do central para descobrir quando a porta caiu. Duas
+    escalas de tempo na mesma tela, sem sufixo dizendo qual é qual, fazem essa
+    comparação dar um número errado de horas — e no Brasil o erro é de três,
+    que é tempo demais para parecer engano.
+    """
     if momento is None:
         return None
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(momento))
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(momento))

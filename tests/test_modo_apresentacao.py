@@ -364,6 +364,15 @@ def test_timeouts_do_orquestrador_acompanham_o_fator(fator, esperado):
     assert cfg.settings.TIMEOUT_VISAO_MESA      == pytest.approx(30 * esperado)
     assert cfg.settings.TIMEOUT_PESO            == pytest.approx(15 * esperado)
     assert cfg.settings.TIMEOUT_LIMPEZA         == pytest.approx(60 * esperado)
+    # O CRONOGRAMA do ciclo da mesa escala junto, e por uma razão mais direta
+    # que a dos timeouts: ele não é teto de espera, é o relógio que decide
+    # QUANDO o `dispensar` sai. Desacelerar a célula sem desacelerá-lo faria o
+    # comando sair com a mesa ainda em trânsito — comprimido no chão, que é a
+    # única forma de o modo apresentação estragar esta feature.
+    assert cfg.settings.CNC_TETO_TRAJETO_S      == pytest.approx(2.5 * esperado)
+    assert cfg.settings.CNC_MARGEM_CHEGADA_S    == pytest.approx(0.75 * esperado)
+    assert cfg.settings.DISPENSA_S_POR_UNIDADE  == pytest.approx(1.0 * esperado)
+    assert cfg.settings.DISPENSA_FOLGA_S        == pytest.approx(1.0 * esperado)
     # O fator publicado é o cru — quem só aumenta é a folga do timeout.
     assert cfg.settings.FATOR_VELOCIDADE == pytest.approx(float(fator))
 

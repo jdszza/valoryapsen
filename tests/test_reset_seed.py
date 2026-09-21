@@ -28,7 +28,7 @@ import pytest
 RAIZ_REPO = Path(__file__).resolve().parent.parent
 CENTRAL_DIR = RAIZ_REPO / "central-computer"
 
-from conftest import NUM_SLOTS  # noqa: E402
+from conftest import NUM_SLOTS, TEMPLATE_PADRAO  # noqa: E402
 
 
 def _item(med: str, qtd: int = 10) -> dict:
@@ -37,7 +37,12 @@ def _item(med: str, qtd: int = 10) -> dict:
 
 
 def _payload_os(os_id: str, *itens) -> dict:
+    # `template_id` é o que diz QUAL das dez ordens padrão esta é, e é dele que
+    # o orquestrador tira a letra da receita gravada na mesa. Sem ele a OS é
+    # legitimamente abortada com `receita_nao_mapeada` antes do primeiro mover
+    # — o caso tem teste próprio; aqui a OS é uma ordem padrão de verdade.
     return {"os_id": os_id, "descricao": "teste",
+            "template_id": TEMPLATE_PADRAO,
             "medicamentos": list(itens) or [_item("Dipirona")]}
 
 
@@ -368,7 +373,7 @@ def test_quantidades_batem_com_os_templates(seed, os_templates):
         template = por_descricao[ordem["descricao"]]
         itens = sorted(itens_por_os[ordem["os_id"]], key=lambda i: i["dispenser_id"])
         assert len(itens) == len(template["itens"])
-        for item, modelo in zip(itens, template["itens"]):
+        for item, modelo in zip(itens, template["itens"], strict=True):
             assert item["medicamento"] == modelo["medicamento"]
             assert item["quantidade_alvo"] == modelo["quantidade"]
 
@@ -499,7 +504,10 @@ def test_serie_de_sensor_tem_forma(seed):
     amplitude = max(valores) - min(valores)
     assert amplitude > 3.0, "série chapada — não desenha nada"
 
-    saltos = [abs(b - a) for a, b in zip(valores, valores[1:])]
+    # `strict=False`: pares VIZINHOS, e o último valor não tem par —
+    # a truncagem aqui é a forma, não um descuido.
+    saltos = [abs(b - a)
+              for a, b in zip(valores, valores[1:], strict=False)]
     salto_medio = sum(saltos) / len(saltos)
     assert salto_medio < amplitude / 4, "ruído domina — a forma some no chuvisco"
 
@@ -599,3 +607,94 @@ def test_limpeza_de_historico_nao_toca_em_catalogo_nem_usuarios():
                        "alarmes", "dispensas", "os_itens", "ordens"}
     assert not tabelas & {"medicamentos", "usuarios", "log_manutencao",
                           "dispenser_estado"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A janela entre a checagem e o reset
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `resetar_planta` recusa com OS em execução, e recusar é a decisão central
+# dela. Mas entre a LEITURA de `_estado["os_ativa"]` e o primeiro `cmd_limpar`
+# há `await`s, e o `loop_orquestrador` roda no mesmo event loop: uma OS que
+# estivesse esperando na fila podia começar exatamente aí, e o reset mandaria
+# `cmd_limpar` para slots que ela acabou de carregar — 409
+# `limpeza_em_operacao`, e um reset pela metade.
+
+def test_o_loop_nao_comeca_os_com_reset_em_curso(carregar_orquestrador):
+    """A OS tirada da fila durante o reset fecha em `cancelada`, como as que
+    estavam na fila — o desfecho é o mesmo, venha ela de antes ou de durante."""
+    orq = carregar_orquestrador()
+    orq.modulo._reset_em_curso = True
+    processadas = []
+
+    async def _nao_deveria(payload):
+        processadas.append(payload["os_id"])
+
+    async def _uma_volta():
+        import asyncio as _a
+        orq.modulo._os_queue.put_nowait({"os_id": "OS-DURANTE", "medicamentos": []})
+        tarefa = _a.create_task(orq.modulo.loop_orquestrador())
+        await _a.sleep(0)
+        await _a.sleep(0)
+        tarefa.cancel()
+
+    orq.modulo._processar_os = _nao_deveria
+    asyncio.run(_uma_volta())
+
+    assert processadas == []
+    canceladas = orq.banco.chamadas_de("cancelar_ordens_pendentes")
+    assert canceladas and canceladas[0]["args"][0] == ["OS-DURANTE"]
+
+
+def test_o_flag_cai_mesmo_quando_o_reset_e_recusado(carregar_orquestrador):
+    """Flag preso de pé calaria o orquestrador para sempre: toda OS seguinte
+    seria cancelada por um reset que não aconteceu."""
+    orq = carregar_orquestrador()
+    orq.estado["os_ativa"] = {"os_id": "OS-VIVA"}
+
+    with pytest.raises(orq.modulo.ResetRecusado):
+        asyncio.run(orq.modulo.resetar_planta())
+
+    assert orq.modulo._reset_em_curso is False
+
+
+def test_o_flag_cai_depois_de_um_reset_normal(carregar_orquestrador):
+    orq = carregar_orquestrador()
+
+    asyncio.run(orq.modulo.resetar_planta())
+
+    assert orq.modulo._reset_em_curso is False
+
+
+def test_o_reset_arma_o_cancelamento_do_cronograma(carregar_orquestrador):
+    """O docstring de `_cancelar_cronograma` sempre disse que ele é armado pela
+    trava do Triple Check **e pelo reset da planta**. Era a única parte dele que
+    não era verdade."""
+    orq = carregar_orquestrador()
+    orq.modulo._cancelar_cronograma = asyncio.Event()
+
+    asyncio.run(orq.modulo.resetar_planta())
+
+    assert orq.modulo._cancelar_cronograma.is_set()
+
+
+def test_o_loop_continua_processando_sem_reset(carregar_orquestrador):
+    """Controle: sem o flag, a OS da fila é processada como sempre."""
+    orq = carregar_orquestrador()
+    processadas = []
+
+    async def _registrar(payload):
+        processadas.append(payload["os_id"])
+
+    async def _uma_volta():
+        import asyncio as _a
+        orq.modulo._os_queue.put_nowait({"os_id": "OS-NORMAL", "medicamentos": []})
+        tarefa = _a.create_task(orq.modulo.loop_orquestrador())
+        await _a.sleep(0)
+        await _a.sleep(0)
+        tarefa.cancel()
+
+    orq.modulo._processar_os = _registrar
+    asyncio.run(_uma_volta())
+
+    assert processadas == ["OS-NORMAL"]

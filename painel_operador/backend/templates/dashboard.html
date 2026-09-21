@@ -35,6 +35,7 @@
         {% else %}
         <form method="post" action="{{ url_for('web_liberar_trava') }}" class="align-self-center"
               onsubmit="return confirm('Liberar a trava e retomar a OS? Confira fisicamente o slot antes de prosseguir.');">
+            {{ campo_csrf() }}
             <button type="submit" class="btn btn-warning fw-semibold" id="btn-liberar-trava">
                 <i class="bi bi-unlock me-1"></i>Liberar trava
             </button>

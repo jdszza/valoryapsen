@@ -68,6 +68,28 @@ Supervisor, telas TFT e portas fixas:
 | 6 | O central avisa a célula que travou (`/comandos/estado-celula`, uma vez, timeout curto) | ✅ feito |
 | 7 | Portas fixas no mini PC Windows: `APSEN_DISPLAY_PORTA`, profile `simulado`, `docs/DEPLOY_WINDOWS.md` | ✅ feito |
 
+Firmware dos dispensers (frente de [`TASKS_DISPENSER.md`](TASKS_DISPENSER.md)):
+
+| # | Task | Estado |
+|---|------|--------|
+| 1 | Higiene do `servos_hub`: 8 slots, índices fechados, pinos do I²C numa fonte só | ✅ feito |
+| 2 | A segunda voz: JSON na mesma porta, sem tocar no terminal `MANUT` | ✅ feito |
+| 3 | `carregar`, `dispensar`, `limpar` e a contagem por IR (uma unidade por ciclo) | ✅ feito |
+| 4 | `status` na transição e periódico; `telemetria` do que a placa REALMENTE mede | ✅ feito |
+| 5 | A placa das 8 telas TFT (`dispenser/telas_tft/`) | ✅ feito (falta **escolher o painel**) |
+| 6 | `dispenser/README.md` e as docs que passaram a mentir | ✅ feito |
+| 7 | `dispenser/PRIMEIRO_ENSAIO.md` | ✅ feito |
+
+> **O que sobrou é bancada, e nenhuma dessas se decide no editor**: calibrar os
+> oito servos e colar o `EXPORT` no `CAL_BACKUP`; medir o prazo por unidade e
+> ajustar `DISPENSA_TIMEOUT_UNIDADE_MS`; conferir os pinos do I²C do PCA9685
+> (o esquemático e o código discordam, e quem decide é o multímetro); escolher
+> modelo e ligação dos 8 TFTs — até lá o `TELA_DRIVER` é o de log, que compila
+> sem biblioteca nenhuma e mostra no Monitor Serial o que cada tela mostraria.
+> A lista completa está no fim do [dispenser/README.md](dispenser/README.md).
+> A **mesa CNC** continua sem firmware — é a frente de
+> [`TASKS_CNC.md`](TASKS_CNC.md).
+
 > **Trava do Triple Check no display** saiu de "Decisões adiadas de propósito":
 > a decisão de operação foi tomada — o supervisor libera pelo painel de
 > bancada, autenticado por PIN, na web e no display. O display em campo precisa
@@ -306,6 +328,27 @@ O que sobrou de pendência real está registrado abaixo e no README:
 - **Os itens de higiene do P2**, listados na seção "Itens de higiene" acima.
 
 ---
+
+# Rodada: a mesa CNC por RELÓGIO
+
+`TASKS_CNC_TIMER.md`, tasks 1 a 9. O ciclo `mover` → `dispensar` deixou de ser
+handshake: o central calcula o cronograma e dispara na hora marcada, e o evento
+da placa passou a REGISTRAR (a posição medida, a contagem) e, no máximo,
+CANCELAR. O firmware da mesa ganhou a voz de máquina, o endereçamento por
+dispensador e a trava do Triple Check.
+
+O que ficou de bancada está no fim de [`cnc/README.md`](cnc/README.md), e o
+resumo é: **os três números do cronograma são estimativas do sketch, não
+medidas da máquina.** `CNC_TETO_TRAJETO_S` (2,5 s) sai da conta do pior trajeto
+assumindo `FEED = 750`; `CNC_MARGEM_CHEGADA_S` (0,75 s) é palpite de serial +
+ACK + salto de thread; `DISPENSA_S_POR_UNIDADE` (1 s) vem do dwell gravado nas
+receitas. O terceiro é o que mais dói errado: se o servo real for mais lento,
+o central corta a dispensa no meio e a OS termina "completa" com menos
+comprimido no leito.
+
+Falta também gravar as dez receitas — o caminho do central não passa por elas
+(ele endereça por `dispenser_alvo`), mas o `EXEC` de bancada e a demonstração
+presencial passam.
 
 # Decisões adiadas de propósito
 

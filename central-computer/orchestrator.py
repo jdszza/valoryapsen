@@ -28,6 +28,7 @@ from typing import NamedTuple, Optional
 import httpx
 
 import injecao
+import os_templates
 from config import settings
 from database import (
     atribuir_dispenser_item,
@@ -49,9 +50,24 @@ logger = logging.getLogger(__name__)
 #        D5      D6      D7      D8          ← fileira direita  (y = +150)
 #        x=0    x=120   x=240   x=360
 #
-# Estes quatro números são a ÚNICA fonte do mapa: `POSICOES` é derivada deles, e
-# o cnc-simulator não tem cópia nenhuma (recebe x/y em cada comando). Mudar o
-# passo, o afastamento ou o nº de slots não exige tocar em mais nada.
+# `POSICOES` é o MODELO LÓGICO da célula, e deixou de ser o mapa que a mesa
+# obedece. Ela serve para exatamente duas coisas:
+#
+#   1. ORDENAR A ROTA (`planejar_rota`, `distancia_rota`). Para isso basta a
+#      geometria RELATIVA — quem está de que lado, quem é vizinho de quem —, e
+#      essa continua correta: a serpentina é ótima pelo formato do arranjo, não
+#      pelos milímetros.
+#   2. PREENCHER O HISTÓRICO quando a máquina não informa a posição, e só aí
+#      (ver o passo 4c de `_processar_os`).
+#
+# O que mudou: a mesa agora executa um roteiro MEDIDO nela, gravado waypoint a
+# waypoint na bancada e indexado pelo dispenser. Mandar coordenadas para ela
+# seria mandar um número que ela ignora — e número ignorado que continua sendo
+# gravado no banco é pior que nenhum, porque ninguém descobre que ele não
+# descreve a máquina. Em troca, a placa REPORTA a posição medida no evento
+# `posicionado`, e é dela que saem a câmera da mesa e o `cnc_eventos`.
+#
+# O desenho acima fica: é ele que explica por que a serpentina é a rota certa.
 NUM_SLOTS         = settings.NUM_SLOTS         # total, somando as duas fileiras
 SLOTS_POR_FILEIRA = NUM_SLOTS // 2             # NUM_SLOTS é par (ver config)
 PASSO_X_MM        = 120.0                      # distância entre slots vizinhos
@@ -106,6 +122,36 @@ _trava_evento: Optional[asyncio.Event] = None   # set() para liberar a trava
 _trava_motivo: str = ""
 _trava_slot_id: Optional[int] = None
 _trava_os_id: Optional[str] = None
+
+# ── Cancelamento do cronograma ────────────────────────────────────────────────
+# Um Event por OS, criado no início de `_processar_os`. Enquanto o ciclo da mesa
+# corre por RELÓGIO, este é o único jeito de interromper um prazo EM CURSO: sem
+# ele, um cancelamento só teria efeito no ciclo seguinte, e "o ciclo seguinte"
+# pode ser um `dispensar` que já saiu.
+#
+# Ele é ARMADO por quem precisa parar a OS agora (a trava do Triple Check, o
+# reset da planta) e LIMPO por quem a retoma. Esquecer de limpar é o modo de
+# falhar desta peça: todo prazo posterior venceria na hora, a OS terminaria em
+# silêncio no meio da rota, e nada no log diria por quê — por isso a limpeza
+# mora no mesmo bloco que espera a liberação, e não num chamador distante.
+_cancelar_cronograma: Optional[asyncio.Event] = None
+
+# ── A janela entre a checagem do reset e o reset ──────────────────────────────
+#
+# `resetar_planta` recusa com OS em execução, e a decisão de recusar é a peça
+# central dela. Mas entre a LEITURA de `_estado["os_ativa"]` e o primeiro
+# `cmd_limpar` há `await`s — e o `loop_orquestrador` roda no mesmo event loop.
+# Uma OS que estivesse esperando na fila podia começar exatamente aí, e o reset
+# então mandaria `cmd_limpar` para slots que ela acabou de carregar: 409
+# `limpeza_em_operacao` e um reset pela metade, que é o estado mais difícil de
+# diagnosticar que esta planta produz.
+#
+# O flag fecha a janela pelo outro lado: enquanto ele está de pé, o loop NÃO
+# começa OS nenhuma — ele fecha em `cancelada` o que tirou da fila e volta a
+# esperar. Uma OS cancelada por um reset é exatamente o que o reset já faz com
+# a fila inteira (`cancelar_ordens_pendentes`), então o desfecho é o mesmo,
+# venha ela de antes ou de durante.
+_reset_em_curso: bool = False
 
 
 def _ts() -> str:
@@ -192,6 +238,16 @@ async def _ativar_trava(os_id: str, slot_id: Optional[int], motivo: str,
     _trava_slot_id = slot_id
     _trava_os_id   = os_id
     _trava_evento  = asyncio.Event()
+
+    # E o cronograma morre AQUI, antes de qualquer aviso a qualquer placa.
+    #
+    # A ordem é a feature. Avisar a mesa custa uma requisição com
+    # TIMEOUT_AVISO_TELAS_S (3 s) de teto, e 3 s é tempo de sobra para o relógio
+    # disparar mais um `dispensar` — o comando sairia DEPOIS de a trava existir,
+    # com a mesa já indo para o HOME, e o medicamento cairia no caminho.
+    # Cancelar primeiro custa uma linha e fecha essa janela inteira.
+    cancelar_cronograma()
+
     logger.error(
         "[TRAVA] ⛔ TRAVA ATIVADA — OS=%s slot=%s motivo=%s",
         os_id, slot_id, motivo,
@@ -231,6 +287,203 @@ def registrar_evento(chave: str) -> asyncio.Event:
     evt = asyncio.Event()
     _pending_events[chave] = evt
     return evt
+
+
+def espiar_evento(chave: str) -> Optional[dict]:
+    """Lê o evento que já chegou, SEM esperar e SEM cancelar o registro.
+
+    Por que não `aguardar_evento(chave, 0)`, que seria o caminho óbvio: ele
+    desregistra a chave no `finally`. Uma espiada que não achasse nada apagaria
+    o registro, e o evento que chegasse 200 ms depois seria DESCARTADO por
+    `notificar_evento` — que ignora chave sem ninguém esperando. No modelo por
+    relógio isso é o modo de falhar mais provável, porque a espiada acontece
+    justamente enquanto o evento ainda está a caminho: o `posicionado` que
+    atravessa o adapter enquanto o `dispensar` já saiu tem de continuar
+    chegando, e é ele que carrega a posição MEDIDA para a câmera da mesa.
+
+    O segundo motivo é menor e vale registrar: `wait_for(..., timeout=0)` é um
+    `await` que cede ao loop para produzir um `None` que já se sabe.
+    """
+    return _pending_data.get(chave)
+
+
+def colher_evento(chave: str) -> Optional[dict]:
+    """Lê e ENCERRA o registro — no fim do ciclo, quando não se espera mais nada.
+
+    O par de `espiar_evento`: espiar durante o ciclo não desregistra, colher no
+    fim desregistra. Sem a colheita, `_pending_events` cresceria uma entrada por
+    slot por OS e `_limpar_eventos_os` teria de varrer o que este ciclo deixou.
+    """
+    dados = _pending_data.pop(chave, None)
+    _pending_events.pop(chave, None)
+    return dados
+
+
+def cronograma_do_ciclo(quantidade: int) -> tuple[float, float]:
+    """(espera até o `dispensar`, duração da dispensa), em segundos.
+
+    O ciclo da mesa não espera confirmação: o central calcula quando cada peça
+    acontece e dispara no relógio. Esta função é esse cálculo, e é PURA de
+    propósito — dá para conferir o cronograma de uma OS inteira sem subir nada.
+
+        espera   = CNC_TETO_TRAJETO_S + CNC_MARGEM_CHEGADA_S
+        dispensa = quantidade × DISPENSA_S_POR_UNIDADE + DISPENSA_FOLGA_S
+
+    A segunda conta é a MESMA que o `WP()` do firmware usa para gravar o dwell
+    das receitas — `(quantidade + 1) × 1000 ms`, com 1 s por unidade. As duas
+    descrevem o mesmo mecanismo físico (um ciclo de servo por comprimido) visto
+    de dois lugares, e **têm de ser mudadas juntas**: se o servo real for mais
+    lento e só o firmware for ajustado, o central segue cortando a dispensa no
+    meio — a OS termina "completa" com menos comprimido do que o leito precisa,
+    que é o pior desfecho possível desta feature.
+
+    `quantidade` menor que zero é tratada como zero: a folga sozinha ainda é um
+    prazo válido, e um cronograma negativo faria o `dispensar` e a colheita
+    saírem no mesmo instante.
+    """
+    espera = settings.CNC_TETO_TRAJETO_S + settings.CNC_MARGEM_CHEGADA_S
+    dispensa = max(0, quantidade) * settings.DISPENSA_S_POR_UNIDADE + settings.DISPENSA_FOLGA_S
+    return espera, dispensa
+
+
+async def _dormir_ou_cancelar(segundos: float, cancelar: asyncio.Event) -> bool:
+    """Cumpre o prazo, ou acorda antes se `cancelar` for disparado.
+
+    Devolve True quando o prazo foi cumprido (o caminho normal) e False quando
+    foi cancelado.
+
+    **`asyncio.wait` e não `wait_for`, e o motivo é o sinal invertido.** Com
+    `wait_for(cancelar.wait(), timeout=segundos)`, o caminho NORMAL — o prazo
+    vencendo sem cancelamento nenhum — é o que levanta `TimeoutError`. Além de
+    pagar a construção de uma exceção a cada perna de cada ciclo, isso põe o
+    caso esperado no ramo `except`: qualquer `try/except asyncio.TimeoutError`
+    acrescentado em volta um dia engoliria o caminho feliz sem que nada
+    parecesse errado. `asyncio.wait` diz o que aconteceu pelo RETORNO — o
+    conjunto `feitos` vem vazio quando o prazo venceu —, e o cancelamento, que é
+    a exceção de verdade, fica sendo a exceção também na leitura do código.
+    """
+    espera = asyncio.ensure_future(cancelar.wait())
+    try:
+        feitos, _ = await asyncio.wait({espera}, timeout=segundos)
+    finally:
+        if not espera.done():
+            espera.cancel()
+            # Aguardar a task cancelada evita o "Task was destroyed but it is
+            # pending" que apareceria no log do central a cada ciclo.
+            try:
+                await espera
+            except asyncio.CancelledError:
+                pass
+    return not feitos
+
+
+# Os quatro desfechos de um ciclo. Fechado, e cada um com nome: um ciclo que
+# termina sem nome no log é um ciclo que ninguém consegue auditar depois, e no
+# modelo por relógio a maior parte dos desfechos não é mais "abortou".
+DESFECHO_COMPLETO        = "completo"          # chegou tudo e a quantidade bate
+DESFECHO_CURTO           = "curto"             # dispensou menos que o alvo
+DESFECHO_SEM_CONFIRMACAO = "sem_confirmacao"   # o prazo venceu sem o `dispensado`
+DESFECHO_ERRO            = "erro"              # evento `erro` de uma das pontas
+
+
+async def _aguardar_liberacao(evento_liberacao: asyncio.Event,
+                              cancelar: asyncio.Event) -> None:
+    """Espera o supervisor liberar a trava e RETOMA o cronograma.
+
+    A limpeza do cancelamento mora aqui, colada na espera, e não em cada bloco
+    que trava. `_ativar_trava` arma o cancelamento para matar qualquer prazo em
+    curso; quem esperou a liberação é quem sabe que a pausa acabou.
+
+    Espalhada pelos chamadores, a limpeza vira coisa de lembrar — e o que
+    acontece é o que já aconteceu: o bloco de SKU errado (etapa 3b) trava pela
+    MESMA função e tem o próprio ponto de retomada. Sem passar por aqui, ele
+    voltava com o cancelamento ainda armado, o primeiro prazo do ciclo da mesa
+    vencia na hora, e a OS terminava no meio da rota sem uma linha de log
+    dizendo por quê — com a bancada inteira íntegra.
+    """
+    await evento_liberacao.wait()
+    cancelar.clear()
+
+
+def cancelar_cronograma() -> None:
+    """Arma o cancelamento do cronograma da OS em curso, se houver uma.
+
+    Seguro de chamar sem OS ativa (vira no-op) e de chamar duas vezes. Quem
+    retoma a OS é quem limpa — ver `_cancelar_cronograma`.
+    """
+    if _cancelar_cronograma is not None and not _cancelar_cronograma.is_set():
+        _cancelar_cronograma.set()
+
+
+def _desfecho_do_ciclo(disp_id: int, qtd_esperada: int,
+                       resultado_pos: Optional[dict],
+                       resultado_disp: Optional[dict]) -> tuple[str, Optional[int]]:
+    """Classifica o ciclo e devolve (desfecho, quantidade medida pelo dispenser).
+
+    A quantidade volta como `None` quando o dispenser NÃO confirmou — e é esse
+    `None` que segue para `avaliar_triple_check`. Devolver o alvo no lugar dele,
+    que é o que a versão de handshake fazia com `.get(..., qtd_esperada)`, faria
+    a fonte 1 CONFIRMAR uma contagem que ninguém fez: o Triple Check viraria um
+    double check sem que nada no log dissesse isso.
+
+    Nenhum desfecho aborta a OS aqui. "curto" e "sem_confirmacao" são
+    PENDÊNCIAS, e quem decide sobre elas é o Triple Check no fim do ciclo, que
+    já compara três fontes — é para lá que elas vão, e não para uma lista
+    paralela que alguém teria de lembrar de consultar.
+    """
+    if resultado_disp is not None and resultado_disp.get("tipo") == "erro":
+        return DESFECHO_ERRO, None
+    if resultado_pos is not None and resultado_pos.get("tipo") == "erro":
+        return DESFECHO_ERRO, None
+    if resultado_disp is None:
+        return DESFECHO_SEM_CONFIRMACAO, None
+
+    qtd = resultado_disp.get("quantidade_dispensada")
+    if qtd is None:
+        # O evento veio, mas sem a contagem (contrato antigo). É o mesmo
+        # "não confirmou" — a fonte 1 não tem o que dizer.
+        return DESFECHO_SEM_CONFIRMACAO, None
+    if qtd < qtd_esperada:
+        return DESFECHO_CURTO, int(qtd)
+    return DESFECHO_COMPLETO, int(qtd)
+
+
+def _registrar_desfecho(disp_id: int, os_id: str, desfecho: str,
+                        qtd_dispensada: Optional[int], qtd_esperada: int,
+                        medicamento: str) -> None:
+    """Log + estado publicado. O banco fica com o handler do evento, como sempre.
+
+    O desfecho entra em `_estado["dispensers"][slot]` para aparecer no painel
+    pelo WebSocket que já existe: um ciclo "sem_confirmacao" precisa ser visível
+    ENQUANTO a OS corre, não só no relatório depois — é ele que explica por que
+    o Triple Check travou dois slots adiante.
+    """
+    medido = "—" if qtd_dispensada is None else str(qtd_dispensada)
+    if desfecho == DESFECHO_COMPLETO:
+        logger.info("[ORCH] D%d ciclo %s — dispensou %s/%d × %s.",
+                    disp_id, desfecho, medido, qtd_esperada, medicamento)
+    else:
+        logger.warning("[ORCH] D%d ciclo %s — dispensou %s/%d × %s. "
+                       "A OS SEGUE; quem decide é o Triple Check.",
+                       disp_id, desfecho, medido, qtd_esperada, medicamento)
+
+    with _lock:
+        slot = _estado["dispensers"].get(str(disp_id))
+        if slot is not None:
+            slot["ultimo_ciclo"] = {
+                "desfecho": desfecho,
+                "os_id": os_id,
+                "quantidade_dispensada": qtd_dispensada,
+                "quantidade_esperada": qtd_esperada,
+            }
+
+
+# Marcador interno: a câmera não respondeu ao re-scan da trava de SKU. NÃO é um
+# `tipo` de evento do contrato — nenhum adapter o emite, e nenhum teste de
+# protocolo o conhece. Ele existe para o laço de trava distinguir "a câmera leu
+# e está OK" de "a câmera não disse nada", que é a diferença entre soltar e não
+# soltar um slot com SKU comprovadamente errado.
+_VISAO_INDISPONIVEL = "visao_indisponivel"
 
 
 async def _nulo() -> None:
@@ -389,7 +642,7 @@ class ResultadoTripleCheck(NamedTuple):
 
 def avaliar_triple_check(
     quantidade_esperada: int,
-    quantidade_dispensada: int,
+    quantidade_dispensada: Optional[int],
     resultado_mesa: Optional[dict],
     resultado_peso: Optional[dict],
     min_divergencias: Optional[int] = None,
@@ -397,7 +650,8 @@ def avaliar_triple_check(
     """
     Confronta as 3 fontes independentes de contagem e decide se a OS trava.
 
-    Fonte 1 — dispenser: quantidade contada mecanicamente (`quantidade_dispensada`).
+    Fonte 1 — dispenser: quantidade contada mecanicamente (`quantidade_dispensada`);
+               `None` quando o `dispensado` não chegou no prazo do cronograma.
     Fonte 2 — câmera da mesa: contagem por visão (`leitura_mesa_divergencia`).
     Fonte 3 — balança HX711: delta de peso vs esperado (`peso_divergencia`).
 
@@ -429,8 +683,20 @@ def avaliar_triple_check(
     categorias: list[str] = []
     indisponiveis: list[str] = []
 
-    # Fonte 1 — dispenser (sempre presente: sem o evento a OS já teria abortado)
-    if quantidade_dispensada != quantidade_esperada:
+    # Fonte 1 — dispenser. `None` significa que o `dispensado` NÃO chegou dentro
+    # do prazo do cronograma, e isso deixou de abortar a OS quando o ciclo
+    # passou a ser por relógio. É a mesma distinção que já valia para as outras
+    # duas fontes: o dispenser não contradisse nada, apenas não confirmou.
+    #
+    # Contá-lo como divergência seria transformar todo evento perdido no
+    # encaminhamento (o `_post_central` do adapter desiste depois de 3
+    # tentativas) numa trava — trava por ruído é trava desligada em campo. E
+    # assumir o alvo, que é o que a versão anterior fazia com o `.get(...,
+    # qtd_esperada)`, seria pior: a fonte 1 passaria a CONFIRMAR uma contagem
+    # que ninguém fez, e o Triple Check viraria um double check sem avisar.
+    if quantidade_dispensada is None:
+        indisponiveis.append("dispenser: sem confirmação de dispensa (prazo vencido)")
+    elif quantidade_dispensada != quantidade_esperada:
         divergencias.append(
             f"dispenser: dispensou {quantidade_dispensada} de {quantidade_esperada} esperados"
         )
@@ -599,35 +865,65 @@ def resumo_da_trava(veredito: "ResultadoTripleCheck") -> str:
     return categoria[:TRAVA_RESUMO_MAX]
 
 
-async def _avisar_telas(trava_ativa: bool, slot_id: Optional[int],
-                        os_id: Optional[str], resumo: str) -> bool:
+async def _avisar_uma_placa(alvo: str, url: str, payload: dict) -> bool:
     """POST único em `/comandos/estado-celula`. Nunca levanta; devolve se chegou."""
     if _client is None:
         return False
-    payload = {
-        "trava_ativa":   bool(trava_ativa),
-        "trava_slot_id": slot_id,
-        "os_id":         os_id or "",
-        "trava_resumo":  (resumo or "")[:TRAVA_RESUMO_MAX],
-    }
-    url = settings.DISPENSER_ADAPTER_URL + "/comandos/estado-celula"
     try:
         r = await _client.post(url, json=payload, timeout=TIMEOUT_AVISO_TELAS_S)
     except Exception as exc:  # noqa: BLE001 — cosmético: loga e segue
-        logger.warning("[TELAS] estado-celula não entregue (%s) — as telas ficam "
-                       "desatualizadas até o próximo aviso.", exc)
+        logger.warning("[TELAS] estado-celula não entregue a %s (%s) — a placa "
+                       "fica desatualizada até o próximo aviso.", alvo, exc)
         return False
     if r.status_code >= 300:
-        logger.warning("[TELAS] estado-celula → HTTP %d — as telas ficam "
-                       "desatualizadas até o próximo aviso.", r.status_code)
+        logger.warning("[TELAS] estado-celula → %s HTTP %d — a placa fica "
+                       "desatualizada até o próximo aviso.", alvo, r.status_code)
         return False
     try:
         telas = (r.json() or {}).get("telas")
     except Exception:  # noqa: BLE001 — corpo não é JSON: o status já disse que chegou
         telas = None
     if telas and telas != "ok":
-        logger.warning("[TELAS] estado-celula aceito pelo adapter, telas=%s", telas)
+        logger.warning("[TELAS] estado-celula aceito por %s, telas=%s", alvo, telas)
     return True
+
+
+async def _avisar_telas(trava_ativa: bool, slot_id: Optional[int],
+                        os_id: Optional[str], resumo: str) -> bool:
+    """Avisa as DUAS placas que precisam saber da trava, em paralelo.
+
+    As telas TFT, porque elas mostram ao operador de qual slot é a divergência.
+    E a MESA, que é a peça fisicamente sobre a bancada onde o supervisor vai
+    mexer — e que, sob o ciclo por relógio, é também a peça que continua andando
+    sozinha se ninguém a avisar.
+
+    **Em `gather`, não em sequência.** Em série, uma placa fora do ar somaria o
+    seu `TIMEOUT_AVISO_TELAS_S` ao prazo da outra, e o aviso à mesa (a que
+    importa, porque ela se move) chegaria depois de um timeout inteiro gasto
+    esperando uma tela. `return_exceptions=True` pelo mesmo motivo de sempre:
+    isto é cosmético para as telas e defensivo para a mesa, e nenhum dos dois
+    pode derrubar o caminho da trava.
+
+    O cancelamento do cronograma NÃO está aqui — ele acontece em
+    `_ativar_trava`, antes desta função ser sequer agendada. Ver o comentário
+    de lá: 3 s de teto é tempo de sobra para o relógio disparar mais um
+    `dispensar`.
+    """
+    payload = {
+        "trava_ativa":   bool(trava_ativa),
+        "trava_slot_id": slot_id,
+        "os_id":         os_id or "",
+        "trava_resumo":  (resumo or "")[:TRAVA_RESUMO_MAX],
+    }
+    alvos = (
+        ("telas", settings.DISPENSER_ADAPTER_URL + "/comandos/estado-celula"),
+        ("mesa",  settings.CNC_ADAPTER_URL + "/comandos/estado-celula"),
+    )
+    resultados = await asyncio.gather(
+        *(_avisar_uma_placa(alvo, url, payload) for alvo, url in alvos),
+        return_exceptions=True,
+    )
+    return all(r is True for r in resultados)
 
 
 def _agendar_aviso_telas(trava_ativa: bool, slot_id: Optional[int],
@@ -757,15 +1053,46 @@ async def _liberar_slot(disp_id: int, solicitado_por: str) -> bool:
     return True
 
 
-async def cmd_mover(disp_id: int, os_id: str, ciclo: int, total: int) -> bool:
-    px, py = POSICOES[disp_id]
+def _posicao_do_evento(evento: Optional[dict], disp_id: int) -> tuple[float, float]:
+    """Posição para a câmera da mesa: a MEDIDA, ou o modelo com aviso.
+
+    Um lugar só, porque o fallback é a parte que se esquece: o evento pode não
+    ter vindo (timeout) ou vir sem os campos (contrato antigo), e as duas
+    coisas precisam da mesma resposta.
+    """
+    if evento:
+        px = evento.get("posicao_x")
+        py = evento.get("posicao_y")
+        if px is not None and py is not None:
+            return float(px), float(py)
+
+    modelo = POSICOES[disp_id]
+    logger.warning(
+        "[ORCH] D%d sem posição medida no evento — usando o MODELO (%.1f, %.1f). "
+        "A câmera da mesa vai olhar para onde o modelo diz que o slot está, não "
+        "para onde a máquina parou.",
+        disp_id, modelo[0], modelo[1],
+    )
+    return modelo
+
+
+async def cmd_mover(disp_id: int, os_id: str, receita: str,
+                    ciclo: int, total: int) -> bool:
+    """Manda a mesa ao dispenser — pela RECEITA, não por coordenada.
+
+    A mesa segue o roteiro que ela mesma gravou: `receita` diz QUAL ordem está
+    em execução (a letra A–J do slot na NVS da placa) e `dispenser_alvo` diz
+    qual parada daquele roteiro. O waypoint é indexado pelo DISPENSER e não
+    pela posição na rota, porque a rota é decidida aqui, em tempo de execução
+    (serpentina), e muda quando um slot sai da OS: "vá ao ponto 3" seria outro
+    dispenser no dia seguinte, e a mesa iria ao lugar errado sem erro nenhum.
+    """
     return await _post(
         settings.CNC_ADAPTER_URL + "/comandos/mover",
         {
             "dispenser_alvo": disp_id,
             "os_id":          os_id,
-            "posicao_x":      px,
-            "posicao_y":      py,
+            "receita":        receita,
             "ciclo_atual":    ciclo,
             "total_ciclos":   total,
         },
@@ -773,15 +1100,16 @@ async def cmd_mover(disp_id: int, os_id: str, ciclo: int, total: int) -> bool:
 
 
 async def cmd_homing(os_id: str) -> bool:
-    """Manda a CNC voltar para HOME, com as coordenadas no próprio comando.
+    """Manda a mesa voltar para HOME — sem coordenadas, como o `mover`.
 
-    Mesmo princípio de `cmd_mover`: quem conhece a geometria é o central. Sem
-    isso o simulador precisaria de uma cópia do HOME, e a cópia divergiria no
-    dia em que o corredor mudasse de lugar.
+    O HOME da máquina é o zero que o homing dela estabelece contra os fins de
+    curso: um par de coordenadas vindo daqui seria um segundo HOME, e os dois
+    concordariam só enquanto ninguém mexesse na mesa. `HOME` continua existindo
+    neste módulo como origem do modelo lógico (a serpentina parte dele).
     """
     return await _post(
         settings.CNC_ADAPTER_URL + "/comandos/homing",
-        {"os_id": os_id, "posicao_x": HOME[0], "posicao_y": HOME[1]},
+        {"os_id": os_id},
     )
 
 
@@ -865,12 +1193,19 @@ async def cmd_pesar(slot_id: int, os_id: str, quantidade: int, peso_unitario_g: 
 # ── Processamento de uma OS ────────────────────────────────────────────────────
 
 async def _processar_os(os_payload: dict):
+    global _cancelar_cronograma
     os_id        = os_payload["os_id"]
     medicamentos = os_payload.get("medicamentos", [])
     descricao    = os_payload.get("descricao", "")
 
     logger.info("\n%s\n[ORCH] OS INICIADA: %s | %d medicamentos\n%s",
                 "=" * 60, os_id, len(medicamentos), "=" * 60)
+
+    # Um Event por OS, e novo a cada OS: reaproveitar o da anterior traria junto
+    # um cancelamento já armado, e a OS nova morreria no primeiro prazo sem que
+    # nada no log explicasse.
+    cancelar = asyncio.Event()
+    _cancelar_cronograma = cancelar
 
     # ── Estado: em andamento ─────────────────────────────────────────────────
     with _lock:
@@ -891,6 +1226,24 @@ async def _processar_os(os_payload: dict):
         await asyncio.to_thread(atualizar_status_ordem, os_id, "em_andamento")
     except Exception as e:
         logger.warning("[DB] atualizar_status_ordem em_andamento: %s", e)
+
+    # ── 0. A receita gravada na mesa ─────────────────────────────────────────
+    # A mesa não recebe coordenadas: ela executa o roteiro que foi gravado nela,
+    # e o comando `mover` leva a LETRA do slot de receita. Uma OS que não seja
+    # uma das dez padrão não tem roteiro gravado — e descobrir isso pelo
+    # `receita_desconhecida` que a placa devolve no PRIMEIRO ciclo significaria
+    # ter carregado os dispensers, limpado resíduo e gasto o ciclo inteiro para
+    # nada. A checagem vem antes de reservar slot.
+    receita = os_templates.receita_de(os_payload.get("template_id") or "")
+    if receita is None:
+        logger.error(
+            "[ORCH] OS %s sem receita mapeada (template_id=%r) — a mesa não tem "
+            "roteiro gravado para esta ordem. Abortada antes do primeiro mover.",
+            os_id, os_payload.get("template_id"),
+        )
+        await _abortar_os(os_id, "receita_nao_mapeada")
+        return
+    logger.info("[ORCH] OS %s usa a receita %s da mesa.", os_id, receita)
 
     # ── 1. Atribuição de slots (IA) ──────────────────────────────────────────
     atribuicoes = atribuir_slots(medicamentos, disp_snapshot)
@@ -964,11 +1317,15 @@ async def _processar_os(os_payload: dict):
         asyncio.to_thread(get_peso_medicamento, a["medicamento"])
         for a in atribuicoes
     ], return_exceptions=True)
-    for a, peso in zip(atribuicoes, pesos):
-        if isinstance(peso, BaseException):
+    for a, lido in zip(atribuicoes, pesos, strict=True):
+        # `lido` e não `peso`: reatribuir a variável do laço confunde o que veio
+        # do banco com o que foi decidido aqui, e é o fallback que interessa
+        # entender depois.
+        peso = lido
+        if isinstance(lido, BaseException):
             logger.warning(
                 "[DB] get_peso_medicamento(%s): %s — usando %.0f g.",
-                a["medicamento"], peso, PESO_UNITARIO_PADRAO_G,
+                a["medicamento"], lido, PESO_UNITARIO_PADRAO_G,
             )
             peso = PESO_UNITARIO_PADRAO_G
         a["peso_unitario_g"] = peso
@@ -1000,7 +1357,9 @@ async def _processar_os(os_payload: dict):
     # Envio recusado é informação que já temos: esperar os 180s de um comando
     # que sabidamente não chegou ao adapter só atrasa o abort — e mantém a fila
     # inteira parada nesse intervalo, porque o orquestrador é um loop único.
-    nao_enviados = [a["dispenser_id"] for a, ok in zip(atribuicoes, envios) if not ok]
+    nao_enviados = [a["dispenser_id"]
+                    for a, ok in zip(atribuicoes, envios, strict=True)
+                    if not ok]
     if nao_enviados:
         logger.error(
             "[ORCH] Falha ao enviar comando carregar para %s. Abortando OS %s.",
@@ -1057,7 +1416,7 @@ async def _processar_os(os_payload: dict):
     # planta o evento nunca vem, então o `aguardar_evento` seria TIMEOUT_VISAO_
     # DISPENSER de relógio queimado por um resultado que já sabemos que não
     # existe. Resolvemos o slot como `None` na hora, que é onde ele cairia.
-    for a, ok in zip(atribuicoes, envios_scan):
+    for a, ok in zip(atribuicoes, envios_scan, strict=True):
         if not ok:
             logger.warning(
                 "[ORCH] Não foi possível solicitar scan câmera dispenser D%d — "
@@ -1103,23 +1462,33 @@ async def _processar_os(os_payload: dict):
     # Loop de bloqueio: mantém trava até todos os slots com SKU errado serem corrigidos
     while slots_sku_errado:
         a_err, res_err = slots_sku_errado[0]
-        motivo = (
-            f"SKU errado no dispenser D{a_err['dispenser_id']}: "
-            f"lido={res_err.get('sku_lido', '?')} | esperado={res_err.get('sku_esperado', '?')} — "
-            f"remova o medicamento incorreto e libere a trava para re-escanear."
-        )
+        if res_err.get("tipo") == _VISAO_INDISPONIVEL:
+            motivo = (
+                f"Câmera não respondeu ao re-scan do dispenser D{a_err['dispenser_id']}: "
+                f"a divergência de SKU (lido={res_err.get('sku_lido', '?')} | "
+                f"esperado={res_err.get('sku_esperado', '?')}) segue SEM confirmação. "
+                f"Verifique a estação de visão e libere a trava para tentar de novo."
+            )
+            resumo = "visão indisponível"
+        else:
+            motivo = (
+                f"SKU errado no dispenser D{a_err['dispenser_id']}: "
+                f"lido={res_err.get('sku_lido', '?')} | esperado={res_err.get('sku_esperado', '?')} — "
+                f"remova o medicamento incorreto e libere a trava para re-escanear."
+            )
+            resumo = "SKU errado"
         logger.error("[ORCH] ⛔ %s", motivo)
 
         # `_ativar_trava` arma o estado interno e só então publica em
         # `_estado["trava"]` — publicar aqui antes reabriria a janela em que a
         # tela mostra trava que `liberar_trava` ainda não reconhece.
         evento_lib = await _ativar_trava(os_id, a_err["dispenser_id"], motivo,
-                                         resumo="SKU errado")
+                                         resumo=resumo)
         logger.warning(
             "[ORCH] Aguardando operador corrigir dispenser D%d (OS %s)…",
             a_err["dispenser_id"], os_id,
         )
-        await evento_lib.wait()
+        await _aguardar_liberacao(evento_lib, cancelar)
 
         with _lock:
             _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
@@ -1129,23 +1498,63 @@ async def _processar_os(os_payload: dict):
         # Re-escaneia todos os slots que ainda têm divergência
         logger.info("[ORCH] Trava liberada. Re-escaneando %d slot(s) com SKU errado…", len(slots_sku_errado))
         atribuicoes_retry = [a for a, _ in slots_sku_errado]
+        # A divergência ANTERIOR de cada slot, guardada antes de a lista ser
+        # refeita: é ela que o motivo da trava cita quando a câmera não
+        # responde ao re-scan — a pendência é a de sempre, o que faltou foi a
+        # confirmação.
+        res_anterior = {a["dispenser_id"]: res for a, res in slots_sku_errado}
         chaves_retry = [f"{os_id}:visao_dispenser:{a['dispenser_id']}" for a in atribuicoes_retry]
         for chave in chaves_retry:
             registrar_evento(chave)
-        for a in atribuicoes_retry:
-            await cmd_visao_dispenser(
+        # Envio recusado é resolvido NA HORA como "sem medição", em vez de
+        # queimar TIMEOUT_VISAO_DISPENSER esperando um evento que já se sabe
+        # inexistente — a mesma regra da etapa 3b.
+        envios_retry = await asyncio.gather(*[
+            cmd_visao_dispenser(
                 a["dispenser_id"], a.get("sku", ""), a["medicamento"], a["quantidade"], os_id,
             )
+            for a in atribuicoes_retry
+        ])
+        for a, chave, ok in zip(atribuicoes_retry, chaves_retry, envios_retry,
+                                strict=True):
+            if not ok:
+                logger.error(
+                    "[ORCH] ⛔ Re-scan D%d não foi aceito pelo vision-adapter.",
+                    a["dispenser_id"],
+                )
+                _pending_events.pop(chave, None)
+
         resultados_retry = await asyncio.gather(*[
             aguardar_evento(chave, settings.TIMEOUT_VISAO_DISPENSER)
+            if chave in _pending_events else _nulo()
             for chave in chaves_retry
         ])
 
         # Verifica se ainda há divergência após a correção
         slots_sku_errado = []
-        for a, res in zip(atribuicoes_retry, resultados_retry):
+        for a, res in zip(atribuicoes_retry, resultados_retry, strict=True):
             if res is None:
-                logger.warning("[ORCH] Timeout re-scan D%d — assumindo corrigido.", a["dispenser_id"])
+                # Fonte que não RESPONDEU não é fonte que CONFIRMOU, e aqui a
+                # diferença decide o que sai do dispenser. Este slot tem SKU
+                # comprovadamente errado — foi essa medição que armou a trava.
+                # Soltá-lo por falta de resposta transformava o vision-adapter
+                # fora do ar num caminho para dispensar o medicamento errado:
+                # bastava liberar a trava e esperar o timeout.
+                #
+                # É a mesma linha que `avaliar_triple_check` já traça entre
+                # `divergencias` e `fontes_indisponiveis`, com o sinal
+                # invertido de propósito: lá a fonte muda faz a OS seguir
+                # porque nada a contradisse; aqui já há contradição registrada,
+                # e o silêncio não a apaga.
+                logger.error(
+                    "[ORCH] ⛔ Re-scan D%d sem resposta da câmera — a trava CONTINUA.",
+                    a["dispenser_id"],
+                )
+                slots_sku_errado.append((
+                    a,
+                    {**res_anterior.get(a["dispenser_id"], {}),
+                     "tipo": _VISAO_INDISPONIVEL},
+                ))
             elif res.get("tipo") == "leitura_dispenser_divergencia":
                 logger.error(
                     "[ORCH] ⛔ Ainda SKU errado em D%d após re-scan. Nova trava.", a["dispenser_id"]
@@ -1182,65 +1591,115 @@ async def _processar_os(os_payload: dict):
         logger.info("[ORCH] Ciclo %d/%d → D%d (%s × %d)",
                     seq, total, disp_id, a["medicamento"], a["quantidade"])
 
-        # 4a. Mover CNC
-        chave_pos = f"{os_id}:posicionado:{disp_id}"
-        registrar_evento(chave_pos)
+        # ── O CICLO É POR RELÓGIO, e o evento da placa não é portão ──────────
+        #
+        # A mesa avisa que chegou, mas ninguém espera o aviso para seguir. O
+        # central calcula QUANDO cada peça acontece (`cronograma_do_ciclo`) e
+        # dispara na hora marcada, tenha o evento chegado ou não.
+        #
+        # O que o evento passou a valer: ele REGISTRA (a posição medida, a
+        # contagem do dispenser) e, no máximo, CANCELA. Um evento que fizesse o
+        # central esperar recriaria o handshake por acidente — e é exatamente
+        # isso que quem mexer aqui vai querer fazer quando vir uma OS seguir sem
+        # confirmação. O custo de esperar está escrito em
+        # `docs/PROTOCOLO_SERIAL.md`, seção "Por que o relógio e não a
+        # confirmação".
+        qtd_esperada = a["quantidade"]
+        espera_trajeto, duracao_dispensa = cronograma_do_ciclo(qtd_esperada)
 
-        ok = await cmd_mover(disp_id, os_id, seq, total)
-        if not ok:
-            logger.error("[ORCH] Falha ao enviar cmd mover para D%d.", disp_id)
-            await _abortar_os(os_id, "erro_cnc", atribuicoes)
-            return
-
-        resultado_pos = await aguardar_evento(chave_pos, settings.TIMEOUT_POSICIONAMENTO)
-        if resultado_pos is None:
-            logger.error("[ORCH] Timeout CNC posicionando em D%d.", disp_id)
-            await _abortar_os(os_id, "erro_cnc", atribuicoes)
-            return
-        if resultado_pos.get("tipo") == "erro":
-            logger.error("[ORCH] ERRO CNC ao mover para D%d: %s.",
-                         disp_id, resultado_pos.get("descricao", ""))
-            await _abortar_os(os_id, "erro_cnc", atribuicoes)
-            return
-
-        logger.info("[ORCH] CNC posicionada em D%d. Disparando dispensa.", disp_id)
-
-        # 4b. Dispensar
+        # 4a. As DUAS chaves são registradas antes de qualquer comando sair.
+        # Registrar a do `dispensado` aqui, e não depois do trajeto, é o que faz
+        # um `dispensado` rápido não chegar antes de haver quem o guarde.
+        chave_pos  = f"{os_id}:posicionado:{disp_id}"
         chave_disp = f"{os_id}:dispensado:{disp_id}"
+        registrar_evento(chave_pos)
         registrar_evento(chave_disp)
 
+        # 4b. Mover. Falha de POST continua abortando: é falha de TRANSPORTE
+        # (ou ACK negativo da placa, que o adapter devolve como 502), não falta
+        # de confirmação. No modelo por relógio esta é a ÚNICA defesa que age
+        # antes do `dispensar` — ver o veto em 4c.
+        ok = await cmd_mover(disp_id, os_id, receita, seq, total)
+        if not ok:
+            logger.error("[ORCH] Mesa recusou ou não recebeu o mover para D%d.", disp_id)
+            colher_evento(chave_pos)
+            colher_evento(chave_disp)
+            await _abortar_os(os_id, "erro_cnc", atribuicoes)
+            return
+
+        # 4c. O prazo do trajeto. Não é `aguardar_evento`: é o relógio.
+        # `_dormir_ou_cancelar` acorda antes se a OS for cancelada no meio —
+        # a trava do Triple Check dispara esse Event, e sem isso o cronograma
+        # seguiria correndo por até um ciclo inteiro depois de a mesa ter sido
+        # mandada para o HOME.
+        if not await _dormir_ou_cancelar(espera_trajeto, cancelar):
+            logger.warning("[ORCH] Cronograma cancelado durante o trajeto até D%d.", disp_id)
+            colher_evento(chave_pos)
+            colher_evento(chave_disp)
+            return
+
+        # ── O VETO ───────────────────────────────────────────────────────────
+        # A mesa pode NÃO ter chegado: limit disparado, origem perdida, placa
+        # muda. Disparar o `dispensar` assim mesmo despeja medicamento fora da
+        # célula. O cronograma não pode ESPERAR (seria o handshake de volta),
+        # mas pode ser cancelado por um evento que já chegou.
+        #
+        # ⚠ A AUSÊNCIA DO `posicionado` NÃO CANCELA, e isto é a diferença entre
+        # este modelo e o anterior. Quem mexer aqui depois vai querer "só
+        # esperar mais um pouquinho" — e esperar é voltar ao handshake. Um
+        # evento perdido no encaminhamento (o `_post_central` do adapter desiste
+        # depois de 3 tentativas) NÃO é a mesa parada, e tratar os dois como
+        # iguais aborta OS com o hardware intacto. Só um `erro` EXPLÍCITO veta.
+        erro_cnc = espiar_evento(chave_pos)
+        if erro_cnc is not None and erro_cnc.get("tipo") == "erro":
+            logger.error("[ORCH] ERRO da mesa em D%d (%s): %s — dispensa NÃO disparada.",
+                         disp_id, erro_cnc.get("codigo_erro", "?"),
+                         erro_cnc.get("descricao", ""))
+            colher_evento(chave_pos)
+            colher_evento(chave_disp)
+            await _abortar_os(os_id, "erro_cnc", atribuicoes)
+            return
+
+        # 4d. Dispensar, na hora marcada.
         ok = await cmd_dispensar(disp_id, os_id)
         if not ok:
             logger.error("[ORCH] Falha ao enviar cmd dispensar para D%d.", disp_id)
+            colher_evento(chave_pos)
+            colher_evento(chave_disp)
             await _abortar_os(os_id, "erro_dispenser", atribuicoes)
             return
 
-        resultado_disp = await aguardar_evento(chave_disp, settings.TIMEOUT_DISPENSA)
-        if resultado_disp is None:
-            logger.error("[ORCH] Timeout dispensando D%d.", disp_id)
-            await _abortar_os(os_id, "erro_dispenser", atribuicoes)
-            return
-        if resultado_disp.get("tipo") == "erro":
-            logger.error("[ORCH] ERRO dispensa D%d: %s.",
-                         disp_id, resultado_disp.get("descricao", ""))
-            await _abortar_os(os_id, "erro_dispenser", atribuicoes)
+        # 4e. O prazo da dispensa — a mesma conta do dwell gravado na receita.
+        if not await _dormir_ou_cancelar(duracao_dispensa, cancelar):
+            logger.warning("[ORCH] Cronograma cancelado durante a dispensa em D%d.", disp_id)
+            colher_evento(chave_pos)
+            colher_evento(chave_disp)
             return
 
-        # Contagem da fonte 1, necessária tanto para a pesagem (4d) quanto para
-        # o Triple Check (4e). Ausente do payload, assume-se o alvo — o que
-        # deixa a decisão nas outras duas fontes.
-        qtd_esperada   = a["quantidade"]
-        qtd_dispensada = resultado_disp.get("quantidade_dispensada", qtd_esperada)
+        # 4f. Colhe o que chegou, SEM esperar. Daqui em diante ninguém mais
+        # espera por estas chaves, então é colheita e não espiada.
+        resultado_pos  = colher_evento(chave_pos)
+        resultado_disp = colher_evento(chave_disp)
 
-        logger.info("[ORCH] D%d dispensou %d/%d × %s.",
-                    disp_id, qtd_dispensada, qtd_esperada, a["medicamento"])
+        desfecho, qtd_dispensada = _desfecho_do_ciclo(
+            disp_id, qtd_esperada, resultado_pos, resultado_disp)
+        _registrar_desfecho(disp_id, os_id, desfecho, qtd_dispensada, qtd_esperada,
+                            a["medicamento"])
 
         # 4c. Scan da câmera da mesa (não-bloqueante)
         chave_visao_mesa = f"{os_id}:visao_mesa:{disp_id}"
         registrar_evento(chave_visao_mesa)
 
-        pos_x = resultado_pos.get("posicao_x", 0.0)
-        pos_y = resultado_pos.get("posicao_y", 0.0)
+        # A posição vem da MÁQUINA (o evento `posicionado` carrega a medida do
+        # tracker da placa). Só quando ela não vem é que se cai no modelo — e
+        # o log diz isso, porque um número do modelo e um medido valem coisas
+        # diferentes para quem depois lê o histórico.
+        #
+        # O default 0.0 que estava aqui era a pior saída possível: 0.0 é a
+        # ORIGEM da mesa, então a câmera seria mandada olhar para o HOME e
+        # chamar aquilo de D5 — divergência de contagem num slot só, que é
+        # indistinguível de medicamento faltando.
+        pos_x, pos_y = _posicao_do_evento(resultado_pos, disp_id)
         ok = await cmd_visao_mesa(disp_id, os_id, a["quantidade"], pos_x, pos_y)
         if not ok:
             logger.warning("[ORCH] Não foi possível solicitar scan câmera mesa D%d", disp_id)
@@ -1270,7 +1729,14 @@ async def _processar_os(os_payload: dict):
         registrar_evento(chave_peso)
         peso_unit = a.get("peso_unitario_g") or PESO_UNITARIO_PADRAO_G
         resultado_peso: Optional[dict] = None
-        ok_p = await cmd_pesar(disp_id, os_id, qtd_esperada, peso_unit, qtd_dispensada)
+        # `quantidade_real` é o melhor palpite sobre o que caiu na mesa; sem a
+        # confirmação do dispenser, o melhor palpite é o alvo. São perguntas
+        # diferentes e é por isso que os dois valores se separam aqui: a balança
+        # precisa de um número para simular a massa depositada, e o Triple Check
+        # precisa saber que a fonte 1 NÃO mediu. Passar o alvo para os dois faria
+        # a fonte 1 confirmar uma contagem que ninguém fez.
+        qtd_para_balanca = qtd_esperada if qtd_dispensada is None else qtd_dispensada
+        ok_p = await cmd_pesar(disp_id, os_id, qtd_esperada, peso_unit, qtd_para_balanca)
         if ok_p:
             resultado_peso = await aguardar_evento(chave_peso, settings.TIMEOUT_PESO)
             if resultado_peso is None:
@@ -1326,7 +1792,7 @@ async def _processar_os(os_payload: dict):
             evento_liberacao = await _ativar_trava(os_id, disp_id, motivo_trava,
                                                    resumo=resumo_da_trava(veredito))
             logger.warning("[ORCH] Aguardando liberação da trava (OS %s, D%d)…", os_id, disp_id)
-            await evento_liberacao.wait()
+            await _aguardar_liberacao(evento_liberacao, cancelar)
             logger.info("[ORCH] Trava liberada. Retomando OS %s a partir de D%d.", os_id, disp_id)
             with _lock:
                 _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
@@ -1349,8 +1815,32 @@ async def _processar_os(os_payload: dict):
                 logger.warning("[DB] salvar_alarme triple_check: %s", e)
 
     # ── 5. CNC retorna para home ─────────────────────────────────────────────
+    #
+    # O retorno é CONFERIDO, e não por zelo: a OS seguinte planeja a serpentina
+    # a partir de HOME (ver "A rota é serpentina, e a escolha foi medida"), e a
+    # otimalidade dessa rota é a do ciclo FECHADO. Homing que não sai deixa a
+    # mesa parada no último dispenser, esta OS fecha como `concluida` sem nada
+    # no log, e quem paga é a próxima — com uma travessia a mais e nenhuma
+    # pista de por quê.
+    #
+    # Não aborta: a dispensa desta OS já terminou e o Triple Check já opinou.
+    # Abortar aqui trocaria uma mesa fora de lugar por uma OS marcada em erro
+    # depois de ter entregue tudo certo. O alarme é o desfecho proporcional —
+    # ele manda alguém olhar a mesa antes da OS seguinte.
     logger.info("[ORCH] Ciclo completo. CNC retornando para HOME.")
-    await cmd_homing(os_id)
+    if not await cmd_homing(os_id):
+        descricao = (
+            f"OS {os_id}: comando de homing de fim de ciclo não foi aceito pelo "
+            f"cnc-adapter. A mesa pode ter ficado parada no último dispenser, e a "
+            f"OS seguinte planeja a rota a partir do HOME."
+        )
+        logger.error("[ORCH] %s", descricao)
+        try:
+            await asyncio.to_thread(
+                salvar_alarme, "cnc", "homing_nao_confirmado", descricao
+            )
+        except Exception as e:
+            logger.warning("[DB] salvar_alarme homing_nao_confirmado: %s", e)
 
     # ── 6. OS concluída ──────────────────────────────────────────────────────
     try:
@@ -1427,22 +1917,53 @@ async def resetar_planta(limpar_historico_tambem: bool = False) -> dict:
     confirmaram a limpeza, que é o que manda o operador olhar a bancada em vez
     de confiar na tela.
     """
-    # `global` no topo: a mensagem de recusa logo abaixo já LÊ `_trava_ativa`, e
-    # Python recusa a declaração depois do primeiro uso no corpo da função.
+    # Só `_reset_em_curso` é ATRIBUÍDO aqui: os cinco campos da trava passaram
+    # a ser escritos em `_resetar_planta`, e uma declaração `global` que só lê
+    # não faz nada além de sugerir uma escrita que não existe.
+    global _reset_em_curso
+
+    # O flag sobe ANTES da leitura de `os_ativa`, e a ordem é a feature: do
+    # outro lado, o `loop_orquestrador` o consulta logo depois de tirar a OS da
+    # fila. Levantado primeiro, não existe instante em que a checagem veja "não
+    # há OS" e uma OS comece mesmo assim — é a mesma disciplina de
+    # `_ativar_trava` (estado real primeiro, publicação depois).
+    _reset_em_curso = True
+    try:
+        # E o cronograma morre junto. Ele é ARMADO por quem precisa parar a OS
+        # agora, e o reset é um desses — o docstring de `_cancelar_cronograma`
+        # já dizia isso, e era a única parte dele que não era verdade. Sem OS em
+        # curso vira no-op; com uma OS que tenha escapado pela janela acima, é o
+        # que impede o `dispensar` agendado de sair com a mesa já sendo limpa.
+        cancelar_cronograma()
+
+        with _lock:
+            os_ativa = _estado.get("os_ativa")
+        if os_ativa:
+            raise ResetRecusado(
+                f"OS {os_ativa.get('os_id', '?')} em execução. "
+                + ("Libere a trava do Triple Check e espere a OS fechar antes de resetar."
+                   if _trava_ativa else
+                   "Espere a OS terminar (ou pause o gerador para não entrar outra).")
+            )
+
+        logger.warning("[ORCH] RESET DA PLANTA pedido pelo console "
+                       "(limpar_historico=%s).", limpar_historico_tambem)
+        return await _resetar_planta(limpar_historico_tambem)
+    finally:
+        # `finally` e não uma linha no fim: a recusa levanta `ResetRecusado`, e
+        # um flag que ficasse de pé depois dela calaria o orquestrador para
+        # sempre — toda OS seguinte seria cancelada por um reset que não
+        # aconteceu.
+        _reset_em_curso = False
+
+
+async def _resetar_planta(limpar_historico_tambem: bool) -> dict:
+    """O reset em si, já com a recusa decidida e o flag de pé.
+
+    Separada de `resetar_planta` para que o `try/finally` do flag envolva TODAS
+    as saídas sem embrulhar noventa linhas num nível a mais de indentação.
+    """
     global _trava_ativa, _trava_evento, _trava_motivo, _trava_slot_id, _trava_os_id
-
-    with _lock:
-        os_ativa = _estado.get("os_ativa")
-    if os_ativa:
-        raise ResetRecusado(
-            f"OS {os_ativa.get('os_id', '?')} em execução. "
-            + ("Libere a trava do Triple Check e espere a OS fechar antes de resetar."
-               if _trava_ativa else
-               "Espere a OS terminar (ou pause o gerador para não entrar outra).")
-        )
-
-    logger.warning("[ORCH] RESET DA PLANTA pedido pelo console "
-                   "(limpar_historico=%s).", limpar_historico_tambem)
 
     relatorio: dict = {
         "os_canceladas":   [],
@@ -1486,7 +2007,7 @@ async def resetar_planta(limpar_historico_tambem: bool = False) -> dict:
     resultados = await asyncio.gather(*[
         _liberar_slot(slot, "reset_console") for slot in range(1, NUM_SLOTS + 1)
     ])
-    for slot, ok in zip(range(1, NUM_SLOTS + 1), resultados):
+    for slot, ok in zip(range(1, NUM_SLOTS + 1), resultados, strict=True):
         (relatorio["slots_limpos"] if ok else relatorio["slots_com_falha"]).append(slot)
         try:
             await asyncio.to_thread(limpar_dispenser_estado, slot)
@@ -1494,7 +2015,7 @@ async def resetar_planta(limpar_historico_tambem: bool = False) -> dict:
             logger.warning("[DB] limpar_dispenser_estado D%d: %s", slot, exc)
 
     with _lock:
-        for key, slot in _estado["dispensers"].items():
+        for slot in _estado["dispensers"].values():
             slot.update({
                 "status": "idle", "medicamento": None, "sku": None,
                 "categoria": None, "quantidade": 0, "quantidade_alvo": 0,
@@ -1677,6 +2198,22 @@ async def loop_orquestrador():
                 _estado["fila_os"].remove(os_id)
             _estado["fila_tamanho"] = _os_queue.qsize()
             _estado["fila_capacidade"] = _os_queue.maxsize
+
+        # A checagem vem DEPOIS do `get`, e não antes, porque é aqui que o loop
+        # passa a maior parte do tempo: bloqueado em `_os_queue.get()`. O
+        # `get_nowait` do reset não vê nada nesse estado — a fila está vazia —,
+        # e um `put` que chegasse durante o reset seria entregue direto a este
+        # `get` que já estava esperando. Conferir só no topo do laço deixaria
+        # justamente essa OS passar.
+        if _reset_em_curso:
+            logger.warning("[ORCH] OS %s cancelada: reset da planta em curso.", os_id)
+            try:
+                await asyncio.to_thread(cancelar_ordens_pendentes, [os_id])
+            except Exception as exc:
+                logger.warning("[DB] cancelar_ordens_pendentes (reset): %s", exc)
+            _os_queue.task_done()
+            continue
+
         try:
             await _processar_os(os_payload)
         except Exception as exc:

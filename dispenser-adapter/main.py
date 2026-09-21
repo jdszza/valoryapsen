@@ -47,7 +47,7 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 import serial_link
 
@@ -59,6 +59,16 @@ CENTRAL_URL          = os.getenv("CENTRAL_URL",          "http://central-compute
 DISPENSER_SIM_URL    = os.getenv("DISPENSER_SIM_URL",    "http://dispenser-simulator:8201")
 TIMEOUT_CMD          = float(os.getenv("TIMEOUT_CMD",    "15"))
 TIMEOUT_EVENT        = float(os.getenv("TIMEOUT_EVENT",  "5"))
+
+# Quantos dispensers a célula tem. Declarado UMA vez no compose
+# (`${NUM_SLOTS:-8}`) e lido por todos: nenhuma faixa escrita à mão, e nenhuma
+# mensagem de erro com um "1-6" desatualizado mandando quem lê o log procurar o
+# problema na faixa errada. Este adapter era o único dos três que não o lia.
+NUM_SLOTS            = int(os.getenv("NUM_SLOTS", "8"))
+# Teto de unidades por comando. Não é regra de negócio — as ordens padrão vão
+# até 15 —, é o teto do que um MECANISMO faz num comando só: além dele, o que
+# chegou é erro de quem montou o payload, e o lugar de dizer isso é aqui.
+MAX_UNIDADES         = int(os.getenv("MAX_UNIDADES", "500"))
 
 SUBSISTEMA           = "dispenser"
 
@@ -139,6 +149,34 @@ async def _wait_for_upstream(name: str, url: str, retries: int = 30, interval: f
     logger.error("[HEALTH] %s não ficou disponível em %ds. Continuando assim mesmo.", name, retries * interval)
 
 
+def _exigir_url(transporte: str, url: str, variavel: str) -> None:
+    """Transporte serial ligado sem porta fixada RECUSA subir.
+
+    Com a URL vazia o `serial_link` varre TODAS as portas, e cada sondagem abre
+    a porta por até `PROBE_ASSENTAR_S + PROBE_ESPERA_S` (~9,5 s). Na célula
+    montada são cinco placas e cinco processos: enquanto um deles segura a COM
+    da CNC para conferir, o cnc-adapter toma `ACCESS_DENIED` na própria — boot
+    não-determinístico em que uma placa às vezes não é achada, e o log de cada
+    processo mostra só a metade dele.
+
+    Recusar é a resposta certa AQUI, e não um aviso: este processo existe para
+    falar com as portas, e sem elas não faz nada de útil. Serviço que não sobe
+    trava, por `depends_on`, quem espera por ele — e é justamente o que se quer
+    quando a bancada está mal configurada, em vez de uma OS que morre por
+    timeout num slot íntegro.
+
+    A varredura continua existindo e continua sendo o caminho de quem tem UMA
+    placa na mesa: basta não ligar o transporte serial de mais nada.
+    """
+    if transporte == "serial" and not url:
+        raise RuntimeError(
+            f"{variavel} está vazia com o transporte serial ligado. Com cinco "
+            f"placas na célula, a varredura automática faz os processos "
+            f"disputarem as portas uns dos outros — fixe a COM no Windows e "
+            f"defina {variavel} (ex.: COM4, /dev/ttyUSB0 ou rfc2217://host:porta)."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _client, _link, _link_tft, _loop
@@ -146,6 +184,8 @@ async def lifespan(app: FastAPI):
     _loop = asyncio.get_running_loop()
     logger.info("[STARTUP] httpx.AsyncClient criado | transporte=%s | telas=%s",
                 TRANSPORTE, TFT_TRANSPORTE)
+    _exigir_url(TRANSPORTE, SERIAL_URL, "DISPENSER_SERIAL_URL")
+    _exigir_url(TFT_TRANSPORTE, TFT_SERIAL_URL, "DISPENSER_TFT_SERIAL_URL")
     if TRANSPORTE == "serial":
         _link = serial_link.LinkSerial(
             subsistema=SUBSISTEMA, url=SERIAL_URL, baud=SERIAL_BAUD,
@@ -181,6 +221,32 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 
 # ── Pydantic Models ────────────────────────────────────────────────────────────
 
+# ── A faixa é conferida NA BORDA, como no cnc-adapter ─────────────────────────
+#
+# Este adapter não validava nada: `dispenser_id` aceitava 0, -3 e 99, e
+# `quantidade` aceitava negativo. Cada um desses sai do adapter e vira um modo
+# de falhar diferente, todos longe daqui:
+#
+#   - slot fora da faixa no transporte HTTP vira um 4xx do simulador, que o
+#     `_post_sim` traduz em 502 — "a ponta de lá recusou", quando quem estava
+#     errado era o payload desta ponta;
+#   - no transporte SERIAL é pior: a placa recusa com ACK negativo depois de o
+#     comando ter ido e voltado pelo cabo, e o orquestrador perde o prazo do
+#     ACK num comando que nunca poderia dar certo;
+#   - `quantidade` negativa no `carregar` desce para o firmware, que grava
+#     `sl.quantidade` negativa — e a partir daí o `residual` do `dispensado`
+#     mente para o central, sem erro em lugar nenhum.
+#
+# Recusar aqui é 422 na hora, com o nome do campo. É a mesma escolha que o
+# `_receita_valida` do cnc-adapter já registra: deixar passar custaria a ida à
+# ponta de lá para voltar com o mesmo "não", mais caro.
+
+def _slot_na_faixa(v: int) -> int:
+    if not 1 <= v <= NUM_SLOTS:
+        raise ValueError(f"dispenser_id deve ser 1-{NUM_SLOTS}")
+    return v
+
+
 class ComandoCarregarReq(BaseModel):
     dispenser_id: int
     medicamento: str
@@ -189,10 +255,27 @@ class ComandoCarregarReq(BaseModel):
     quantidade: int
     os_id: str
 
+    @field_validator("dispenser_id")
+    @classmethod
+    def _faixa(cls, v: int) -> int:
+        return _slot_na_faixa(v)
+
+    @field_validator("quantidade")
+    @classmethod
+    def _quantidade_positiva(cls, v: int) -> int:
+        if not 1 <= v <= MAX_UNIDADES:
+            raise ValueError(f"quantidade deve ser 1-{MAX_UNIDADES}")
+        return v
+
 
 class ComandoDispensarReq(BaseModel):
     dispenser_id: int
     os_id: str
+
+    @field_validator("dispenser_id")
+    @classmethod
+    def _faixa(cls, v: int) -> int:
+        return _slot_na_faixa(v)
     # Campo de DEMONSTRAÇÃO, ausente no caminho normal (ver
     # `central-computer/injecao.py`). O adapter não o interpreta: repassa como
     # veio, do mesmo jeito que faz com as duas quantidades da pesagem. Quem
@@ -203,6 +286,11 @@ class ComandoDispensarReq(BaseModel):
 class ComandoLimparReq(BaseModel):
     dispenser_id: int
     solicitado_por: str = "sistema"
+
+    @field_validator("dispenser_id")
+    @classmethod
+    def _faixa(cls, v: int) -> int:
+        return _slot_na_faixa(v)
 
 
 class EventoReq(BaseModel):
@@ -307,6 +395,27 @@ async def _tft_serial(comando: str, campos: dict) -> bool:
         return False
 
 
+# As tasks em voo, guardadas por referência forte.
+#
+# `asyncio.create_task` NÃO guarda uma: o loop mantém só uma referência fraca
+# enquanto a corrotina está suspensa, e o coletor pode recolher a task no meio
+# do caminho — o envio some sem log nenhum, e o sintoma é uma tela de slot
+# parada no estado anterior. É raro e é intermitente, que é o pior par: some
+# quando alguém vai procurar.
+#
+# O `discard` no callback é o que impede o conjunto de virar um vazamento: sem
+# ele, `_enviar_tft` acrescentaria um objeto por transição de slot, para
+# sempre.
+_tarefas_tft: set = set()
+
+
+def _agendar(corrotina):
+    tarefa = asyncio.create_task(corrotina)
+    _tarefas_tft.add(tarefa)
+    tarefa.add_done_callback(_tarefas_tft.discard)
+    return tarefa
+
+
 def _enviar_tft(comando: str, campos: dict):
     """Agenda o envio à placa das telas. Devolve a Task, ou None se não há telas.
 
@@ -321,11 +430,11 @@ def _enviar_tft(comando: str, campos: dict):
         rota = _COMANDOS_TFT[comando]
         if rota is None:
             return None
-        return asyncio.create_task(_tft_http(rota, campos))
+        return _agendar(_tft_http(rota, campos))
     if _link_tft is None:
         logger.warning("[TFT] '%s' descartado: porta das telas não iniciada", comando)
         return None
-    return asyncio.create_task(_tft_serial(comando, campos))
+    return _agendar(_tft_serial(comando, campos))
 
 
 # O que cada tela mostra, slot a slot. É a memória que este adapter já tinha

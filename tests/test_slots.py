@@ -80,10 +80,12 @@ def _weight_pesar(sim, slot_id):
 
 
 def _cnc_mover(sim, slot_id):
+    # Sem coordenadas: a mesa é endereçada pelo DISPENSER e acha o waypoint
+    # sozinha. `receita` precisa estar entre as gravadas, senão a recusa que
+    # este teste mede seria a da receita e não a da faixa de slots.
     return sim.modulo.executar_mover(
         sim.modulo.MoverReq(dispenser_alvo=slot_id, os_id="OS-SLOT",
-                            posicao_x=0.0, posicao_y=0.0,
-                            ciclo_atual=1, total_ciclos=1)
+                            receita="A", ciclo_atual=1, total_ciclos=1)
     )
 
 
@@ -165,13 +167,28 @@ def test_dispenser_expoe_um_slot_por_posicao_da_celula(carregar_simulador):
     assert sorted(sim.modulo._estoque) == list(range(1, NUM_SLOTS + 1))
 
 
-def test_cnc_nao_guarda_mapa_de_posicoes(carregar_simulador):
-    """O mapa é do central: cópia no simulador é a duplicação que saiu daqui.
+def test_cnc_nao_guarda_copia_do_mapa_do_central(carregar_simulador,
+                                                 carregar_orquestrador):
+    """O simulador tem bancada PRÓPRIA — o que ele não pode ter é a do central.
 
-    O simulador recebe `posicao_x`/`posicao_y` em cada comando de movimento e
-    valida apenas a faixa do id. Se um `POSICOES` reaparecer aqui, volta o par
-    de dicionários mantidos à mão em serviços diferentes.
+    O comando deixou de trazer coordenada: a mesa é endereçada pelo dispenser e
+    REPORTA onde parou, então o simulador precisa de números para reportar. A
+    linha que continua valendo não é "nenhum mapa aqui" — é que nenhum número
+    daqui precisa CONCORDAR com o central.
+
+    É isso que este teste mede. `POSICOES` de volta seria a duplicação que saiu
+    daqui; e uma bancada que casasse com a do central faria toda asserção sobre
+    posição passar por concordância acidental — o central comparando o próprio
+    número com uma cópia dele, verde inclusive no dia em que voltasse a ignorar
+    o que a máquina informa.
     """
     sim = carregar_simulador("cnc", env=ENV_RAPIDO)
 
     assert not hasattr(sim.modulo, "POSICOES")
+
+    modelo = carregar_orquestrador().modulo.POSICOES
+    for slot, ponto in sim.modulo.BANCADA.items():
+        assert ponto != modelo[slot], (
+            f"a bancada do simulador casou com o modelo do central em D{slot} "
+            f"({ponto}) — a partir daqui a posição 'medida' não prova nada"
+        )

@@ -56,6 +56,22 @@ MIN_ITENS = 2
 QTD_MIN   = 2
 QTD_MAX   = 15
 
+# ── A receita gravada na mesa ────────────────────────────────────────────────
+# A mesa CNC não recebe coordenadas: ela segue o roteiro que foi gravado nela,
+# na bancada, waypoint a waypoint. São dez slots de receita (A–J), um por
+# ordem padrão, e o comando `mover` leva a LETRA.
+#
+# A letra sai do ÍNDICE do template nesta lista, e não de um dicionário à
+# parte. Um segundo mapa mantido à mão divergiria no primeiro template que
+# alguém reordenasse ou renomeasse, e o sintoma seria a mesa executando o
+# roteiro de OUTRA ordem — parada no dispenser errado, com a câmera acusando
+# SKU divergente num slot só, que é o quadro de uma falha mecânica. É a mesma
+# duplicação que este repositório já recusou no mapa de posições da célula.
+#
+# O limite de dez é da placa (slots A–J na NVS), e por isso é `validar_estrutura`
+# quem o cobra: um décimo primeiro template nasceria sem receita para onde ir.
+RECEITAS = "ABCDEFGHIJ"
+
 # `ordens.os_id` é VARCHAR(60) e o id instanciado é
 # `{template_id}-{AAAAMMDDTHHMMSS}-{6 hex}` = len(template_id) + 23.
 TAM_MAX_OS_ID = 60
@@ -260,6 +276,21 @@ def por_id(template_id: str) -> dict | None:
     return None
 
 
+def receita_de(template_id: str) -> str | None:
+    """A letra do slot de receita gravado na mesa, ou None se a ordem não é uma
+    das dez padrão.
+
+    None é um resultado legítimo e o chamador precisa tratá-lo: uma OS criada
+    fora dos templates (um POST à mão, um teste) não tem roteiro gravado, e a
+    mesa a recusaria com `receita_desconhecida` no meio do ciclo. Quem descobre
+    isso ANTES do primeiro `mover` é o orquestrador.
+    """
+    for i, template in enumerate(TEMPLATES):
+        if template["template_id"] == template_id:
+            return RECEITAS[i] if i < len(RECEITAS) else None
+    return None
+
+
 def nomes_usados(templates: list[dict] | None = None) -> set[str]:
     """Todo medicamento citado por algum template — o que precisa existir na
     tabela `medicamentos`."""
@@ -271,6 +302,19 @@ def nomes_usados(templates: list[dict] | None = None) -> set[str]:
 
 
 # ── Validação ─────────────────────────────────────────────────────────────────
+
+def _problema_de_receita(templates: list[dict]) -> list[str]:
+    """Mais templates que slots de receita na placa é um template sem roteiro.
+
+    Sem esta checagem, o décimo primeiro seria aceito no import, apareceria no
+    console, e só falharia com a OS já na fila — `receita_de` devolvendo None
+    para ele e a OS abortando no primeiro ciclo.
+    """
+    if len(templates) > len(RECEITAS):
+        return [f"{len(templates)} templates para {len(RECEITAS)} slots de receita "
+                f"(A–{RECEITAS[-1]}) — os excedentes não teriam roteiro na mesa."]
+    return []
+
 
 def validar_estrutura(templates: list[dict] | None = None,
                       num_slots: int = 8) -> list[str]:
@@ -331,6 +375,7 @@ def validar_estrutura(templates: list[dict] | None = None,
                     f"{QTD_MIN}..{QTD_MAX}."
                 )
 
+    problemas.extend(_problema_de_receita(lista))
     return problemas
 
 

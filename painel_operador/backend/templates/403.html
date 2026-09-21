@@ -8,7 +8,9 @@
         </div>
         <h2 class="fw-bold mt-3 mb-1">Acesso Negado</h2>
         <p class="text-muted mb-1">
+            {% if motivo %}{{ motivo }}{% else %}
             Seu perfil <strong>{{ perfil or sess_perfil }}</strong> não tem permissão para esta ação.
+            {% endif %}
         </p>
         <p class="text-muted small mb-4">
             Se precisar de acesso, solicite ao Administrador do sistema.

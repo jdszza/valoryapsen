@@ -19,15 +19,61 @@ rede da fábrica tinha acesso de Admin.
    `APSEN_ENV=dev` ou o processo não sobe.
 """
 import ast
+import os
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from conftest import PAINEL_API_TOKEN
 
+RAIZ_REPO = Path(__file__).resolve().parent.parent
+CONFTEST = RAIZ_REPO / "tests" / "conftest.py"
+
 
 # Rotas /api/* de leitura, para os casos em que o método não importa.
 ROTA_GET = "/api/resumo"
+
+
+# ── A suíte é dona dos DOIS lados do token ────────────────────────────────────
+
+def test_o_token_que_o_app_espera_e_o_que_a_suite_manda():
+    """`api()` manda uma CONSTANTE no header; o `app.py` lê o ambiente.
+
+    São dois lados da mesma comparação, e a suíte é dona dos dois — então ela
+    tem que ditar o valor, não aceitar o que estiver exportado. Foi por não
+    ditar que 18 testes passaram a falhar: numa máquina de bancada a variável
+    está exportada de verdade (o `iniciar_backend.bat` manda gravá-la com
+    `setx`, que é permanente), os dois lados divergiram, e toda rota /api/*
+    respondeu 401 — sem nada no repositório ter mudado.
+    """
+    assert os.environ["APSEN_API_TOKEN"] == PAINEL_API_TOKEN
+
+
+def test_o_conftest_nao_deixa_o_ambiente_ditar_o_token():
+    """A guarda da guarda, e a única que vale em máquina limpa.
+
+    O teste acima só fica vermelho onde `APSEN_API_TOKEN` já está exportada —
+    ou seja, justamente na máquina em que o problema aparece, e em nenhuma
+    outra. Esta varredura pega o `setdefault` de volta em qualquer lugar.
+
+    O `setdefault` continua certo para `NUM_SLOTS` e `APSEN_SECRET`: lá a suíte
+    lê o valor de volta e se adapta a ele. A diferença é essa, e é o que separa
+    "configurável de propósito" de "frágil ao ambiente".
+    """
+    arvore = ast.parse(CONFTEST.read_text(encoding="utf-8"))
+    for no in ast.walk(arvore):
+        if not (isinstance(no, ast.Call)
+                and isinstance(no.func, ast.Attribute)
+                and no.func.attr == "setdefault"
+                and no.args
+                and isinstance(no.args[0], ast.Constant)):
+            continue
+        assert no.args[0].value != "APSEN_API_TOKEN", (
+            "conftest voltou a usar setdefault para APSEN_API_TOKEN — o "
+            "ambiente de quem roda a suíte volta a ditar um dos lados da "
+            "comparação, e /api/* responde 401 em máquina de bancada"
+        )
 
 
 @pytest.fixture
@@ -157,8 +203,12 @@ def test_get_operadores_do_display_nao_carrega_credencial(painel):
 def test_serial_valida_pin_e_diz_de_quem_ele_e(painel):
     conn = painel.conexao()
     try:
+        # `pin_provisorio` vai junto, e o display NÃO é bloqueado por ele: a
+        # troca acontece na web, onde há teclado. Bloquear no display deixaria
+        # a bancada sem operador até alguém achar um computador.
         assert painel.modulo._validar_pin_data(conn, "1234") == {
             "ok": True, "nome": "Administrador", "perfil": "Admin",
+            "pin_provisorio": True,
         }
         assert painel.modulo._validar_pin_data(conn, "9999") == {"ok": False}
         assert painel.modulo._validar_pin_data(conn, "") == {"ok": False}
@@ -443,5 +493,80 @@ def test_migracao_nao_reintroduz_o_seed(painel_legado):
         assert conn.execute(
             "SELECT COUNT(*) c FROM operadores WHERE nome='Administrador'"
         ).fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. Importar o módulo não cria banco nem inventa dado
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `init_db()` e `seed_demo_data()` rodavam no TOPO do módulo: importar `app.py`
+# criava um arquivo no disco e o populava com dado fabricado. Qualquer import
+# servia — `waitress-serve app:app`, um linter, um `python -c "import app"`.
+#
+# É a regra que o central já tem escrita para o `seed_demo.py` dele: um seed que
+# roda sozinho transforma a primeira subida de uma instalação DE VERDADE em dado
+# inventado no banco de produção. Lá, `tests/test_reset_seed.py` varre o AST
+# para exigir que o único chamador seja a rota do console; aqui a varredura é a
+# de baixo.
+
+def test_o_import_nao_chama_init_db_nem_o_seed():
+    """Varredura do topo do módulo — só as chamadas de nível zero contam."""
+    fonte = (RAIZ_REPO / "painel_operador" / "backend" / "app.py"
+             ).read_text(encoding="utf-8")
+    chamadas_no_topo = {
+        no.value.func.id
+        for no in ast.parse(fonte).body
+        if isinstance(no, ast.Expr) and isinstance(no.value, ast.Call)
+        and isinstance(no.value.func, ast.Name)
+    }
+
+    assert "init_db" not in chamadas_no_topo
+    assert "seed_demo_data" not in chamadas_no_topo
+
+
+def test_quem_prepara_o_banco_e_o_iniciar_workers():
+    """A função certa e ninguém a chamando é o mesmo que não existir — e aqui o
+    sintoma seria o painel subindo sem tabela nenhuma."""
+    fonte = (RAIZ_REPO / "painel_operador" / "backend" / "app.py"
+             ).read_text(encoding="utf-8")
+    for no in ast.walk(ast.parse(fonte)):
+        if isinstance(no, ast.FunctionDef) and no.name == "iniciar_workers":
+            chamadas = {c.func.id for c in ast.walk(no)
+                        if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            assert "preparar_banco" in chamadas
+            return
+    pytest.fail("`iniciar_workers` não foi encontrada — o extrator quebrou")
+
+
+def test_preparar_banco_cria_o_schema(carregar_painel, tmp_path, monkeypatch):
+    """Controle: tirar do import não pode ter tirado a criação do schema."""
+    monkeypatch.setenv("APSEN_DB", str(tmp_path / "vazio.db"))
+    painel = carregar_painel()
+
+    conn = painel.conexao()
+    try:
+        tabelas = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+    assert {"ordens", "lotes", "medicamentos", "operadores"} <= tabelas
+
+
+def test_preparar_banco_sem_semear_nao_inventa_lote(carregar_painel, tmp_path,
+                                                    monkeypatch):
+    """`semear=False` é o que um deploy de verdade quer: schema sem história."""
+    monkeypatch.setenv("APSEN_DB", str(tmp_path / "limpo.db"))
+    painel = carregar_painel()
+    conn = painel.conexao()
+    try:
+        conn.execute("DELETE FROM lotes")
+        conn.commit()
+
+        painel.modulo.preparar_banco(semear=False)
+
+        assert conn.execute("SELECT COUNT(*) c FROM lotes").fetchone()["c"] == 0
     finally:
         conn.close()

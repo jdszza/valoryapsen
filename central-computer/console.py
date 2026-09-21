@@ -183,6 +183,19 @@ def duracao_cookie_s() -> int:
 def registrar_falha(origem: str, agora: float | None = None) -> None:
     momento = agora if agora is not None else time.monotonic()
     with _tentativas_lock:
+        # Varre TODOS os baldes, não só o desta origem. A chave é
+        # `ip|username`, ou seja, ela é escolhida por quem tenta: uma varredura
+        # com um username novo a cada tentativa criava uma entrada que ninguém
+        # mais consultaria — `bloqueado` só limpa a chave que recebe —, e o
+        # dicionário crescia sem teto num processo que não reinicia.
+        #
+        # O custo é O(nº de baldes) por tentativa FALHA, e é ele mesmo que
+        # mantém o número pequeno: sobrevive aqui só o que tentou nos últimos
+        # `JANELA_TENTATIVAS_S`. Login que dá certo não passa por aqui.
+        for chave in [k for k, ts in _tentativas.items()
+                      if all(momento - t >= JANELA_TENTATIVAS_S for t in ts)]:
+            del _tentativas[chave]
+
         recentes = [t for t in _tentativas.get(origem, [])
                     if momento - t < JANELA_TENTATIVAS_S]
         recentes.append(momento)
@@ -201,7 +214,15 @@ def bloqueado(origem: str, agora: float | None = None) -> float:
     with _tentativas_lock:
         recentes = [t for t in _tentativas.get(origem, [])
                     if momento - t < JANELA_TENTATIVAS_S]
-        _tentativas[origem] = recentes
+        # Balde que esvaziou é REMOVIDO, e não regravado vazio. A chave é
+        # `ip|username`, ou seja, ela é escolhida por quem tenta: uma varredura
+        # com um username diferente por tentativa deixava uma entrada
+        # permanente por tentativa, e o dicionário crescia sem teto num
+        # processo que não reinicia. Custa um `pop` e fecha o caminho.
+        if recentes:
+            _tentativas[origem] = recentes
+        else:
+            _tentativas.pop(origem, None)
         if len(recentes) < MAX_TENTATIVAS:
             return 0.0
         return max(JANELA_TENTATIVAS_S - (momento - min(recentes)), 1.0)

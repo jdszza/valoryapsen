@@ -70,8 +70,13 @@ def _enviar(modulo, respostas):
 def test_evento_perdido_por_falha_de_rede_e_reenviado(carregar_adapter, nome):
     """O bug: uma falha de rede e o evento sumia para sempre.
 
-    O orquestrador não repergunta nada — ele espera o evento. Sem reenvio, a OS
-    inteira morre por `TIMEOUT_DISPENSA` de um dispenser que dispensou.
+    O orquestrador não repergunta nada — ninguém reenvia evento. O que muda com
+    o ciclo por RELÓGIO é a consequência, não a gravidade: antes a OS morria por
+    `TIMEOUT_DISPENSA` de um dispenser que dispensou; hoje ela SEGUE, e o slot
+    entra no Triple Check como fonte que não mediu. Com limiar 1, uma segunda
+    fonte discordando trava a OS — ou seja, o evento perdido deixou de derrubar
+    a OS na hora e passou a gastar o supervisor. O reenvio continua sendo o que
+    separa as duas coisas.
     """
     modulo = carregar_adapter(nome)
 

@@ -8,13 +8,19 @@ cnc-adapter toma ACCESS_DENIED na própria porta. Fixar a porta elimina a
 varredura, e sem varredura não há competição.
 
 O que estes testes prendem: definida, o painel abre SÓ aquela porta e não
-enumera as demais; vazia, o comportamento é exatamente o de hoje (varre); e a
-porta fixa continua passando pela sondagem de sempre, com DTR/RTS desligados —
-fixar o número não dispensa conferir que há um display do outro lado.
+enumera as demais; e a porta fixa continua passando pela sondagem de sempre, com
+DTR/RTS desligados — fixar o número não dispensa conferir que há um display do
+outro lado.
+
+**A varredura virou OPT-IN** (`APSEN_DISPLAY_VARRER=1`), e não sumiu: ela é o
+caminho de quem desenvolve sem hardware ou com uma placa só na mesa. O que ela
+deixou de ser é o default, porque na bancada montada ela é o problema e não a
+conveniência. Sem nenhuma das duas variáveis, o display fica OFFLINE com uma
+linha dizendo o que definir — e o painel SOBE assim mesmo, que é a diferença
+deliberada para os adapters: eles existem para falar com uma porta, este
+processo também serve a tela que o gestor está olhando.
 """
 import re
-
-import pytest
 
 
 class _Porta:
@@ -71,8 +77,25 @@ def test_porta_fixa_sem_display_do_outro_lado_nao_cai_na_varredura(carregar_pain
     assert enumeracoes == []
 
 
-def test_sem_a_variavel_varre_como_hoje(carregar_painel, monkeypatch):
-    painel = carregar_painel(env={"APSEN_DISPLAY_PORTA": None})
+def test_sem_nenhuma_das_duas_nao_varre_e_diz_o_que_fazer(carregar_painel,
+                                                          monkeypatch, capsys):
+    """O default mudou: varrer faz este processo abrir as portas dos outros
+    quatro, e o sintoma é boot não-determinístico em que uma placa às vezes
+    simplesmente não é achada."""
+    painel = carregar_painel(env={"APSEN_DISPLAY_PORTA": None,
+                                  "APSEN_DISPLAY_VARRER": None})
+    sonda = _Sonda(responde_em="COM4")
+    enumeracoes = _instalar(painel, monkeypatch, sonda, ["COM3", "COM4"])
+
+    assert painel.modulo.find_display_port() is None
+    assert enumeracoes == []
+    assert sonda.sondadas == []
+    assert "APSEN_DISPLAY_PORTA" in capsys.readouterr().out
+
+
+def test_varredura_religada_volta_a_ser_a_de_antes(carregar_painel, monkeypatch):
+    painel = carregar_painel(env={"APSEN_DISPLAY_PORTA": None,
+                                  "APSEN_DISPLAY_VARRER": "1"})
     sonda = _Sonda(responde_em="COM4")
     enumeracoes = _instalar(painel, monkeypatch, sonda, ["COM3", "COM4", "COM5"])
 
@@ -84,7 +107,8 @@ def test_sem_a_variavel_varre_como_hoje(carregar_painel, monkeypatch):
 
 
 def test_variavel_em_branco_conta_como_ausente(carregar_painel, monkeypatch):
-    painel = carregar_painel(env={"APSEN_DISPLAY_PORTA": "   "})
+    painel = carregar_painel(env={"APSEN_DISPLAY_PORTA": "   ",
+                                  "APSEN_DISPLAY_VARRER": "1"})
     sonda = _Sonda(responde_em="COM3")
     enumeracoes = _instalar(painel, monkeypatch, sonda, ["COM3"])
 
@@ -96,7 +120,8 @@ def test_a_variavel_e_lida_a_cada_tentativa(carregar_painel, monkeypatch):
     """O `.bat` da bancada é reiniciado com frequência, mas o `serial_worker`
     reprocura a cada 3 s: a porta fixada depois do boot vale na tentativa
     seguinte, sem reiniciar o painel."""
-    painel = carregar_painel(env={"APSEN_DISPLAY_PORTA": None})
+    painel = carregar_painel(env={"APSEN_DISPLAY_PORTA": None,
+                                  "APSEN_DISPLAY_VARRER": "1"})
     sonda = _Sonda(responde_em="COM7")
     enumeracoes = _instalar(painel, monkeypatch, sonda, ["COM3"])
 

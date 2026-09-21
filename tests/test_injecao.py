@@ -30,6 +30,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from conftest import TEMPLATE_PADRAO
 
 RAIZ_REPO = Path(__file__).resolve().parent.parent
 CENTRAL_DIR = RAIZ_REPO / "central-computer"
@@ -49,7 +50,12 @@ def _item(med: str, qtd: int = 10) -> dict:
 
 
 def _payload_os(os_id: str, *itens) -> dict:
+    # `template_id` é o que diz QUAL das dez ordens padrão esta é, e é dele que
+    # o orquestrador tira a letra da receita gravada na mesa. Sem ele a OS é
+    # legitimamente abortada com `receita_nao_mapeada` antes do primeiro mover
+    # — o caso tem teste próprio; aqui a OS é uma ordem padrão de verdade.
     return {"os_id": os_id, "descricao": "teste",
+            "template_id": TEMPLATE_PADRAO,
             "medicamentos": list(itens) or [_item("Dipirona")]}
 
 

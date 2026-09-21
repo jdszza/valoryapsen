@@ -247,6 +247,57 @@ def test_a_segunda_porta_do_dispenser_adapter_declara_as_quatro_variaveis(servic
     assert str(ambiente["DISPENSER_TFT_TRANSPORTE"]).endswith(":-http}")
 
 
+# ── O que o `.env` precisa conseguir sobrescrever ─────────────────────────────
+
+# Endereço de cada adapter visto pelo CENTRAL. O default é o nome DNS da rede
+# `apsen-net`, e ele só vale enquanto o adapter for um container.
+_URLS_DE_ADAPTER = {
+    "DISPENSER_ADAPTER_URL": "http://dispenser-adapter:8100",
+    "CNC_ADAPTER_URL":       "http://cnc-adapter:8101",
+    "VISION_ADAPTER_URL":    "http://vision-adapter:8102",
+    "WEIGHT_ADAPTER_URL":    "http://weight-adapter:8103",
+}
+
+
+@pytest.mark.parametrize("variavel,default", sorted(_URLS_DE_ADAPTER.items()))
+def test_a_url_de_cada_adapter_e_sobrescrivivel_pelo_env(servicos, variavel, default):
+    """Adapter com porta serial roda FORA do Docker, e o central o alcança por
+    `host.docker.internal:<porta>` — um valor que só pode vir do `.env`.
+
+    Fixá-lo aqui não dá erro: faz o `.env` ser IGNORADO em silêncio. O sintoma
+    é o pior que um passo a passo pode ter — `docs/DEPLOY_WINDOWS.md` seguido à
+    risca, a variável no arquivo certo, e o central ainda tentando falar com um
+    container que, sem o profile `simulado`, nem existe. Foi o que aconteceu
+    quando a balança virou a primeira placa de verdade.
+    """
+    valor = str(servicos["central-computer"]["environment"][variavel])
+    assert valor == "${" + variavel + ":-" + default + "}", (
+        f"{variavel} precisa ser ${{{variavel}:-{default}}} para o .env valer; "
+        f"está {valor!r}"
+    )
+
+
+# As cinco que o CLAUDE.md descreve como "estão no `.env` de quem já roda a
+# planta" — e que estavam fixas no compose, ou seja, não estavam em `.env`
+# nenhum. `INTERVALO_OS` é a que decide se o gerador fica calado durante uma
+# integração parcial da célula.
+_VARIAVEIS_DO_GERADOR = ("INTERVALO_OS", "RELOAD_CATALOGO_MIN",
+                         "ESPERA_FILA_CHEIA", "MAX_ESPERAS_FILA", "ESPERA_PAUSA")
+
+
+@pytest.mark.parametrize("variavel", _VARIAVEIS_DO_GERADOR)
+def test_o_gerador_e_configuravel_pelo_env(servicos, variavel):
+    """Sem dispenser e CNC, toda OS automática aborta em
+    `erro_envio_carregamento` — a cada `INTERVALO_OS`, enchendo o histórico e o
+    badge de alarmes de falhas que ninguém provocou. Silenciar o gerador não
+    pode exigir editar o compose."""
+    valor = str(servicos["erp-simulator"]["environment"][variavel])
+    assert valor.startswith("${" + variavel + ":-"), (
+        f"{variavel} está fixa no compose ({valor!r}) e o CLAUDE.md a descreve "
+        f"como variável de `.env`"
+    )
+
+
 # ── Profiles: planta simulada × célula montada (Windows) ──────────────────────
 # O mini PC da célula roda Windows, e o Docker Desktop não repassa COM para
 # container: os três adapters seriais rodam no host. No compose eles e os quatro

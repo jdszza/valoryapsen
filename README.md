@@ -20,7 +20,7 @@ simuladores já têm contrato e transporte prontos do lado Python.
 ## Índice
 
 - [Visão geral](#visão-geral)
-- [Arquitetura](#arquitetura)
+- [Arquitetura](#arquitetura) — serviços, os dois transportes, o estado dos firmwares
 - [A célula por dentro](#a-célula-por-dentro) — layout, câmeras, Triple Check, fluxo
 - [As 10 ordens padrão](#as-10-ordens-padrão)
 - [Subir a stack](#subir-a-stack)
@@ -167,6 +167,30 @@ Docker Desktop não repassa COM para container: os três adapters seriais rodam
 RFC2217 foi avaliada e preterida. O porquê, e o passo a passo, estão em
 [Portas seriais na célula montada](#portas-seriais-na-célula-montada) e em
 [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md).
+
+### Os firmwares das placas
+
+Três subsistemas têm placa própria, e **elas não estão no mesmo ponto**:
+
+| Subsistema | Pasta | Estado | Manual |
+|---|---|---|---|
+| `dispenser` + `dispenser_tft` | `dispenser/` | fala as duas vozes | [`dispenser/README.md`](dispenser/README.md) · [primeiro ensaio](dispenser/PRIMEIRO_ENSAIO.md) |
+| `weight` | `weight/` | fala as duas vozes | [`weight/README.md`](weight/README.md) · [primeiro ensaio](weight/PRIMEIRO_ENSAIO.md) |
+| `cnc` | `cnc/` | fala as duas vozes | [`cnc/README.md`](cnc/README.md) |
+
+**"Duas vozes" é o que faz as duas conversas caberem na mesma porta USB.** Toda
+linha de máquina tem um `{`; toda linha sem `{` é log do operador, e o adapter
+extrai o JSON a partir do primeiro `{` — então log e JSON podem sair **grudados**
+na mesma linha, que é o que os firmwares realmente fazem no boot. Nada do que o
+terminal de bancada imprimia foi removido: é isso que mantém cada placa
+utilizável sozinha, com o Monitor Serial, no dia em que o resto da planta
+estiver fora do ar.
+
+**A mesa CNC ainda não tem a segunda voz**, e ligar `CNC_TRANSPORTE=serial`
+nela não dá erro na subida — dá um adapter que se anuncia conectado e uma
+planta que não anda. Ela fica no default (`http`, o `cnc_simulator`) até lá; o
+firmware que existe hoje é máquina de bancada, e é com ele que se gravam as dez
+receitas.
 
 ### Fontes de verdade
 
@@ -506,13 +530,65 @@ e [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md).
 > de porta preenchida. A varredura automática é só para desenvolvimento sem
 > hardware.** Cinco portas, cinco donos, um processo por porta — nenhum varre.
 
-| Placa | Subsistema | Variável | Processo (no host) |
+| Placa | Subsistema | Variável | Processo (no host) | Manual da placa |
+|---|---|---|---|---|
+| mecanismos dos 8 dispensers | `dispenser` | `DISPENSER_SERIAL_URL` | dispenser-adapter | [`dispenser/README.md`](dispenser/README.md) |
+| as 8 telas TFT | `dispenser_tft` | `DISPENSER_TFT_SERIAL_URL` | dispenser-adapter (a segunda porta do mesmo processo) | [`dispenser/README.md`](dispenser/README.md) |
+| mesa CNC | `cnc` | `CNC_SERIAL_URL` | cnc-adapter | [`cnc/README.md`](cnc/README.md) |
+| balança HX711 | `weight` | `WEIGHT_SERIAL_URL` | weight-adapter | [`weight/README.md`](weight/README.md) |
+| display de 7" | — | `APSEN_DISPLAY_PORTA` | painel_operador | [`docs/BANCADA.md`](docs/BANCADA.md) |
+
+> **A mesa CNC entra por aqui como as outras.** O firmware
+> (`cnc/receitas_manuais`) fala as duas vozes desde a frente do ciclo por
+> relógio: ele atende `mover`, `homing` e `estado_celula`, é endereçado por
+> `dispenser_alvo` e REPORTA a posição alcançada. O que ficou pendente é de
+> bancada — medir os prazos do cronograma e gravar as dez receitas —, e está no
+> fim de [`cnc/README.md`](cnc/README.md).
+
+### Onde escrever o número da COM
+
+**Na primeira linha editável do `.bat` daquele processo.** São quatro `.bat`,
+um por processo do host, todos no mesmo molde: abra, troque o número da COM,
+salve, rode.
+
+| Processo | Placa | Arquivo | Variável |
 |---|---|---|---|
-| mecanismos dos 8 dispensers | `dispenser` | `DISPENSER_SERIAL_URL` | dispenser-adapter |
-| as 8 telas TFT | `dispenser_tft` | `DISPENSER_TFT_SERIAL_URL` | dispenser-adapter (a segunda porta do mesmo processo) |
-| mesa CNC | `cnc` | `CNC_SERIAL_URL` | cnc-adapter |
-| balança HX711 | `weight` | `WEIGHT_SERIAL_URL` | weight-adapter |
-| display de 7" | — | `APSEN_DISPLAY_PORTA` | painel_operador |
+| dispenser-adapter | mecanismos dos 8 dispensers | [`dispenser-adapter/iniciar_host.bat`](dispenser-adapter/iniciar_host.bat) | `DISPENSER_SERIAL_URL` |
+| " | as 8 telas TFT | o **mesmo** arquivo, a linha de baixo | `DISPENSER_TFT_SERIAL_URL` |
+| cnc-adapter | mesa CNC | [`cnc-adapter/iniciar_host.bat`](cnc-adapter/iniciar_host.bat) | `CNC_SERIAL_URL` |
+| weight-adapter | balança HX711 | [`weight-adapter/iniciar_host.bat`](weight-adapter/iniciar_host.bat) | `WEIGHT_SERIAL_URL` |
+| painel de bancada | display de 7" | [`painel_operador/iniciar_backend.bat`](painel_operador/iniciar_backend.bat) | `APSEN_DISPLAY_PORTA` |
+
+Cada arquivo tem no topo o bloco *a única linha que você precisa editar*. Fora
+a COM, ele já liga o transporte serial, aponta o `CENTRAL_URL` para
+`http://localhost:8000` — `central-computer:8000` é nome DNS da rede Docker e
+**não resolve no host**, a mesma armadilha do `BACKEND_URL` — e sobe o processo
+na mesma porta HTTP que o compose publicava, para que o central, o dashboard e
+o pré-voo não notem diferença. **Rodar o `.bat` é tudo que a bancada faz.**
+
+Quem preferir não editar arquivo exporta a variável antes: os `.bat` só aplicam
+o próprio default quando ela vem vazia (`if "%VAR%"=="" set VAR=...`).
+
+```bat
+set WEIGHT_SERIAL_URL=COM9
+weight-adapter\iniciar_host.bat
+```
+
+Duas coisas que o `.bat` **não** é:
+
+* **não é o `.env` da raiz.** O `.env` alimenta o **compose**, e na célula
+  montada esses quatro processos rodam fora do Docker — ninguém lê o `.env`
+  deles. Escrever `CNC_SERIAL_URL=COM5` lá, no Windows, não chega a processo
+  nenhum e **não dá erro**: o adapter do host sobe varrendo as portas, como se
+  a variável estivesse vazia. (No caminho Linux, com o `devices:` do compose
+  descomentado, aí sim quem lê é o container, e o lugar é o `.env`.)
+* **não é o `setx` do Windows.** Ele continua valendo para segredos que não
+  entram em arquivo versionado — `APSEN_SECRET`, `APSEN_API_TOKEN` —, e o
+  `.bat` do painel checa os dois antes de subir.
+
+**Se a porta HTTP do adapter estiver ocupada**, o adapter de *container* está de
+pé: `docker compose stop <adapter>`, ou tire o `COMPOSE_PROFILES=simulado` do
+`.env`.
 
 **Por que a porta fixa é obrigatória.** Com a variável vazia, cada adapter
 varre todas as portas procurando a sua placa, e em cada candidata gasta
@@ -782,6 +858,8 @@ pegam a regressão que nenhum outro pega:
 | `test_serial_link.py` | serial bloqueando o event loop; as 3 cópias de `serial_link.py` divergindo |
 | `test_protocolo_serial.py` | contrato do display divergindo entre C++, backend e simulador |
 | `test_protocolo_placas.py` | contrato serial divergindo entre `docs/`, adapters e placas falsas |
+| `test_balanca_serial.py` | firmware da balança divergindo do adapter (lê o `.ino` por texto; validado por mutação) |
+| `test_dispenser_firmware.py` | as 2 cópias de `apsen_serial.h` divergindo; evento de bancada vazando para o central |
 | `test_seguranca.py` | rota conferindo JWT sem revalidar no banco |
 | `test_limites.py` | `?limite=` cru indo para o `LIMIT` do MySQL |
 
@@ -939,7 +1017,9 @@ GET  /console/api/prevoo                 o relatório item a item
 valoryapsen/
 ├── README.md               # este arquivo
 ├── CLAUDE.md               # decisões de arquitetura e armadilhas
-├── TASKS.md                # backlog
+├── TASKS.md                # backlog geral
+├── TASKS_CNC.md            # frente aberta: a mesa CoreXY
+├── TASKS_DISPENSER.md      # frente aberta: as placas dos dispensers
 ├── docs/
 │   ├── PROTOCOLO_SERIAL.md # contrato adapter ↔ firmware (uma linha JSON por mensagem)
 │   ├── BANCADA.md          # painel de bancada + display ESP32
@@ -966,6 +1046,9 @@ valoryapsen/
 ├── erp-simulator/          # o ERP que emite as OS (sem porta)
 ├── dashboard/              # Dash read-only :8050
 ├── manut_web/              # Dash manutenção e operação :8051
+├── dispenser/              # FIRMWARE — mecanismos + telas TFT (2 placas)
+├── cnc/                    # FIRMWARE — mesa CoreXY, receitas na NVS
+├── weight/                 # FIRMWARE — balança 4 × HX711
 ├── painel_operador/        # FORA do Docker — backend Flask + firmware do display
 ├── mysql/init.sql          # só charset/collation; o schema vem do database.py
 ├── tests/                  # pytest — sem Docker, sem MySQL, sem porta física

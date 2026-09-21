@@ -175,6 +175,17 @@ class ClienteHTTPFake:
         return self._Resposta(self.status)
 
 
+def _sl_modulo(link):
+    """O módulo `serial_link` em que este `LinkSerial` foi definido.
+
+    A `SESSAO` é de MÓDULO (o processo tem uma só), e a suíte importa o
+    `serial_link` por caminho — pegá-la pela classe evita depender de qual das
+    três cópias o fixture carregou.
+    """
+    import sys
+    return sys.modules[type(link).__module__]
+
+
 @pytest.fixture
 def montar_link(sl):
     """Uma placa falsa + um `LinkSerial` já conectado a ela."""
@@ -333,6 +344,79 @@ def test_varredura_aceita_a_primeira_porta_do_SUBSISTEMA_certo(sl, monkeypatch):
         balanca.parar()
 
 
+def test_porta_fixa_que_nao_abre_avisa_em_vez_de_ficar_muda(sl, caplog):
+    """O primeiro erro de bancada não pode ser silencioso.
+
+    COM errada, cabo fora do soquete ou Monitor Serial aberto — os três param no
+    mesmo lugar: `_abrir` levanta, loga em `debug`, e os adapters rodam em INFO.
+    O processo então sobe, anuncia "Application startup complete" e entra num
+    laço de reconexão de 3 em 3 segundos sem dizer NADA. Quem está na bancada vê
+    um terminal parado e não tem como saber se o problema é a porta, o cabo ou o
+    firmware.
+
+    Aconteceu no primeiro ensaio da balança, exatamente assim.
+    """
+    link = sl.LinkSerial(subsistema="weight", url="COM_QUE_NAO_EXISTE",
+                         reconexao_s=0.05)
+    with caplog.at_level("WARNING"):
+        link.iniciar()
+        try:
+            assert _ate(lambda: any("NÃO abriu" in r.message
+                                    for r in caplog.records), timeout=5)
+        finally:
+            link.parar()
+
+    aviso = [r for r in caplog.records if "NÃO abriu" in r.message][0]
+    # A mensagem tem que levar o técnico aos três suspeitos, em ordem.
+    assert "COM_QUE_NAO_EXISTE" in aviso.getMessage()
+    assert "WEIGHT_SERIAL_URL" in aviso.getMessage()
+    assert "exclusiva" in aviso.getMessage()
+
+
+def test_o_aviso_de_porta_fixa_sai_UMA_vez_por_transicao(sl, caplog):
+    """O laço tenta para sempre. Uma linha por tentativa encheria o log e
+    esconderia justamente a linha que interessa — a da volta.
+
+    É a mesma regra de `_marcar_desconectado`, e pelo mesmo motivo."""
+    link = sl.LinkSerial(subsistema="cnc", url="COM_QUE_NAO_EXISTE",
+                         reconexao_s=0.02)
+    with caplog.at_level("WARNING"):
+        link.iniciar()
+        try:
+            assert _ate(lambda: any("NÃO abriu" in r.message
+                                    for r in caplog.records), timeout=5)
+            time.sleep(0.4)          # ~20 tentativas de reconexão
+        finally:
+            link.parar()
+
+    avisos = [r for r in caplog.records if "NÃO abriu" in r.message]
+    assert len(avisos) == 1, f"{len(avisos)} avisos — o laço está logando por tentativa"
+
+
+def test_a_varredura_que_falha_continua_calada(sl, caplog, monkeypatch):
+    """A outra metade da decisão, e a que impede o conserto de virar ruído.
+
+    Com a URL vazia o `_abrir` é chamado em TODA porta candidata e falha na
+    maioria — é rotina, não erro de configuração. Subir o nível ali encheria o
+    log de linhas normais, e o WARNING deixaria de significar alguma coisa.
+    """
+    monkeypatch.setattr(sl, "_portas_disponiveis",
+                        lambda: ["COM_FALSA_1", "COM_FALSA_2"])
+    link = sl.LinkSerial(subsistema="dispenser", url="", reconexao_s=0.05,
+                         probe_assentar_s=0.0, probe_espera_s=0.05)
+    with caplog.at_level("WARNING"):
+        link.iniciar()
+        try:
+            time.sleep(0.3)
+        finally:
+            link.parar()
+
+    assert not [r for r in caplog.records if "NÃO abriu" in r.message], (
+        "a varredura passou a avisar — toda porta de outro processo viraria "
+        "um WARNING a cada ciclo"
+    )
+
+
 @pytest.mark.parametrize("subsistema", ADAPTERS_SERIAIS)
 def test_url_configurada_manda_e_nao_ha_varredura(sl, montar_link, subsistema,
                                                   monkeypatch):
@@ -465,6 +549,116 @@ def test_cmd_id_repetido_nao_executa_duas_vezes_na_placa(montar_link):
     assert len(placa.executados) == 1, (
         "a placa executou o mesmo cmd_id mais de uma vez — dose dobrada no leito"
     )
+
+
+# ── `sessao`: o contador nasce de novo, e a placa precisa saber ──────────────
+#
+# O `cmd_id` é monotônico DENTRO de uma sessão do adapter: ele nasce em 1 a cada
+# `LinkSerial` novo. A idempotência acima, sozinha, transforma isso num modo de
+# falhar — um restart de 2 a 5 s do processo (o `.bat` da bancada reinicia
+# sozinho) faz o contador voltar a 1 com a placa ainda em `ultimoCmdId = 47`, e
+# TODO comando até 47 recebe ACK POSITIVO sem executar.
+#
+# Com o ciclo por relógio o sintoma mudou de lugar: não é mais só timeout — o
+# central segue o cronograma e dispara o `dispensar` de um `mover` que a mesa
+# nunca fez.
+#
+# A heurística antiga (silêncio de 10 s sem pong) continua no firmware como rede
+# de segurança, e não cobre este caso: 2 s de queda não chegam perto de três
+# pings perdidos.
+
+def test_todo_comando_carrega_a_sessao(montar_link):
+    placa, link, _ = montar_link("dispenser")
+
+    link.enviar_comando("limpar", {"dispenser_id": 1, "solicitado_por": "t"})
+
+    (linha,) = [l for l in placa.linhas_recebidas if '"cmd":"limpar"' in l]
+    assert '"sessao"' in linha
+
+
+def test_o_pong_tambem_carrega_a_sessao(montar_link):
+    """O pong sozinho não basta (o primeiro comando pode chegar antes dele), mas
+    sem ele a placa só saberia da sessão nova no primeiro comando — e é ela que
+    decide se esse comando executa."""
+    placa, link, _ = montar_link("dispenser")
+
+    assert _ate(lambda: any('"resp":"pong"' in l for l in placa.linhas_recebidas))
+    (pong,) = [l for l in placa.linhas_recebidas if '"resp":"pong"' in l][:1]
+    assert '"sessao"' in pong
+
+
+def test_sessao_nova_faz_a_placa_executar_o_cmd_id_repetido(montar_link):
+    """O caso do restart rápido, encenado: o mesmo `cmd_id`, sessão diferente."""
+    placa, link, _ = montar_link("dispenser")
+    sessao = _sl_modulo(link).SESSAO
+    base = {"cmd": "limpar", "dispenser_id": 1, "solicitado_por": "t"}
+
+    link._escrever({**base, "cmd_id": 7, "sessao": sessao})
+    assert _ate(lambda: len(placa.executados) == 1)
+    # O adapter reiniciou: contador de volta ao 1, sessão nova.
+    link._escrever({**base, "cmd_id": 1, "sessao": sessao + 1})
+
+    assert _ate(lambda: len(placa.executados) == 2), (
+        "a placa respondeu ACK sem executar — é o comando de um adapter que "
+        "acabou de reiniciar, não um reenvio")
+
+
+def test_a_mesma_sessao_continua_ignorando_repeticao(montar_link):
+    """Controle, e é ele que separa as duas regras: dentro da MESMA sessão, o
+    `cmd_id` repetido continua sendo reenvio — e reenviar `dispensar` é dose
+    dobrada no leito."""
+    placa, link, _ = montar_link("dispenser")
+    sessao = _sl_modulo(link).SESSAO
+    comando = {"cmd": "dispensar", "cmd_id": 1, "dispenser_id": 4,
+               "os_id": "OS-9", "sessao": sessao}
+
+    link._escrever(comando)
+    assert _ate(lambda: len(placa.executados) == 1)
+    link._escrever(dict(comando))
+    time.sleep(0.3)
+
+    assert len(placa.executados) == 1
+
+
+def test_a_primeira_sessao_nao_descarta_nada(montar_link):
+    """Zero (ou ausente) é "ainda não sei". Zerar na primeira faria todo boot da
+    placa descartar o primeiro comando legítimo.
+
+    Sem afirmar `sessao_adapter is None` antes: o pong chega de forma assíncrona
+    e a placa pode já tê-la adotado por ali. O que importa é que o primeiro
+    comando EXECUTE — e é isso que se mede.
+    """
+    placa, link, _ = montar_link("dispenser")
+
+    link.enviar_comando("limpar", {"dispenser_id": 2, "solicitado_por": "t"})
+
+    assert len(placa.executados) == 1
+    assert placa.sessao_adapter == _sl_modulo(link).SESSAO
+
+
+def test_relogio_que_anda_para_tras_tambem_e_sessao_nova(montar_link):
+    """A comparação é de DIFERENÇA, não de ordem: NTP, fuso ou máquina sem RTC
+    podem devolver um epoch menor, e continua sendo outro processo."""
+    placa, link, _ = montar_link("dispenser")
+    sessao = _sl_modulo(link).SESSAO
+    base = {"cmd": "limpar", "dispenser_id": 1, "solicitado_por": "t"}
+
+    link._escrever({**base, "cmd_id": 7, "sessao": sessao})
+    assert _ate(lambda: len(placa.executados) == 1)
+    link._escrever({**base, "cmd_id": 1, "sessao": sessao - 3600})
+
+    assert _ate(lambda: len(placa.executados) == 2)
+
+
+def test_a_sessao_nao_vira_campo_de_comando(montar_link):
+    """Ela é do TRANSPORTE, como o `cmd_id`. Entrando no payload, ela viraria um
+    campo que `test_protocolo_placas.py` cobraria do contrato de cada
+    subsistema — e que o adapter repassaria ao central no evento."""
+    placa, link, _ = montar_link("dispenser")
+
+    link.enviar_comando("limpar", {"dispenser_id": 1, "solicitado_por": "t"})
+
+    assert "sessao" not in placa.executados[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -825,11 +1019,19 @@ def test_comando_http_sai_na_rota_e_no_corpo_de_sempre(carregar_adapter, subsist
         return
 
     if subsistema == "cnc":
+        # As coordenadas são ACEITAS pelo modelo (chamador antigo não toma 422)
+        # e NÃO descem: o endereço da mesa é o dispenser, e a posição volta
+        # medida no `posicionado`. Mandá-las seria um segundo mapa da célula na
+        # linha serial, que o firmware teria de ignorar.
         asyncio.run(modulo.cmd_mover(modulo.ComandoMoverReq(
-            dispenser_alvo=3, os_id="OS-1", posicao_x=240.0, posicao_y=-150.0,
+            dispenser_alvo=3, os_id="OS-1", receita="C",
+            posicao_x=240.0, posicao_y=-150.0,
             ciclo_atual=1, total_ciclos=3)))
         assert enviados[0][0] == "/executar/mover"
         assert enviados[0][1]["dispenser_alvo"] == 3
+        assert enviados[0][1]["receita"] == "C"
+        assert "posicao_x" not in enviados[0][1]
+        assert "posicao_y" not in enviados[0][1]
     elif subsistema == "dispenser":
         asyncio.run(modulo.cmd_dispensar(modulo.ComandoDispensarReq(
             dispenser_id=2, os_id="OS-1")))
@@ -966,3 +1168,91 @@ def test_a_imagem_do_adapter_leva_pyserial_e_o_serial_link(subsistema):
     assert "pyserial" in (pasta / "requirements.txt").read_text(encoding="utf-8")
     dockerfile = (pasta / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY . ." in dockerfile or "serial_link.py" in dockerfile
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A mesa CNC pela porta de verdade — adapter → socket:// → placa
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `tests/test_protocolo_placas.py` cobre a placa falsa da mesa isoladamente.
+# Estes exercitam a cadeia inteira, que é onde o `estado_celula` e a
+# idempotência do `cmd_id` realmente valem: entre o endpoint do adapter e a
+# thread leitora, atravessando uma porta serial de verdade.
+
+
+def test_estado_celula_atravessa_o_adapter_da_mesa(adapter_serial):
+    """A trava chega à mesa pelo MESMO caminho de um `mover`, sem tradução."""
+    adapter = adapter_serial("cnc")
+
+    adapter.chamar(adapter.modulo.cmd_estado_celula(
+        adapter.modulo.EstadoCelulaReq(trava_ativa=True, trava_slot_id=5,
+                                       os_id="OS-1", trava_resumo="divergência de peso")))
+
+    executados = [e for e in adapter.placa.executados if e["cmd"] == "estado_celula"]
+    assert executados, "o comando não chegou à placa"
+    assert executados[0]["trava_ativa"] is True
+    assert executados[0]["trava_slot_id"] == 5
+
+
+def test_o_resumo_da_trava_chega_cortado_em_48(adapter_serial):
+    """O motivo formatado do central passa de 240 caracteres e NÃO viaja.
+
+    Mandá-lo acoplaria o formato de mensagem do central à largura de um
+    terminal, e criaria um segundo ponto de truncamento para algo cosmético.
+    """
+    adapter = adapter_serial("cnc")
+
+    adapter.chamar(adapter.modulo.cmd_estado_celula(
+        adapter.modulo.EstadoCelulaReq(trava_ativa=True, os_id="OS-1",
+                                       trava_resumo="x" * 200)))
+
+    executados = [e for e in adapter.placa.executados if e["cmd"] == "estado_celula"]
+    assert len(executados[0]["trava_resumo"]) == adapter.modulo.TRAVA_RESUMO_MAX
+
+
+def test_estado_celula_e_aceito_no_meio_de_um_mover(adapter_serial):
+    """Aceito NO MEIO é o ponto: a mesa está a caminho de um slot cuja dispensa
+    o supervisor acabou de reprovar.
+
+    A placa falsa com `atraso_evento` encena o `mover` que ainda não terminou; o
+    `estado_celula` tem de ser aceito e executado nesse intervalo, sem esperar
+    o fim do movimento.
+    """
+    adapter = adapter_serial("cnc", atraso_evento=0.4)
+
+    adapter.chamar(adapter.modulo.cmd_mover(adapter.modulo.ComandoMoverReq(
+        dispenser_alvo=3, os_id="OS-1", receita="C", ciclo_atual=1, total_ciclos=2)))
+
+    # O `mover` já foi ACEITO (o ACK voltou) mas o `posicionado` ainda não saiu.
+    adapter.chamar(adapter.modulo.cmd_estado_celula(
+        adapter.modulo.EstadoCelulaReq(trava_ativa=True, trava_slot_id=3,
+                                       os_id="OS-1", trava_resumo="peso")))
+
+    cmds = [e["cmd"] for e in adapter.placa.executados]
+    assert cmds == ["mover", "estado_celula"], cmds
+
+
+def test_cmd_id_repetido_nao_move_a_mesa_duas_vezes(adapter_serial):
+    """A idempotência do §2 aplicada ao comando que MOVE massa.
+
+    O `serial_link` não reenvia nada, mas o reenvio pode vir de qualquer origem
+    — um restart do adapter no meio do ciclo, um operador repetindo a ação. É a
+    parte do protocolo que não dá para acrescentar depois sem trocar as duas
+    pontas ao mesmo tempo.
+    """
+    adapter = adapter_serial("cnc")
+    link = adapter.link
+
+    corpo = {"dispenser_alvo": 3, "os_id": "OS-1", "receita": "C",
+             "ciclo_atual": 1, "total_ciclos": 2}
+    link.enviar_comando("mover", corpo)
+
+    # O MESMO cmd_id de novo, montado à mão: é o reenvio que um ACK perdido
+    # provoca.
+    cmd_id = adapter.placa.executados[-1]["cmd_id"]
+    link._escrever({"cmd": "mover", "cmd_id": cmd_id, **corpo})
+    time.sleep(0.3)
+
+    movimentos = [e for e in adapter.placa.executados if e["cmd"] == "mover"]
+    assert len(movimentos) == 1, (
+        f"a mesa executou {len(movimentos)} movimentos para um cmd_id só")

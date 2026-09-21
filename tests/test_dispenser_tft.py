@@ -109,7 +109,10 @@ def adapter_com_telas(carregar_adapter):
             link.iniciar()
             links.append(link)
         for link in links:
-            assert _ate(lambda: link.conectado)
+            # `l=link` liga o valor AGORA. Sem isso a closure lê a variável
+            # do laço, e o teste afirmaria sobre o último link da lista —
+            # verde mesmo com o primeiro sem conectar.
+            assert _ate(lambda l=link: l.conectado)
 
         montagem = Montagem(modulo, placa_disp, placa_tft, loop, cliente)
         criados.append((montagem, links, thread))

@@ -37,6 +37,14 @@ class PlacaFalsa:
     SUBSISTEMA: str = ""
     COMANDOS: dict[str, tuple[str, ...]] = {}
 
+    # Comandos que existem SÓ no serial — a placa os atende, mas nenhum
+    # simulador HTTP os implementa, então eles não entram em `_ROTAS_SIM` nem
+    # na tabela de comandos do documento. Hoje é só a balança de bancada
+    # (`docs/PROTOCOLO_SERIAL.md` §5, "Comandos de bancada"): com o transporte
+    # serial ligado, o adapter é o dono da porta e ninguém mais abre o Monitor
+    # Serial para configurar o peso unitário.
+    COMANDOS_BANCADA: dict[str, tuple[str, ...]] = {}
+
     def __init__(self, atraso_evento: float = 0.0, intervalo_ping: float = 0.5,
                  host: str = "127.0.0.1"):
         self.atraso_evento = float(atraso_evento)
@@ -54,6 +62,7 @@ class PlacaFalsa:
         self.pongs_recebidos = 0
 
         self._ultimo_cmd_id = 0
+        self.sessao_adapter = None
         self._servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._servidor.bind((host, 0))
@@ -195,22 +204,51 @@ class PlacaFalsa:
             return
         if mensagem.get("resp") == "pong":
             self.pongs_recebidos += 1
+            self._adotar_sessao(mensagem)
             return
         cmd = mensagem.get("cmd")
         if cmd:
             self._executar(cmd, mensagem)
 
+    def _adotar_sessao(self, mensagem: dict) -> None:
+        """Sessão nova do adapter zera o contador de idempotência.
+
+        O `cmd_id` é monotônico DENTRO de uma sessão do adapter, e um restart do
+        processo o faz nascer em 1. A placa guarda o último executado e ignora
+        id menor ou igual — certo contra reenvio, errado contra RESTART: todo
+        comando até o último id recebia ACK positivo SEM EXECUTAR, e com o ciclo
+        por relógio o central dispara o `dispensar` de um `mover` que a mesa
+        nunca fez.
+
+        Comparação por DIFERENÇA e não por ordem: relógio do host que ande para
+        trás continua sendo uma sessão nova. Zero (ou ausente) significa "ainda
+        não sei", e a primeira sessão vista é adotada sem zerar nada — senão
+        todo boot da placa descartaria o primeiro comando legítimo.
+        """
+        sessao = mensagem.get("sessao")
+        if not isinstance(sessao, int) or sessao <= 0:
+            return
+        if self.sessao_adapter is not None and sessao != self.sessao_adapter:
+            self._ultimo_cmd_id = 0
+        self.sessao_adapter = sessao
+
     def _executar(self, cmd: str, mensagem: dict) -> None:
         if self.mudo:
             return  # placa travada: nem ACK, nem evento
+        # ANTES da checagem de idempotência, e a ordem é o ponto: um comando da
+        # sessão nova tem de ser executado, não respondido como repetido. O pong
+        # também a carrega, mas o primeiro comando depois do restart pode chegar
+        # antes do primeiro pong.
+        self._adotar_sessao(mensagem)
         cmd_id = mensagem.get("cmd_id")
 
-        if cmd not in self.COMANDOS:
+        aceitos = {**self.COMANDOS, **self.COMANDOS_BANCADA}
+        if cmd not in aceitos:
             self._enviar({"resp": "erro", "cmd_id": cmd_id,
                           "msg": f"comando desconhecido: {cmd}"})
             return
 
-        faltando = [c for c in self.COMANDOS[cmd] if c not in mensagem]
+        faltando = [c for c in aceitos[cmd] if c not in mensagem]
         if faltando:
             self._enviar({"resp": "erro", "cmd_id": cmd_id,
                           "msg": f"campos ausentes: {','.join(faltando)}"})
@@ -231,7 +269,11 @@ class PlacaFalsa:
 
         if isinstance(cmd_id, int):
             self._ultimo_cmd_id = cmd_id
-        campos = {k: v for k, v in mensagem.items() if k not in ("cmd", "cmd_id")}
+        # `sessao` fora do payload: ela é do TRANSPORTE, como `cmd_id`. Deixá-la
+        # entrar faria `test_protocolo_placas.py` cobrá-la como campo de
+        # comando do contrato de cada subsistema, que ela não é.
+        campos = {k: v for k, v in mensagem.items()
+                  if k not in ("cmd", "cmd_id", "sessao")}
         self.executados.append({"cmd": cmd, "cmd_id": cmd_id, **campos})
 
         # ACK primeiro: ele diz "aceitei", e o orquestrador continua esperando o
@@ -256,6 +298,19 @@ class PlacaFalsa:
     def emitir(self, payload: dict) -> None:
         """Empurra um evento sem ter sido perguntada (telemetria, resultado)."""
         self._enviar({"evento": payload})
+
+    def emitir_grudado(self, payload: dict, prefixo: str) -> None:
+        """Log humano e JSON na MESMA linha, como o firmware de verdade escreve.
+
+        O firmware imprime as duas vozes no mesmo Serial e nada garante que
+        caiam em linhas separadas — `Tara c0: offset=8412{"evento":{...}}` é o
+        que sai de verdade. Exigir que a linha comece com '{' descartaria
+        justamente os primeiros eventos do boot; é o caso que `extrair_json`
+        existe para cobrir, e é este método que o encena.
+        """
+        linha = json.dumps({"evento": payload}, ensure_ascii=False,
+                           separators=(",", ":"))
+        self.enviar_bruto(prefixo + linha + "\n")
 
     def enviar_bruto(self, texto: str) -> None:
         """Escreve texto cru na linha, sem enquadrar nada.

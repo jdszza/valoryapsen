@@ -170,20 +170,38 @@ as declara com os nomes DNS de sempre como default, e o `.env` as sobrescreve.
 
 ### Como subir cada adapter no host
 
+**Uma vez por adapter**, crie o ambiente:
+
 ```bat
 cd C:\apsen\cnc-adapter
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-set CENTRAL_URL=http://localhost:8000
-set CNC_TRANSPORTE=serial
-set CNC_SERIAL_URL=COM5
-python -m uvicorn main:app --host 0.0.0.0 --port 8101
 ```
 
-O mesmo para `dispenser-adapter` (porta 8100, com as duas `SERIAL_URL`) e
-`weight-adapter` (porta 8103). As portas HTTP são as mesmas que o compose
+**Depois disso, só o `.bat`.** Cada processo do host tem o seu, com a COM na
+primeira linha editável — e é o único lugar onde o número da porta se escreve
+(README da raiz, [Onde escrever o número da COM](../README.md#onde-escrever-o-número-da-com)):
+
+| Processo | Arquivo | Porta HTTP |
+|---|---|---|
+| dispenser-adapter (2 COM) | `dispenser-adapter\iniciar_host.bat` | 8100 |
+| cnc-adapter | `cnc-adapter\iniciar_host.bat` | 8101 |
+| weight-adapter | `weight-adapter\iniciar_host.bat` | 8103 |
+| painel de bancada | `painel_operador\iniciar_backend.bat` | 5000 |
+
+O `.bat` já liga o transporte serial, aponta o `CENTRAL_URL` para a porta
+publicada do central e sobe o uvicorn na mesma porta HTTP que o compose
 publicava: nada muda para o central, o dashboard ou o pré-voo.
+
+> ⚠️ **O `cnc-adapter` sobe, mas a mesa ainda não obedece.** O firmware
+> (`cnc/receitas_manuais`) fala só com humano — não entende JSON. Com `serial`
+> e a COM fixada o adapter abre a porta e se dá por conectado (URL fixa não
+> passa pela sondagem por ping), mas nenhum comando é executado e o ACK nunca
+> vem: `/comandos/mover` falha no `CNC_ACK_TIMEOUT_S` e a OS aborta com a placa
+> aparecendo saudável no `/health`. O próprio `.bat` avisa isso ao subir. Para
+> rodar a planta agora, `set CNC_TRANSPORTE=http` antes de chamá-lo.
+> Ver [`../cnc/README.md`](../cnc/README.md).
 
 ### Consequências no compose
 

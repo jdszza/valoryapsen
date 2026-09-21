@@ -29,7 +29,7 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 import serial_link
 
@@ -41,6 +41,11 @@ CENTRAL_URL      = os.getenv("CENTRAL_URL",      "http://central-computer:8000")
 CNC_SIM_URL      = os.getenv("CNC_SIM_URL",      "http://cnc-simulator:8200")
 TIMEOUT_CMD      = float(os.getenv("TIMEOUT_CMD",   "15"))
 TIMEOUT_EVENT    = float(os.getenv("TIMEOUT_EVENT", "5"))
+# Quantos dispensers a célula tem. Declarado UMA vez no compose
+# (`${NUM_SLOTS:-8}`) e lido por todos: nenhuma faixa escrita à mão, e nenhuma
+# mensagem de erro com um "1-6" desatualizado mandando quem lê o log procurar
+# o problema na faixa errada.
+NUM_SLOTS        = int(os.getenv("NUM_SLOTS", "8"))
 
 SUBSISTEMA       = "cnc"
 
@@ -83,12 +88,41 @@ async def _wait_for_upstream(name: str, url: str, retries: int = 30, interval: f
     logger.error("[HEALTH] %s não ficou disponível em %ds. Continuando assim mesmo.", name, retries * interval)
 
 
+def _exigir_url(transporte: str, url: str, variavel: str) -> None:
+    """Transporte serial ligado sem porta fixada RECUSA subir.
+
+    Com a URL vazia o `serial_link` varre TODAS as portas, e cada sondagem
+    abre a porta por até `PROBE_ASSENTAR_S + PROBE_ESPERA_S` (~9,5 s). Na
+    célula montada são cinco placas e cinco processos: enquanto um deles
+    segura a COM da CNC para conferir, o cnc-adapter toma `ACCESS_DENIED` na
+    própria — boot não-determinístico em que uma placa às vezes não é achada,
+    e o log de cada processo mostra só a metade dele.
+
+    Recusar é a resposta certa AQUI, e não um aviso: este processo existe para
+    falar com UMA porta, e sem ela não faz nada de útil. Serviço que não sobe
+    trava, por `depends_on`, quem espera por ele — e é justamente o que se quer
+    quando a bancada está mal configurada, em vez de uma OS que morre por
+    timeout num slot íntegro.
+
+    A varredura continua existindo e continua sendo o caminho de quem tem UMA
+    placa na mesa: basta não ligar o transporte serial de mais nada.
+    """
+    if transporte == "serial" and not url:
+        raise RuntimeError(
+            f"{variavel} está vazia com o transporte serial ligado. Com cinco "
+            f"placas na célula, a varredura automática faz os processos "
+            f"disputarem as portas uns dos outros — fixe a COM no Windows e "
+            f"defina {variavel} (ex.: COM4, /dev/ttyUSB0 ou rfc2217://host:porta)."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _client, _link, _loop
     _client = httpx.AsyncClient()
     _loop = asyncio.get_running_loop()
     logger.info("[STARTUP] httpx.AsyncClient criado | transporte=%s", TRANSPORTE)
+    _exigir_url(TRANSPORTE, SERIAL_URL, "CNC_SERIAL_URL")
     if TRANSPORTE == "serial":
         _link = serial_link.LinkSerial(
             subsistema=SUBSISTEMA, url=SERIAL_URL, baud=SERIAL_BAUD,
@@ -115,21 +149,71 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 # ── Pydantic Models ────────────────────────────────────────────────────────────
 
 class ComandoMoverReq(BaseModel):
+    """A mesa não recebe coordenadas — recebe QUAL receita e QUAL parada.
+
+    `posicao_x`/`posicao_y` saíram: o roteiro é MEDIDO na bancada e gravado na
+    placa, waypoint a waypoint, indexado pelo dispenser. Em troca, a placa
+    REPORTA a posição alcançada no evento `posicionado`, e é ela que o central
+    registra. O waypoint é por dispenser e não por posição na rota porque a
+    rota é decidida pelo orquestrador em tempo de execução e muda quando um
+    slot sai da OS.
+    """
     dispenser_alvo: int
     os_id: str
-    posicao_x: float
-    posicao_y: float
+    receita: str
     ciclo_atual: int = 0
     total_ciclos: int = 0
+    # ACEITAS e IGNORADAS, e a assimetria é de propósito. Aceitar custa nada e
+    # evita 422 num chamador que ainda as mande; RELAYÁ-LAS custaria o que esta
+    # frente acabou de tirar do caminho — um par de coordenadas na linha serial
+    # que o firmware tem de ignorar. "Tem de ignorar" é exatamente como dois
+    # lados passam a discordar em silêncio: bastaria um dia alguém preferir o
+    # número que veio ao waypoint medido, e a mesa iria para onde o central acha
+    # que o slot está. A posição atravessa na direção contrária — no evento
+    # `posicionado`, medida pela máquina.
+    posicao_x: float | None = None
+    posicao_y: float | None = None
+
+    @field_validator("receita")
+    @classmethod
+    def _receita_valida(cls, v: str) -> str:
+        # A faixa A–J é a da NVS da placa (dez slots, uma por ordem padrão).
+        # Recusar aqui é 422 na hora; deixar passar custaria a ida à placa para
+        # voltar com `receita_desconhecida` — o mesmo "não", mais caro.
+        v = (v or "").strip().upper()
+        if len(v) != 1 or not "A" <= v <= "J":
+            raise ValueError("receita deve ser uma letra de A a J")
+        return v
+
+    @field_validator("dispenser_alvo")
+    @classmethod
+    def _dispenser_na_faixa(cls, v: int) -> int:
+        if not 1 <= v <= NUM_SLOTS:
+            raise ValueError(f"dispenser_alvo deve ser 1-{NUM_SLOTS}")
+        return v
 
 
 class ComandoHomingReq(BaseModel):
-    # Coordenadas do HOME vêm do central, como as de `mover`: a geometria da
-    # célula tem um dono só. Opcionais para não quebrar chamador antigo — o
-    # simulador cai no próprio default quando não vêm.
+    # O HOME da máquina é o zero que o homing dela estabelece contra os fins de
+    # curso; o central não o dita mais. As coordenadas ficam OPCIONAIS e não
+    # obrigatórias: recusar um chamador que ainda as mande seria quebrar sem
+    # ganho, e o simulador tem o próprio default para quando não vêm.
     os_id: str
     posicao_x: float | None = None
     posicao_y: float | None = None
+
+
+class EstadoCelulaReq(BaseModel):
+    """O que a MESA precisa saber da célula: há trava, e de qual slot.
+
+    Mesmo modelo, mesmos nomes de campo e mesmo teto do `estado_celula` das
+    telas TFT — tradução nenhuma. O central manda um payload só para as duas
+    placas, e traduzir de um lado é onde os dois passam a divergir depois.
+    """
+    trava_ativa: bool
+    trava_slot_id: Optional[int] = None
+    os_id: str = ""
+    trava_resumo: str = ""
 
 
 class EventoReq(BaseModel):
@@ -161,9 +245,16 @@ async def _post_sim(path: str, payload: dict, timeout: float = TIMEOUT_CMD) -> d
 # pela qual o evento atravessa daqui para o central sem interpretação.
 
 _ROTAS_SIM = {
-    "mover":  "/executar/mover",
-    "homing": "/executar/homing",
+    "mover":         "/executar/mover",
+    "homing":        "/executar/homing",
+    "estado_celula": "/executar/estado-celula",
 }
+
+# Teto do resumo que vai para a placa, igual ao do dispenser-adapter. O motivo
+# formatado do central passa de 240 caracteres e NÃO viaja: mandá-lo acoplaria
+# o formato de mensagem do central ao que a mesa consegue registrar, e criaria
+# um segundo ponto de truncamento para algo cosmético.
+TRAVA_RESUMO_MAX = 48
 
 
 async def _enviar(comando: str, payload: dict) -> dict:
@@ -301,18 +392,44 @@ async def health():
 
 @app.post("/comandos/mover")
 async def cmd_mover(req: ComandoMoverReq):
-    logger.info("[CMD] MOVER → D%d (%.1f, %.1f) ciclo %d/%d OS %s",
-                req.dispenser_alvo, req.posicao_x, req.posicao_y,
+    logger.info("[CMD] MOVER → D%d receita %s ciclo %d/%d OS %s",
+                req.dispenser_alvo, req.receita,
                 req.ciclo_atual, req.total_ciclos, req.os_id)
     resultado = await _enviar(
         "mover",
         {
             "dispenser_alvo": req.dispenser_alvo,
             "os_id":          req.os_id,
-            "posicao_x":      req.posicao_x,
-            "posicao_y":      req.posicao_y,
+            "receita":        req.receita,
             "ciclo_atual":    req.ciclo_atual,
             "total_ciclos":   req.total_ciclos,
+        },
+    )
+    return _resposta(resultado)
+
+
+@app.post("/comandos/estado-celula")
+async def cmd_estado_celula(req: EstadoCelulaReq):
+    """A trava do Triple Check chegando à mesa.
+
+    Ela é a peça fisicamente sobre a bancada onde o supervisor vai mexer — e,
+    sob o ciclo por relógio, é também a peça que continua andando sozinha se
+    ninguém a avisar. Com a trava ativa a mesa interrompe o movimento, volta ao
+    HOME e passa a RECUSAR `mover` até a liberação.
+
+    Espelha `cmd_estado_celula` do dispenser-adapter: mesmo modelo, mesmos
+    campos, nenhuma tradução.
+    """
+    resumo = " ".join(str(req.trava_resumo or "").split())[:TRAVA_RESUMO_MAX]
+    logger.info("[CMD] ESTADO-CELULA trava=%s slot=%s os=%s '%s'",
+                req.trava_ativa, req.trava_slot_id, req.os_id, resumo)
+    resultado = await _enviar(
+        "estado_celula",
+        {
+            "trava_ativa":   req.trava_ativa,
+            "trava_slot_id": req.trava_slot_id,
+            "os_id":         req.os_id,
+            "trava_resumo":  resumo,
         },
     )
     return _resposta(resultado)

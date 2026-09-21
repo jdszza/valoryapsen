@@ -27,6 +27,8 @@ seção de lotes em `app.py` registra o porquê. O que os dois números ganharam
 foi uma invariante declarada — o agregado conta só saldo DISPENSÁVEL — e um
 dono único, `_mover_saldo_lote`, por onde passa toda transição de status.
 """
+from datetime import date, timedelta
+
 import pytest
 
 
@@ -59,13 +61,25 @@ def _zerar_medicamento(painel, nome: str = MED) -> int:
         conn.close()
 
 
+def daqui_a(dias: int) -> str:
+    """Validade RELATIVA a hoje, e nunca uma data escrita à mão.
+
+    Data literal no fixture envelhece sozinha, e o vermelho chega meses depois
+    parecendo bug de código: `L-VELHO` vencia em 2026-03-01 e, a partir daquele
+    dia, os testes de BLOQUEIO passaram a depender de um lote que a varredura de
+    vencidos tira de circulação — o assunto errado, no arquivo errado. Quem
+    testa vencimento pede um número negativo aqui, de propósito.
+    """
+    return (date.today() + timedelta(days=dias)).strftime("%Y-%m-%d")
+
+
 def _entrada(painel, med_id: int, lote: str, qtd: int, validade: str) -> int:
     """Entrada de lote pelo caminho de produção — ele já soma no agregado."""
     conn = painel.conexao()
     try:
         painel.modulo._registrar_entrada_lote(
             conn, med_id, lote, validade, qtd, "Fornecedor", "NF-1",
-            "2026-01-01", "Teste", "Admin",
+            daqui_a(-365), "Teste", "Admin",   # data de FABRICAÇÃO
         )
         conn.commit()
         return conn.execute(
@@ -113,10 +127,15 @@ def _bloquear(painel, lote_id: int):
 
 @pytest.fixture
 def med_com_dois_lotes(painel):
-    """40 unidades em dois lotes: L-VELHO (15, vence antes) e L-NOVO (25)."""
+    """40 unidades em dois lotes: L-VELHO (15, vence antes) e L-NOVO (25).
+
+    Os dois VÁLIDOS — "velho" aqui quer dizer "vence primeiro", que é o que o
+    FEFO ordena. Vencido é outro assunto, e tem bloco próprio no fim deste
+    arquivo.
+    """
     med_id = _zerar_medicamento(painel)
-    velho = _entrada(painel, med_id, "L-VELHO", 15, "2026-03-01")
-    novo  = _entrada(painel, med_id, "L-NOVO",  25, "2027-03-01")
+    velho = _entrada(painel, med_id, "L-VELHO", 15, daqui_a(30))
+    novo  = _entrada(painel, med_id, "L-NOVO",  25, daqui_a(365))
     assert _agregado(painel, med_id) == 40
     return med_id, velho, novo
 
@@ -300,7 +319,7 @@ def test_lote_baixado_nao_volta_a_ativo_pelo_botao_de_bloquear(painel,
 def test_entrada_de_lote_continua_somando_no_agregado(painel):
     med_id = _zerar_medicamento(painel)
 
-    _entrada(painel, med_id, "L-1", 30, "2027-01-01")
+    _entrada(painel, med_id, "L-1", 30, daqui_a(365))
 
     assert _agregado(painel, med_id) == 30
     assert _agregado(painel, med_id) == _saldo_ativo(painel, med_id)
@@ -329,3 +348,200 @@ def test_estoque_sem_lote_continua_dispensavel(painel):
                 for r in _genealogia(painel, "OS-LEGADO")]
     assert consumos == [("SEM LOTE REGISTRADO", 10)]
     assert _agregado(painel, med_id) == 40
+
+
+# ── 4. Lote VENCIDO: o FEFO o preferia, por construção ───────────────────────
+#
+# FEFO é "vence primeiro, sai primeiro". Sem filtro de validade, um lote já
+# vencido é, por definição, o que vence primeiro de TODOS — então ele não era
+# apenas aceito: era escolhido na frente do lote bom. E `verificar_estoque_ordem`
+# não ajudava, porque consulta `medicamentos.quantidade`, que somava o saldo
+# vencido junto.
+#
+# O único freio era manual: `lotes_proximos_vencimento` pinta o alerta no
+# dashboard e alguém precisa lembrar de dar `baixa_lote`. Na bancada ninguém
+# lembrou por dois meses — seis lotes vencidos em 26/07, 286 unidades ainda
+# dispensáveis.
+
+def _desvios(painel, numero_os: str = None) -> list:
+    conn = painel.conexao()
+    try:
+        if numero_os is None:
+            return conn.execute("SELECT * FROM desvios").fetchall()
+        return conn.execute(
+            "SELECT * FROM desvios WHERE numero_os=?", (numero_os,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def med_com_vencido_e_valido(painel):
+    """40 unidades: L-VENCIDO (15, venceu ontem) e L-VALIDO (25)."""
+    med_id = _zerar_medicamento(painel)
+    vencido = _entrada(painel, med_id, "L-VENCIDO", 15, daqui_a(-1))
+    valido = _entrada(painel, med_id, "L-VALIDO", 25, daqui_a(365))
+    return med_id, vencido, valido
+
+
+def test_o_fefo_consome_o_valido_e_nao_o_vencido(painel, med_com_vencido_e_valido):
+    """O teste que o achado pede: vencido + válido ⇒ sai o VÁLIDO."""
+    _, _, _ = med_com_vencido_e_valido
+    ordem_id = _ordem_de(painel, "OS-VENC", 10)
+
+    _concluir(painel, ordem_id)
+
+    consumos = [(r["lote"], r["quantidade"]) for r in _genealogia(painel, "OS-VENC")]
+    assert consumos == [("L-VALIDO", 10)]
+
+
+def test_o_vencido_sai_do_saldo_dispensavel(painel, med_com_vencido_e_valido):
+    """A metade que faz `verificar_estoque_ordem` parar de mentir: o agregado
+    deixa de contar o que não pode sair."""
+    med_id, vencido, _ = med_com_vencido_e_valido
+
+    conn = painel.conexao()
+    try:
+        painel.modulo.expirar_lotes_vencidos(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _lote(painel, vencido)["status"] == "Vencido"
+    assert _agregado(painel, med_id) == 25
+
+
+def test_a_varredura_e_idempotente(painel, med_com_vencido_e_valido):
+    """`_mover_saldo_lote` soma e subtrai, não reconcilia: uma segunda passada
+    que achasse o mesmo lote zeraria um estoque que existe."""
+    med_id, _, _ = med_com_vencido_e_valido
+
+    for _ in range(3):
+        conn = painel.conexao()
+        try:
+            painel.modulo.expirar_lotes_vencidos(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+    assert _agregado(painel, med_id) == 25
+
+
+def test_ordem_que_so_cabe_no_vencido_e_recusada(painel, med_com_vencido_e_valido):
+    """Com o agregado corrigido, a ordem não chega nem a começar — que é o
+    lugar certo de recusar. Antes ela era liberada, caía no ramo do resíduo e
+    o medicamento saía do lote vencido sem genealogia nenhuma."""
+    med_id, _, _ = med_com_vencido_e_valido
+    ordem_id = _ordem_de(painel, "OS-SO-VENCIDO", 30)   # 30 > 25 válidos
+
+    painel.logar()
+    painel.cliente.post(f"/ordens/{ordem_id}/status/Em Processo")
+
+    assert painel.ordem("OS-SO-VENCIDO")["status"] == "Pendente"
+    assert _agregado(painel, med_id) == 25
+
+
+def test_consumo_sem_lote_valido_abre_desvio(painel):
+    """Consumir sem lote rastreável sempre foi legítimo (estoque anterior ao
+    cadastro de lotes existe), mas desde que o vencido deixou de ser escolhido
+    ele é TAMBÉM o sintoma de "só restava vencido na prateleira" — e num painel
+    de rastreabilidade isso não pode passar calado."""
+    med_id = _zerar_medicamento(painel)
+    _entrada(painel, med_id, "L-SO-VENCIDO", 40, daqui_a(-1))
+    conn = painel.conexao()
+    try:
+        # O agregado é reposto à mão: a ordem precisa ser LIBERADA para que a
+        # dispensa aconteça e o resíduo apareça. É o estado da bancada real —
+        # agregado inflado por um lote que venceu enquanto ninguém olhava.
+        conn.execute("UPDATE medicamentos SET quantidade=40 WHERE id=?", (med_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    ordem_id = _ordem_de(painel, "OS-DESVIO", 10)
+
+    _concluir(painel, ordem_id)
+
+    consumos = [(r["lote"], r["quantidade"]) for r in _genealogia(painel, "OS-DESVIO")]
+    assert consumos == [("SEM LOTE REGISTRADO", 10)]
+    tipos = [d["tipo"] for d in _desvios(painel, "OS-DESVIO")]
+    assert "Consumo sem lote válido" in tipos
+
+
+def test_o_vencido_continua_no_alerta_do_dashboard(painel, med_com_vencido_e_valido):
+    """Filtrar o alerta por 'Ativo' faria o lote SUMIR da tela no dia seguinte
+    ao vencimento — exatamente quando ele mais precisa de alguém. O saldo já
+    não conta; o que falta é a baixa, e ela é manual."""
+    _, _, _ = med_com_vencido_e_valido
+    conn = painel.conexao()
+    try:
+        painel.modulo.expirar_lotes_vencidos(conn)
+        conn.commit()
+        alertados = [l["lote"] for l in
+                     painel.modulo.lotes_proximos_vencimento(conn, dias=30)]
+    finally:
+        conn.close()
+
+    assert "L-VENCIDO" in alertados
+
+
+def test_lote_sem_validade_nao_vence(painel):
+    """Controle: validade vazia é estoque legado, não estoque vencido.
+    Tratá-la como vencida zeraria a prateleira de quem nunca cadastrou data."""
+    med_id = _zerar_medicamento(painel)
+    _entrada(painel, med_id, "L-SEM-DATA", 20, "")
+
+    conn = painel.conexao()
+    try:
+        painel.modulo.expirar_lotes_vencidos(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _agregado(painel, med_id) == 20
+
+
+# ── 5. O corpo do sync de dispensers vem de fora e nada o conferia ───────────
+#
+# `PUT /api/dispensers/sync` e o `cmd` do display entregavam o JSON direto ao
+# `for`: `None` derruba com TypeError, um dicionário solto itera as CHAVES e
+# `i.get` estoura, item sem `quantidade` chegava ao `UPDATE` com KeyError. Todos
+# viram 500 numa rota que ESCREVE estoque — e é por ela que o display reporta o
+# que contou.
+
+@pytest.mark.parametrize("corpo", [None, {}, "texto", 42, [None], ["x"],
+                                   [{"slot": 1}], [{"quantidade": 5}],
+                                   [{"slot": "1", "quantidade": 5}],
+                                   [{"slot": 1, "quantidade": -3}],
+                                   [{"slot": True, "quantidade": 5}]])
+def test_corpo_torto_nao_derruba_o_sync(painel, corpo):
+    conn = painel.conexao()
+    try:
+        ok, erro = painel.modulo._sync_dispensers_data(conn, corpo)
+    finally:
+        conn.close()
+
+    assert isinstance(ok, bool)      # não levantou
+
+
+def test_item_torto_no_meio_nao_descarta_os_bons(painel):
+    """Quem manda aqui é uma ponte serial: derrubar dez slots bons por causa de
+    um campo faltando num deles deixaria o estoque do display e o do painel
+    divergindo, sem ninguém saber qual está certo."""
+    med_id = _zerar_medicamento(painel)
+    conn = painel.conexao()
+    try:
+        slot = next(s for s, m in painel.modulo._slot_para_id(conn).items()
+                    if m == med_id)
+        ok, _ = painel.modulo._sync_dispensers_data(
+            conn, [{"slot": slot, "quantidade": 42}, {"quantidade": 7}, None])
+        assert ok
+    finally:
+        conn.close()
+
+    assert _agregado(painel, med_id) == 42
+
+
+def test_a_rota_responde_400_e_nao_500(painel):
+    resposta = painel.api("put", "/api/dispensers/sync", json={"slot": 1})
+
+    assert resposta.status_code == 400

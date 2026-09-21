@@ -154,7 +154,7 @@ async def sondar_servicos(cliente, timeout: float = TIMEOUT_SONDA_S) -> list[dic
         return_exceptions=True,
     )
     itens: list[dict] = []
-    for servico, resultado in zip(SONDAVEIS, resultados):
+    for servico, resultado in zip(SONDAVEIS, resultados, strict=True):
         if isinstance(resultado, BaseException):
             logger.warning("[PREVOO] sonda de %s falhou: %s", servico.nome, resultado)
             itens.append(_item(servico.nome, "Serviços", servico.nome, FALHA,

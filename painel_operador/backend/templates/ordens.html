@@ -108,6 +108,7 @@
                             <a href="{{ url_for('editar_ordem', id=o.id) }}" class="btn btn-sm btn-outline-secondary" title="Editar"><i class="bi bi-pencil"></i></a>
                             {% if o.status != 'Concluido' %}
                             <form method="post" action="{{ url_for('excluir_ordem', id=o.id) }}" onsubmit="return confirm('Excluir esta ordem?')">
+                                {{ campo_csrf() }}
                                 <button class="btn btn-sm btn-outline-danger" title="Excluir"><i class="bi bi-trash"></i></button>
                             </form>
                             {% endif %}

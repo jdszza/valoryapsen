@@ -63,7 +63,7 @@ def test_supervisor_e_admin_liberam_em_nome_de_quem_logou(painel, perfil):
     with painel.cliente.session_transaction() as sessao:
         sessao["op_nome"] = "Maria Silva"
 
-    resposta = painel.cliente.post("/trava/liberar", follow_redirects=False)
+    resposta = painel.post_form("/trava/liberar", follow_redirects=False)
 
     assert resposta.status_code == 302
     (chamada,) = _liberacoes(painel)
@@ -80,7 +80,7 @@ def test_outros_perfis_tomam_403_na_rota_e_nada_sai_para_o_central(painel, perfi
     """Botão escondido não é proteção: a rota confere a permissão no servidor."""
     painel.logar(perfil)
 
-    resposta = painel.cliente.post("/trava/liberar")
+    resposta = painel.post_form("/trava/liberar")
 
     assert resposta.status_code == 403
     assert _liberacoes(painel) == []
@@ -88,7 +88,7 @@ def test_outros_perfis_tomam_403_na_rota_e_nada_sai_para_o_central(painel, perfi
 
 
 def test_sem_sessao_a_rota_manda_para_o_login(painel):
-    resposta = painel.cliente.post("/trava/liberar", follow_redirects=False)
+    resposta = painel.post_form("/trava/liberar", follow_redirects=False)
     assert resposta.status_code == 302
     assert "/login" in resposta.headers["Location"]
     assert _liberacoes(painel) == []
@@ -190,7 +190,7 @@ def test_sem_conta_de_servico_a_rota_recusa_com_a_mesma_mensagem(carregar_painel
                              env={"PAINEL_CENTRAL_USER": None, "PAINEL_CENTRAL_SENHA": None})
     painel.logar("Admin")
 
-    resposta = painel.cliente.post("/trava/liberar", follow_redirects=True)
+    resposta = painel.post_form("/trava/liberar", follow_redirects=True)
 
     assert resposta.status_code == 200
     assert "PAINEL_CENTRAL_USER" in resposta.get_data(as_text=True)

@@ -83,6 +83,7 @@ from database import (
     get_historico_ordens, get_historico_sensor, get_log_manutencao,
     get_ordem_ativa, get_ordem_por_id, get_total_alarmes_ativos, get_ultimas_leituras,
     get_usuario, get_usuarios,
+    fechar_os_orfas,
     init_db, limpar_dispenser_estado, listar_categorias, listar_medicamentos,
     resolver_alarme,
     salvar_alarme, salvar_cnc_evento, salvar_dispensa, salvar_dispenser_estado,
@@ -216,6 +217,21 @@ def _ts() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _inteiro(valor, padrao: int = 0) -> int:
+    """O que veio no JSON, como int — nunca uma exceção.
+
+    Os payloads dos adapters atravessam SEM interpretação (é o contrato), então
+    um campo numérico pode chegar `null`, string ou float. Quem formata com
+    `:+d` ou faz aritmética com ele precisa de um int, e levantar aqui
+    transforma um campo torto em 500 na rota de eventos — que o adapter retenta,
+    e o evento que ele trazia se perde de vez.
+    """
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return padrao
+
+
 def _log(tipo: str, msg: str, dados: dict = None):
     _log_eventos.appendleft({"tipo": tipo, "msg": msg, "dados": dados or {}, "ts": _ts()})
 
@@ -236,7 +252,13 @@ class WSManager:
     async def broadcast(self, data: dict):
         msg = json.dumps(data, default=str)
         dead = []
-        for ws in self.active:
+        # `list(...)`: há um `await` dentro do laço, e nesse ponto o loop pode
+        # rodar o handler de outro cliente — que entra ou sai da lista. Iterar
+        # a lista viva levanta `RuntimeError: list changed size during
+        # iteration` no meio do broadcast, e aí NINGUÉM recebe o resto do
+        # snapshot: um cliente conectando derrubaria a atualização de todos os
+        # outros. É a mesma razão do `deepcopy` em `get_estado`.
+        for ws in list(self.active):
             try:
                 await ws.send_text(msg)
             except Exception:
@@ -324,12 +346,75 @@ async def _broadcast_flusher():
 
 
 # ── Helpers DB async ──────────────────────────────────────────────────────────
-async def _db(fn, *args):
-    """Executa função síncrona de DB em threadpool — não bloqueia o event loop."""
+#
+# Escrita perdida em silêncio foi o que escondeu o `medicamento` nulo por tempo
+# demais: `salvar_dispensa` levava None numa coluna NOT NULL, o INSERT falhava
+# com 1048, e o único rastro era um `warning` no meio de centenas de linhas de
+# evento. Nem toda escrita pesa o mesmo, e a diferença não é de gravidade
+# abstrata — é de quem conserta:
+#
+#   - telemetria e `dispenser_estado` são MEDIÇÕES REPETIDAS: o valor seguinte
+#     chega em 15s e reescreve a linha. Perder uma é perder um quadro;
+#   - `salvar_dispensa` e `atualizar_item_os` são o rastro NOMINAL de quem
+#     recebeu o quê — fatos que acontecem UMA vez e que ninguém reemite. A
+#     linha perdida some do relatório da OS (`GET /os/{os_id}`, CSV/XLSX), que
+#     é o documento de maior valor que este sistema produz, e o item fica com o
+#     progresso errado para sempre.
+#
+# Por isso as duas de baixo viram alarme: o que não pode continuar é a planta
+# seguir dispensando enquanto o banco recusa justamente as escritas que provam
+# o que ela dispensou.
+def _escrita_critica(fn) -> str | None:
+    """Nome da escrita, se ela for uma das duas críticas; senão, None.
+
+    Comparação por IDENTIDADE, como `_abriu_alarme` já faz, e não por
+    `fn.__name__`: o nome é do objeto que chegou, e quem instrumentar ou
+    duplicar `salvar_dispensa` — a suíte faz isso — passaria a entregar aqui
+    uma função com outro nome. A regra deixaria de valer justamente onde ela é
+    exercitada, e sem vermelho nenhum.
+    """
+    if fn is salvar_dispensa:
+        return "salvar_dispensa"
+    if fn is atualizar_item_os:
+        return "atualizar_item_os"
+    return None
+
+
+async def _db(fn, *args) -> bool:
+    """Executa função síncrona de DB em threadpool — não bloqueia o event loop.
+
+    Devolve False quando a escrita falhou.
+    """
     try:
         await asyncio.to_thread(fn, *args)
+        return True
     except Exception as exc:
-        logger.warning("[DB] %s(%s): %s", fn.__name__, args[:2], exc)
+        critica = _escrita_critica(fn)
+        if critica is None:
+            logger.warning("[DB] %s(%s): %s", getattr(fn, "__name__", fn),
+                           args[:2], exc)
+            return False
+
+        # O payload INTEIRO no log, e não `args[:2]`: quem for reconstruir a
+        # linha à mão precisa dos números, não do os_id e do slot.
+        logger.error("[DB] FALHA CRITICA: %s(%r) — %s", critica, args, exc)
+        # O alarme é outra escrita no MESMO banco: com o MySQL fora ele falha
+        # junto, e tudo bem — o log já registrou. O que não pode acontecer é
+        # essa segunda falha derrubar o handler, que é o único caminho de volta
+        # do adapter ao orquestrador. Daí o try/except próprio; e ele NÃO
+        # chama `_db` de novo, para não recursar sobre a mesma indisponibilidade.
+        try:
+            await asyncio.to_thread(
+                salvar_alarme, "central", "persistencia_falhou",
+                f"{critica} falhou: {exc} | args={args!r}"[:500])
+        except Exception as exc_alarme:
+            logger.error("[DB] o alarme de persistencia_falhou também falhou: %s",
+                         exc_alarme)
+        else:
+            # Alarme aberto FORA das `db_tasks`: `_abriu_alarme` não o vê, e o
+            # badge ficaria até `_ALARMES_TTL_S` sem ele.
+            await _atualizar_alarmes_ativos(forcar=True)
+        return False
 
 
 # ── Alarmes ativos: derivado do banco, com cache curto ────────────────────────
@@ -449,16 +534,25 @@ async def _handle_evento_dispenser(payload: dict):
             # Telemetria periódica: só estoque. Escrever "status"/"os_id" aqui
             # desfazia, a cada 15s, o reset de fim de OS do orquestrador — o
             # slot voltava a "concluido" para sempre e a limpeza dava 409.
-            med = payload.get("medicamento")
+            #
+            # E `null` num periódico é "não informado", não "não tem". O
+            # firmware esvazia o slot e emite `status` com medicamento nulo
+            # ANTES do `dispensado` que fecha a etapa: apagar o nome aqui
+            # fazia a dispensa chegar sem medicamento, e `dispensas.medicamento`
+            # é VARCHAR(100) NOT NULL — o INSERT falhava com 1048 e a linha da
+            # dispensa simplesmente não existia. Quem apaga o nome é a
+            # TRANSIÇÃO (`dispensado` com resíduo 0, `limpeza_ok`), que sabe
+            # que o slot esvaziou de verdade; o periódico só confirma.
             qty = payload.get("quantidade", 0)
-            d.update({
-                "medicamento": med,
-                "sku":         payload.get("sku"),
-                "categoria":   payload.get("categoria"),
-                "quantidade":  qty,
-            })
-            med_db = med if (qty or 0) > 0 else None
-            cat_db = payload.get("categoria") if (qty or 0) > 0 else None
+            for campo in ("medicamento", "sku", "categoria"):
+                valor = payload.get(campo)
+                if valor is not None:
+                    d[campo] = valor
+            d["quantidade"] = qty
+            # A LINHA do banco, essa sim, segue a quantidade: slot vazio não
+            # guarda medicamento em `dispenser_estado`.
+            med_db = d.get("medicamento") if (qty or 0) > 0 else None
+            cat_db = d.get("categoria") if (qty or 0) > 0 else None
             # ultima_os_id vem do fluxo que o central conhece, não do payload.
             db_tasks.append((salvar_dispenser_estado,
                              (int(disp_id), qty or 0, d["os_id"], med_db, cat_db)))
@@ -485,7 +579,14 @@ async def _handle_evento_dispenser(payload: dict):
             falha_mec = payload.get("falha_mecanica", False)
             validado  = not falha_mec and (qtd_disp >= qtd_alvo)
             falha     = payload.get("motivo_falha")
-            med       = d.get("medicamento", payload.get("medicamento", ""))
+            # `or`, e não `d.get(chave, default)`: o default do `get` NÃO
+            # entra quando a chave existe com valor None — que é exatamente o
+            # caminho normal, o do slot que acabou de esvaziar. Sem isto,
+            # `salvar_dispensa` recebia None numa coluna NOT NULL e a linha
+            # nunca era gravada: o relatório da OS saía sem a dispensa que ela
+            # de fato fez, e o único rastro era um warning.
+            med       = (d.get("medicamento") or payload.get("medicamento")
+                         or "(desconhecido)")
 
             d.update({
                 "status":                "concluido" if qtd_disp >= qtd_alvo else "dispensando",
@@ -584,43 +685,75 @@ async def _handle_evento_cnc(payload: dict):
     db_tasks   = []
 
     with _lock:
-        _estado["cnc"].update({
-            "status":         tipo,
-            "os_id":          os_id,
-            "dispenser_alvo": disp_alvo,
-            "posicao_x":      pos_x,
-            "posicao_y":      pos_y,
-            "ciclo_atual":    ciclo,
-            "total_ciclos":   total,
-        })
-        if _estado["os_ativa"] and os_id:
-            if _estado["os_ativa"].get("os_id") == os_id and tipo == "concluido":
-                _estado["os_ativa"]["status"] = "concluida"
-
-        # Só TRANSIÇÃO vira linha. "movendo" chega a cada 0.5s durante todo o
-        # movimento — eram centenas de linhas por OS para descrever uma
-        # trajetória que o dashboard já mostra ao vivo e que ninguém consulta
-        # depois. Quem quiser rastro grava amostrado (CNC_AMOSTRAGEM_MOVENDO).
-        if tipo in ("posicionado", "concluido", "erro"):
-            db_tasks.append((salvar_cnc_evento,
-                             (os_id, tipo, disp_alvo, pos_x, pos_y, ciclo, total)))
-        elif tipo == "movendo" and _amostrar_movendo():
-            db_tasks.append((salvar_cnc_evento,
-                             (os_id, tipo, disp_alvo, pos_x, pos_y, ciclo, total)))
-
-        if tipo == "erro":
-            descricao = payload.get("descricao", "Erro desconhecido na CNC")
-            db_tasks.append((salvar_alarme,
-                             ("cnc", payload.get("codigo_erro", "erro_cnc"), descricao)))
-            _log("alarme", f"ERRO CNC: {descricao}")
-
-        elif tipo == "telemetria":
+        # Telemetria é leitura de SENSOR: não traz posição, nem alvo, nem
+        # ciclo. Passando pelo `update` de baixo, os defaults do `payload.get`
+        # (None e 0.0) entravam no snapshot como se fossem medida — a cada
+        # leitura a mesa "voltava" para (0,0) com `dispenser_alvo` nulo, entre
+        # dois eventos de movimento. E é a posição publicada que
+        # `prevoo.itens_celula` compara com o HOME. O handler do dispenser já
+        # separava a periódica do fluxo; este não separava.
+        if tipo == "telemetria":
             componente = payload.get("componente", "cnc")
             valor      = payload.get("valor", 0.0)
             unidade    = payload.get("unidade", "°C")
             tipo_leit  = payload.get("tipo_leitura", "temperatura")
             db_tasks.append((salvar_leitura_sensor,
                              (componente, tipo_leit, valor, unidade)))
+        else:
+            _estado["cnc"].update({
+                "status":         tipo,
+                "os_id":          os_id,
+                "dispenser_alvo": disp_alvo,
+                "posicao_x":      pos_x,
+                "posicao_y":      pos_y,
+                "ciclo_atual":    ciclo,
+                "total_ciclos":   total,
+            })
+            # `concluido` NÃO fecha OS travada, e este é o caso NORMAL do
+            # Triple Check, não uma borda: a trava dispara entre dois ciclos,
+            # com a mesa parada. O firmware então faz homing por conta própria
+            # — é onde o supervisor espera encontrar a mesa — e emite
+            # `concluido` endereçado ao `trava_os_id`, que é a OS que acabou de
+            # travar. O dashboard, o `/estado` e o `/ws` passavam a mostrar
+            # CONCLUÍDA a OS que está parada esperando um supervisor: a tela que
+            # a pessoa que vai liberar a trava está olhando.
+            #
+            # A guarda mora AQUI, e não no firmware, por duas razões. Quem manda
+            # no FLUXO é o central (README, "Fontes de verdade") — a mesa
+            # reporta o que ela fez, não o que a OS virou. E a placa em campo
+            # precisaria ser regravada; esta linha vale na bancada que já está
+            # montada.
+            if (tipo == "concluido" and os_id and _estado["os_ativa"]
+                    and _estado["os_ativa"].get("os_id") == os_id):
+                # `get_trava_estado` lê globais do orquestrador e NÃO pega
+                # `_lock` — pode ser chamada daqui de dentro.
+                if orch.get_trava_estado()["ativa"]:
+                    logger.info(
+                        "[CNC] `concluido` de %s ignorado para o status da OS: "
+                        "a trava do Triple Check está ativa (é o retorno ao HOME).",
+                        os_id,
+                    )
+                else:
+                    _estado["os_ativa"]["status"] = "concluida"
+
+            # Só TRANSIÇÃO vira linha. "movendo" chega a cada 0.5s durante todo
+            # o movimento — eram centenas de linhas por OS para descrever uma
+            # trajetória que o dashboard já mostra ao vivo e que ninguém
+            # consulta depois. Quem quiser rastro grava amostrado
+            # (CNC_AMOSTRAGEM_MOVENDO).
+            if tipo in ("posicionado", "concluido", "erro"):
+                db_tasks.append((salvar_cnc_evento,
+                                 (os_id, tipo, disp_alvo, pos_x, pos_y, ciclo, total)))
+            elif tipo == "movendo" and _amostrar_movendo():
+                db_tasks.append((salvar_cnc_evento,
+                                 (os_id, tipo, disp_alvo, pos_x, pos_y, ciclo, total)))
+
+            if tipo == "erro":
+                descricao = payload.get("descricao", "Erro desconhecido na CNC")
+                db_tasks.append((salvar_alarme,
+                                 ("cnc", payload.get("codigo_erro", "erro_cnc"),
+                                  descricao)))
+                _log("alarme", f"ERRO CNC: {descricao}")
 
     # DB fora do lock
     for fn, args in db_tasks:
@@ -636,7 +769,15 @@ async def _handle_evento_cnc(payload: dict):
             orch.notificar_evento(f"{os_id}:posicionado:{disp_alvo}",
                                   {**payload, "tipo": "erro"})
 
-    _log(f"cnc_{tipo}", f"CNC {tipo} | D{disp_alvo} | ({pos_x:.1f},{pos_y:.1f})")
+    if tipo == "telemetria":
+        # Mesma razão do bloco acima: a linha de log alimenta `/log/eventos`, e
+        # "CNC telemetria | DNone | (0.0,0.0)" é a mesma posição inventada,
+        # só que na tela em vez do snapshot.
+        _log("cnc_telemetria",
+             f"CNC {payload.get('componente', 'cnc')}="
+             f"{payload.get('valor', 0.0)}{payload.get('unidade', '°C')}")
+    else:
+        _log(f"cnc_{tipo}", f"CNC {tipo} | D{disp_alvo} | ({pos_x:.1f},{pos_y:.1f})")
     _broadcast_estado(prioritario=tipo not in _TIPOS_ALTA_FREQUENCIA)
 
 
@@ -756,8 +897,15 @@ async def _handle_evento_visao(payload: dict):
                 _log("alarme", descricao)
 
             elif tipo == "leitura_mesa_divergencia":
-                det = payload.get("quantidade_detectada", 0)
-                esp = payload.get("quantidade_esperada", 0)
+                # `:+d` exige INT, e o que chega aqui é JSON de um adapter: um
+                # `null` ou um `10.0` derrubava o endpoint com 500 — e aí o
+                # adapter retenta 3×, então o mesmo evento derruba a rota três
+                # vezes e o orquestrador nunca é notificado da divergência que
+                # o evento veio contar. A divergência de contagem é uma das
+                # três fontes do Triple Check: perdê-la por causa de uma
+                # formatação é perder a trava.
+                det = _inteiro(payload.get("quantidade_detectada"))
+                esp = _inteiro(payload.get("quantidade_esperada"))
                 descricao = (f"Contagem incorreta slot {slot_id}: "
                              f"esperado={esp} detectado={det} "
                              f"(Δ={det - esp:+d})")
@@ -923,6 +1071,37 @@ async def _diagnosticar_templates() -> tuple[list, dict | None]:
     return problemas + os_templates.validar_contra_catalogo(catalogo), catalogo
 
 
+async def _fechar_os_orfas_no_boot() -> None:
+    """Fecha em `erro` toda OS deixada em `em_andamento` por um processo morto.
+
+    Um alarme POR LINHA, e não um agregado: a tela de necessidades agrupa por
+    fonte, e o `os_id` é o que permite ir ao relatório daquela OS e ver até
+    onde ela chegou. Banco fora não derruba o boot — a reconciliação roda de
+    novo no startup seguinte, e até lá o pior é o sintoma que já existia.
+    """
+    try:
+        orfas = await asyncio.to_thread(fechar_os_orfas)
+    except Exception as exc:
+        logger.warning("[BOOT] Não foi possível reconciliar OS órfãs (%s) — "
+                       "`GET /os/ativa` pode anunciar uma OS de um processo "
+                       "anterior até o próximo startup.", exc)
+        return
+
+    if not orfas:
+        return
+
+    logger.error("[BOOT] %d OS estavam em 'em_andamento' de um processo anterior "
+                 "e foram fechadas em 'erro': %s", len(orfas), ", ".join(orfas))
+    _log("os_orfa_no_boot",
+         f"{len(orfas)} OS de um processo anterior fechada(s) em erro")
+    for os_id in orfas:
+        await _db(salvar_alarme, "central", "os_orfa_no_boot",
+                  f"OS {os_id} ficou em 'em_andamento' de um central que caiu no "
+                  f"meio do ciclo e foi fechada em 'erro' no boot. O que ela "
+                  f"chegou a dispensar está em `dispensas`.")
+    await _atualizar_alarmes_ativos(forcar=True)
+
+
 async def _validar_templates_no_boot() -> None:
     problemas, catalogo = await _diagnosticar_templates()
     if problemas:
@@ -954,6 +1133,14 @@ async def lifespan(app: FastAPI):
     # Segredo fraco derruba o boot (fora de APSEN_ENV=dev). O valor default é
     # público neste repositório: com ele qualquer um forja um JWT role=admin.
     validar_secret_key(settings.SECRET_KEY, settings.APSEN_ENV)
+
+    # OS que ficaram em `em_andamento` são de um central que morreu no meio do
+    # ciclo — o orquestrador é um loop ÚNICO, então no boot não existe OS em
+    # execução por definição. Elas não somem sozinhas, e `get_ordem_ativa`
+    # prefere `em_andamento ORDER BY criado_em ASC`: a órfã mais ANTIGA vira "a
+    # OS ativa" para sempre, no `GET /os/ativa`, no app de manutenção e no
+    # espelho do painel de bancada.
+    await _fechar_os_orfas_no_boot()
 
     # As 10 ordens padrão contra o catálogo REAL, agora que o banco está de pé.
     # Aqui é WARNING, não queda: o central serve a planta inteira e derrubá-lo
@@ -1220,6 +1407,14 @@ class NovaOSReq(BaseModel):
     descricao: str = ""
     categoria: str = ""
     medicamentos: list
+    # Qual das dez ordens padrão é esta. Ele já vinha no corpo (o gerador e o
+    # console montam por `os_templates.instanciar`), mas o modelo o descartava
+    # — e `req.model_dump()` é o que vai para a fila. Sem o campo aqui, o
+    # orquestrador não teria como saber qual receita a mesa deve executar, e
+    # toda OS abortaria com `receita_nao_mapeada`.
+    # Vazio é legítimo: uma OS criada fora dos templates. Quem decide o que
+    # fazer com isso é o orquestrador, que a recusa com motivo claro.
+    template_id: str = ""
 
 
 class EventoDispenserReq(BaseModel):
@@ -2663,14 +2858,31 @@ async def console_prevoo(request: Request):
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    """Snapshot na conexão e, daí em diante, o que `_broadcast_estado` publicar.
+
+    **O `finally` é a correção, e o que ele conserta é um vazamento LENTO.**
+    Só `WebSocketDisconnect` era tratado, e ela é uma das saídas: `CancelledError`
+    no shutdown, um erro de rede no `send_text` do snapshot, um cliente que morre
+    de outro jeito — qualquer uma delas deixava o `WebSocket` na lista do
+    manager para sempre. A partir daí todo broadcast tentava escrever nele e
+    pagava a exceção, e cada reconexão de um dashboard acrescentava mais um.
+    O `broadcast` até removia o morto pelo `except`, mas só quando o envio
+    levantava; o que nunca mais fosse escrito ficava.
+
+    O `connect` fica FORA do try: se o `accept()` falhar não há nada a
+    desconectar, e chamar `disconnect` sobre um cliente que nunca entrou na
+    lista esconderia o erro do accept.
+    """
     await _ws_manager.connect(ws)
-    with _lock:
-        # deepcopy pelo mesmo motivo de `get_estado`: o json.dumps abaixo roda
-        # fora do lock e percorreria os dicionários vivos.
-        snap = copy.deepcopy(_estado)
-    await ws.send_text(json.dumps({"tipo": "estado", **snap}, default=str))
     try:
+        with _lock:
+            # deepcopy pelo mesmo motivo de `get_estado`: o json.dumps abaixo
+            # roda fora do lock e percorreria os dicionários vivos.
+            snap = copy.deepcopy(_estado)
+        await ws.send_text(json.dumps({"tipo": "estado", **snap}, default=str))
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
+        pass
+    finally:
         _ws_manager.disconnect(ws)

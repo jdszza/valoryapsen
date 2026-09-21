@@ -17,12 +17,14 @@ As duas metades da correção:
     chegou a reservar, devolvendo o slot ao pool.
 """
 import asyncio
+import collections
 import itertools
+import logging
 import time
 
 import pytest
 
-from conftest import NUM_SLOTS, SLOTS_POR_FILEIRA
+from conftest import NUM_SLOTS, SLOTS_POR_FILEIRA, TEMPLATE_PADRAO
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -178,7 +180,10 @@ def test_posicoes_formam_duas_fileiras_frente_a_frente(carregar_orquestrador):
     esquerda, direita = _slots_de_cada_lado()
     assert all(pos[d][1] == -afastamento for d in esquerda)
     assert all(pos[d][1] == +afastamento for d in direita)
-    for frente, fundo in zip(esquerda, direita):
+    # `strict=True`: as duas fileiras TÊM o mesmo tamanho (NUM_SLOTS é par,
+    # e `_num_slots` recusa ímpar). Um zip que truncasse em silêncio faria
+    # este teste aprovar uma bancada com uma fileira mais curta que a outra.
+    for frente, fundo in zip(esquerda, direita, strict=True):
         assert pos[frente][0] == pos[fundo][0], f"D{frente} e D{fundo} não são um par"
 
 
@@ -275,25 +280,41 @@ def test_rota_de_um_lado_so_nao_cruza_o_corredor(carregar_orquestrador):
     assert rota == esquerda
 
 
-def test_cnc_recebe_a_posicao_do_mapa_do_central(carregar_orquestrador):
-    """O comando carrega x/y — é o que dispensa a cópia do mapa no simulador."""
+def test_cnc_recebe_a_receita_e_NAO_recebe_coordenada(carregar_orquestrador):
+    """Substitui `test_cnc_recebe_a_posicao_do_mapa_do_central`.
+
+    A decisão virou: a mesa executa o roteiro que foi gravado nela, indexado
+    pelo DISPENSER, e o comando leva a LETRA da receita. Mandar x/y junto seria
+    mandar um número que a placa ignora — e número ignorado que continua sendo
+    gravado no banco é pior que nenhum, porque ninguém descobre que ele não
+    descreve a máquina.
+    """
     orq = carregar_orquestrador()
     alvo = SLOTS_POR_FILEIRA + 1   # primeiro slot da fileira de trás
 
-    asyncio.run(orq.modulo.cmd_mover(alvo, "OS-1", 1, 1))
+    asyncio.run(orq.modulo.cmd_mover(alvo, "OS-1", "C", 1, 1))
 
     (comando,) = orq.adapter.comandos("/comandos/mover")
-    assert (comando["posicao_x"], comando["posicao_y"]) == orq.modulo.POSICOES[alvo]
+    assert comando["receita"] == "C"
+    assert comando["dispenser_alvo"] == alvo
+    assert "posicao_x" not in comando and "posicao_y" not in comando
 
 
-def test_homing_tambem_leva_as_coordenadas(carregar_orquestrador):
-    """Mesma razão do mover: o HOME é do central, não do simulador."""
+def test_homing_manda_so_o_os_id(carregar_orquestrador):
+    """Substitui `test_homing_tambem_leva_as_coordenadas`.
+
+    O HOME da máquina é o zero que o homing dela estabelece contra os fins de
+    curso. Um par de coordenadas vindo do central seria um SEGUNDO home, e os
+    dois concordariam só enquanto ninguém mexesse na mesa — depois de uma
+    remontagem, o central mandaria a mesa para um ponto que deixou de ser o
+    zero, e nada acusaria a diferença.
+    """
     orq = carregar_orquestrador()
 
     asyncio.run(orq.modulo.cmd_homing("OS-1"))
 
     (comando,) = orq.adapter.comandos("/comandos/homing")
-    assert (comando["posicao_x"], comando["posicao_y"]) == orq.modulo.HOME
+    assert comando == {"os_id": "OS-1"}
 
 
 # ── atribuir_slots com a célula inteira ────────────────────────────────────────
@@ -471,9 +492,14 @@ def test_liberar_slot_falha_quando_a_limpeza_e_recusada(carregar_orquestrador,
 # por um pior — OS eternamente em execução para quem consulta o banco.
 
 def _payload_os(os_id: str, *itens) -> dict:
+    # `template_id` é o que diz QUAL das dez ordens padrão esta é, e é dele que
+    # o orquestrador tira a letra da receita gravada na mesa. Sem ele a OS é
+    # legitimamente abortada com `receita_nao_mapeada` antes do primeiro mover
+    # — o caso tem teste próprio; aqui a OS é uma ordem padrão de verdade.
     return {
         "os_id":        os_id,
         "descricao":    "teste",
+        "template_id":  TEMPLATE_PADRAO,
         "medicamentos": list(itens) or [_item("Dipirona")],
     }
 
@@ -968,7 +994,16 @@ def test_scan_recusado_nao_aborta_a_os_mas_tambem_nao_espera(carregar_orquestrad
         "esperou um scan que o vision-adapter recusou enviar"
     )
     # O restante do ciclo segue aguardando normalmente — a exceção é o scan.
-    assert [c for c in aguardadas if "dispensado" in c]
+    #
+    # O controle era a chave `dispensado`, e ele descrevia o modelo ANTERIOR: o
+    # ciclo da mesa passou a correr por RELÓGIO, então `posicionado` e
+    # `dispensado` não são mais aguardados — são COLHIDOS depois do prazo (ver
+    # `espiar_evento`/`colher_evento`). Trocado por `peso`, que continua sendo
+    # handshake de verdade: sem um controle, "não esperou o scan" ficaria
+    # indistinguível de "não esperou nada".
+    assert [c for c in aguardadas if "peso" in c], (
+        "nenhuma espera sobrou no ciclo — o controle deixou de controlar"
+    )
     assert orq.modulo._pending_events == {}
 
 
@@ -1392,8 +1427,16 @@ class _TelasFake:
             await asyncio.sleep(self.atraso)
         return _RespostaTelas(self.status)
 
-    def avisos(self) -> list[dict]:
-        return [c["json"] for c in self.chamadas if c["url"].endswith("/comandos/estado-celula")]
+    def avisos(self, placa: str = "") -> list[dict]:
+        """Os avisos de trava, opcionalmente de UMA placa.
+
+        A trava passou a avisar DUAS placas por transição — as telas TFT e a
+        mesa. Sem o filtro, `[True, False]` viraria `[True, True, False, False]`
+        e toda asserção sobre a ORDEM das transições passaria a medir também
+        quantos destinos existem, que é outra pergunta.
+        """
+        return [c["json"] for c in self.chamadas
+                if c["url"].endswith("/comandos/estado-celula") and placa in c["url"]]
 
 
 def _com_telas(orq, **kw) -> _TelasFake:
@@ -1421,9 +1464,13 @@ def test_ativar_trava_avisa_as_telas_com_slot_e_resumo(carregar_orquestrador):
 
     asyncio.run(_cenario())
 
-    (aviso,) = telas.avisos()
-    assert aviso == {"trava_ativa": True, "trava_slot_id": 3, "os_id": "OS-1",
-                     "trava_resumo": "divergência de peso"}
+    # O MESMO payload vai para as duas placas: as telas mostram de qual slot é
+    # a divergência, e a mesa para de andar. Traduzir de um lado seria onde os
+    # dois passariam a divergir depois.
+    for placa in ("dispenser", "cnc"):
+        (aviso,) = telas.avisos(placa)
+        assert aviso == {"trava_ativa": True, "trava_slot_id": 3, "os_id": "OS-1",
+                         "trava_resumo": "divergência de peso"}, placa
     assert telas.chamadas[0]["timeout"] == orq.modulo.TIMEOUT_AVISO_TELAS_S
 
 
@@ -1439,9 +1486,11 @@ def test_liberar_trava_avisa_as_telas_que_a_trava_saiu(carregar_orquestrador):
 
     asyncio.run(_cenario())
 
-    assert [a["trava_ativa"] for a in telas.avisos()] == [True, False]
-    assert telas.avisos()[-1] == {"trava_ativa": False, "trava_slot_id": None,
-                                  "os_id": "", "trava_resumo": ""}
+    # Por placa, e não no bolo: a ORDEM das transições é o que este teste mede.
+    for placa in ("dispenser", "cnc"):
+        assert [a["trava_ativa"] for a in telas.avisos(placa)] == [True, False], placa
+        assert telas.avisos(placa)[-1] == {"trava_ativa": False, "trava_slot_id": None,
+                                           "os_id": "", "trava_resumo": ""}
 
 
 def test_reset_da_planta_avisa_as_telas(carregar_orquestrador):
@@ -1548,7 +1597,12 @@ def test_adapter_fora_do_ar_nao_atrasa_nem_derruba_a_ativacao(carregar_orquestra
     assert duracao["ativacao"] < 0.2, f"ativação levou {duracao['ativacao']:.3f}s"
     assert orq.modulo.get_trava_estado()["ativa"] is True
     assert orq.estado["trava"]["ativa"] is True
-    assert len(telas.chamadas) == 1, "o aviso saiu mais de uma vez — retentou"
+    # UMA tentativa POR PLACA. São duas placas desde que a mesa passou a ser
+    # avisada, então contar chamadas no bolo deixou de distinguir "avisou os
+    # dois destinos" de "retentou o mesmo" — que é o que este teste mede.
+    por_url = collections.Counter(c["url"] for c in telas.chamadas)
+    assert set(por_url.values()) == {1}, f"o aviso saiu mais de uma vez: {por_url}"
+    assert len(por_url) == 2, f"nem todas as placas foram avisadas: {por_url}"
 
 
 def test_o_aviso_nao_usa_o_post_com_retry(carregar_orquestrador):
@@ -1587,3 +1641,780 @@ def test_o_triple_check_decide_igual_com_e_sem_o_aviso(carregar_orquestrador, mo
     assert sem_cliente == respondendo == explodindo
     assert sem_cliente[0][-1] == ("OS-T", "concluida")
     assert sem_cliente[1] is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A POSIÇÃO É MEDIDA PELA MÁQUINA — o central registra, não dita
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_camera_da_mesa_recebe_a_posicao_MEDIDA(carregar_orquestrador):
+    """O evento `posicionado` traz onde a mesa parou, e é isso que vale.
+
+    A placa falsa reporta uma bancada deliberadamente diferente de `POSICOES`
+    (ver `_POSICAO_MEDIDA` no conftest). Se este teste passar com os números do
+    MODELO, é porque o central voltou a ditar a geometria em vez de registrar a
+    medição — e o sintoma em campo seria a câmera olhando para onde o modelo
+    diz que o slot está, não para onde a máquina parou.
+    """
+    orq = carregar_orquestrador()
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-MED")))
+
+    capturas = orq.adapter.comandos("/comandos/capturar/mesa")
+    assert capturas, "nenhuma captura de mesa foi pedida"
+    for captura in capturas:
+        slot = captura["slot_id"]
+        assert (captura["posicao_x"], captura["posicao_y"]) == (1000.0 + slot, 2000.0 + slot)
+        assert (captura["posicao_x"], captura["posicao_y"]) != orq.modulo.POSICOES[slot]
+
+
+def test_sem_posicao_no_evento_cai_no_modelo_E_avisa(carregar_orquestrador, caplog):
+    """Fallback EXPLÍCITO, num lugar só, e com aviso.
+
+    O que estava aqui antes era `.get("posicao_x", 0.0)`, e 0.0 é a ORIGEM da
+    mesa: a câmera seria mandada olhar para o HOME e chamar aquilo de D5 —
+    divergência de contagem num slot só, indistinguível de medicamento
+    faltando. O modelo é um palpite defensável; o zero silencioso não é.
+    """
+    orq = carregar_orquestrador()
+    orq.adapter.posicao_medida = False
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(orq.modulo._processar_os(_payload_os("OS-SEM-POS")))
+
+    capturas = orq.adapter.comandos("/comandos/capturar/mesa")
+    assert capturas
+    for captura in capturas:
+        slot = captura["slot_id"]
+        assert (captura["posicao_x"], captura["posicao_y"]) == orq.modulo.POSICOES[slot]
+
+    assert any("MODELO" in r.message or "modelo" in r.message.lower()
+               for r in caplog.records), "o fallback tem que aparecer no log"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORDEM SEM RECEITA GRAVADA NA MESA
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_os_fora_das_dez_padrao_aborta_antes_do_primeiro_mover(carregar_orquestrador):
+    """Descobrir isso pelo `receita_desconhecida` da placa custaria o ciclo todo.
+
+    A mesa só executa roteiro gravado nela, e o que diz QUAL roteiro é o
+    `template_id` da ordem. Uma OS criada fora das dez padrão não tem nenhum —
+    e se a checagem viesse depois da atribuição, a OS teria carregado os
+    dispensers, descartado resíduo e reservado slots para abortar no primeiro
+    ciclo.
+    """
+    orq = carregar_orquestrador()
+    payload = _payload_os("OS-AVULSA")
+    payload.pop("template_id")
+
+    asyncio.run(orq.modulo._processar_os(payload))
+
+    assert orq.adapter.comandos("/comandos/mover") == []
+    assert orq.adapter.comandos("/comandos/carregar") == []
+    assert ("OS-AVULSA", "erro") in _status_gravados(orq)
+
+    motivos = [c["args"][1] for c in orq.banco.chamadas_de("salvar_alarme")]
+    assert any("receita_nao_mapeada" in str(m) for m in motivos), motivos
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# O CICLO POR RELÓGIO — o central agenda, a mesa avisa, ninguém espera o aviso
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# O que mudou de modelo: `posicionado` e `dispensado` deixaram de ser PORTÃO.
+# O central calcula quando cada peça acontece e dispara na hora marcada; o
+# evento REGISTRA (a posição medida, a contagem do dispenser) e, no máximo,
+# CANCELA. Um evento que fizesse o central esperar recriaria o handshake por
+# acidente — e é isso que quem mexer aqui depois vai querer fazer.
+#
+# Os testes abaixo prendem as duas metades: que o cronograma é previsível, e
+# que a ausência de confirmação NÃO derruba a OS enquanto um `erro` explícito
+# derruba.
+
+
+class _RelogioFalso:
+    """Substitui o prazo por um registro do prazo.
+
+    Cronômetro em suíte é flaky, e "demorou o esperado" depende da máquina. O
+    que interessa é QUANTO o orquestrador pediu para dormir, em que ordem — e
+    isso é um número exato, não uma medição.
+
+    Mantém a semântica de `_dormir_ou_cancelar`: devolve False (cancelado) se o
+    Event já está armado, True se o prazo "venceu". Sem isso, um teste de
+    cancelamento passaria por acidente.
+    """
+
+    def __init__(self):
+        self.prazos: list[float] = []
+
+    async def dormir(self, segundos: float, cancelar) -> bool:
+        self.prazos.append(segundos)
+        if cancelar.is_set():
+            return False
+        return True
+
+    @property
+    def total(self) -> float:
+        return sum(self.prazos)
+
+
+def _com_relogio_falso(orq, monkeypatch) -> _RelogioFalso:
+    relogio = _RelogioFalso()
+    monkeypatch.setattr(orq.modulo, "_dormir_ou_cancelar", relogio.dormir)
+    return relogio
+
+
+# ── cronograma_do_ciclo: função pura ─────────────────────────────────────────
+
+@pytest.mark.parametrize("quantidade, dispensa_esperada", [(2, 3.0), (15, 16.0)])
+def test_cronograma_do_ciclo_bate_com_o_dwell_gravado_na_mesa(
+        carregar_orquestrador, quantidade, dispensa_esperada):
+    """A dispensa é a MESMA conta do `WP()` do firmware: (qty + 1) × 1000 ms.
+
+    As duas descrevem o mesmo mecanismo físico — um ciclo de servo por
+    comprimido — visto de dois lugares, e têm de ser mudadas juntas. Se o servo
+    real for mais lento e só o firmware for ajustado, o central segue cortando a
+    dispensa no meio: a OS termina "completa" com menos comprimido no leito, que
+    é o pior desfecho possível desta feature.
+
+    Os valores são os de produção, pedidos explicitamente — o conftest zera o
+    cronograma para o resto da suíte não dormir de verdade.
+    """
+    orq = carregar_orquestrador(env={
+        "CNC_TETO_TRAJETO_S": "2.5", "CNC_MARGEM_CHEGADA_S": "0.75",
+        "DISPENSA_S_POR_UNIDADE": "1.0", "DISPENSA_FOLGA_S": "1.0",
+    })
+
+    espera, dispensa = orq.modulo.cronograma_do_ciclo(quantidade)
+
+    assert espera == pytest.approx(3.25)          # 2,5 de trajeto + 0,75 de margem
+    assert dispensa == pytest.approx(dispensa_esperada)
+
+
+def test_o_teto_de_trajeto_cobre_o_pior_percurso_da_celula(carregar_orquestrador):
+    """2,5 s não é um número escolhido: é o pior trajeto MAIS folga.
+
+    FEED 750 mm/min = 1000 passos/s; CoreXY max_p = max(|dx+dy|,|dx−dy|) × 80;
+    HOME(0,0) → D8(7,18) = 25 × 80 = 2000 passos ≈ 2016 ms.
+
+    E ele é um TETO, não uma cópia da geometria — precisa ser MAIOR que o
+    trajeto real, não igual. É isso que o mantém fora da regra do mapa
+    duplicado: um limite superior continua verdadeiro depois de alguém regravar
+    um waypoint na bancada; uma cópia passaria a mentir.
+    """
+    orq = carregar_orquestrador(env={"CNC_TETO_TRAJETO_S": "2.5",
+                                     "CNC_MARGEM_CHEGADA_S": "0.75"})
+
+    pior_trajeto_s = 2000 / 1000.0            # passos ÷ passos por segundo
+    espera, _ = orq.modulo.cronograma_do_ciclo(1)
+
+    assert orq.modulo.settings.CNC_TETO_TRAJETO_S > pior_trajeto_s, (
+        "o teto não cobre o pior trajeto: o `dispensar` sairia com a mesa em "
+        "trânsito")
+    assert espera > pior_trajeto_s
+
+
+# ── O que não chegou não derruba a OS ────────────────────────────────────────
+
+def test_ciclo_sem_nenhum_evento_nao_aborta_a_os(carregar_orquestrador, monkeypatch):
+    """A mesa muda não é a mesa parada.
+
+    Um evento perdido no encaminhamento — o `_post_central` do adapter desiste
+    depois de 3 tentativas — chegaria aqui idêntico a "o hardware não fez nada".
+    Tratar os dois como iguais aborta OS com a bancada intacta, que é
+    exatamente o que o modelo por relógio existe para não fazer. A OS SEGUE, e
+    quem decide é o Triple Check no fim, que já compara três fontes.
+    """
+    orq = carregar_orquestrador()
+    # O adapter aceita os comandos e NÃO devolve evento nenhum da mesa nem do
+    # dispenser: é o silêncio total do caminho de volta.
+    orq.adapter.responder_cnc = False
+    orq.adapter.responder_dispenser = False
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-CRON-1")))
+
+    assert _status_gravados(orq) == [("OS-CRON-1", "em_andamento"),
+                                     ("OS-CRON-1", "concluida")]
+
+
+def test_sem_confirmacao_vira_fonte_indisponivel_e_nao_divergencia(carregar_orquestrador):
+    """Fonte que não mediu ≠ fonte que divergiu — a regra que sustenta o limiar 1.
+
+    É a pendência indo para a estrutura que a OS JÁ carrega para o Triple Check,
+    e não para uma lista paralela que alguém teria de lembrar de consultar.
+    Contá-la como divergência faria todo evento perdido virar trava; assumir o
+    alvo faria a fonte 1 CONFIRMAR uma contagem que ninguém fez — o Triple Check
+    viraria um double check sem que nada dissesse isso.
+    """
+    orq = carregar_orquestrador()
+
+    veredito = orq.modulo.avaliar_triple_check(
+        quantidade_esperada=10, quantidade_dispensada=None,
+        resultado_mesa=None, resultado_peso=None,
+    )
+
+    assert veredito.divergencias == []
+    assert not veredito.travar
+    assert any("dispenser" in f for f in veredito.fontes_indisponiveis)
+
+
+def test_desfecho_de_cada_ciclo_tem_nome(carregar_orquestrador):
+    """Os quatro desfechos, e cada um com nome no log e no estado publicado.
+
+    Um ciclo que termina sem nome é um ciclo que ninguém audita depois — e no
+    modelo por relógio a maior parte dos desfechos deixou de ser "abortou".
+    """
+    orq = carregar_orquestrador()
+    m = orq.modulo
+
+    disp = lambda q: {"tipo": "dispensado", "quantidade_dispensada": q}
+    pos = {"tipo": "posicionado", "posicao_x": 1.0, "posicao_y": 2.0}
+
+    assert m._desfecho_do_ciclo(1, 10, pos, disp(10)) == (m.DESFECHO_COMPLETO, 10)
+    assert m._desfecho_do_ciclo(1, 10, pos, disp(8)) == (m.DESFECHO_CURTO, 8)
+    assert m._desfecho_do_ciclo(1, 10, pos, None) == (m.DESFECHO_SEM_CONFIRMACAO, None)
+    assert m._desfecho_do_ciclo(1, 10, pos, {"tipo": "erro"}) == (m.DESFECHO_ERRO, None)
+    assert m._desfecho_do_ciclo(1, 10, {"tipo": "erro"}, disp(10)) == (m.DESFECHO_ERRO, None)
+
+
+def test_posicionado_atrasado_nao_se_perde(carregar_orquestrador, monkeypatch):
+    """O evento que chega DEPOIS de o `dispensar` já ter saído ainda é colhido.
+
+    É o motivo de `espiar_evento` não usar `aguardar_evento(chave, 0)`: aquele
+    desregistra a chave no `finally`, e `notificar_evento` DESCARTA evento de
+    chave sem ninguém esperando. A espiada do veto acontece justamente enquanto
+    o `posicionado` ainda está a caminho — desregistrar ali perderia a posição
+    MEDIDA, que é o que a câmera da mesa usa para saber onde olhar.
+    """
+    orq = carregar_orquestrador()
+    entregues: list[tuple] = []
+
+    # A mesa só responde DEPOIS que o dispensar foi enviado: o `posicionado`
+    # atravessa o adapter no meio da dispensa, tarde demais para o veto.
+    orq.adapter.atrasar_posicionado = True
+
+    post_anterior = orq.modulo._post
+
+    async def _post(url, payload, timeout=10.0):
+        ok = await post_anterior(url, payload, timeout)
+        if url.endswith("/comandos/capturar/mesa"):
+            entregues.append((payload.get("posicao_x"), payload.get("posicao_y")))
+        return ok
+
+    monkeypatch.setattr(orq.modulo, "_post", _post)
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-CRON-2", _item("Dipirona"))))
+
+    assert entregues, "a câmera da mesa não chegou a ser comandada"
+    # A posição que foi para a câmera é a MEDIDA pela placa, não a do modelo.
+    medida = orq.adapter.posicao_reportada
+    assert entregues[0] == medida, (
+        f"a câmera foi mandada para {entregues[0]} e a mesa reportou {medida} — "
+        f"o evento atrasado se perdeu e o central caiu no modelo")
+
+
+# ── O cronograma é previsível ────────────────────────────────────────────────
+
+def test_o_tempo_de_uma_os_de_oito_paradas_e_a_soma_do_cronograma(
+        carregar_orquestrador, monkeypatch):
+    """Previsível é o ponto: é dele que sai a promessa de que o `dispensar`
+    sai com a mesa parada.
+
+    Medido com relógio FALSO — o que se compara é o prazo PEDIDO, não o tempo de
+    parede. Cronômetro em suíte é flaky, e "demorou o esperado" mede sobretudo a
+    máquina que rodou o teste.
+    """
+    itens = [_item(f"Med{i}", qtd=2 + i) for i in range(8)]
+    orq = carregar_orquestrador(env={
+        "CNC_TETO_TRAJETO_S": "2.5", "CNC_MARGEM_CHEGADA_S": "0.75",
+        "DISPENSA_S_POR_UNIDADE": "1.0", "DISPENSA_FOLGA_S": "1.0",
+    })
+    relogio = _com_relogio_falso(orq, monkeypatch)
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-CRON-3", *itens)))
+
+    esperado = 0.0
+    for item in itens:
+        espera, dispensa = orq.modulo.cronograma_do_ciclo(item["quantidade"])
+        esperado += espera + dispensa
+
+    assert relogio.total == pytest.approx(esperado), {
+        "prazos pedidos": relogio.prazos,
+        "soma do cronograma": esperado,
+    }
+    # Duas pernas por parada: trajeto e dispensa. Uma perna a mais seria uma
+    # espera que voltou ao ciclo sem ninguém notar.
+    assert len(relogio.prazos) == 2 * len(itens)
+
+
+# ── O veto: o evento não atrasa, mas cancela ─────────────────────────────────
+
+def test_erro_da_mesa_impede_o_dispensar(carregar_orquestrador):
+    """Sem o veto, o relógio despeja medicamento numa mesa que não chegou.
+
+    É a ÚNICA coisa que o evento pode fazer com o cronograma além de registrar:
+    cancelá-lo. Ele não pode ATRASÁ-LO — atrasar é o handshake de volta.
+    """
+    orq = carregar_orquestrador()
+    orq.adapter.erro_cnc_em = 1        # a mesa emite `erro` ao receber o mover
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-CRON-4", _item("Dipirona"))))
+
+    assert not orq.adapter.comandos("/comandos/dispensar"), (
+        "dispensou com a mesa fora de posição")
+    assert _status_gravados(orq)[-1] == ("OS-CRON-4", "erro")
+
+
+def test_ack_negativo_no_mover_aborta_sem_dispensar(carregar_orquestrador, monkeypatch):
+    """O ACK negativo da placa chega aqui como POST que falha (o adapter o
+    transforma em 502), e é ele que cancela o agendamento antes da hora.
+
+    No modelo por relógio esta é a única defesa que age ANTES do `dispensar` —
+    daí o firmware recusar com ACK negativo em vez de só emitir evento.
+    """
+    orq = carregar_orquestrador()
+    post_anterior = orq.modulo._post
+
+    async def _post(url, payload, timeout=10.0):
+        if url.endswith("/comandos/mover"):
+            return False           # 502: a placa recusou o comando
+        return await post_anterior(url, payload, timeout)
+
+    monkeypatch.setattr(orq.modulo, "_post", _post)
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-CRON-5", _item("Dipirona"))))
+
+    assert not orq.adapter.comandos("/comandos/dispensar")
+    assert _status_gravados(orq)[-1] == ("OS-CRON-5", "erro")
+
+
+def test_ausencia_de_posicionado_nao_cancela_o_dispensar(carregar_orquestrador):
+    """A diferença entre este modelo e o handshake, num teste.
+
+    Quem mexer aqui depois vai querer "só esperar mais um pouquinho" pelo
+    `posicionado`. Um evento perdido no encaminhamento não é a mesa parada, e
+    tratar os dois como iguais aborta OS com hardware intacto. Só um `erro`
+    EXPLÍCITO veta.
+    """
+    orq = carregar_orquestrador()
+    orq.adapter.responder_cnc = False      # nenhum `posicionado`, e nenhum `erro`
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-CRON-6", _item("Dipirona"))))
+
+    assert orq.adapter.comandos("/comandos/dispensar"), (
+        "o dispensar não saiu por falta de um evento que nunca cancelou nada")
+    assert _status_gravados(orq)[-1] == ("OS-CRON-6", "concluida")
+
+
+def test_cancelamento_interrompe_o_prazo_em_curso(carregar_orquestrador):
+    """Cancelar só o ciclo SEGUINTE não serve: "o ciclo seguinte" pode ser um
+    `dispensar` que já saiu.
+
+    Por isso o prazo é um `asyncio.wait` sobre um Event, e não um `sleep` nu.
+    """
+    orq = carregar_orquestrador(env={"CNC_TETO_TRAJETO_S": "30"})
+    cancelar = asyncio.Event()
+
+    async def _cenario():
+        orq.modulo._cancelar_cronograma = cancelar
+        # Arma o cancelamento antes do prazo começar: o prazo de 30 s tem de
+        # terminar na hora, e não em 30 s.
+        orq.modulo.cancelar_cronograma()
+        return await orq.modulo._dormir_ou_cancelar(30.0, cancelar)
+
+    inicio = time.monotonic()
+    cumpriu = asyncio.run(_cenario())
+    decorrido = time.monotonic() - inicio
+
+    assert cumpriu is False, "o prazo foi cumprido apesar do cancelamento"
+    assert decorrido < 1.0, f"o cancelamento levou {decorrido:.1f}s para agir"
+
+
+def test_a_trava_cancela_o_cronograma_antes_de_avisar_qualquer_placa(
+        carregar_orquestrador):
+    """A ordem é a feature.
+
+    Avisar a mesa custa até TIMEOUT_AVISO_TELAS_S (3 s), e 3 s é tempo de sobra
+    para o relógio disparar mais um `dispensar` — que sairia DEPOIS de a trava
+    existir, com a mesa já indo para o HOME. Cancelar primeiro fecha essa
+    janela inteira por uma linha.
+    """
+    orq = carregar_orquestrador()
+    ordem: list[str] = []
+    cancelar = asyncio.Event()
+
+    def _avisar(*args, **kwargs):
+        ordem.append("aviso_as_placas")
+
+    async def _cenario():
+        orq.modulo._cancelar_cronograma = cancelar
+        orq.modulo._agendar_aviso_telas = _avisar
+        await orq.modulo._ativar_trava("OS-CRON-7", 3, "motivo", resumo="peso")
+
+    asyncio.run(_cenario())
+
+    assert cancelar.is_set(), "a trava não cancelou o cronograma"
+    assert ordem == ["aviso_as_placas"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A TRAVA CHEGA À MESA — o caminho inteiro, passo a passo
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Até aqui a trava avisava uma placa só: as telas TFT. A mesa é a peça que está
+# fisicamente sobre a bancada onde o supervisor vai mexer — e, sob o ciclo por
+# relógio, é também a peça que continua andando sozinha se ninguém a avisar.
+#
+# A sequência tem seis passos e cada um tem teste próprio abaixo:
+#   1. o Triple Check reprova
+#   2. `_ativar_trava` cancela o cronograma        (antes de qualquer aviso)
+#   3. o aviso sai para os DOIS adapters           (em paralelo)
+#   4. a mesa recusa `mover` enquanto travada
+#   5. o supervisor libera
+#   6. a mesa volta a aceitar, e a OS retoma de onde parou
+
+
+def _urls_avisadas(orq) -> list[str]:
+    return [c["url"] for c in orq.adapter.chamadas
+            if c["url"].endswith("/comandos/estado-celula")]
+
+
+def test_trava_avisa_as_duas_placas(carregar_orquestrador, monkeypatch):
+    """Passo 3. As telas mostram DE QUAL slot é a divergência; a mesa PARA.
+
+    Em `gather` e não em sequência: em série, uma placa fora do ar somaria o seu
+    TIMEOUT_AVISO_TELAS_S ao prazo da outra, e o aviso à mesa — a que importa,
+    porque ela se move — chegaria depois de um timeout inteiro gasto esperando
+    uma tela.
+    """
+    orq = carregar_orquestrador()
+    postados: list[tuple] = []
+
+    class _ClienteFake:
+        async def post(self, url, json=None, timeout=None):
+            postados.append((url, json))
+
+            class _R:
+                status_code = 200
+
+                @staticmethod
+                def json():
+                    return {"telas": "ok"}
+            return _R()
+
+    monkeypatch.setattr(orq.modulo, "_client", _ClienteFake())
+
+    entregue = asyncio.run(orq.modulo._avisar_telas(True, 3, "OS-T", "peso"))
+
+    assert entregue is True
+    avisados = [u for u, _ in postados]
+    assert any("dispenser" in u for u in avisados), "as telas não foram avisadas"
+    assert any("cnc" in u for u in avisados), "a MESA não foi avisada"
+    # O mesmo payload para as duas: traduzir de um lado é onde os dois passam a
+    # divergir depois.
+    corpos = [c for _, c in postados]
+    assert corpos[0] == corpos[1]
+
+
+def test_uma_placa_fora_do_ar_nao_impede_o_aviso_a_outra(carregar_orquestrador,
+                                                         monkeypatch):
+    """A mesa tem de ser avisada mesmo com as telas mortas, e vice-versa.
+
+    É o motivo do `return_exceptions=True`: isto é cosmético para as telas e
+    defensivo para a mesa, e nenhum dos dois pode derrubar o caminho da trava.
+    """
+    orq = carregar_orquestrador()
+    postados: list[str] = []
+
+    class _ClienteFake:
+        async def post(self, url, json=None, timeout=None):
+            postados.append(url)
+            if "dispenser" in url:
+                raise ConnectionError("telas fora do ar")
+
+            class _R:
+                status_code = 200
+
+                @staticmethod
+                def json():
+                    return {}
+            return _R()
+
+    monkeypatch.setattr(orq.modulo, "_client", _ClienteFake())
+
+    entregue = asyncio.run(orq.modulo._avisar_telas(True, 3, "OS-T", "peso"))
+
+    assert entregue is False          # nem tudo chegou, e o retorno diz isso
+    assert any("cnc" in u for u in postados), "a mesa ficou sem aviso por causa das telas"
+
+
+def test_a_trava_do_triple_check_avisa_a_mesa_e_a_libera_depois(carregar_orquestrador,
+                                                                monkeypatch):
+    """A sequência inteira, de ponta a ponta: passos 1 a 6.
+
+    O Triple Check reprova (o dispenser solta menos que o alvo), a trava é
+    ativada, os dois adapters são avisados, o supervisor libera de dentro do
+    broadcast — que é o instante exato em que a trava aparece na tela — e a OS
+    termina. O aviso de liberação tem de sair DEPOIS do de ativação: uma tela
+    que ficasse com o aviso invertido mostraria trava ativa numa célula solta.
+    """
+    orq = carregar_orquestrador()
+    orq.adapter.quantidade_dispensada = 3        # alvo é 10 → Triple Check reprova
+    avisos: list[bool] = []
+    liberacoes: list[bool] = []
+
+    async def _avisar(trava_ativa, slot_id, os_id, resumo):
+        avisos.append(bool(trava_ativa))
+        return True
+
+    monkeypatch.setattr(orq.modulo, "_avisar_telas", _avisar)
+
+    def _broadcast_e_liberar():
+        if orq.estado["trava"]["ativa"] and not liberacoes:
+            liberacoes.append(orq.modulo.liberar_trava("supervisor"))
+
+    monkeypatch.setattr(orq.modulo, "_broadcast_fn", _broadcast_e_liberar)
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-T1", _item("Dipirona"))))
+
+    assert liberacoes == [True], "a trava não chegou a ser liberável"
+    assert avisos == [True, False], (
+        f"a ordem dos avisos às placas saiu {avisos} — a liberação tem de vir "
+        f"depois da ativação")
+    assert _status_gravados(orq)[-1] == ("OS-T1", "concluida")
+
+
+def test_a_os_retoma_do_slot_seguinte_depois_da_trava(carregar_orquestrador,
+                                                      monkeypatch):
+    """Passo 6, e o modo de falhar que ele cobre.
+
+    `_ativar_trava` arma o cancelamento do cronograma para matar qualquer prazo
+    em curso. Se ele ficasse armado depois da liberação, TODO prazo dos slots
+    restantes venceria na hora, um atrás do outro, e a OS terminaria no meio da
+    rota sem uma linha de log dizendo por quê — com a bancada inteira íntegra.
+    É `_aguardar_liberacao` que fecha isso, e é por isso que a limpeza mora
+    colada na espera.
+    """
+    itens = [_item("Dipirona"), _item("Amoxicilina"), _item("Omeprazol")]
+    orq = carregar_orquestrador()
+    orq.adapter.quantidade_dispensada = 3        # toda dispensa reprova
+    liberadas = []
+
+    def _broadcast_e_liberar():
+        if orq.estado["trava"]["ativa"]:
+            liberadas.append(orq.modulo.liberar_trava("supervisor"))
+
+    monkeypatch.setattr(orq.modulo, "_broadcast_fn", _broadcast_e_liberar)
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-T2", *itens)))
+
+    movimentos = orq.adapter.comandos("/comandos/mover")
+    assert len(movimentos) == len(itens), (
+        f"a OS visitou {len(movimentos)} de {len(itens)} slots — o cancelamento "
+        f"ficou armado depois da liberação")
+    assert _status_gravados(orq)[-1] == ("OS-T2", "concluida")
+
+
+def test_o_cronograma_da_os_mais_pesada_e_o_que_a_conta_diz(carregar_orquestrador,
+                                                            monkeypatch):
+    """A OS que usa a célula inteira, com os valores de produção.
+
+    Oito paradas e 52 unidades: 8 × 3,25 s de trajeto mais 52 × 1 s de dispensa
+    mais 8 × 1 s de folga = **86,00 s de ciclo CNC**. Esse número é a promessa
+    do modelo — é dele que sai "o `dispensar` sai com a mesa parada", porque o
+    prazo de cada trajeto cobre o pior percurso da célula com folga.
+
+    Fixá-lo aqui é o que transforma a conta feita uma vez, na verificação da
+    frente, em algo que continua sendo conferido. Quem mexer num dos quatro
+    números do cronograma vê o total mudar e decide se era isso que queria.
+
+    O relógio é FALSO: o que se compara é o prazo PEDIDO, não o tempo de parede.
+    """
+    from conftest import CENTRAL_DIR  # noqa: PLC0415
+    import importlib.util, sys        # noqa: PLC0415, E401
+
+    spec = importlib.util.spec_from_file_location(
+        "apsen_tpl_geral", CENTRAL_DIR / "os_templates.py")
+    tpl = importlib.util.module_from_spec(spec)
+    sys.modules["apsen_tpl_geral"] = tpl
+    spec.loader.exec_module(tpl)
+    try:
+        alvo = next(t for t in tpl.TEMPLATES if "GERAL" in t["template_id"].upper())
+    finally:
+        sys.modules.pop("apsen_tpl_geral", None)
+
+    itens = [_item(i["medicamento"], qtd=i["quantidade"]) for i in alvo["itens"]]
+    assert len(itens) == 8, "OS-GERAL-01 deixou de usar a célula inteira"
+    assert sum(i["quantidade"] for i in itens) == 52
+
+    orq = carregar_orquestrador(env={
+        "CNC_TETO_TRAJETO_S": "2.5", "CNC_MARGEM_CHEGADA_S": "0.75",
+        "DISPENSA_S_POR_UNIDADE": "1.0", "DISPENSA_FOLGA_S": "1.0",
+    })
+    relogio = _com_relogio_falso(orq, monkeypatch)
+
+    asyncio.run(orq.modulo._processar_os(
+        _payload_os("OS-GERAL-CRON", *itens)))
+
+    assert relogio.total == pytest.approx(86.0), {
+        "medido pela suíte": relogio.total,
+        "conta": "8 × 3,25 (trajeto) + 52 × 1,0 (dispensa) + 8 × 1,0 (folga)",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# O retorno de quem comanda é CONFERIDO — e "não respondeu" ≠ "está certo"
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _alarmes(orq) -> list:
+    return [c["args"] for c in orq.banco.chamadas_de("salvar_alarme")]
+
+
+def test_homing_de_fim_de_os_recusado_abre_alarme(carregar_orquestrador):
+    """A rota é serpentina, e a serpentina parte de HOME.
+
+    O homing do passo 5 tinha o retorno ignorado: comando recusado deixava a
+    mesa parada no último dispenser e a OS fechava como `concluida`, sem nada
+    no log. Quem paga é a OS SEGUINTE — ela planeja o ciclo fechado a partir do
+    HOME, e a otimalidade da serpentina é a do ciclo fechado.
+    """
+    orq = carregar_orquestrador()
+    orq.adapter.recusar_rotas = {"/comandos/homing"}
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-H1")))
+
+    tipos = [tipo for _, tipo, _ in _alarmes(orq)]
+    assert "homing_nao_confirmado" in tipos
+
+
+def test_homing_recusado_nao_aborta_a_os(carregar_orquestrador):
+    """A dispensa já terminou e o Triple Check já opinou: abortar aqui marcaria
+    em erro uma OS que entregou tudo certo. O alarme é o desfecho proporcional."""
+    orq = carregar_orquestrador()
+    orq.adapter.recusar_rotas = {"/comandos/homing"}
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-H2")))
+
+    assert _status_gravados(orq) == [("OS-H2", "em_andamento"), ("OS-H2", "concluida")]
+
+
+def test_homing_aceito_nao_abre_alarme(carregar_orquestrador):
+    """Controle: sem ele, "não abriu alarme" não distingue conferir de não
+    conferir — a OS feliz não abre alarme nenhum de qualquer jeito."""
+    orq = carregar_orquestrador()
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-H3")))
+
+    assert _alarmes(orq) == []
+
+
+# ── Re-scan de SKU: silêncio não solta um slot comprovadamente errado ─────────
+#
+# O slot chegou aqui porque a câmera LEU e acusou SKU errado — é essa medição
+# que armou a trava. O re-scan tratava `res is None` como "assumindo
+# corrigido": com o vision-adapter fora do ar, bastava liberar a trava e
+# esperar o timeout para o medicamento errado seguir para a dispensa.
+#
+# É a mesma linha que `avaliar_triple_check` traça entre `divergencias` e
+# `fontes_indisponiveis`, com o sinal invertido de propósito: lá o silêncio
+# deixa a OS seguir porque nada a contradisse; aqui já há contradição
+# registrada, e o silêncio não a apaga.
+
+def _supervisor_que_libera(orq, na_primeira_trava=None) -> list:
+    """Supervisor que libera toda trava que aparece; devolve os motivos.
+
+    `na_primeira_trava` roda uma vez, no instante em que a PRIMEIRA trava
+    aparece — que é o único ponto em que dá para encenar o que acontece com o
+    RE-SCAN sem encenar também o scan inicial, que é quem arma a trava.
+    """
+    motivos: list[str] = []
+
+    def _broadcast_e_liberar():
+        if not orq.estado["trava"]["ativa"]:
+            return
+        if not motivos and na_primeira_trava is not None:
+            na_primeira_trava()
+        motivos.append(orq.estado["trava"]["motivo"])
+        orq.modulo.liberar_trava("supervisor")
+
+    orq.modulo._broadcast_fn = _broadcast_e_liberar
+    orq.adapter.capturas_divergentes = 1
+    return motivos
+
+
+def test_re_scan_mudo_mantem_a_trava(carregar_orquestrador, monkeypatch):
+    """Duas travas: a do SKU errado e a da câmera que não respondeu ao re-scan."""
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.modulo.settings, "TIMEOUT_VISAO_DISPENSER", 0.05)
+    # O scan inicial acusa SKU errado; o re-scan, aí sim, fica mudo.
+    motivos = _supervisor_que_libera(
+        orq, na_primeira_trava=lambda: setattr(orq.adapter, "scans_mudos", 1))
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-V1")))
+
+    assert len(motivos) == 2, (
+        "o re-scan mudo soltou o slot — um slot com SKU comprovadamente errado "
+        "seguiu para a dispensa porque a câmera ficou calada")
+
+
+def test_a_segunda_trava_diz_que_foi_a_camera(carregar_orquestrador, monkeypatch):
+    """O motivo não pode repetir "SKU errado": a saída é outra — olhar a
+    estação de visão, não trocar o medicamento do slot. E a pendência é a
+    MESMA, então o motivo tem de dizer qual era."""
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.modulo.settings, "TIMEOUT_VISAO_DISPENSER", 0.05)
+    motivos = _supervisor_que_libera(
+        orq, na_primeira_trava=lambda: setattr(orq.adapter, "scans_mudos", 1))
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-V2")))
+
+    assert "SKU errado" in motivos[0]
+    assert "não respondeu" in motivos[1]
+    assert "SKU" in motivos[1]
+
+
+def test_re_scan_recusado_nao_queima_o_timeout(carregar_orquestrador, monkeypatch):
+    """Envio recusado é resolvido na hora como "sem medição" — a mesma regra da
+    etapa 3b. Esperar um evento que já se sabe inexistente gasta o relógio do
+    orquestrador no exato momento em que o supervisor olha para a tela."""
+    orq = carregar_orquestrador()
+    # Timeout ALTO de propósito: se o código esperasse por ele, o cronômetro
+    # deste teste diria. O que se mede é que a espera não aconteceu.
+    monkeypatch.setattr(orq.modulo.settings, "TIMEOUT_VISAO_DISPENSER", 30.0)
+
+    def _recusar_so_o_re_scan():
+        orq.adapter.recusar_rotas = {"/comandos/capturar/dispenser"}
+
+    motivos = _supervisor_que_libera(orq, na_primeira_trava=_recusar_so_o_re_scan)
+    # Da segunda trava em diante a câmera volta, senão o laço é infinito — que
+    # é, aliás, o comportamento correto com a visão fora do ar.
+    orq.modulo._broadcast_fn_original = orq.modulo._broadcast_fn
+
+    def _liberar_e_devolver_a_camera():
+        orq.modulo._broadcast_fn_original()
+        if len(motivos) >= 2:
+            orq.adapter.recusar_rotas = set()
+
+    orq.modulo._broadcast_fn = _liberar_e_devolver_a_camera
+
+    inicio = time.monotonic()
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-V3")))
+    decorrido = time.monotonic() - inicio
+
+    assert len(motivos) >= 2
+    assert decorrido < 10.0, (
+        f"{decorrido:.1f}s — o re-scan recusado ficou esperando um evento que "
+        f"já se sabia que não viria")
+
+
+def test_re_scan_que_responde_OK_solta_o_slot(carregar_orquestrador):
+    """Controle: o caminho feliz continua funcionando — uma trava só."""
+    orq = carregar_orquestrador()
+    motivos = _supervisor_que_libera(orq)
+
+    asyncio.run(orq.modulo._processar_os(_payload_os("OS-V4")))
+
+    assert len(motivos) == 1
+    assert _status_gravados(orq)[-1] == ("OS-V4", "concluida")

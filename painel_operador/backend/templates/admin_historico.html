@@ -18,6 +18,7 @@
     </div>
     <form method="POST" action="{{ url_for('admin_limpar_historico') }}"
           onsubmit="return confirm('Limpar TODO o histórico? Esta ação não pode ser desfeita.')">
+        {{ campo_csrf() }}
         <button class="btn btn-outline-danger btn-sm">
             <i class="bi bi-trash"></i> Limpar Log
         </button>

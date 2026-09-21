@@ -13,12 +13,14 @@ Quando a telemetria invadia o fluxo, o reset de fim de OS era desfeito no
 ciclo seguinte: o slot ficava eternamente "concluido" no dashboard, a limpeza
 respondia 409 e `dispenser_estado.ultima_os_id` congelava numa OS antiga.
 """
+import ast
 import asyncio
+import logging
 
 import pytest
 from fastapi import HTTPException
 
-from conftest import NUM_SLOTS
+from conftest import CENTRAL_DIR, NUM_SLOTS
 
 
 def _evento(central, payload: dict) -> None:
@@ -199,6 +201,99 @@ def test_limpeza_ok_solta_o_slot(carregar_central):
     assert slot["quantidade"] == 0
     assert slot["medicamento"] is None
     assert central.banco.chamadas_de("limpar_dispenser_estado")
+
+
+# ── O nome do medicamento sobrevive ao slot que esvaziou ──────────────────────
+#
+# A sequência abaixo é a NORMAL, não uma borda: o firmware conta a última
+# unidade, esvazia `sl.medicamento`, emite `status` com medicamento nulo e só
+# então emite `dispensado`. O central lia o nome do seu próprio snapshot — que
+# o periódico acabara de apagar — e chamava `salvar_dispensa(..., None, ...)`.
+# `dispensas.medicamento` é VARCHAR(100) NOT NULL: o INSERT falhava com 1048,
+# `_db` logava um `warning`, e a dispensa que deu CERTO era exatamente a que
+# não virava linha. Some do relatório da OS, do CSV e do XLSX, sem erro.
+
+def _dispensa_completa(disp_id: int) -> dict:
+    return {
+        "tipo":                  "dispensado",
+        "dispenser_id":          disp_id,
+        "os_id":                 "OS-1",
+        "quantidade_dispensada": 5,
+        "quantidade_alvo":       5,
+        "quantidade_residual":   0,
+        "falha_mecanica":        False,
+    }
+
+
+def test_status_nulo_nao_apaga_o_que_o_slot_ja_sabe(carregar_central):
+    """`null` num periódico é "não informado", não "não tem"."""
+    central = carregar_central()
+    central.slot(1).update({
+        "medicamento": "Dipirona", "sku": "DIP-500", "categoria": "analgesico",
+        "quantidade": 5,
+    })
+
+    _evento(central, {
+        "tipo": "status", "dispenser_id": 1,
+        "medicamento": None, "sku": None, "categoria": None, "quantidade": 0,
+    })
+
+    slot = central.slot(1)
+    assert slot["quantidade"] == 0          # o estoque, esse o periódico manda
+    assert slot["medicamento"] == "Dipirona"
+    assert slot["sku"] == "DIP-500"
+    assert slot["categoria"] == "analgesico"
+
+
+def test_dispensa_grava_o_medicamento_mesmo_depois_do_status_vazio(carregar_central):
+    """carregado → status(medicamento=None) → dispensado: a linha sai com nome."""
+    central = carregar_central()
+
+    _evento(central, {
+        "tipo": "carregado", "dispenser_id": 1, "os_id": "OS-1",
+        "medicamento": "Dipirona", "sku": "DIP-500", "categoria": "analgesico",
+        "quantidade_total": 5,
+    })
+    # O slot esvaziou e a telemetria já saiu: é ela que chega primeiro.
+    _evento(central, {
+        "tipo": "status", "dispenser_id": 1,
+        "medicamento": None, "sku": None, "categoria": None, "quantidade": 0,
+    })
+    _evento(central, _dispensa_completa(1))
+
+    (chamada,) = central.banco.chamadas_de("salvar_dispensa")
+    os_id, disp_id, medicamento, qtd, alvo, validado, falha = chamada["args"]
+    assert (os_id, disp_id) == ("OS-1", 1)
+    assert medicamento == "Dipirona", (
+        "a dispensa foi gravada sem medicamento — a coluna é NOT NULL e o "
+        "INSERT falha em silêncio")
+    assert validado is True
+
+
+def test_o_proprio_dispensado_serve_de_fonte_do_nome(carregar_central):
+    """Central sem o nome em memória (restart no meio da OS): vale o do evento."""
+    central = carregar_central()
+    central.slot(2).update({"status": "dispensando", "os_id": "OS-1"})
+
+    _evento(central, {**_dispensa_completa(2), "medicamento": "Amoxicilina"})
+
+    (chamada,) = central.banco.chamadas_de("salvar_dispensa")
+    assert chamada["args"][2] == "Amoxicilina"
+
+
+def test_sem_nome_em_lugar_nenhum_a_linha_ainda_sai(carregar_central):
+    """Entre gravar "(desconhecido)" e não gravar nada, um sistema de
+    medicação grava: o que aconteceu com o paciente não pode depender de o
+    nome ter chegado."""
+    central = carregar_central()
+    central.slot(3).update({"status": "dispensando", "os_id": "OS-1"})
+
+    _evento(central, _dispensa_completa(3))
+
+    (chamada,) = central.banco.chamadas_de("salvar_dispensa")
+    medicamento = chamada["args"][2]
+    assert medicamento, "coluna NOT NULL: string vazia também derruba o INSERT"
+    assert medicamento == "(desconhecido)"
 
 
 # ── Limpeza manual pelo app de manutenção ─────────────────────────────────────
@@ -400,6 +495,57 @@ def test_amostragem_de_trajetoria_grava_1_em_n(carregar_central, monkeypatch):
         _evento_cnc(central, "movendo")
 
     assert len(central.banco.chamadas_de("salvar_cnc_evento")) == 4
+
+
+# ── Telemetria da CNC: leitura de sensor, não posição ─────────────────────────
+#
+# O `_estado["cnc"].update(...)` rodava para TODO tipo de evento, e a
+# telemetria não traz posição, alvo nem ciclo: os defaults do `payload.get`
+# entravam no snapshot como se fossem medida. Entre dois eventos de movimento a
+# mesa "voltava" para (0,0) com `dispenser_alvo` nulo — e o painel é o único
+# lugar onde se vê a mesa nesse intervalo. Pior: `prevoo.itens_celula` compara
+# a posição PUBLICADA com o HOME, então a tela de conferência passava a
+# concordar com uma origem que ninguém mediu. O handler do dispenser já
+# separava a periódica do fluxo; este não separava.
+
+def _telemetria_cnc(central, **extra) -> None:
+    asyncio.run(central.modulo._handle_evento_cnc({
+        "tipo": "telemetria", "componente": "motor_x",
+        "valor": 48.2, "unidade": "°C", **extra,
+    }))
+
+
+def test_telemetria_de_cnc_nao_apaga_a_posicao_nem_o_alvo(carregar_central):
+    central = carregar_central()
+    _evento_cnc(central, "posicionado")
+    antes = dict(central.modulo._estado["cnc"])
+
+    _telemetria_cnc(central)
+
+    assert central.modulo._estado["cnc"] == antes
+
+
+def test_telemetria_de_cnc_continua_virando_leitura_de_sensor(carregar_central):
+    """Controle: o que ela SEMPRE fez não pode ter sumido com a separação."""
+    central = carregar_central()
+
+    _telemetria_cnc(central)
+
+    (chamada,) = central.banco.chamadas_de("salvar_leitura_sensor")
+    assert chamada["args"] == ("motor_x", "temperatura", 48.2, "°C")
+    assert central.banco.chamadas_de("salvar_cnc_evento") == []
+
+
+def test_a_linha_de_log_da_telemetria_nao_inventa_posicao(carregar_central):
+    """Mesma mentira, outra superfície: `/log/eventos` é o que a bancada lê."""
+    central = carregar_central()
+
+    _telemetria_cnc(central)
+
+    (linha,) = [e for e in central.modulo._log_eventos
+                if e["tipo"].startswith("cnc_")]
+    assert "0.0" not in linha["msg"], linha["msg"]
+    assert "motor_x" in linha["msg"]
 
 
 # ── Throttle do broadcast ─────────────────────────────────────────────────────
@@ -769,3 +915,342 @@ def test_pesagem_de_slot_continua_saindo_na_hora(carregar_central, monkeypatch):
     _pesagem_de_slot(central)
 
     assert len(enviados) == 1
+
+
+# ── Escrita crítica perdida vira alarme, não um warning ───────────────────────
+#
+# `_db` engolia TODA falha de banco num `logger.warning`. Foi isso que escondeu
+# o `medicamento` nulo acima por tempo demais: a linha de dispensa não existia,
+# e o único rastro era um warning no meio de centenas de linhas de evento.
+#
+# A separação não é de gravidade abstrata, é de quem conserta. Telemetria e
+# `dispenser_estado` são MEDIÇÕES REPETIDAS — o valor seguinte chega em 15s e
+# reescreve a linha. `salvar_dispensa` e `atualizar_item_os` são o rastro
+# NOMINAL de quem recebeu o quê: acontecem UMA vez, ninguém os reemite, e a
+# linha perdida some do relatório da OS para sempre.
+
+def _explodir(central, monkeypatch, nome: str, erro: str = "1048 Column cannot be null"):
+    """Troca uma função de banco por uma que levanta, como o PyMySQL levantaria."""
+    def _levanta(*args, **kwargs):
+        raise RuntimeError(erro)
+
+    monkeypatch.setattr(central.modulo, nome, _levanta)
+
+
+def _alarmes_de_persistencia(central) -> list:
+    return [c for c in central.banco.chamadas_de("salvar_alarme")
+            if c["args"][1] == "persistencia_falhou"]
+
+
+def test_falha_ao_gravar_a_dispensa_abre_alarme(carregar_central, monkeypatch):
+    central = carregar_central()
+    central.slot(1).update({"status": "dispensando", "os_id": "OS-1",
+                            "medicamento": "Dipirona"})
+    _explodir(central, monkeypatch, "salvar_dispensa")
+
+    _evento(central, _dispensa_completa(1))
+
+    (alarme,) = _alarmes_de_persistencia(central)
+    fonte, tipo, descricao = alarme["args"]
+    assert (fonte, tipo) == ("central", "persistencia_falhou")
+    assert "salvar_dispensa" in descricao
+    # O payload vai junto: é com ele que alguém reconstrói a linha à mão.
+    assert "Dipirona" in descricao
+
+
+def test_falha_ao_fechar_o_item_da_os_abre_alarme(carregar_central, monkeypatch):
+    central = carregar_central()
+    central.slot(1).update({"status": "dispensando", "os_id": "OS-1",
+                            "medicamento": "Dipirona"})
+    _explodir(central, monkeypatch, "atualizar_item_os")
+
+    _evento(central, _dispensa_completa(1))
+
+    (alarme,) = _alarmes_de_persistencia(central)
+    assert "atualizar_item_os" in alarme["args"][2]
+
+
+@pytest.mark.parametrize("escrita", ["salvar_dispenser_estado", "salvar_leitura_sensor"])
+def test_falha_de_medicao_repetida_continua_so_no_log(carregar_central, monkeypatch,
+                                                      escrita):
+    """Controle da linha: alarme para TODA escrita encheria a tela de
+    necessidades com um item a cada 15s enquanto o MySQL reinicia."""
+    central = carregar_central()
+    _explodir(central, monkeypatch, escrita)
+
+    _evento(central, {"tipo": "telemetria", "dispenser_id": 1, "valor_c": 30.0})
+    _evento(central, {"tipo": "status", "dispenser_id": 1, "quantidade": 4})
+
+    assert _alarmes_de_persistencia(central) == []
+
+
+def test_o_alarme_que_tambem_falha_nao_derruba_o_handler(carregar_central,
+                                                         monkeypatch):
+    """Banco fora derruba as DUAS escritas. O handler é o único caminho de
+    volta do adapter ao orquestrador: se ele propagar, o adapter toma 500 e
+    retenta um evento que já foi processado."""
+    central = carregar_central()
+    central.slot(1).update({"status": "dispensando", "os_id": "OS-1"})
+    _explodir(central, monkeypatch, "salvar_dispensa")
+    _explodir(central, monkeypatch, "salvar_alarme", erro="2003 Can't connect")
+
+    _evento(central, _dispensa_completa(1))          # não pode levantar
+
+    assert central.slot(1)["status"] == "concluido"  # o fluxo andou assim mesmo
+
+
+def test_a_falha_critica_e_registrada_como_erro(carregar_central, monkeypatch,
+                                                caplog):
+    """`warning` foi o que escondeu o bug: quem varre log de produção por
+    `ERROR` não via nada."""
+    central = carregar_central()
+    central.slot(1).update({"status": "dispensando", "os_id": "OS-1"})
+    _explodir(central, monkeypatch, "salvar_dispensa")
+
+    with caplog.at_level(logging.ERROR, logger=central.modulo.logger.name):
+        _evento(central, _dispensa_completa(1))
+
+    assert any("salvar_dispensa" in r.getMessage() for r in caplog.records
+               if r.levelno >= logging.ERROR)
+
+
+# ── A mesa que volta para o HOME não conclui a OS que travou ─────────────────
+#
+# É o caso NORMAL do Triple Check, não uma borda: a trava dispara entre dois
+# ciclos, com a mesa parada. O firmware então faz homing por conta própria — é
+# onde o supervisor espera encontrá-la para mexer na bancada — e emite
+# `concluido` endereçado ao `trava_os_id`, que é o `os_id` do último `mover`,
+# ou seja, a OS que acabou de travar.
+#
+# O dashboard, o `/estado` e o `/ws` passavam a mostrar CONCLUÍDA a OS que está
+# parada esperando alguém liberar. É a tela que a pessoa que vai liberar está
+# olhando.
+
+def _travar(central, monkeypatch, os_id: str = "OS-42") -> None:
+    """Arma a trava no orquestrador, que é onde ela mora de verdade."""
+    monkeypatch.setattr(central.modulo.orch, "_trava_ativa", True)
+    monkeypatch.setattr(central.modulo.orch, "_trava_os_id", os_id)
+
+
+def _com_os_ativa(central, os_id: str = "OS-42") -> None:
+    central.modulo._estado["os_ativa"] = {"os_id": os_id, "status": "em_andamento"}
+
+
+def test_concluido_da_mesa_nao_fecha_os_travada(carregar_central, monkeypatch):
+    central = carregar_central()
+    _com_os_ativa(central)
+    _travar(central, monkeypatch)
+
+    _evento_cnc(central, "concluido")
+
+    assert central.modulo._estado["os_ativa"]["status"] == "em_andamento", (
+        "a OS aparece como CONCLUIDA no painel enquanto a trava do Triple Check "
+        "está ativa e o supervisor ainda não liberou")
+
+
+def test_concluido_da_mesa_fecha_a_os_sem_trava(carregar_central):
+    """Controle: o caminho normal de fim de ciclo continua fechando a OS."""
+    central = carregar_central()
+    _com_os_ativa(central)
+
+    _evento_cnc(central, "concluido")
+
+    assert central.modulo._estado["os_ativa"]["status"] == "concluida"
+
+
+def test_o_evento_de_homing_da_trava_continua_virando_linha(carregar_central,
+                                                            monkeypatch):
+    """A guarda é só sobre o STATUS DA OS. O `concluido` continua sendo
+    transição, então continua indo para `cnc_eventos` e para a posição da mesa
+    — é o registro de que ela voltou ao HOME."""
+    central = carregar_central()
+    _com_os_ativa(central)
+    _travar(central, monkeypatch)
+
+    _evento_cnc(central, "concluido")
+
+    (chamada,) = central.banco.chamadas_de("salvar_cnc_evento")
+    assert chamada["args"][1] == "concluido"
+    assert central.modulo._estado["cnc"]["status"] == "concluido"
+
+
+# ── OS órfã: o central que morreu no meio do ciclo deixa rastro no banco ─────
+#
+# O orquestrador é um loop ÚNICO, então no boot não existe OS em execução por
+# definição: toda linha `em_andamento` é de um processo que já morreu. Elas não
+# somem sozinhas, e `get_ordem_ativa` prefere `em_andamento ORDER BY criado_em
+# ASC` — a órfã MAIS ANTIGA vira "a OS ativa" para sempre, no `GET /os/ativa`,
+# no app de manutenção e no espelho do painel de bancada. Na bancada isso já
+# aconteceu: três ordens paradas desde 11/09.
+
+def _com_orfas(central, monkeypatch, *os_ids: str) -> None:
+    monkeypatch.setattr(central.modulo, "fechar_os_orfas", lambda: list(os_ids))
+
+
+def test_boot_fecha_as_os_orfas_com_um_alarme_por_linha(carregar_central,
+                                                        monkeypatch):
+    central = carregar_central()
+    _com_orfas(central, monkeypatch, "OS-A", "OS-B")
+
+    asyncio.run(central.modulo._fechar_os_orfas_no_boot())
+
+    alarmes = [c["args"] for c in central.banco.chamadas_de("salvar_alarme")]
+    assert [tipo for _, tipo, _ in alarmes] == ["os_orfa_no_boot"] * 2
+    # Um por linha, e não um agregado: é o `os_id` que leva ao relatório
+    # daquela OS e mostra até onde ela chegou.
+    assert "OS-A" in alarmes[0][2]
+    assert "OS-B" in alarmes[1][2]
+
+
+def test_boot_sem_orfas_nao_abre_alarme(carregar_central, monkeypatch):
+    """Controle: o caso normal é não haver nenhuma."""
+    central = carregar_central()
+    _com_orfas(central, monkeypatch)
+
+    asyncio.run(central.modulo._fechar_os_orfas_no_boot())
+
+    assert central.banco.chamadas_de("salvar_alarme") == []
+
+
+def test_banco_fora_no_boot_nao_derruba_o_central(carregar_central, monkeypatch):
+    """A reconciliação roda de novo no startup seguinte; derrubar o boot por
+    causa dela trocaria um `GET /os/ativa` errado por uma planta parada."""
+    central = carregar_central()
+
+    def _levanta():
+        raise RuntimeError("2003 Can't connect")
+
+    monkeypatch.setattr(central.modulo, "fechar_os_orfas", _levanta)
+
+    asyncio.run(central.modulo._fechar_os_orfas_no_boot())   # não pode levantar
+
+
+def test_a_lifespan_chama_a_reconciliacao():
+    """A função certa e ninguém a chamando é o mesmo que não existir.
+
+    Os testes acima a chamam direto — é o que permite exercitá-la sem subir o
+    FastAPI —, e por isso nenhum deles fica vermelho se a linha sumir da
+    `lifespan`. Esta varredura é a que fica.
+    """
+    arvore = ast.parse((CENTRAL_DIR / "main.py").read_text(encoding="utf-8"))
+
+    for no in ast.walk(arvore):
+        if isinstance(no, ast.AsyncFunctionDef) and no.name == "lifespan":
+            chamadas = {c.func.id for c in ast.walk(no)
+                        if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            assert "_fechar_os_orfas_no_boot" in chamadas
+            return
+    pytest.fail("`lifespan` não foi encontrada em main.py — o extrator quebrou")
+
+
+# ── Campo torto num evento não pode virar 500 ────────────────────────────────
+#
+# O payload dos adapters atravessa SEM interpretação — é o contrato —, então um
+# campo numérico pode chegar `null`, string ou float. `f"(Δ={det - esp:+d})"`
+# exige int: um `null` derrubava o endpoint com 500, o adapter retentava 3× e o
+# evento se perdia de vez. A divergência de CONTAGEM é uma das três fontes do
+# Triple Check; perdê-la por causa de uma formatação é perder a trava.
+
+@pytest.mark.parametrize("detectada, esperada", [
+    (None, 10), (10, None), ("9", 10), (9.0, 10.0), (None, None),
+])
+def test_divergencia_de_mesa_com_campo_torto_nao_levanta(carregar_central,
+                                                         detectada, esperada):
+    central = carregar_central()
+
+    asyncio.run(central.modulo._handle_evento_visao({
+        "tipo": "leitura_mesa_divergencia", "camera": "mesa", "slot_id": 3,
+        "os_id": "OS-1",
+        "quantidade_detectada": detectada, "quantidade_esperada": esperada,
+    }))
+
+    (alarme,) = [c["args"] for c in central.banco.chamadas_de("salvar_alarme")]
+    assert alarme[1] == "divergencia_contagem"
+
+
+def test_a_divergencia_de_mesa_avisa_o_orquestrador_mesmo_com_campo_torto(
+        carregar_central, monkeypatch):
+    """O 500 não custava só a linha de alarme: custava a NOTIFICAÇÃO, que é o
+    que faz a trava acontecer."""
+    central = carregar_central()
+    avisos = []
+    monkeypatch.setattr(central.modulo.orch, "notificar_evento",
+                        lambda chave, payload: avisos.append(chave))
+
+    asyncio.run(central.modulo._handle_evento_visao({
+        "tipo": "leitura_mesa_divergencia", "camera": "mesa", "slot_id": 3,
+        "os_id": "OS-1", "quantidade_detectada": None, "quantidade_esperada": 10,
+    }))
+
+    assert "OS-1:visao_mesa:3" in avisos
+
+
+def test_o_numero_certo_continua_aparecendo_na_descricao(carregar_central):
+    """Controle: tolerar o torto não pode custar a informação do caso normal."""
+    central = carregar_central()
+
+    asyncio.run(central.modulo._handle_evento_visao({
+        "tipo": "leitura_mesa_divergencia", "camera": "mesa", "slot_id": 3,
+        "os_id": "OS-1", "quantidade_detectada": 8, "quantidade_esperada": 10,
+    }))
+
+    (alarme,) = [c["args"] for c in central.banco.chamadas_de("salvar_alarme")]
+    assert "esperado=10 detectado=8" in alarme[2]
+    assert "-2" in alarme[2]
+
+
+# ── O WebSocket não vaza conexão ─────────────────────────────────────────────
+
+def test_cliente_que_sai_no_meio_do_broadcast_nao_pula_o_seguinte(carregar_central):
+    """Há um `await` dentro do laço, e nesse ponto o loop roda outra corrotina.
+
+    Iterar a lista VIVA e remover um item durante a iteração desloca os
+    índices: o `for` pula o cliente seguinte, que perde aquele snapshot sem
+    erro nenhum. Com o `/ws` chamando `disconnect` no `finally`, isso deixou de
+    ser hipótese — a saída de um cliente acontece exatamente durante o `await`
+    de outro.
+    """
+    central = carregar_central()
+    manager = central.modulo.WSManager()
+
+    class Cliente:
+        def __init__(self, ao_enviar=None):
+            self.recebidos = []
+            self.ao_enviar = ao_enviar
+
+        async def send_text(self, msg):
+            if self.ao_enviar:
+                self.ao_enviar()
+            self.recebidos.append(msg)
+
+    segundo = Cliente()
+    terceiro = Cliente()
+    # O primeiro sai da lista enquanto está sendo servido — é o `finally` do
+    # handler dele rodando durante este `await`.
+    primeiro = Cliente(ao_enviar=lambda: manager.disconnect(primeiro))
+    manager.active.extend([primeiro, segundo, terceiro])
+
+    asyncio.run(manager.broadcast({"tipo": "estado"}))
+
+    assert segundo.recebidos, "o cliente seguinte foi PULADO pelo deslocamento"
+    assert terceiro.recebidos
+
+
+def test_toda_saida_do_ws_tira_o_cliente_da_lista(carregar_central):
+    """Só `WebSocketDisconnect` era tratada, e ela é UMA das saídas.
+
+    `CancelledError` no shutdown, erro de rede no `send_text` do snapshot, um
+    cliente que morre de outro jeito — qualquer uma deixava o WebSocket na
+    lista do manager para sempre. A partir daí todo broadcast tentava escrever
+    nele, e cada reconexão de um dashboard acrescentava mais um.
+    """
+    import ast
+    import inspect
+
+    arvore = ast.parse(inspect.getsource(central_ws := carregar_central()
+                                         .modulo.ws_endpoint))
+    corpo = arvore.body[0]
+    assert any(isinstance(no, ast.Try) and no.finalbody for no in corpo.body), (
+        "`ws_endpoint` não tem `finally` — a desconexão depende de qual exceção "
+        "saiu, e só uma delas era tratada")
+    assert central_ws is not None
