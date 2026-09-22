@@ -24,7 +24,7 @@ rem  placa dos mecanismos emite {"cmd":"ping","sub":"dispenser"} e a das telas
 rem  emite {"cmd":"ping","sub":"dispenser_tft"}. Casar por VID/PID acharia a
 rem  placa errada — o VID/PID do conversor USB-serial e o mesmo nas duas.
 if "%DISPENSER_SERIAL_URL%"=="" set DISPENSER_SERIAL_URL=COM6
-if "%DISPENSER_TFT_SERIAL_URL%"=="" set DISPENSER_TFT_SERIAL_URL=COM9
+if "%DISPENSER_TFT_SERIAL_URL%"=="" set DISPENSER_TFT_SERIAL_URL=COM10
 
 rem ---- O resto raramente muda ------------------------------------------------
 rem  `serial` e o firmware; `http` voltaria para o dispenser_simulator. Para as
