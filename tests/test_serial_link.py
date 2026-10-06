@@ -645,9 +645,43 @@ def test_relogio_que_anda_para_tras_tambem_e_sessao_nova(montar_link):
 
     link._escrever({**base, "cmd_id": 7, "sessao": sessao})
     assert _ate(lambda: len(placa.executados) == 1)
-    link._escrever({**base, "cmd_id": 1, "sessao": sessao - 3600})
+    # No mesmo módulo da `SESSAO`: perto da volta do ciclo, `sessao - 3600`
+    # cru daria <= 0, que o contrato lê como "ainda não sei".
+    link._escrever({**base, "cmd_id": 1, "sessao": (sessao - 3600) % 2 ** 24 or 1})
 
     assert _ate(lambda: len(placa.executados) == 2)
+
+
+def _como_a_placa_le(valor: int) -> int:
+    """O que o firmware enxerga: `jsonNumero` faz `(float)strtod(...)` e o
+    `adotarSessao` converte de volta para `unsigned long`."""
+    import struct
+    return int(struct.unpack("<f", struct.pack("<f", float(valor)))[0])
+
+
+def test_a_sessao_sobrevive_ao_float_da_placa(montar_link):
+    """A placa falsa compara `sessao` como `int` e por isso nunca viu o defeito:
+    o firmware a lê em float32. Um epoch inteiro (~1,8·10⁹) tem resolução de
+    128 s ali, e dois restarts a segundos um do outro viravam o MESMO número —
+    o restart rápido passava sem zerar `ultimoCmdId`, e a placa respondia ACK
+    sem executar."""
+    _, link, _ = montar_link("weight")
+    sessao = _sl_modulo(link).SESSAO
+
+    assert 0 < sessao < 2 ** 24
+    assert _como_a_placa_le(sessao) == sessao
+    # O caso que motivou a regra: restart de 2 a 5 s depois.
+    for delta in (1, 2, 5, 30):
+        outra = (sessao + delta) % 2 ** 24 or 1
+        assert _como_a_placa_le(outra) != _como_a_placa_le(sessao), delta
+
+
+def test_o_epoch_cru_nao_sobreviveria_ao_float_da_placa():
+    """Controle: sem o `% 2**24`, o mesmo restart de 2 s seria invisível. Sem
+    este teste, o de cima passaria também com uma placa que lesse `double`, e
+    ninguém saberia por que a sessão é cortada."""
+    epoch = 1_791_311_757
+    assert _como_a_placa_le(epoch) == _como_a_placa_le(epoch + 2)
 
 
 def test_a_sessao_nao_vira_campo_de_comando(montar_link):

@@ -27,8 +27,11 @@ existem separados.
 - [ ] ESP32 dos mecanismos, com o PCA9685, os 8 servos e os 8 TCRT5000 ligados,
       e **alimentação externa para os servos** (o USB é só dados — oito servos
       sob carga não saem da porta USB);
-- [ ] ESP32 das telas, se os TFTs já estiverem escolhidos e ligados. Se não,
-      pule: o firmware compila e roda sem painel nenhum;
+- [ ] ESP32 das telas, com os 8 ST7735 ligados (pinos em
+      [`README.md`](README.md#o-painel-oito-st7735-e-a-tela-mostra-a-caixa)).
+      Ela grava com **Partition Scheme = Huge APP** — as 39 imagens não cabem
+      no esquema default:
+      `& $ACLI upload -p COM6 --fqbn esp32:esp32:esp32:PartitionScheme=huge_app dispenser/telas_tft`;
 - [ ] dois cabos USB de **dados** — cabo só de carga não enumera porta nenhuma,
       e o sintoma é "a COM não aparece";
 - [ ] **um multímetro**, para o item 1.1 (os pinos do I²C do PCA9685 estão

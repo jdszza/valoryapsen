@@ -31,7 +31,7 @@ arduino-cli compile --fqbn esp32:esp32:esp32 dispenser/servos_hub
 ```
 
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32 dispenser/telas_tft
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app dispenser/telas_tft
 ```
 
 > **Primeira vez com a placa na mão?** O roteiro do zero — gravar, calibrar os
@@ -284,9 +284,10 @@ correto.
 
 | estado recebido | a tela do slot mostra |
 |---|---|
-| `trava_ativa=false` | medicamento · SKU · dispensada/alvo · residual · status |
-| `trava_ativa=true` e `trava_slot_id` == meu id | alerta + **AGUARDE SUPERVISOR** + `trava_resumo` |
-| `trava_ativa=true` e outro slot | **PARADO — D{n}**, conteúdo esmaecido |
+| `trava_ativa=false`, medicamento com imagem | a caixa do medicamento, tela cheia; faixa **D{n} ERRO** se `status=erro` |
+| `trava_ativa=false`, sem imagem | texto: D{n} · status · nome (ou **VAZIO**) · dispensada/alvo |
+| `trava_ativa=true` e `trava_slot_id` == meu id | fundo vermelho + **AGUARDE SUPERVISOR** + `trava_resumo` |
+| `trava_ativa=true` e outro slot | a mesma tela, com a faixa **PARADO — D{n}** no topo |
 
 `trava_slot_id` pode vir **nulo** (trava sem slot), mas a **chave** vem sempre:
 é ela que diz a cada tela se é este slot ou outro. Chave ausente é comando mal
@@ -303,29 +304,54 @@ decide.
 pintura; a placa não recusa comando e não atrasa nada porque um display não
 respondeu. Tela errada é cosmética; dispensa atrasada não é.
 
-### O painel ainda não foi escolhido, e o código deixa isso em aberto
+### O painel: oito ST7735, e a tela mostra a caixa
 
-Modelo, driver, tamanho, como as oito telas são selecionadas (oito CS de SPI,
-um mux, ou I²C com endereço por tela) e onde entra o PWM do brilho são decisões
-**físicas**. Por isso a camada de desenho fica atrás de quatro funções finas —
-`telaIniciar`, `telaLimpar`, `telaLinha`, `telaMostrar` — e a escolha é um
-`#define TELA_DRIVER`.
+O hardware é o que está soldado na bancada, e o pinout veio sem mudança do
+`telas_tft/referencia/TFT.ino` — o sketch de teste que já desenhava as oito
+telas antes da integração:
 
-O default é **`TELA_DRIVER_LOG`**, e não um driver concreto, por duas razões:
+| sinal | GPIO |
+|---|---|
+| SCK / MOSI (VSPI) | 18 / 23 |
+| DC (compartilhado) | 4 |
+| RST (compartilhado, pulsado **uma vez** no boot) | 22 |
+| CS de D1..D8 | 12, 13, 14, 25, 26, 27, 32, 33 |
 
-1. ele compila em qualquer máquina, sem biblioteca a instalar. Um default que
-   exigisse `TFT_eSPI` ou `Adafruit_ILI9341` quebraria o build de todo mundo
-   por causa de um display que ninguém escolheu ainda;
-2. ele é a ferramenta de bancada de verdade: o Monitor Serial mostra
-   exatamente o que cada tela mostraria. Quando um painel não acender, é assim
-   que se descobre se o problema é a ligação ou a mensagem.
+O RST é pulsado uma vez para as oito e o construtor recebe `-1`: se cada
+`initR` pulsasse o reset, inicializar a tela 2 apagaria a tela 1.
 
-O bloco `TELA_DRIVER_ILI9341_SPI` está escrito e **não compilado**, pronto para
-a troca. Ele usa `Adafruit_GFX` + driver e **não** `TFT_eSPI` por um motivo
-prático: o `TFT_eSPI` se configura por um `User_Setup.h` **dentro da pasta da
-biblioteca**, fora deste repositório — a ligação da bancada ficaria gravada num
-arquivo que nenhum commit registra. Aqui os pinos estão numa tabela no topo do
-sketch, versionados.
+**Nome → número da imagem.** O `slot` traz o nome do catálogo do central
+(`"ALOIS 10MG"`); a tela desenha `imgN` de `imagens.h`. A tradução é
+`catalogo_imagens.h`, onde a POSIÇÃO na lista é o número da imagem —
+`NOMES_IMAGEM[0]` desenha `img0`. Acrescentar um medicamento é acrescentar a
+imagem no fim de `imagens.h`, o nome no fim da lista e o ponteiro no fim de
+`IMAGENS[]` no sketch, no mesmo commit. O build para (`static_assert`) se as
+contagens divergirem, e `tests/test_telas_imagens.py` cobra a ordem, o tamanho
+de cada imagem e que todo nome exista no `_MEDICAMENTOS_SEED` do central.
+
+Medicamento fora da lista vira **tela de texto** com o nome escrito e "(sem
+imagem)" — nunca uma caixa aproximada: casar `XAFAC 15MG` com a imagem do
+`XAFAC 10MG` poria na tela uma caixa que ninguém conferiu.
+
+**Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)" é obrigatório.** As 39
+imagens são 1,6 MB (128 × 160 × 2 bytes cada); o build inteiro dá ~1,95 MB, e o
+esquema default tem 1,25 MB de app — o `arduino-cli` responde "Sketch too
+big". O `TFT.ino` cabia no default porque referenciava só 8 imagens e o linker
+descartava as outras 31.
+
+**Conferir a ordem sem PC:** no Monitor Serial da placa das telas, `lista`
+imprime número → nome, e `img <slot> <n>` desenha a imagem `n` na tela do
+slot. O próximo `slot` daquele dispenser redesenha o estado verdadeiro.
+
+Redesenho igual ao anterior é pulado (a placa guarda uma assinatura do que cada
+tela mostra): com a caixa na tela, `dispensando` → `concluido` não empurra
+40 KB pela SPI de novo nem pisca a tela. Por isso a quantidade não aparece
+sobre a imagem — só na tela de texto.
+
+`TELA_DRIVER_LOG` continua disponível (`-DTELA_DRIVER=0`): compila sem
+biblioteca e mostra no Monitor Serial o que cada tela desenharia. O ST7735 não
+tem linha de leitura, então a placa não sabe que um painel não acendeu — quem
+confere é o olho, com `img`.
 
 ## `apsen_serial.h`: duas cópias, e um teste que as compara
 
@@ -418,7 +444,5 @@ Nenhuma destas se decide no editor. Elas estão marcadas assim também no códig
 | **Os pinos do I²C do PCA9685** | `servos_hub.ino`, `PCA_SDA` / `PCA_SCL` | o esquemático da REV 1.0 mostra D21/D22 como NC e o código diz GPIO23/GPIO22. Quem decide é o multímetro. As mensagens do boot imprimem os valores das constantes com `%d` — mensagem de erro que aponta para o pino errado manda quem lê procurar no lugar errado |
 | **Calibrar os 8 servos** e colar o `EXPORT` no `CAL_BACKUP` | terminal `MANUT` | sem calibração própria o `min` é 0° e pode estar **além** do fim de curso. O boot **não move** servo não calibrado, de propósito, e avisa no log |
 | **`DISPENSA_TIMEOUT_UNIDADE_MS`** e **`DISPENSA_SERVO_MS`** | `servos_hub.ino` | medir o intervalo real entre o ciclo e o pulso do IR, com o medicamento de verdade |
-| **Modelo, driver e ligação dos 8 TFTs** | `telas_tft.ino`, tabela do topo | escolha física; o código já está atrás de uma interface fina |
-| **`TFT_PIN_CS[]`, `TFT_PIN_DC`, `TFT_PIN_RST`, `TFT_PIN_BRILHO`** | `telas_tft.ino` | dependem da escolha acima |
-| **`TELA_LINHAS` e `TELA_COLUNAS`** | `telas_tft.ino` | o layout de §6 precisa de cinco campos mais o cabeçalho |
+| **Conferir as 39 imagens** com `img <slot> <n>` contra a lista de `catalogo_imagens.h` | Monitor Serial da placa das telas | a ordem veio de fora do repositório; o teste confere contagem e nomes, não o desenho |
 | **Fixar as duas COM** e preencher `DISPENSER_SERIAL_URL` / `DISPENSER_TFT_SERIAL_URL` | `.env` do host | ver acima |

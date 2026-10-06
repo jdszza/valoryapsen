@@ -165,7 +165,19 @@ class _Espera:
 # A placa compara com a que tem guardada: mudou, zera `ultimoCmdId`. É um
 # inteiro que já existe (não há relógio novo a manter), e a comparação é de
 # DIFERENÇA, não de ordem — relógio que anda para trás não quebra a regra.
-SESSAO = int(time.time())
+#
+# E ela cabe em 24 bits DE PROPÓSITO. O firmware lê todo número do JSON com
+# `jsonNumero`, que converte para `float` (`apsen_serial.h` e a cópia inline da
+# balança). Um epoch inteiro (~1,8·10⁹) em float32 tem resolução de 128 s:
+# dois restarts a menos de ~2 min um do outro viravam o MESMO número na placa,
+# e o restart rápido — o caso para o qual `sessao` existe — passava sem zerar
+# `ultimoCmdId`. Abaixo de 2**24 todo inteiro é exato em float32, e a placa não
+# precisa ser regravada. O `% 2**24` só repete a cada ~194 dias, e repetir
+# exige um restart caindo exatamente no mesmo segundo do ciclo.
+#
+# Zero é "ainda não sei" no contrato (a placa adota sem zerar nada); daí o
+# `or 1`, para que a volta do ciclo nunca produza a sessão que não conta.
+SESSAO = (int(time.time()) % 2**24) or 1
 
 
 class LinkSerial:

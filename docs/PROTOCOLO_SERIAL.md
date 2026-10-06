@@ -500,9 +500,17 @@ adapter se comporta exatamente como antes desta placa existir.
 **Firmware escrito:** `dispenser/telas_tft/telas_tft.ino`. Ele compartilha com
 a placa dos mecanismos o núcleo do protocolo (`apsen_serial.h`, cópia idêntica
 nas duas pastas, com teste cobrando a igualdade) e não implementa nada além do
-que esta seção descreve. O painel ainda não foi escolhido, e por isso a camada
-de desenho fica atrás de quatro funções finas — ver
+que esta seção descreve. O painel é o da bancada — oito ST7735 de 128×160 —
+e cada slot carregado mostra a **imagem da caixa** do medicamento; ver
 [`dispenser/README.md`](../dispenser/README.md).
+
+**O `slot` continua levando o NOME, e a placa o traduz para o número da
+imagem.** A tabela nome → número é `dispenser/telas_tft/catalogo_imagens.h`,
+ao lado de `imagens.h`: a ordem das imagens é um fato daquela pasta, e um
+campo `imagem` calculado no adapter seria um segundo lugar guardando o mesmo
+fato — divergir ali não dá erro, dá a caixa de outro medicamento na tela. A
+comparação ignora maiúsculas e espaços, e só isso; nome sem imagem vira tela
+de texto, nunca uma caixa aproximada.
 
 ### Comandos (adapter → placa)
 
@@ -539,9 +547,10 @@ adapter loga e segue. Tela errada é cosmética; dispensa atrasada não é.
 
 | estado recebido | a tela do slot mostra |
 |---|---|
-| `trava_ativa=false` | medicamento · SKU · dispensada/alvo · residual · status |
-| `trava_ativa=true` e `trava_slot_id` == meu id | alerta + **AGUARDE SUPERVISOR** + `trava_resumo` |
-| `trava_ativa=true` e outro slot | **PARADO — D{n}**, conteúdo esmaecido |
+| `trava_ativa=false`, medicamento com imagem | a caixa do medicamento, tela cheia; faixa **D{n} ERRO** se `status=erro` |
+| `trava_ativa=false`, sem imagem | texto: D{n} · status · nome (ou **VAZIO**) · dispensada/alvo |
+| `trava_ativa=true` e `trava_slot_id` == meu id | fundo vermelho + **AGUARDE SUPERVISOR** + `trava_resumo` |
+| `trava_ativa=true` e outro slot | a mesma tela, com a faixa **PARADO — D{n}** no topo |
 
 ### Eventos (placa → adapter, dentro de `{"evento":{...}}`)
 

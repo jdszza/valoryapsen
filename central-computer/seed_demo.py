@@ -80,19 +80,19 @@ FRACAO_ERRO = 0.12
 # apareceria em tela nenhuma, porque o app de manutenção consulta
 # `/manutencao/sensores/{componente}` pelo nome que está no banco.
 COMPONENTES_CNC = [
-    ("motor_eixo_x", 35.0, 55.0),
-    ("motor_eixo_y", 33.0, 50.0),
-    ("driver_x",     40.0, 70.0),
-    ("driver_y",     38.0, 68.0),
-    ("placa_cnc",    45.0, 65.0),
+    ("motor_eixo_x", 28.0, 38.0),
+    ("motor_eixo_y", 27.0, 36.0),
+    ("driver_x",     32.0, 44.0),
+    ("driver_y",     31.0, 42.0),
+    ("placa_cnc",    30.0, 40.0),
 ]
 COMPONENTES_VISAO = [
-    ("camera_dispenser_esq", 35.0, 50.0),
-    ("camera_dispenser_dir", 35.0, 50.0),
-    ("camera_mesa",          33.0, 48.0),
-    ("processador_visao",    45.0, 70.0),
+    ("camera_dispenser_esq", 30.0, 40.0),
+    ("camera_dispenser_dir", 30.0, 40.0),
+    ("camera_mesa",          29.0, 38.0),
+    ("processador_visao",    34.0, 46.0),
 ]
-COMPONENTE_BALANCA = ("hx711_balanca_mesa", 24.0, 33.0)
+COMPONENTE_BALANCA = ("hx711_balanca_mesa", 24.0, 30.0)
 
 # Uma leitura por componente a cada 30 min. Mais denso que isto multiplica
 # linhas sem acrescentar forma ao gráfico — e `leituras_sensores` é justamente

@@ -24,14 +24,30 @@
  *  pinta o que der, e conta o resto no evento `erro`. Tela errada e
  *  cosmetica; dispensa atrasada nao e.
  *
+ *  A TELA MOSTRA A CAIXA DO MEDICAMENTO
+ *    O hardware e o da bancada: 8 ST7735 de 128x160, ligacao e inicializacao
+ *    vindas do `referencia/TFT.ino` (o sketch de teste que ja funcionava), sem
+ *    mudar um pino. Cada slot com medicamento carregado mostra a IMAGEM dele,
+ *    de `imagens.h`. O `slot` traz o NOME; quem o traduz para o numero da
+ *    imagem e `catalogo_imagens.h`, ao lado das imagens — o protocolo e o
+ *    adapter nao mudaram para isso.
+ *
  *  DUAS VOZES NA MESMA PORTA, E O SEPARADOR E O '{'
  *    Igual a placa dos mecanismos e a balanca: linha COM '{' e mensagem,
- *    linha SEM '{' e log. Aqui a voz do humano e so log — esta placa nao tem
- *    terminal de manutencao, porque nao ha nada nela para calibrar.
+ *    linha SEM '{' e log. A voz do humano aqui so tem dois comandos de
+ *    bancada, para conferir a ordem das imagens sem PC: `lista` e
+ *    `img <slot> <n>`.
  *
  *  ARDUINO IDE
  *    Placa: "ESP32 Dev Module"
- *    Compilar: arduino-cli compile --fqbn esp32:esp32:esp32 dispenser/telas_tft
+ *    Partition Scheme: "Huge APP (3MB No OTA/1MB SPIFFS)"  <-- OBRIGATORIO
+ *      As 39 imagens somam 1,6 MB (39 x 128 x 160 x 2 bytes), e o esquema
+ *      default tem 1,25 MB de app: o build falha com "Sketch too big". O
+ *      `referencia/TFT.ino` cabia no default porque usava so 8 imagens, e o
+ *      linker descartava as outras 31.
+ *    Bibliotecas: Adafruit GFX Library, Adafruit ST7735 and ST7789 Library
+ *    Compilar:
+ *      arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app dispenser/telas_tft
  * =====================================================================
  */
 
@@ -44,29 +60,20 @@
 #define APSEN_SUBSISTEMA "dispenser_tft"
 #include "apsen_serial.h"
 
+#include "catalogo_imagens.h"
+
 // ---------------------------------------------------------------------
-// HARDWARE DAS TELAS  —  TUDO AQUI ESTA "A CONFIRMAR NA BANCADA"
+// DRIVER DAS TELAS
 // ---------------------------------------------------------------------
-// O painel ainda nao foi escolhido, e essa escolha e FISICA: modelo, driver,
-// tamanho, como as oito telas sao selecionadas (oito CS de SPI, um mux, ou
-// I2C com endereco por tela) e onde entra o PWM do brilho. Por isso a camada
-// de desenho fica atras de quatro funcoes finas — `telaIniciar`, `telaLimpar`,
-// `telaLinha` e `telaMostrar` — e a escolha e UM #define.
-//
-// O default e TELA_DRIVER_LOG de proposito, e nao um driver concreto:
-//   * compila em qualquer maquina, sem biblioteca a instalar. Um default que
-//     exigisse TFT_eSPI ou Adafruit_ILI9341 quebraria o build de todo mundo
-//     por causa de um display que ninguem escolheu ainda;
-//   * e a ferramenta de bancada de verdade: com ele, o Monitor Serial mostra
-//     exatamente o que cada tela mostraria. Quando um painel nao acender, e
-//     assim que se descobre se o problema e a ligacao ou a mensagem.
-// Trocar e uma linha: ponha TELA_DRIVER_ILI9341_SPI e preencha a tabela de
-// pinos abaixo.
-#define TELA_DRIVER_LOG            0
-#define TELA_DRIVER_ILI9341_SPI    1
+// O default e o painel REAL da bancada (ST7735). TELA_DRIVER_LOG continua
+// existindo como ferramenta: compila sem biblioteca nenhuma e mostra no Monitor
+// Serial o que cada tela desenharia — quando um painel nao acender, e assim que
+// se descobre se o problema e a ligacao ou a mensagem.
+#define TELA_DRIVER_LOG     0
+#define TELA_DRIVER_ST7735  1
 
 #ifndef TELA_DRIVER
-#define TELA_DRIVER TELA_DRIVER_LOG
+#define TELA_DRIVER TELA_DRIVER_ST7735
 #endif
 
 // Oito telas, uma por dispenser. O `dispenser_id` do contrato e 1..8; o indice
@@ -76,22 +83,25 @@
 // olha a bancada acredita na tela.
 #define NUM_TELAS 8
 
-// Quantas linhas de texto cabem numa tela. A CONFIRMAR NA BANCADA junto com o
-// modelo: o layout de §6 precisa de cinco campos mais o cabecalho.
-#define TELA_LINHAS 6
-#define TELA_COLUNAS 20
+// PINOUT — o do `referencia/TFT.ino`, que e o que esta soldado na bancada.
+// SPI por hardware (VSPI): SCK = GPIO18, MOSI = GPIO23. DC e RST sao
+// compartilhados pelas oito; cada tela tem o seu CS.
+#define TFT_PIN_DC      4
+#define TFT_PIN_RST    22         // reset COMPARTILHADO: pulsado UMA vez no boot
+#define TFT_PIN_BRILHO -1         // backlight direto no 3V3; -1 = sem controle
+#define TFT_SPI_HZ     27000000
+// A ordem do array E a ordem dos slots: CS_PINS[0] e a tela do D1.
+// GPIO12 e pino de strapping (tensao da flash): nada pode puxa-lo para HIGH
+// durante o reset. O setup so o leva a HIGH depois do boot, como o TFT.ino.
+static const uint8_t TFT_PIN_CS[NUM_TELAS] = { 12, 13, 14, 25, 26, 27, 32, 33 };
 
-// A CONFIRMAR NA BANCADA: pinos. Com TELA_DRIVER_LOG nenhum deles e usado.
-#define TFT_PIN_SCK     18
-#define TFT_PIN_MOSI    23
-#define TFT_PIN_DC       2
-#define TFT_PIN_RST      4
-#define TFT_PIN_BRILHO  -1        // PWM do backlight; -1 = sem controle
-// Um CS por tela (o metodo mais provavel com SPI). Mux ou I2C com endereco por
-// tela trocam ESTA tabela e o corpo de `telaSelecionar`, e nada mais.
-static const int8_t TFT_PIN_CS[NUM_TELAS] = { 5, 13, 14, 15, 16, 17, 21, 22 };
-
+// Sem pino de backlight nao ha brilho a ajustar; a telemetria reporta o que a
+// tela efetivamente tem.
+#if TFT_PIN_BRILHO >= 0
 #define BRILHO_PCT_PADRAO 80
+#else
+#define BRILHO_PCT_PADRAO 100
+#endif
 
 // Periodo do `telemetria`. O mesmo 15 s dos outros subsistemas; o adapter
 // descarta a repeticao identica (comparacao ignorando `ts`), entao com as oito
@@ -114,6 +124,12 @@ static const int8_t TFT_PIN_CS[NUM_TELAS] = { 5, 13, 14, 15, 16, 17, 21, 22 };
 // slot? O buffer tem o tamanho do contrato, e nao o do texto de hoje.
 #define TRAVA_RESUMO_MAX 48
 
+// Tudo que uma tela desenhou, numa string. Redesenho com a mesma assinatura e
+// pulado: empurrar 40 KB de imagem pela SPI a cada transicao que nao muda a
+// tela (um `dispensando` de um slot cuja caixa ja esta la) e piscar a tela a
+// toa. Cabe medicamento + resumo + os numeros.
+#define ASSINATURA_MAX (MAX_MED_LEN + TRAVA_RESUMO_MAX + MAX_STATUS_LEN + 48)
+
 // ---------------------------------------------------------------------
 // ESTADO
 // ---------------------------------------------------------------------
@@ -126,7 +142,9 @@ struct TelaSlot {
   int  quantidade_alvo;
   int  quantidade_dispensada;
   int  quantidade_residual;
+  int  imagem;    // indice em NOMES_IMAGEM; -1 = sem imagem (vazio ou desconhecido)
   bool ok;        // o ultimo redesenho desta tela deu certo?
+  char desenhado[ASSINATURA_MAX];   // assinatura do que esta na tela agora
 };
 
 static TelaSlot telas[NUM_TELAS];
@@ -145,7 +163,7 @@ static unsigned long ultimaTelemetriaMs = 0;
 // Erros de pintura desde o boot — vao no log, e cada um vira um evento `erro`.
 static uint32_t errosDePintura = 0;
 
-enum Enfase { ENF_NORMAL, ENF_REALCE, ENF_ESMAECIDO };
+enum Enfase { ENF_NORMAL, ENF_REALCE, ENF_ESMAECIDO, ENF_ALERTA };
 
 // ---------------------------------------------------------------------
 // LOG  (a voz do humano; `apsen_serial.h` exige esta assinatura)
@@ -170,62 +188,143 @@ static inline bool    slotValido(int slot_1a8)       { return slot_1a8 >= 1 && s
 static inline uint8_t canalDoSlot(int slot_1a8)      { return (uint8_t)(slot_1a8 - 1); }
 static inline int     slotDoCanal(uint8_t canal_0a7) { return (int)canal_0a7 + 1; }
 
-// Corta terminando em "...", como o `copy_trunc()` do display de 7". Texto
-// cortado e visivelmente cortado; texto cortado em silencio e texto em que
-// alguem acredita.
-static void recortar(char* dest, size_t n, const char* origem) {
-  if (n == 0) return;
-  size_t tam = strlen(origem);
-  if (tam < n) { memcpy(dest, origem, tam + 1); return; }
-  if (n <= 4)  { memcpy(dest, origem, n - 1); dest[n - 1] = '\0'; return; }
-  memcpy(dest, origem, n - 4);
-  memcpy(dest + n - 4, "...", 4);
+// =====================================================================
+// NOME -> NUMERO DA IMAGEM
+// =====================================================================
+// So ASCII: os nomes do catalogo sao todos maiusculos e sem acento, e a
+// comparacao nao precisa ser mais esperta do que isso — ver o cabecalho de
+// `catalogo_imagens.h` sobre por que "parecido" nao serve.
+static inline char maiuscula(char c) { return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
+static inline bool espaco(char c)    { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+// Maiusculas, sem espaco nas pontas, espacos repetidos viram um.
+static void normalizarNome(char* dest, size_t n, const char* origem) {
+  size_t j = 0;
+  bool pendente = false;
+  while (*origem && espaco(*origem)) origem++;
+  for (; *origem && j + 1 < n; origem++) {
+    if (espaco(*origem)) { pendente = true; continue; }
+    if (pendente && j + 2 < n) dest[j++] = ' ';
+    pendente = false;
+    dest[j++] = maiuscula(*origem);
+  }
+  dest[j] = '\0';
+}
+
+// -1 = sem imagem. Nome vazio tambem e -1, e nao e erro: e o slot vazio.
+static int indiceDaImagem(const char* nome) {
+  char alvo[MAX_MED_LEN], candidato[MAX_MED_LEN];
+  normalizarNome(alvo, sizeof alvo, nome);
+  if (alvo[0] == '\0') return -1;
+  for (int i = 0; i < NUM_IMAGENS; i++) {
+    normalizarNome(candidato, sizeof candidato, NOMES_IMAGEM[i]);
+    if (strcmp(alvo, candidato) == 0) return i;
+  }
+  return -1;
 }
 
 // =====================================================================
-// CAMADA DE DESENHO — quatro funcoes, e a escolha do painel e um #define
+// CAMADA DE DESENHO
 // =====================================================================
-#if TELA_DRIVER == TELA_DRIVER_ILI9341_SPI
-// A troca e este bloco. Ele NAO e compilado por padrao, para que o build nao
-// dependa de uma biblioteca escolhida para um display que ainda nao existe.
-#include <Adafruit_GFX.h>
-#include <Adafruit_ILI9341.h>
+// Seis funcoes finas, e a escolha do driver e um #define. Todas devolvem bool:
+// e o que vira o evento `erro` quando uma tela nao responde.
+//   telaIniciar  telaImagem  telaFundo  telaTexto  telaFaixa  telaMostrar
 
-// Adafruit_GFX + driver, e nao TFT_eSPI, por um motivo pratico: o TFT_eSPI se
-// configura por um `User_Setup.h` DENTRO da pasta da biblioteca, fora deste
-// repositorio — a ligacao da bancada ficaria gravada num arquivo que nenhum
-// commit registra. Aqui os pinos estao na tabela acima, versionados.
-static Adafruit_ILI9341* painel[NUM_TELAS];
+#if TELA_DRIVER == TELA_DRIVER_ST7735
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include "imagens.h"
+
+// A tabela de ponteiros acompanha `catalogo_imagens.h` posicao a posicao:
+// IMAGENS[i] e a caixa de NOMES_IMAGEM[i]. Se alguem acrescentar uma imagem e
+// esquecer o nome (ou o contrario), o build para aqui — antes de a tela de um
+// slot mostrar a caixa do vizinho na lista.
+static const uint16_t* const IMAGENS[] = {
+  img0,  img1,  img2,  img3,  img4,  img5,  img6,  img7,  img8,  img9,
+  img10, img11, img12, img13, img14, img15, img16, img17, img18, img19,
+  img20, img21, img22, img23, img24, img25, img26, img27, img28, img29,
+  img30, img31, img32, img33, img34, img35, img36, img37, img38,
+};
+static_assert((int)(sizeof(IMAGENS) / sizeof(IMAGENS[0])) == NUM_IMAGENS,
+              "imagens.h e catalogo_imagens.h tem tamanhos diferentes");
+
+#define COR_CINZA 0x7BEF
+
+// Adafruit_GFX + driver, e nao TFT_eSPI: o TFT_eSPI se configura por um
+// `User_Setup.h` DENTRO da pasta da biblioteca, fora deste repositorio — a
+// ligacao da bancada ficaria gravada num arquivo que nenhum commit registra.
+static Adafruit_ST7735* painel[NUM_TELAS];
 
 static void telaIniciar() {
+  // Todos os CS em HIGH = nenhuma tela selecionada. Precisa vir ANTES do
+  // reset: com um CS flutuando, a tela dele leria a inicializacao das outras.
   for (uint8_t i = 0; i < NUM_TELAS; i++) {
-    painel[i] = new Adafruit_ILI9341(TFT_PIN_CS[i], TFT_PIN_DC, TFT_PIN_RST);
-    painel[i]->begin();
+    pinMode(TFT_PIN_CS[i], OUTPUT);
+    digitalWrite(TFT_PIN_CS[i], HIGH);
+  }
+
+  // Reset compartilhado: pulsa UMA vez para todas. Por isso o construtor
+  // recebe -1 no RST — se cada `initR` pulsasse o reset, inicializar a tela 2
+  // apagaria a tela 1.
+  pinMode(TFT_PIN_RST, OUTPUT);
+  digitalWrite(TFT_PIN_RST, LOW);  delay(20);
+  digitalWrite(TFT_PIN_RST, HIGH); delay(150);
+
+  for (uint8_t i = 0; i < NUM_TELAS; i++) {
+    painel[i] = new Adafruit_ST7735(TFT_PIN_CS[i], TFT_PIN_DC, -1);
+    painel[i]->initR(INITR_BLACKTAB);
+    painel[i]->setSPISpeed(TFT_SPI_HZ);
     painel[i]->setRotation(0);
-    painel[i]->setTextSize(2);
+    painel[i]->setTextWrap(false);
   }
 }
 
 static uint16_t corDaEnfase(Enfase e) {
   switch (e) {
-    case ENF_REALCE:     return ILI9341_YELLOW;
-    case ENF_ESMAECIDO:  return ILI9341_DARKGREY;
-    default:             return ILI9341_WHITE;
+    case ENF_REALCE:     return ST77XX_YELLOW;
+    case ENF_ESMAECIDO:  return COR_CINZA;
+    case ENF_ALERTA:     return ST77XX_RED;
+    default:             return ST77XX_WHITE;
   }
 }
 
-static bool telaLimpar(uint8_t i, bool alerta) {
-  painel[i]->fillScreen(alerta ? ILI9341_RED : ILI9341_BLACK);
+static bool telaImagem(uint8_t i, int imagem) {
+  if (imagem < 0 || imagem >= NUM_IMAGENS) return false;
+  painel[i]->drawRGBBitmap(0, 0, IMAGENS[imagem], IMAGEM_LARGURA, IMAGEM_ALTURA);
   return true;
 }
 
-static bool telaLinha(uint8_t i, uint8_t linha, const char* texto, Enfase enfase) {
-  painel[i]->setCursor(4, 4 + linha * 22);
+static bool telaFundo(uint8_t i, bool alerta) {
+  painel[i]->fillScreen(alerta ? ST77XX_RED : ST77XX_BLACK);
+  return true;
+}
+
+// Texto centralizado na linha `y` (pixels). Fonte padrao: 6x8 por tamanho.
+static bool telaTexto(uint8_t i, int16_t y, const char* texto, Enfase enfase, uint8_t tam) {
+  int16_t largura = (int16_t)strlen(texto) * 6 * tam;
+  int16_t x = (IMAGEM_LARGURA - largura) / 2;
+  if (x < 0) x = 0;
+  painel[i]->setTextSize(tam);
   painel[i]->setTextColor(corDaEnfase(enfase));
+  painel[i]->setCursor(x, y);
   painel[i]->print(texto);
   return true;
 }
 
+// Faixa de 18 px por cima da imagem, no topo ou no rodape.
+static bool telaFaixa(uint8_t i, bool topo, const char* texto, Enfase enfase) {
+  const int16_t alt = 18;
+  const int16_t y = topo ? 0 : IMAGEM_ALTURA - alt;
+  painel[i]->fillRect(0, y, IMAGEM_LARGURA, alt,
+                      enfase == ENF_ALERTA ? ST77XX_RED : ST77XX_BLACK);
+  return telaTexto(i, y + 5, texto,
+                   enfase == ENF_ALERTA ? ENF_NORMAL : enfase, 1);
+}
+
+// O ST7735 nao tem linha de leitura (so MOSI): nao ha como a placa saber que
+// um painel nao acendeu. `true` aqui e "a SPI aceitou", nao "o painel mostrou"
+// — quem confere e o olho na bancada, com `img <slot> <n>`.
 static bool telaMostrar(uint8_t i) { (void)i; return true; }
 
 #else   // TELA_DRIVER_LOG
@@ -234,18 +333,29 @@ static bool telaMostrar(uint8_t i) { (void)i; return true; }
 
 static void telaIniciar() {
   logMsg("TELA", "driver = LOG (nenhum painel). O que cada tela mostraria sai aqui.");
-  logMsg("TELA", "escolha o painel, troque TELA_DRIVER e preencha a tabela de pinos.");
 }
 
-static bool telaLimpar(uint8_t i, bool alerta) {
+static bool telaImagem(uint8_t i, int imagem) {
+  if (imagem < 0 || imagem >= NUM_IMAGENS) return false;
+  Serial.printf("+-- D%d [imagem %d: %s]\n", slotDoCanal(i), imagem, NOMES_IMAGEM[imagem]);
+  return true;
+}
+
+static bool telaFundo(uint8_t i, bool alerta) {
   Serial.printf("+-- D%d %s\n", slotDoCanal(i), alerta ? "[ALERTA] ----" : "-----------");
   return true;
 }
 
-static bool telaLinha(uint8_t i, uint8_t linha, const char* texto, Enfase enfase) {
+static bool telaTexto(uint8_t i, int16_t y, const char* texto, Enfase enfase, uint8_t tam) {
   const char* marca = (enfase == ENF_REALCE) ? "*" : (enfase == ENF_ESMAECIDO ? "." : " ");
   Serial.printf("| D%d %s %s\n", slotDoCanal(i), marca, texto);
-  (void)linha;
+  (void)y; (void)tam;
+  return true;
+}
+
+static bool telaFaixa(uint8_t i, bool topo, const char* texto, Enfase enfase) {
+  Serial.printf("| D%d [faixa %s] %s\n", slotDoCanal(i), topo ? "topo" : "rodape", texto);
+  (void)enfase;
   return true;
 }
 
@@ -283,106 +393,138 @@ static void emitErroTela(int slot_1a8, const char* codigo, const char* descricao
 // PINTURA — a tabela de §6, e nada alem dela
 // =====================================================================
 //
-//  | estado recebido                            | a tela mostra                       |
-//  |--------------------------------------------|-------------------------------------|
-//  | trava_ativa=false                          | medicamento, SKU, disp/alvo,        |
-//  |                                            | residual, status                    |
-//  | trava_ativa=true e trava_slot_id == meu id | alerta + AGUARDE SUPERVISOR +       |
-//  |                                            | trava_resumo                        |
-//  | trava_ativa=true e outro slot              | PARADO - D{n}, conteudo esmaecido   |
+//  | estado recebido                            | a tela mostra                        |
+//  |--------------------------------------------|--------------------------------------|
+//  | trava_ativa=false, medicamento com imagem  | a caixa do medicamento (tela cheia); |
+//  |                                            | faixa vermelha "D{n} ERRO" se erro   |
+//  | trava_ativa=false, sem imagem              | TEXTO: D{n}, status, nome, disp/alvo |
+//  | trava_ativa=true e trava_slot_id == meu id | fundo vermelho + AGUARDE SUPERVISOR  |
+//  |                                            | + trava_resumo                       |
+//  | trava_ativa=true e outro slot              | a mesma tela, com a faixa            |
+//  |                                            | "PARADO - D{n}" no topo              |
+//
+// "Sem imagem" e dois casos, e os dois TEM que parecer diferentes de uma
+// caixa: slot vazio ("VAZIO") e medicamento fora de `catalogo_imagens.h` (o
+// nome escrito). Caixa generica para um nome desconhecido seria uma tela
+// afirmando um medicamento que ninguem conferiu.
 
-static bool pintarNormal(uint8_t canal, const TelaSlot& t) {
-  char linha[TELA_COLUNAS + 8];
-  char campo[TELA_COLUNAS + 8];
+#define TEXTO_COLUNAS 21     // 128 px / 6 px por caractere, tamanho 1
+
+// Ate `linhas` linhas de TEXTO_COLUNAS a partir de `y`, quebrando por tamanho.
+static bool textoEmLinhas(uint8_t canal, int16_t y, const char* texto,
+                          uint8_t linhas, Enfase enfase) {
+  char parte[TEXTO_COLUNAS + 1];
   bool ok = true;
-
-  ok &= telaLimpar(canal, false);
-
-  snprintf(linha, sizeof linha, "D%d  %s", slotDoCanal(canal),
-           t.status[0] ? t.status : "idle");
-  ok &= telaLinha(canal, 0, linha, ENF_REALCE);
-
-  recortar(campo, sizeof campo, t.medicamento[0] ? t.medicamento : "-");
-  ok &= telaLinha(canal, 1, campo, ENF_NORMAL);
-
-  recortar(campo, sizeof campo, t.sku[0] ? t.sku : "-");
-  ok &= telaLinha(canal, 2, campo, ENF_ESMAECIDO);
-
-  snprintf(linha, sizeof linha, "%d/%d", t.quantidade_dispensada, t.quantidade_alvo);
-  ok &= telaLinha(canal, 3, linha, ENF_NORMAL);
-
-  snprintf(linha, sizeof linha, "resid %d", t.quantidade_residual);
-  ok &= telaLinha(canal, 4, linha, ENF_NORMAL);
-
-  ok &= telaMostrar(canal);
+  const char* resto = texto;
+  for (uint8_t l = 0; l < linhas && *resto; l++) {
+    size_t n = strnlen(resto, TEXTO_COLUNAS);
+    memcpy(parte, resto, n);
+    parte[n] = '\0';
+    ok &= telaTexto(canal, y + l * 10, parte, enfase, 1);
+    resto += n;
+  }
   return ok;
 }
 
-static bool pintarTravaNesteSlot(uint8_t canal, const TelaSlot& t) {
-  char linha[TELA_COLUNAS + 8];
+static bool statusDeErro(const TelaSlot& t) { return strcmp(t.status, "erro") == 0; }
+
+static bool pintarConteudo(uint8_t canal, const TelaSlot& t, bool esmaecido) {
+  char linha[TEXTO_COLUNAS + 8];
   bool ok = true;
+  const int slot = slotDoCanal(canal);
 
-  ok &= telaLimpar(canal, true);
-
-  snprintf(linha, sizeof linha, "D%d  ** TRAVA **", slotDoCanal(canal));
-  ok &= telaLinha(canal, 0, linha, ENF_REALCE);
-  ok &= telaLinha(canal, 1, "AGUARDE",    ENF_REALCE);
-  ok &= telaLinha(canal, 2, "SUPERVISOR", ENF_REALCE);
-
-  // O resumo cabe em 48 caracteres e a tela tem TELA_COLUNAS: ele desce em
-  // ate duas linhas. Nada de pedir mais texto ao adapter — o que ele mandou e
-  // o que existe.
-  char parte[TELA_COLUNAS + 1];
-  const char* resto = travaResumo;
-  for (uint8_t l = 3; l <= 4; l++) {
-    size_t n = strnlen(resto, TELA_COLUNAS);
-    memcpy(parte, resto, n);
-    parte[n] = '\0';
-    ok &= telaLinha(canal, l, parte, ENF_NORMAL);
-    resto += n;
-    if (*resto == '\0') break;
+  if (t.imagem >= 0) {
+    ok &= telaImagem(canal, t.imagem);
+    if (statusDeErro(t)) {
+      snprintf(linha, sizeof linha, "D%d ERRO", slot);
+      ok &= telaFaixa(canal, false, linha, ENF_ALERTA);
+    }
+    return ok;
   }
 
-  ok &= telaMostrar(canal);
+  const Enfase base = esmaecido ? ENF_ESMAECIDO : ENF_NORMAL;
+  ok &= telaFundo(canal, false);
+  snprintf(linha, sizeof linha, "D%d", slot);
+  ok &= telaTexto(canal, 26, linha, esmaecido ? ENF_ESMAECIDO : ENF_REALCE, 3);
+  ok &= telaTexto(canal, 58, t.status[0] ? t.status : "idle",
+                  statusDeErro(t) ? ENF_ALERTA : base, 1);
+
+  if (t.medicamento[0] == '\0') {
+    ok &= telaTexto(canal, 84, "VAZIO", base, 2);
+    return ok;
+  }
+  // Medicamento sem imagem: o nome escrito, e o aviso de que nao ha caixa.
+  ok &= textoEmLinhas(canal, 78, t.medicamento, 3, base);
+  snprintf(linha, sizeof linha, "%d/%d", t.quantidade_dispensada, t.quantidade_alvo);
+  ok &= telaTexto(canal, 114, linha, base, 2);
+  ok &= telaTexto(canal, 142, "(sem imagem)", ENF_ESMAECIDO, 1);
+  return ok;
+}
+
+static bool pintarTravaNesteSlot(uint8_t canal) {
+  char linha[TEXTO_COLUNAS + 8];
+  bool ok = true;
+
+  ok &= telaFundo(canal, true);
+  snprintf(linha, sizeof linha, "D%d", slotDoCanal(canal));
+  ok &= telaTexto(canal, 8,  linha,        ENF_NORMAL, 3);
+  ok &= telaTexto(canal, 40, "TRAVA",      ENF_REALCE, 2);
+  ok &= telaTexto(canal, 66, "AGUARDE",    ENF_NORMAL, 2);
+  ok &= telaTexto(canal, 86, "SUPERVISOR", ENF_NORMAL, 2);
+  // O resumo cabe em 48 caracteres e desce em ate tres linhas. Nada de pedir
+  // mais texto ao adapter — o que ele mandou e o que existe.
+  ok &= textoEmLinhas(canal, 116, travaResumo, 3, ENF_NORMAL);
   return ok;
 }
 
 static bool pintarTravaEmOutroSlot(uint8_t canal, const TelaSlot& t) {
-  char linha[TELA_COLUNAS + 8];
-  char campo[TELA_COLUNAS + 8];
-  bool ok = true;
-
-  ok &= telaLimpar(canal, false);
-
-  snprintf(linha, sizeof linha, "D%d", slotDoCanal(canal));
-  ok &= telaLinha(canal, 0, linha, ENF_NORMAL);
-
+  char linha[TEXTO_COLUNAS + 8];
+  // O conteudo continua la, so nao e o assunto: apaga-lo faria o operador
+  // achar que o slot foi zerado. A faixa diz onde esta o problema.
+  bool ok = pintarConteudo(canal, t, true);
   if (travaSlot >= 1) snprintf(linha, sizeof linha, "PARADO - D%d", travaSlot);
   else                snprintf(linha, sizeof linha, "PARADO");
-  ok &= telaLinha(canal, 1, linha, ENF_REALCE);
-
-  // Conteudo esmaecido: ele continua la, so nao e o assunto. Apaga-lo faria o
-  // operador achar que o slot foi zerado.
-  recortar(campo, sizeof campo, t.medicamento[0] ? t.medicamento : "-");
-  ok &= telaLinha(canal, 2, campo, ENF_ESMAECIDO);
-
-  snprintf(linha, sizeof linha, "%d/%d", t.quantidade_dispensada, t.quantidade_alvo);
-  ok &= telaLinha(canal, 3, linha, ENF_ESMAECIDO);
-
-  ok &= telaMostrar(canal);
+  ok &= telaFaixa(canal, true, linha, ENF_REALCE);
   return ok;
+}
+
+// Tudo que determina o desenho, numa string so. Igual a do ultimo desenho =
+// nada a fazer.
+static void assinaturaDe(uint8_t canal, char* dest, size_t n) {
+  const TelaSlot& t = telas[canal];
+  const int slot = slotDoCanal(canal);
+  if (travaAtiva && travaSlot == slot) {
+    snprintf(dest, n, "T|%s", travaResumo);
+  } else if (t.imagem >= 0) {
+    // Com caixa na tela, os numeros nao aparecem: mudar so a quantidade nao
+    // redesenha 40 KB de imagem.
+    snprintf(dest, n, "I|%d|%d|%d", t.imagem, statusDeErro(t) ? 1 : 0,
+             travaAtiva ? travaSlot : -2);
+  } else {
+    snprintf(dest, n, "X|%s|%s|%d/%d|%d", t.status, t.medicamento,
+             t.quantidade_dispensada, t.quantidade_alvo, travaAtiva ? travaSlot : -2);
+  }
 }
 
 static void pintarSlot(uint8_t canal) {
   TelaSlot& t = telas[canal];
-  bool ok;
+  char assinatura[ASSINATURA_MAX];
+  assinaturaDe(canal, assinatura, sizeof assinatura);
+  if (strcmp(assinatura, t.desenhado) == 0) return;
 
-  if (!travaAtiva)                            ok = pintarNormal(canal, t);
-  else if (travaSlot == slotDoCanal(canal))   ok = pintarTravaNesteSlot(canal, t);
+  bool ok;
+  if (!travaAtiva)                            ok = pintarConteudo(canal, t, false);
+  else if (travaSlot == slotDoCanal(canal))   ok = pintarTravaNesteSlot(canal);
   else                                        ok = pintarTravaEmOutroSlot(canal, t);
+  ok &= telaMostrar(canal);
 
   t.ok = ok;
-  if (!ok) {
+  if (ok) {
+    copiarCampo(t.desenhado, sizeof t.desenhado, assinatura);
+  } else {
+    // Assinatura apagada: a proxima transicao tenta de novo, em vez de achar
+    // que a tela ja mostra o que nunca chegou a mostrar.
+    t.desenhado[0] = '\0';
     // Tela que nao respondeu vira evento `erro` — que para no adapter, em log
     // e no /health. Nao muda nada do caminho do dispenser: o ACK ja saiu.
     errosDePintura++;
@@ -439,6 +581,12 @@ static void cmdSlot(const char* linha, long cmd_id) {
   t.quantidade_dispensada = (int)fdisp;
   t.quantidade_residual   = (int)fresid;
 
+  // A traducao nome -> numero acontece UMA vez, na chegada do nome.
+  t.imagem = indiceDaImagem(t.medicamento);
+  if (t.imagem < 0 && t.medicamento[0])
+    logMsg("TELA", "D%d: '%s' nao esta em catalogo_imagens.h — tela em modo texto",
+           slot, t.medicamento);
+
   pintarSlot(canal);
 }
 
@@ -474,8 +622,9 @@ static void cmdEstadoCelula(const char* linha, long cmd_id) {
        travaAtiva ? "SIM" : "nao", travaSlot,
        travaOsId[0] ? travaOsId : "-", travaResumo);
 
-  // Todas as oito redesenham: cada uma precisa saber se e "este slot" ou
-  // "outro", e so ela sabe responder isso depois de ver a chave.
+  // Todas as oito avaliam: cada uma precisa saber se e "este slot" ou
+  // "outro", e so ela sabe responder isso depois de ver a chave. A assinatura
+  // poupa as que nao mudaram.
   for (uint8_t i = 0; i < NUM_TELAS; i++) pintarSlot(i);
 }
 
@@ -492,11 +641,41 @@ void executarComando(const char* cmd, const char* linha, long cmd_id) {
   }
 }
 
-// A linha SEM '{'. Esta placa nao tem terminal de manutencao: nao ha nada nela
-// para calibrar, e um terminal so existiria para ser mantido.
+// =====================================================================
+// A VOZ DO HUMANO — so para conferir as imagens na bancada
+// =====================================================================
+//   lista            imprime numero -> nome de todas as imagens
+//   img <slot> <n>   desenha a imagem n na tela do slot (1..8)
+//
+// E o teste do `referencia/TFT.ino` sem regravar a placa: "a imagem 5 e mesmo
+// o DESOL?" se responde olhando. O desenho de bancada NAO entra na assinatura
+// — o proximo `slot` daquele dispenser redesenha o estado verdadeiro.
+static bool palavraIgual(const char* a, const char* b) {
+  while (*a && *b) { if (maiuscula(*a++) != maiuscula(*b++)) return false; }
+  return *a == '\0' && (*b == '\0' || espaco(*b));
+}
+
 void linhaHumana(char* linha) {
-  logMsg("INFO", "placa das telas TFT (%d telas). Comando de maquina comeca com "
-       "'{'; '%s' e log.", NUM_TELAS, linha);
+  while (espaco(*linha)) linha++;
+
+  if (palavraIgual("lista", linha)) {
+    for (int i = 0; i < NUM_IMAGENS; i++) logMsg("IMG", "%2d  %s", i, NOMES_IMAGEM[i]);
+    return;
+  }
+  int slot = 0, imagem = -1;
+  if (palavraIgual("img", linha) && sscanf(linha + 3, "%d %d", &slot, &imagem) == 2) {
+    if (!slotValido(slot) || imagem < 0 || imagem >= NUM_IMAGENS) {
+      logMsg("IMG", "uso: img <1..%d> <0..%d>", NUM_TELAS, NUM_IMAGENS - 1);
+      return;
+    }
+    const uint8_t canal = canalDoSlot(slot);
+    telaImagem(canal, imagem);
+    telas[canal].desenhado[0] = '\0';
+    logMsg("IMG", "D%d <- imagem %d (%s)", slot, imagem, NOMES_IMAGEM[imagem]);
+    return;
+  }
+  logMsg("INFO", "placa das telas TFT (%d telas, %d imagens). Comando de maquina "
+       "comeca com '{'; de bancada: 'lista', 'img <slot> <n>'.", NUM_TELAS, NUM_IMAGENS);
 }
 
 // =====================================================================
@@ -512,9 +691,11 @@ void setup() {
     telas[i].sku[0]              = '\0';
     telas[i].categoria[0]        = '\0';
     telas[i].os_id[0]            = '\0';
+    telas[i].desenhado[0]        = '\0';
     telas[i].quantidade_alvo     = 0;
     telas[i].quantidade_dispensada = 0;
     telas[i].quantidade_residual = 0;
+    telas[i].imagem              = -1;
     telas[i].ok                  = true;
     strncpy(telas[i].status, "idle", sizeof telas[i].status - 1);
     telas[i].status[sizeof telas[i].status - 1] = '\0';
@@ -526,11 +707,12 @@ void setup() {
   analogWrite(TFT_PIN_BRILHO, (int)(255L * BRILHO_PCT_PADRAO / 100));
 #endif
 
-  // Pinta o estado inicial: oito telas vazias e sem trava. Tela apagada no
+  // Pinta o estado inicial: oito telas "VAZIO" e sem trava. Tela apagada no
   // boot faria o operador achar que a placa nao subiu.
   for (uint8_t i = 0; i < NUM_TELAS; i++) pintarSlot(i);
 
-  logMsg("BOOT", "pronto. Aguardando `slot` e `estado_celula` do adapter.");
+  logMsg("BOOT", "pronto: %d telas, %d imagens. Aguardando `slot` e `estado_celula`.",
+       NUM_TELAS, NUM_IMAGENS);
 
   // A primeira linha de maquina da porta. Quem inicia o ping e SEMPRE a placa:
   // e por ele que o adapter identifica esta porta como a das telas.

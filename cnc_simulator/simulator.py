@@ -171,11 +171,11 @@ HOME: tuple[float, float] = (
 )
 
 COMPONENTES_TEMP = [
-    ("motor_eixo_x", 35, 55),
-    ("motor_eixo_y", 33, 50),
-    ("driver_x",     40, 70),
-    ("driver_y",     38, 68),
-    ("placa_cnc",    45, 65),
+    ("motor_eixo_x", 28, 38),
+    ("motor_eixo_y", 27, 36),
+    ("driver_x",     32, 44),
+    ("driver_y",     31, 42),
+    ("placa_cnc",    30, 40),
 ]
 COMPONENTES_USO = [
     ("correia_eixo_x",    "desgaste"),
@@ -183,6 +183,14 @@ COMPONENTES_USO = [
     ("rolamento_motor_x", "desgaste"),
     ("rolamento_motor_y", "desgaste"),
 ]
+
+# Teto de "vida útil" para a bancada de demonstração: `horas_uso` alimenta o
+# desgaste (`horas / 10`, em %), e sem teto ele cresce sem parar enquanto o
+# gerador dispara OS — uma demo longa acabaria mostrando componente "no
+# máximo", que é exatamente a leitura que assusta quem está vendo a banca.
+# 250h vira 25% de desgaste: visivelmente em uso, sempre longe do limiar de
+# alerta (60%) que `_cor_desgaste` já pinta em amarelo.
+HORAS_USO_TETO_DEMO = 250.0
 
 
 def _ts() -> str:
@@ -237,7 +245,7 @@ _cnc_state = {
     "pos_y":          HOME[1],
     "ciclo_atual":    0,
     "total_ciclos":   0,
-    "horas_uso":      random.uniform(120, 800),
+    "horas_uso":      random.uniform(60, 150),
     "ciclos_total":   random.randint(5000, 50000),
 }
 
@@ -400,7 +408,10 @@ def _homing(os_id: str, destino: tuple[float, float] = HOME):
             "ciclo_atual": 0,
             "total_ciclos": 0,
             "ciclos_total": _cnc_state["ciclos_total"] + _cnc_state.get("total_ciclos", 0),
-            "horas_uso":    _cnc_state["horas_uso"] + _cnc_state.get("total_ciclos", 0) * 0.01,
+            "horas_uso":    min(
+                HORAS_USO_TETO_DEMO,
+                _cnc_state["horas_uso"] + _cnc_state.get("total_ciclos", 0) * 0.01,
+            ),
         })
 
     logger.info("[CNC] HOME atingida. OS %s concluída.", os_id)
@@ -582,8 +593,8 @@ def _telemetria_loop():
         ts = _ts()
 
         for comp, t_min, t_max in COMPONENTES_TEMP:
-            base  = t_min + (t_max - t_min) * (0.75 if em_uso else 0.2)
-            valor = round(base + random.uniform(-1.5, 1.5), 1)
+            base  = t_min + (t_max - t_min) * (0.6 if em_uso else 0.3)
+            valor = round(base + random.uniform(-1.0, 1.0), 1)
             _evento({
                 "tipo":         "telemetria",
                 "componente":   comp,
@@ -598,7 +609,7 @@ def _telemetria_loop():
                 "tipo":         "telemetria",
                 "componente":   comp,
                 "tipo_leitura": tipo,
-                "valor":        round(min(100.0, horas / 10.0), 1),
+                "valor":        round(min(HORAS_USO_TETO_DEMO, horas) / 10.0, 1),
                 "unidade":      "%",
                 "ts":           ts,
             })

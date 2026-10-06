@@ -585,10 +585,10 @@ def executar_capturar_mesa(req: CapturarMesaReq):
 
 # Um componente por câmera física, mais o processador que roda os três fluxos.
 COMPONENTES_TELEMETRIA = [
-    ("camera_dispenser_esq", 35, 50),
-    ("camera_dispenser_dir", 35, 50),
-    ("camera_mesa",          33, 48),
-    ("processador_visao",    45, 70),
+    ("camera_dispenser_esq", 30, 40),
+    ("camera_dispenser_dir", 30, 40),
+    ("camera_mesa",          29, 38),
+    ("processador_visao",    34, 46),
 ]
 
 
@@ -599,7 +599,7 @@ def _telemetria_loop():
         _time.sleep(60)
         ts = _ts()
         for comp, t_min, t_max in COMPONENTES_TELEMETRIA:
-            valor = round(t_min + random.uniform(0, t_max - t_min) * 0.6, 1)
+            valor = round(t_min + random.uniform(0, t_max - t_min) * 0.3, 1)
             _evento({
                 "tipo":          "telemetria",
                 "camera":        "sistema",
