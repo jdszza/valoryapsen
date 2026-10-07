@@ -164,6 +164,14 @@ services:
       # Nº de fontes do Triple Check que precisam divergir para travar a OS.
       # 1 = regra conservadora (default). Faixa 1..3 — ver README.
       TRIPLE_CHECK_MIN_DIVERGENCIAS: 1
+      # 0 desliga a conferência de SKU pela câmera dos dispensers: os slots
+      # seguem sem conferência de produto, sem mandar comando nem retentar.
+      VISAO_SKU_HABILITADA: ${VISAO_SKU_HABILITADA:-1}
+      # Slots em que a câmera da mesa vê a caixa INTEIRA (medido na bancada).
+      # Fora deles não há foto: o slot é conferido junto com o próximo visível.
+      VISAO_MESA_POSICOES: ${VISAO_MESA_POSICOES:-1,2,3,4,5,6,7,8}
+      # Vazio = desligado; HOME = confere no HOME o que ficou sem conferência.
+      VISAO_MESA_FINAL: ${VISAO_MESA_FINAL:-}
       # Teto de OS ESPERANDO na fila (a em execução já saiu dela). Atingido o
       # teto, POST /api/v1/ordens responde 429 sem persistir. Faixa 1..1000.
       MAX_FILA_OS: 5
@@ -299,7 +307,31 @@ services:
       - "8102:8102"
     environment:
       CENTRAL_URL:    http://central-computer:8000
-      VISION_SIM_URL: http://vision-simulator:8202
+      # Para onde vão os comandos de captura. O default é o vision-simulator;
+      # na célula montada o .env aponta VISION_SIM_URL para
+      # http://host.docker.internal:8212 (a estação da mesa roda no host, dona
+      # da webcam) e põe VISAO_MESA_FONTE=estacao. O vision-simulator continua
+      # subindo de qualquer jeito: voltar a ele é tirar as duas linhas do .env.
+      VISION_SIM_URL: ${VISION_SIM_URL:-http://vision-simulator:8202}
+      NUM_SLOTS:      ${NUM_SLOTS:-8}
+      # De onde vem cada câmera: "simulador" ou "estacao". Com "estacao", a
+      # telemetria que o simulador ainda manda para aquela câmera é descartada
+      # aqui — nenhuma estação real emite telemetria, então ela é inventada.
+      VISAO_MESA_FONTE:      ${VISAO_MESA_FONTE:-simulador}
+      VISAO_DISPENSER_FONTE: ${VISAO_DISPENSER_FONTE:-simulador}
+      # As duas estações dos dispensers (uma por fileira), no host. Só valem
+      # com VISAO_DISPENSER_FONTE=estacao.
+      VISAO_DISP_ESQ_URL: ${VISAO_DISP_ESQ_URL:-http://host.docker.internal:8301}
+      VISAO_DISP_DIR_URL: ${VISAO_DISP_DIR_URL:-http://host.docker.internal:8302}
+      # TEM de ser igual ao backend.intervalo_catalogo do parametros.json das
+      # estações: é com ele que o adapter sabe quando a estação já usa o
+      # catálogo da OS nova.
+      VISAO_DISP_INTERVALO_CATALOGO_S: ${VISAO_DISP_INTERVALO_CATALOGO_S:-2}
+      VISAO_DISP_ASSENTAMENTO_S:       ${VISAO_DISP_ASSENTAMENTO_S:-2}
+      # Teto para emitir a leitura; o central espera 30 s.
+      VISAO_DISP_PRAZO_S:              ${VISAO_DISP_PRAZO_S:-20}
+      # Nome do central → QR/ArUco impressos. Está na imagem (COPY . .).
+      VISAO_ETIQUETAS_ARQ: ${VISAO_ETIQUETAS_ARQ:-/app/etiquetas.json}
       TIMEOUT_CMD:    20
       TIMEOUT_EVENT:  5
     depends_on:
@@ -386,9 +418,11 @@ services:
 
   # ── Vision Simulator ──────────────────────────────────────────────────────────
   # SEM profile, como o vision-adapter: a visão é HTTP (não tem porta serial),
-  # então na célula montada os dois continuam em container — o simulador serve
-  # a bancada até a estação de câmeras real existir, e a decisão de manter a
-  # visão fora do serial está no docs/PROTOCOLO_SERIAL.md.
+  # então na célula montada os dois continuam em container. Com as estações de
+  # visão reais (no host), o simulador segue subindo como ROLLBACK: quem
+  # escolhe a fonte de cada câmera é o .env do vision-adapter (VISAO_*_FONTE,
+  # VISION_SIM_URL). A decisão de manter a visão fora do serial está no
+  # docs/PROTOCOLO_SERIAL.md.
   vision-simulator:
     build: ./vision-simulator
     container_name: apsen-vision-sim

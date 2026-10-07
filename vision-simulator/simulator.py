@@ -447,11 +447,13 @@ def _do_capturar_mesa(slot_id: int, os_id: str, quantidade_esperada: int,
 
     # Caso 2: detecta produto mas conta errado (divergência de quantidade)
     if inj_divergencia or random.random() < cam.prob_divergencia:
-        # Injeção conta sempre UMA A MENOS: é o quadro de uma falha mecânica
-        # real (produto que não saiu), o mais útil de explicar. Contar a MAIS
-        # seria a câmera vendo o que não existe — quadro possível, mas que
-        # confunde quem está aprendendo o que o Triple Check faz.
-        delta = (-1 if quantidade_esperada > 0 else 0) if inj_divergencia                 else random.choice([-2, -1, 1, 2])
+        # Injeção conta sempre UMA A MAIS. Contar a menos era o quadro mais
+        # fácil de explicar (produto que não saiu), mas desde que a câmera a
+        # menos, sozinha, deixou de travar — ela não distingue caixinha
+        # escondida de caixinha que não caiu —, uma injeção a menos não mostraria
+        # mais a trava, que é o que este botão existe para mostrar. A mais
+        # continua travando: caixinha a mais não se esconde.
+        delta = 1 if inj_divergencia else random.choice([-2, -1, 1, 2])
         detectado = max(0, quantidade_esperada + delta)
         logger.warning(
             "[%s] DIVERGÊNCIA slot=%d | esperado=%d | detectado=%d",

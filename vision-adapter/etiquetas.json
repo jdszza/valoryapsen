@@ -1,0 +1,9 @@
+{
+  "_comentario": "Medicamentos que têm etiqueta impressa (QR + 2 ArUco DICT_4X4_50, gerada por vision/visao/src/gerar_qrcodes.py). 'nome' é o nome EXATO de medicamentos.nome no central — é por ele que o vision-adapter casa o medicamento que o central mandou carregar com a etiqueta que a câmera lê. 'qr' é o texto do QR; 'aruco' é o id do marcador (0..49). Os três não podem repetir. Medicamento sem linha aqui não tem como ser conferido pela câmera: o slot dele sai como leitura_dispenser_falha 'sem_etiqueta_cadastrada'. Acrescente no FIM da lista: a posição de cada linha dá o número 'fantasma' (1000 + posição) com que ela vai no catálogo das estações.",
+  "etiquetas": [
+    {"nome": "MIOSAN 5MG",    "qr": "MED-001", "aruco": 1},
+    {"nome": "FLANCOX 500MG", "qr": "MED-002", "aruco": 2},
+    {"nome": "MECLIN 25MG",   "qr": "MED-003", "aruco": 3},
+    {"nome": "LONIUM 40MG",   "qr": "MED-004", "aruco": 4}
+  ]
+}

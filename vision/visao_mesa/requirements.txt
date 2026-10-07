@@ -1,0 +1,21 @@
+# Visao da mesa — dependencias.
+#
+#   pip install -r requirements.txt
+#
+# opencv-contrib-python (e nao o opencv-python comum): traz os modulos extras
+# que o projeto usa hoje na deteccao e que a integracao com a visao dos
+# dispensers vai precisar (aruco). Instalar os dois ao mesmo tempo quebra o
+# import — se ja houver opencv-python no ambiente, desinstale antes:
+#     pip uninstall -y opencv-python opencv-python-headless
+#
+# Faixa 4.8 a 4.11: a API do ArUco mudou na 4.7 e o codigo assume a nova; o
+# teto abaixo de 5.0 evita a proxima quebra de API sem aviso.
+opencv-contrib-python>=4.8.0,<5.0.0
+
+# 1.24 e o piso do numpy 2-compativel usado aqui; teto aberto ate a 3.
+numpy>=1.24.0,<3.0.0
+
+# Opcional, so no Windows: faz o camera_finder mostrar o NOME de cada webcam
+# em vez de adivinhar pela resolucao. Sem ele o script funciona igual, so fica
+# menos direto na hora de separar a webcam externa da camera integrada.
+pygrabber>=0.2 ; sys_platform == "win32"

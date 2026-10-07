@@ -65,3 +65,36 @@ TASKS*.md
 PROMPT_INTEGRACAO_VISAO.md
 weight/VALIDACAO_BALANCA_2_5.md
 weight/TASK_VALIDAR_BALANCA_2_5.md
+
+# vision/: só as duas estações de visão entram no git. A pasta veio inteira de
+# um pacote externo, e o resto dela não pode ser versionado: backend/apsen.db
+# tem PINs de operador (o mesmo motivo de painel_operador/backend/apsen.db);
+# backend/ e firmware/ são uma cópia ANTIGA do painel, que já existe como
+# painel_operador/ — duas cópias divergem; iniciar_visao.bat sobe a estação na
+# porta 8000, que é a do central.
+/vision/*
+!/vision/visao/
+!/vision/visao_mesa/
+!/vision/README.md
+!/vision/iniciar_dispensers.bat
+!/vision/ensaio_dispensers.py
+!/vision/ensaio_mesa.py
+# Saída de execução das estações: bancos de eventos, logs e a calibração de
+# estoque gerada em campo.
+/vision/visao_mesa/dados/
+/vision/visao/dados/
+/vision/visao/logs/
+/vision/visao/config/pilhas.json
+/vision/visao/config/vazios/
+# As pastas de execução das duas câmeras de dispenser: o código nelas é cópia
+# de vision/visao/ e não entra; a calibração de cada câmera (config/) entra.
+# O git não reinclui nada dentro de diretório excluído, por isso o próprio
+# diretório volta primeiro e só depois o conteúdo sai.
+!/vision/visao_esq/
+!/vision/visao_dir/
+/vision/visao_esq/*
+/vision/visao_dir/*
+!/vision/visao_esq/config/
+!/vision/visao_dir/config/
+# .venv/ e .env, lá em cima, já cobrem vision/visao_mesa/.venv e
+# vision/visao_mesa/integracao_apsen/.env.

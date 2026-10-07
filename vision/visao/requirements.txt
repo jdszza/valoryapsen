@@ -1,0 +1,19 @@
+opencv-python>=4.8
+numpy>=1.24
+qrcode[pil]>=7.4
+Pillow>=10.0
+
+# Opcional, mas MUITO recomendado: leitor de codigos mais robusto que o do OpenCV.
+# Precisa da biblioteca nativa zbar:
+#   Ubuntu/Debian/Raspberry Pi OS:  sudo apt install libzbar0
+#   macOS (homebrew):               brew install zbar
+#   Windows:                        ja vem embutido no wheel do pyzbar
+pyzbar>=0.1.9
+
+# Opcional, apenas se for usar o webhook
+requests>=2.31
+
+# Opcional, so no Windows: faz o nome de cada camera bater com o indice certo
+# do OpenCV. Sem ele o Windows lista os nomes numa ordem propria e a associacao
+# nome->indice fica sem garantia (o programa avisa quando isso acontece).
+pygrabber>=0.2 ; sys_platform == "win32"

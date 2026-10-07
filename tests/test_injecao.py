@@ -429,10 +429,10 @@ def test_simulador_vision_injeta_divergencia_de_mesa(carregar_simulador):
                                  injetar_falha="divergencia_mesa")
 
     (evento,) = sim.eventos_do_tipo("leitura_mesa_divergencia")
-    # UMA a menos, sempre: é o quadro de um produto que não saiu. Contar a mais
-    # seria a câmera vendo o que não existe — possível, mas confuso de explicar.
-    assert evento["quantidade_detectada"] == 9
-    assert evento["delta"] == -1
+    # UMA a mais, sempre: a câmera contando a menos, sozinha, não trava mais
+    # (pode ser caixinha escondida), e a injeção existe para mostrar a trava.
+    assert evento["quantidade_detectada"] == 11
+    assert evento["delta"] == 1
     assert evento["falha_injetada"] is True
 
 

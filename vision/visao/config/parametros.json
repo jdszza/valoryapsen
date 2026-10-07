@@ -1,0 +1,93 @@
+{
+  "_comentario": "Parametros gerais do sistema de visao.",
+  "camera": {
+    "indice": 0,
+    "_resolucao_escolhida": "640x480 medido contra 1280x720: dobra o FPS (8 -> 16) e ainda entrega MAIS linhas para o leitor. Reduzir 720p para 640 de largura na etapa de processamento resultava em 640x360; capturar 640x480 direto da 640x480, entao sobra altura e sai mais barato.",
+    "largura": 640,
+    "altura": 480,
+    "fps": 30,
+    "espelhar": false,
+    "_ajustes": "null = deixa a camera decidir. Fixar exposicao e foco costuma ser a maior melhoria em camera ruim: sem autoexposicao a imagem para de 'respirar' e sem autofoco ela para de cacar foco a cada movimento.",
+    "autofoco": null,
+    "foco": null,
+    "autoexposicao": null,
+    "exposicao": null,
+    "ganho": null,
+    "brilho": null,
+    "contraste": null,
+    "_resolucao": "Camera de celular costuma entregar 1080p ou mais. Pedir 1280x720 aqui ja alivia captura e processamento sem perder leitura."
+  },
+  "deteccao": {
+    "_comentario": "backend: 'pyzbar' (mais robusto, precisa da libzbar), 'opencv' (sem dependencia extra) ou 'auto'",
+    "backend": "auto",
+    "escala_processamento": 1.0,
+    "melhorar_contraste": true,
+    "_cascata": "Tenta varias versoes tratadas da imagem ate uma decodificar. Custa CPU so quando a leitura direta falha.",
+    "cascata": true,
+    "_cascata_completa": "Desligada: era o maior custo do loop. Com ela, um frame onde o codigo NAO decodifica de primeira gastava ~150 ms tentando variacoes. A cascata basica continua ligada e cobre os casos comuns.",
+    "cascata_completa": false,
+    "_ler_por_zona": "Recorta cada dispenser e amplia antes de decodificar. E a melhoria mais eficaz para codigo pequeno ou mal iluminado.",
+    "ler_por_zona": true,
+    "lado_alvo_zona": 320,
+    "margem_zona_px": 12,
+    "_aruco": "Marcador redundante impresso na mesma etiqueta. Aguenta angulo, desfoque e pouca luz muito melhor que QR.",
+    "usar_aruco": true,
+    "dicionario_aruco": "DICT_4X4_50",
+    "_lado_minimo_aruco": "Ignora marcador menor que isso (px). Evita que textura de texto vire um id falso.",
+    "lado_minimo_aruco": 16,
+    "_desempenho": "A leitura pesada so roda quando a imagem da zona muda. Como os dispensers sao estaticos, na pratica ela quase nunca roda — o custo medio fica em ~2 ms por frame.",
+    "limiar_mudanca": 2.0,
+    "intervalo_reavaliacao": 1.0,
+    "intervalo_cascata_completa": 0.5,
+    "intervalo_varredura": 1.0,
+    "_orcamento_ms": "Teto de tempo por frame para as tentativas caras. Aumente se a leitura falhar em cena dificil; reduza se o FPS cair em maquina fraca.",
+    "orcamento_ms": 250,
+    "_margem_zona": "Fracao do lado do codigo que pode ficar fora da zona sem invalidar (0.0 = centro precisa estar dentro)",
+    "margem_zona": 0.0,
+    "_largura_processamento": "Reduz o frame para esta largura ANTES de processar e exibir. 0 = nao reduz. Com a camera ja em 640x480 nao ha o que reduzir: reduzir de novo so jogaria fora o detalhe que o leitor de QR precisa.",
+    "largura_processamento": 0
+  },
+  "alertas": {
+    "_frames_para_confirmar": "Quantas LEITURAS BEM-SUCEDIDAS do mesmo erro antes de alertar. Nao precisam ser em frames seguidos — importante quando a camera so decodifica de vez em quando.",
+    "frames_para_confirmar": 3,
+    "_memoria_segundos": "Por quanto tempo a zona mantem o ultimo codigo lido quando a leitura falha. Remove o piscar do status, mas e tambem o piso da latencia de REMOCAO: enquanto a memoria nao expira, a etiqueta retirada continua sendo contada. Com 2.0 tirar demorava 2s a mais que colocar. 0.8 = ~13 frames de tolerancia a 16 FPS.",
+    "memoria_segundos": 0.8,
+    "_cooldown_segundos": "Tempo minimo entre dois alertas identicos, para nao inundar o log",
+    "cooldown_segundos": 10.0,
+    "alertar_qr_desconhecido": true,
+    "alertar_fora_de_zona": false,
+    "som": true,
+    "log_csv": "logs/alertas.csv"
+  },
+  "backend": {
+    "_comentario": "O vision-adapter do PC central. Ele serve o catalogo da OS corrente (GET /api/visao/catalogo) e aceita e descarta o estoque medido (POST /api/visao/estoque): quem manda no estoque e o central. A estacao continua gravando em eventos.db independentemente disso.",
+    "ativo": true,
+    "url": "http://127.0.0.1:8102",
+    "timeout_segundos": 5.0,
+    "_estabilidade": "Segundos que a contagem precisa ficar parada no mesmo valor antes de ser publicada. Nao pode ir a zero: e o que impede a mao do operador atravessando a zona de virar uma saida e uma reposicao falsas.",
+    "estabilidade_segundos": 0.6,
+    "_intervalo_reenvio": "Espera antes de tentar de novo quando o adapter nao responde.",
+    "intervalo_reenvio": 10.0,
+    "_intervalo_catalogo": "De quanto em quanto tempo a estacao repuxa do adapter o mapeamento dispenser -> medicamento. TEM de ser igual ao VISAO_DISP_INTERVALO_CATALOGO_S do vision-adapter: e a conta que ele faz para saber quando a leitura ja vale para o catalogo da OS. config/medicamentos.json so e usado quando o adapter nao responde na partida.",
+    "intervalo_catalogo": 2.0,
+    "fila_maxima": 500
+  },
+  "webhook": {
+    "_comentario": "Opcional. Se 'url' estiver preenchida, cada alerta e enviado via POST JSON.",
+    "ativo": false,
+    "url": "",
+    "timeout_segundos": 3.0
+  },
+  "gpio": {
+    "_comentario": "Opcional, apenas em Raspberry Pi. Aciona um pino (buzzer/LED) por N ms a cada alerta.",
+    "ativo": false,
+    "pino": 18,
+    "duracao_ms": 500
+  },
+  "interface": {
+    "_comentario": "Janela de operacao (identidade Apsen). Tamanho fixo, independente da camera.",
+    "largura": 1280,
+    "altura": 720,
+    "tela_cheia": false
+  }
+}

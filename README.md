@@ -11,8 +11,8 @@ simuladores já têm contrato e transporte prontos do lado Python.
 |---|---|
 | **Como o sistema funciona e como rodá-lo** | este arquivo |
 | **Por que cada decisão foi tomada** (e as armadilhas) | `CLAUDE.md` |
-| **O que falta fazer** | [`TASKS.md`](TASKS.md) |
 | **Contrato serial adapter ↔ firmware** | [`docs/PROTOCOLO_SERIAL.md`](docs/PROTOCOLO_SERIAL.md) |
+| **As estações de visão reais** | [`vision/README.md`](vision/README.md) |
 | **Painel de bancada e display de 7"** | [`docs/BANCADA.md`](docs/BANCADA.md) |
 
 ---
@@ -111,11 +111,11 @@ Painel     :5000  ─ GET (espelho de mão única) → Central
 | `central-computer` | 8000 | Orquestrador, API REST, WebSocket, console |
 | `dispenser-adapter` | 8100 | Bridge central ↔ dispensers |
 | `cnc-adapter` | 8101 | Bridge central ↔ mesa CNC |
-| `vision-adapter` | 8102 | Bridge central ↔ câmeras |
+| `vision-adapter` | 8102 | Bridge central ↔ câmeras (simulador ou estações reais) |
 | `weight-adapter` | 8103 | Bridge central ↔ balança HX711 |
 | `dispenser-simulator` | 8201 | Simula os 8 dispensers (mecânico, sem CV) |
 | `cnc-simulator` | 8200 | Simula o firmware da mesa |
-| `vision-simulator` | 8202 | Simula as 3 câmeras |
+| `vision-simulator` | 8202 | Simula as 3 câmeras (rollback das estações reais) |
 | `weight-simulator` | 8203 | Simula a célula de carga sob a mesa |
 | `erp-simulator` | — | O ERP do hospital: dispara 1 das 10 ordens por ciclo |
 | `dashboard` | 8050 | Monitoramento read-only (Dash) |
@@ -262,6 +262,20 @@ conseguiu ler) é **não-bloqueante**: gera alarme e a OS continua.
 duas; o sufixo `_ESQ`/`_DIR` sobrescreve uma delas (para simular uma lente
 suja). A da mesa é uma só.
 
+**As câmeras reais** são três estações de visão no host (donas das webcams USB),
+e cada câmera escolhe a sua fonte no vision-adapter (`VISAO_MESA_FONTE`,
+`VISAO_DISPENSER_FONTE`: `simulador` ou `estacao`):
+
+| Estação | Pasta | Porta | Como fala com o vision-adapter |
+|---|---|---|---|
+| mesa | `vision/visao_mesa` | 8212 | fala o mesmo contrato do simulador: o adapter só troca o endereço (`VISION_SIM_URL`) |
+| dispensers, esquerda (D1–D4) | `vision/visao_esq` (cópia de `vision/visao`) | 8301 | não recebe comando: lê o catálogo da OS no adapter e publica o veredito; o adapter o traduz em `leitura_dispenser_*` |
+| dispensers, direita (D5–D8) | `vision/visao_dir` (idem) | 8302 | idem |
+
+O vision-simulator continua no compose como rollback: voltar a ele é tirar as
+variáveis do `.env`. Detalhes em [`vision/README.md`](vision/README.md) e em
+[`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md).
+
 ### Triple Check
 
 | Fonte | O que mede | Evento divergente |
@@ -282,6 +296,14 @@ que passa por baixo vira o alarme `divergencia_abaixo_do_limiar`.
 não contradizem nada, apenas deixam de confirmar. Contá-las transformaria os ~2%
 de falha de leitura em trava por ruído — e trava por ruído é trava desligada em
 campo.
+
+**A exceção: câmera da mesa contando a MENOS, sozinha, não trava.** A câmera é
+fixa num poste e olha a caixa de coleta inclinada, e a visão não distingue
+caixinha escondida atrás da parede da caixa de caixinha que não caiu — não há
+critério de oclusão na estação. Contar a menos só conta como divergência se o
+dispenser ou a balança também acusarem no mesmo slot; sozinha, a OS segue e
+fica o alarme `contagem_camera_abaixo`. Contar a **mais** continua travando:
+caixinha a mais não se esconde — é unidade extra ou objeto estranho.
 
 > **Operar este sistema exige supervisor disponível.** Com
 > `PROB_ERRO_MECANICO=0.01`, uma OS que usa a célula inteira move ~70 unidades:
@@ -700,7 +722,7 @@ se desarma sozinho.
 |---|---|---|
 | `sku_dispenser` | a câmera da fileira lê um SKU que não bate | **sim** — e entra no laço de re-scan |
 | `falha_leitura_dispenser` | a câmera não consegue ler | não — alarme, a OS continua |
-| `divergencia_mesa` | a câmera da balança conta uma a menos | **sim** |
+| `divergencia_mesa` | a câmera da balança conta uma a mais | **sim** |
 | `divergencia_peso` | o HX711 mede fora da tolerância | **sim** |
 | `falha_mecanica_dispenser` | o dispenser solta uma unidade a menos | **sim**, pela balança |
 
@@ -844,6 +866,11 @@ caminho e substituem as bordas.
 python -m pip install -r tests/requirements-dev.txt
 python -m pytest tests/ -q
 ```
+
+O `tests/` é parte do comando, não detalhe: o repositório não tem `pytest.ini`,
+e `pytest` sem argumento também coleta os testes próprios das estações de visão
+(`vision/visao/tests/`), que importam `cv2` e `qrcode` — fora de
+`tests/requirements-dev.txt` e fora desta suíte.
 
 Vale conhecer os que vigiam invariantes em vez de comportamento — são eles que
 pegam a regressão que nenhum outro pega:
@@ -1017,9 +1044,6 @@ GET  /console/api/prevoo                 o relatório item a item
 valoryapsen/
 ├── README.md               # este arquivo
 ├── CLAUDE.md               # decisões de arquitetura e armadilhas
-├── TASKS.md                # backlog geral
-├── TASKS_CNC.md            # frente aberta: a mesa CoreXY
-├── TASKS_DISPENSER.md      # frente aberta: as placas dos dispensers
 ├── docs/
 │   ├── PROTOCOLO_SERIAL.md # contrato adapter ↔ firmware (uma linha JSON por mensagem)
 │   ├── BANCADA.md          # painel de bancada + display ESP32
@@ -1038,7 +1062,8 @@ valoryapsen/
 ├── dispenser-adapter/      # :8100 — main.py + serial_link.py
 ├── cnc-adapter/            # :8101 — main.py + serial_link.py
 ├── weight-adapter/         # :8103 — main.py + serial_link.py
-├── vision-adapter/         # :8102 — só HTTP
+├── vision-adapter/         # :8102 — só HTTP; ponte com as estações reais + etiquetas.json
+├── vision/                 # as estações de visão reais (código de fora, não editado aqui)
 ├── dispenser_simulator/    # :8201 — os 8 dispensers
 ├── cnc_simulator/          # :8200 — a mesa
 ├── vision-simulator/       # :8202 — as 3 câmeras
@@ -1082,6 +1107,15 @@ não existe.
 | `MYSQL_POOL_MAX` | `8` conexões guardadas (1–64) | central |
 | `CONSOLE_SENHA` / `CONSOLE_SESSAO_HORAS` | vazia (desabilita) / `8` h | central |
 | `TRIPLE_CHECK_MIN_DIVERGENCIAS` | `1` (1–3) | central |
+| `VISAO_SKU_HABILITADA` | `1` — `0` não manda o comando de SKU; os slots seguem sem conferência de produto | central |
+| `VISAO_MESA_POSICOES` | `1,2,3,4,5,6,7,8` — slots em que a câmera da mesa vê a caixa inteira; fora deles não há foto e o slot é conferido junto com o próximo visível | central |
+| `VISAO_MESA_FINAL` | vazio — `HOME` confere no HOME, no fim da OS, o que ficou sem foto | central |
+| `VISION_SIM_URL` | `http://vision-simulator:8202` — na célula, a estação da mesa: `http://host.docker.internal:8212` | vision-adapter |
+| `VISAO_MESA_FONTE` / `VISAO_DISPENSER_FONTE` | `simulador` — `estacao` = câmera real (descarta a telemetria simulada dela; nos dispensers, liga a ponte com as estações) | vision-adapter |
+| `VISAO_DISP_ESQ_URL` / `_DIR_URL` | `http://host.docker.internal:8301` / `:8302` | vision-adapter |
+| `VISAO_DISP_INTERVALO_CATALOGO_S` | `2` s — TEM de ser igual ao `backend.intervalo_catalogo` das estações | vision-adapter |
+| `VISAO_DISP_ASSENTAMENTO_S` / `VISAO_DISP_PRAZO_S` | `2` s de folga depois do catálogo novo valer / `20` s de teto para emitir a leitura | vision-adapter |
+| `VISAO_ETIQUETAS_ARQ` | `/app/etiquetas.json` — nome do central → QR/ArUco impressos | vision-adapter |
 | `MAX_FILA_OS` | `5` OS esperando | central |
 | `TIMEOUT_CARREGAMENTO` / `_POSICIONAMENTO` / `_DISPENSA` | `180` / `120` / `120` s | central |
 | `TIMEOUT_VISAO_DISPENSER` / `_VISAO_MESA` / `_PESO` | `30` / `30` / `15` s | central |

@@ -756,7 +756,14 @@ trava](#perfil-supervisor-e-a-liberação-da-trava)).
 
 **Estação de visão.** As rotas `/api/visao/*`, a tela `/visao` e as colunas
 `dispenser_visao`, `sku_visao`, `aruco_visao` e `unidades_por_caixa` existem e
-funcionam. A estação em si vive fora deste repositório.
+funcionam, mas **deixaram de ser alimentadas pela estação**. As estações de
+visão da célula (`vision/`) agora falam com o **vision-adapter**, e não com o
+painel: é nele que buscam o catálogo (`GET /api/visao/catalogo`, montado com o
+que o central mandou carregar em cada OS) e é para ele que publicam o estoque
+medido (`POST /api/visao/estoque`), que ele aceita e descarta — quem manda no
+estoque dos dispensers é o central, e o painel o espelha por `GET` como sempre.
+A tela `/visao` e o `POST /api/visao/estoque` do painel continuam no código,
+sem ninguém chamando; nada foi removido. Ver `vision/README.md`.
 
 ## Armadilhas conhecidas do painel
 

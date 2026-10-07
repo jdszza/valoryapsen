@@ -594,9 +594,11 @@ def _avaliar(orq, dispensado=QTD_ALVO, mesa=MESA_OK, peso=PESO_OK, limiar=None):
 @pytest.mark.parametrize("dispensado, mesa, peso, n_esperado", [
     # 0 divergências — as 3 fontes concordam com o alvo
     (QTD_ALVO, MESA_OK,         PESO_OK,         0),
-    # 1 divergência — cada fonte sozinha
+    # 1 divergência — cada fonte sozinha. A câmera sozinha contando A MENOS é a
+    # exceção (pode ser caixinha escondida): vira alerta, não divergência — ver
+    # a tabela-verdade do Triple Check no fim deste arquivo.
     (8,        MESA_OK,         PESO_OK,         1),
-    (QTD_ALVO, MESA_DIVERGENTE, PESO_OK,         1),
+    (QTD_ALVO, MESA_DIVERGENTE, PESO_OK,         0),
     (QTD_ALVO, MESA_OK,         PESO_DIVERGENTE, 1),
     # 2 divergências
     (8,        MESA_DIVERGENTE, PESO_OK,         2),
@@ -2418,3 +2420,459 @@ def test_re_scan_que_responde_OK_solta_o_slot(carregar_orquestrador):
 
     assert len(motivos) == 1
     assert _status_gravados(orq)[-1] == ("OS-V4", "concluida")
+
+
+# ── VISAO_SKU_HABILITADA: a chave da conferência de SKU ──────────────────────
+#
+# Sem as câmeras dos dispensers na bancada, o central mandava o comando a cada
+# slot, tomava a recusa e retentava 3× para chegar ao mesmo desfecho: o slot
+# segue sem conferência de produto. A chave chega lá direto.
+
+def _rodar_os_de_dois_itens(orq, os_id="OS-SKU"):
+    asyncio.run(orq.modulo._processar_os(
+        _payload_os(os_id, _item("Dipirona"), _item("Paracetamol"))))
+
+
+def test_conferencia_de_sku_vem_ligada(carregar_orquestrador):
+    assert carregar_orquestrador().modulo.settings.VISAO_SKU_HABILITADA is True
+
+
+@pytest.mark.parametrize("valor,ligada", [
+    ("0", False), ("false", False), ("nao", False), ("", False),
+    ("1", True), ("true", True), ("sim", True), (" ON ", True),
+])
+def test_grafias_da_chave(carregar_orquestrador, valor, ligada):
+    orq = carregar_orquestrador({"VISAO_SKU_HABILITADA": valor})
+    assert orq.modulo.settings.VISAO_SKU_HABILITADA is ligada
+
+
+def test_sku_desligado_nao_manda_comando_e_a_os_segue(carregar_orquestrador,
+                                                       monkeypatch, caplog):
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.modulo.settings, "VISAO_SKU_HABILITADA", False)
+
+    with caplog.at_level(logging.WARNING):
+        _rodar_os_de_dois_itens(orq)
+
+    assert orq.adapter.comandos("/comandos/capturar/dispenser") == []
+    assert len(orq.adapter.comandos("/comandos/dispensar")) == 2
+    assert _status_gravados(orq)[-1] == ("OS-SKU", "concluida")
+    assert not [c for c in orq.modulo._pending_events if ":visao_dispenser:" in c]
+    avisos = [r for r in caplog.records if "VISAO_SKU_HABILITADA=0" in r.getMessage()]
+    assert len(avisos) == 1, "um aviso por OS, não um por slot"
+
+
+def test_sku_desligado_nao_trava_por_produto_que_ninguem_leu(carregar_orquestrador,
+                                                              monkeypatch):
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.modulo.settings, "VISAO_SKU_HABILITADA", False)
+    orq.adapter.capturas_divergentes = 2     # se perguntasse, a câmera travaria
+
+    _rodar_os_de_dois_itens(orq)
+
+    assert orq.modulo.get_trava_estado()["ativa"] is False
+    assert _status_gravados(orq)[-1] == ("OS-SKU", "concluida")
+
+
+def test_sku_ligado_manda_exatamente_os_mesmos_comandos_de_antes(carregar_orquestrador,
+                                                                 monkeypatch):
+    """Ligada explicitamente ou pelo default, a OS é a mesma, comando a comando."""
+    def comandos(ligada):
+        orq = carregar_orquestrador()
+        if ligada is not None:
+            monkeypatch.setattr(orq.modulo.settings, "VISAO_SKU_HABILITADA", ligada)
+        _rodar_os_de_dois_itens(orq)
+        return [(c["url"], c["payload"]) for c in orq.adapter.chamadas]
+
+    ligada, padrao = comandos(True), comandos(None)
+
+    assert ligada == padrao
+    assert len([u for u, _ in ligada if u.endswith("/comandos/capturar/dispenser")]) == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Triple Check: a câmera da mesa contando a menos, sozinha, não trava
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# A câmera é fixa e inclinada, e a visão não distingue caixinha escondida atrás
+# da parede da caixa de caixinha que não caiu. Contar a menos só é divergência
+# se o dispenser ou a balança também acusarem; sozinha, vira alerta. Contar a
+# MAIS continua travando: caixinha a mais não se esconde.
+
+CAMERA = {
+    "ok":      {"tipo": "leitura_mesa_ok", "quantidade_detectada": QTD_ALVO},
+    "a menos": {"tipo": "leitura_mesa_divergencia", "quantidade_detectada": QTD_ALVO - 2},
+    "a mais":  {"tipo": "leitura_mesa_divergencia", "quantidade_detectada": QTD_ALVO + 1},
+    "falha":   {"tipo": "leitura_mesa_falha"},
+    "None":    None,
+}
+BALANCA = {"ok": PESO_OK, "divergente": PESO_DIVERGENTE, "indisponível": None}
+DISPENSER = {"ok": QTD_ALVO, "divergente": QTD_ALVO - 2, "None": None}
+
+# (câmera, balança, dispenser) → (nº de divergências, alerta de câmera a menos)
+# Escrita linha a linha, e não derivada da regra: é a tabela que a regra cumpre.
+TABELA_VERDADE = [
+    ("ok",      "ok",           "ok",         0, False),
+    ("ok",      "ok",           "divergente", 1, False),
+    ("ok",      "ok",           "None",       0, False),
+    ("ok",      "divergente",   "ok",         1, False),
+    ("ok",      "divergente",   "divergente", 2, False),
+    ("ok",      "divergente",   "None",       1, False),
+    ("ok",      "indisponível", "ok",         0, False),
+    ("ok",      "indisponível", "divergente", 1, False),
+    ("ok",      "indisponível", "None",       0, False),
+    ("a menos", "ok",           "ok",         0, True),
+    ("a menos", "ok",           "divergente", 2, False),
+    ("a menos", "ok",           "None",       0, True),
+    ("a menos", "divergente",   "ok",         2, False),
+    ("a menos", "divergente",   "divergente", 3, False),
+    ("a menos", "divergente",   "None",       2, False),
+    ("a menos", "indisponível", "ok",         0, True),
+    ("a menos", "indisponível", "divergente", 2, False),
+    ("a menos", "indisponível", "None",       0, True),
+    ("a mais",  "ok",           "ok",         1, False),
+    ("a mais",  "ok",           "divergente", 2, False),
+    ("a mais",  "ok",           "None",       1, False),
+    ("a mais",  "divergente",   "ok",         2, False),
+    ("a mais",  "divergente",   "divergente", 3, False),
+    ("a mais",  "divergente",   "None",       2, False),
+    ("a mais",  "indisponível", "ok",         1, False),
+    ("a mais",  "indisponível", "divergente", 2, False),
+    ("a mais",  "indisponível", "None",       1, False),
+    ("falha",   "ok",           "ok",         0, False),
+    ("falha",   "ok",           "divergente", 1, False),
+    ("falha",   "ok",           "None",       0, False),
+    ("falha",   "divergente",   "ok",         1, False),
+    ("falha",   "divergente",   "divergente", 2, False),
+    ("falha",   "divergente",   "None",       1, False),
+    ("falha",   "indisponível", "ok",         0, False),
+    ("falha",   "indisponível", "divergente", 1, False),
+    ("falha",   "indisponível", "None",       0, False),
+    ("None",    "ok",           "ok",         0, False),
+    ("None",    "ok",           "divergente", 1, False),
+    ("None",    "ok",           "None",       0, False),
+    ("None",    "divergente",   "ok",         1, False),
+    ("None",    "divergente",   "divergente", 2, False),
+    ("None",    "divergente",   "None",       1, False),
+    ("None",    "indisponível", "ok",         0, False),
+    ("None",    "indisponível", "divergente", 1, False),
+    ("None",    "indisponível", "None",       0, False),
+]
+
+
+@pytest.mark.parametrize("camera,balanca,dispenser,n_div,alerta", TABELA_VERDADE)
+def test_tabela_verdade_do_triple_check(carregar_orquestrador, camera, balanca,
+                                        dispenser, n_div, alerta):
+    orq = carregar_orquestrador()
+
+    veredito = _avaliar(orq, dispensado=DISPENSER[dispenser], mesa=CAMERA[camera],
+                        peso=BALANCA[balanca])
+
+    assert len(veredito.divergencias) == n_div
+    assert veredito.travar is (n_div >= 1)
+    assert bool(veredito.alertas) is alerta
+    if alerta:
+        (texto,) = veredito.alertas
+        assert "contou 2 a menos" in texto and "possível oclusão" in texto
+    assert len(veredito.categorias) == n_div
+
+
+def test_construtores_antigos_do_resultado_continuam_validos(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    r = orq.modulo.ResultadoTripleCheck(travar=False, divergencias=[],
+                                        fontes_indisponiveis=[], limiar=1)
+    assert r.categorias == () and r.alertas == ()
+
+
+def test_diferenca_sai_dos_inteiros_e_nao_do_delta_do_payload(carregar_orquestrador):
+    """O `delta` do payload mente aqui de propósito: a conta é do central."""
+    orq = carregar_orquestrador()
+    mesa = {"tipo": "leitura_mesa_divergencia", "quantidade_detectada": "11", "delta": -5}
+
+    veredito = _avaliar(orq, mesa=mesa)
+
+    assert veredito.travar is True
+    assert veredito.alertas == ()
+
+
+def test_divergencia_com_contagem_igual_e_fonte_indisponivel(carregar_orquestrador, caplog):
+    orq = carregar_orquestrador()
+    mesa = {"tipo": "leitura_mesa_divergencia", "quantidade_detectada": QTD_ALVO}
+
+    with caplog.at_level(logging.WARNING):
+        veredito = _avaliar(orq, mesa=mesa)
+
+    assert veredito.divergencias == [] and veredito.alertas == ()
+    assert any("incoerente" in f for f in veredito.fontes_indisponiveis)
+    assert "payload incoerente" in caplog.text
+
+
+def test_mensagem_usa_o_esperado_da_foto_e_os_slots_cobertos(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    veredito = orq.modulo.avaliar_triple_check(
+        quantidade_esperada=2, quantidade_dispensada=2,
+        resultado_mesa={"tipo": "leitura_mesa_divergencia", "quantidade_detectada": 6},
+        resultado_peso=PESO_OK, esperado_camera=5, slots_camera=(2, 3))
+    assert veredito.divergencias == ["câmera_mesa: detectou 6 de 5 (D2+D3)"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A câmera da mesa que nem sempre vê a caixa inteira (passo 4c)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# A estação conta o TOTAL da caixa e subtrai o último total que ELA registrou na
+# OS; e nunca refotografa o mesmo (os_id, slot). Os roteiros abaixo encenam a
+# estação slot a slot. A OS é sempre D1=3, D2=4, D3=5.
+
+# O supervisor que libera a trava assim que ela aparece — o mesmo dos testes
+# de injeção; sem ele a OS ficaria parada na trava e a suíte penduraria.
+from test_injecao import _liberar_trava_automaticamente  # noqa: E402
+
+OS_3_SLOTS = (("Dipirona", 3), ("Paracetamol", 4), ("Ibuprofeno", 5))
+
+
+def _os_de_tres(os_id="OS-M"):
+    return _payload_os(os_id, *(_item(n, q) for n, q in OS_3_SLOTS))
+
+
+def _roteiro_mesa(orq, monkeypatch, roteiro: dict):
+    """Troca a resposta da câmera da mesa por um roteiro {slot: ação}.
+
+    Ação: "ok" | "falha" | "timeout_processamento" | "mudo" | ("div", Δ), com Δ
+    sobre o esperado da foto. Slot fora do roteiro responde "ok".
+    """
+    original = orq.adapter._responder
+
+    def responder(url, payload):
+        if not url.endswith("/comandos/capturar/mesa"):
+            return original(url, payload)
+        slot, esperado = payload["slot_id"], payload["quantidade_esperada"]
+        chave = f"{payload['os_id']}:visao_mesa:{slot}"
+        acao = roteiro.get(slot, "ok")
+        if acao == "ok":
+            orq.adapter._evento(chave, tipo="leitura_mesa_ok",
+                                quantidade_esperada=esperado, quantidade_detectada=esperado)
+        elif acao in ("falha", "timeout_processamento"):
+            orq.adapter._evento(chave, tipo="leitura_mesa_falha",
+                                motivo="imagem_fora_de_foco" if acao == "falha" else acao,
+                                quantidade_esperada=esperado, quantidade_detectada=0)
+        elif acao != "mudo":
+            orq.adapter._evento(chave, tipo="leitura_mesa_divergencia",
+                                quantidade_esperada=esperado,
+                                quantidade_detectada=esperado + acao[1])
+
+    monkeypatch.setattr(orq.adapter, "_responder", responder)
+    monkeypatch.setattr(orq.modulo.settings, "TIMEOUT_VISAO_MESA", 0.01)
+
+
+def _fotos(orq) -> list[dict]:
+    """As capturas da mesa — e a regra da estação: nunca o mesmo par duas vezes."""
+    fotos = orq.adapter.comandos("/comandos/capturar/mesa")
+    pares = [(f["os_id"], f["slot_id"]) for f in fotos]
+    assert len(pares) == len(set(pares)), f"par (os_id, slot) repetido: {pares}"
+    return fotos
+
+
+def _tipos_de_alarme(orq) -> list[str]:
+    return [c["args"][1] for c in orq.banco.chamadas_de("salvar_alarme")]
+
+
+def test_mapa_default_manda_as_mesmas_fotos_de_antes(carregar_orquestrador):
+    """Todas as posições visíveis: uma foto por slot, com a quantidade DO slot —
+    o contrato de antes. Os dois campos novos são informativos e, aqui, só
+    repetem o próprio slot."""
+    orq = carregar_orquestrador()
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    fotos = _fotos(orq)
+    antigos = [{k: f[k] for k in ("slot_id", "os_id", "quantidade_esperada")} for f in fotos]
+    assert antigos == [{"slot_id": s, "os_id": "OS-M", "quantidade_esperada": q}
+                       for s, (_, q) in enumerate(OS_3_SLOTS, start=1)]
+    assert [(f["slots_cobertos"], f["quantidade_slot"]) for f in fotos] == \
+        [([1], 3), ([2], 4), ([3], 5)]
+    assert set(fotos[0]) == {"slot_id", "os_id", "quantidade_esperada", "posicao_x",
+                             "posicao_y", "slots_cobertos", "quantidade_slot"}
+    assert orq.estado["trava"]["ativa"] is False
+    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
+
+
+def test_slot_fora_do_mapa_nao_e_fotografado_e_o_proximo_leva_a_soma(
+        carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.modulo.settings, "VISAO_MESA_POSICOES", frozenset({1, 3}))
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    fotos = _fotos(orq)
+    assert [f["slot_id"] for f in fotos] == [1, 3]
+    assert (fotos[1]["quantidade_esperada"], fotos[1]["slots_cobertos"],
+            fotos[1]["quantidade_slot"]) == (9, [2, 3], 5)
+    assert orq.estado["trava"]["ativa"] is False
+
+
+def test_soma_divergente_cita_os_slots_cobertos(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.modulo.settings, "VISAO_MESA_POSICOES", frozenset({1, 3}))
+    _roteiro_mesa(orq, monkeypatch, {3: ("div", +1)})
+    motivos = []
+    original = orq.modulo._ativar_trava
+
+    async def espia(os_id, slot_id, motivo, resumo=""):
+        motivos.append(motivo)
+        return await original(os_id, slot_id, motivo, resumo=resumo)
+    monkeypatch.setattr(orq.modulo, "_ativar_trava", espia)
+    _liberar_trava_automaticamente(orq)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert len(motivos) == 1 and "detectou 10 de 9 (D2+D3)" in motivos[0]
+
+
+def test_falha_simples_faz_o_proximo_levar_a_soma(carregar_orquestrador, monkeypatch):
+    """Falha que a estação não registrou: o total dela é o de antes."""
+    orq = carregar_orquestrador()
+    _roteiro_mesa(orq, monkeypatch, {2: "falha"})
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    fotos = _fotos(orq)
+    assert (fotos[2]["quantidade_esperada"], fotos[2]["slots_cobertos"]) == (9, [2, 3])
+
+
+@pytest.mark.parametrize("desfecho", ["timeout_processamento", "mudo"])
+def test_sem_desfecho_conhecido_o_proximo_nao_e_comparavel(carregar_orquestrador,
+                                                           monkeypatch, desfecho):
+    """Não se sabe se a estação registrou o total: a próxima divergência vira
+    fonte indisponível, e não trava — a estação acaba de ressincronizar."""
+    orq = carregar_orquestrador()
+    _roteiro_mesa(orq, monkeypatch, {2: desfecho, 3: ("div", +3)})
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    fotos = _fotos(orq)
+    assert (fotos[2]["quantidade_esperada"], fotos[2]["slots_cobertos"]) == (5, [3])
+    assert orq.estado["trava"]["ativa"] is False
+    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
+    assert "camera_mesa_ressincronizando" in _tipos_de_alarme(orq)
+
+
+def test_divergencia_depois_de_liberar_a_trava_nao_trava(carregar_orquestrador,
+                                                         monkeypatch):
+    """Decisão F: com a trava aberta alguém pode ter mexido na caixa."""
+    orq = carregar_orquestrador()
+    orq.adapter.capturas_divergentes = 1          # trava de SKU antes da dispensa
+    _roteiro_mesa(orq, monkeypatch, {1: ("div", +2), 3: ("div", +1)})
+    liberacoes = _liberar_trava_automaticamente(orq)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    # SKU (1) + a divergência do D3, que voltou a ser comparável depois do D1.
+    assert liberacoes == [True, True]
+    assert "camera_mesa_ressincronizando" in _tipos_de_alarme(orq)
+
+
+def test_camera_a_menos_sozinha_vira_alarme_e_a_os_segue(carregar_orquestrador,
+                                                         monkeypatch):
+    orq = carregar_orquestrador()
+    _roteiro_mesa(orq, monkeypatch, {2: ("div", -1)})
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert orq.estado["trava"]["ativa"] is False
+    assert "contagem_camera_abaixo" in _tipos_de_alarme(orq)
+    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
+
+
+# ── Conferência final no HOME (VISAO_MESA_FINAL=HOME) ─────────────────────────
+
+def _com_final_home(orq, monkeypatch, posicoes):
+    monkeypatch.setattr(orq.modulo.settings, "VISAO_MESA_FINAL", "HOME")
+    monkeypatch.setattr(orq.modulo.settings, "VISAO_MESA_POSICOES", frozenset(posicoes))
+
+
+def test_final_home_fotografa_o_pendente_livre(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1, 2})
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    fotos = _fotos(orq)
+    assert [f["slot_id"] for f in fotos] == [1, 2, 3]
+    final = fotos[-1]
+    assert (final["quantidade_esperada"], final["slots_cobertos"]) == (5, [3])
+    assert (final["posicao_x"], final["posicao_y"]) == orq.modulo.HOME
+    # A foto final sai depois do homing e antes de a OS fechar.
+    urls = [c["url"] for c in orq.adapter.chamadas]
+    assert urls.index(next(u for u in urls if u.endswith("/comandos/homing"))) < \
+        max(i for i, u in enumerate(urls) if u.endswith("/comandos/capturar/mesa"))
+    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
+
+
+def test_final_home_a_menos_vira_alarme(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1, 2})
+    _roteiro_mesa(orq, monkeypatch, {3: ("div", -2)})
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert orq.estado["trava"]["ativa"] is False
+    assert "contagem_camera_abaixo" in _tipos_de_alarme(orq)
+
+
+def test_final_home_a_mais_trava(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1, 2})
+    _roteiro_mesa(orq, monkeypatch, {3: ("div", +1)})
+    liberacoes = _liberar_trava_automaticamente(orq)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert liberacoes == [True]
+    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
+
+
+def test_final_home_sem_pendente_livre_nao_fotografa_e_alarma(carregar_orquestrador,
+                                                             monkeypatch):
+    """O D3 falhou: o par (OS, D3) já foi usado, e a estação não o refotografa."""
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1, 2, 3})
+    _roteiro_mesa(orq, monkeypatch, {3: "falha"})
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert [f["slot_id"] for f in _fotos(orq)] == [1, 2, 3]
+    assert "conferencia_final_impossivel" in _tipos_de_alarme(orq)
+
+
+def test_final_home_com_homing_falho_nao_fotografa(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1, 2})
+    orq.adapter.recusar_rotas.add("/comandos/homing")
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert [f["slot_id"] for f in _fotos(orq)] == [1, 2]
+    assert "conferencia_final_sem_homing" in _tipos_de_alarme(orq)
+
+
+# ── A configuração ────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("valor,esperado", [
+    ("", set(range(1, NUM_SLOTS + 1))),
+    ("1,2,3,4,5,6,7,8", set(range(1, 9))),
+    (" 1, 3 ,8", {1, 3, 8}),
+    ("1,1", set(range(1, NUM_SLOTS + 1))),          # repetido
+    ("0,2", set(range(1, NUM_SLOTS + 1))),          # fora da faixa
+    ("9", set(range(1, NUM_SLOTS + 1))),            # fora da faixa
+    ("1;2", set(range(1, NUM_SLOTS + 1))),          # não é lista de inteiros
+])
+def test_visao_mesa_posicoes(carregar_orquestrador, valor, esperado):
+    orq = carregar_orquestrador({"VISAO_MESA_POSICOES": valor})
+    assert set(orq.modulo.settings.VISAO_MESA_POSICOES) == esperado
+
+
+@pytest.mark.parametrize("valor,esperado", [("", ""), ("home", "HOME"), ("FIM", "")])
+def test_visao_mesa_final(carregar_orquestrador, valor, esperado):
+    orq = carregar_orquestrador({"VISAO_MESA_FINAL": valor})
+    assert orq.modulo.settings.VISAO_MESA_FINAL == esperado

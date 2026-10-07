@@ -1,0 +1,36 @@
+{
+  "_comentario": "Mapeia o CONTEUDO do QR code -> medicamento e dispenser esperado. O conteudo deve ser IDENTICO em todas as caixas do mesmo tipo de medicamento.",
+  "_fonte_de_verdade": "Em operacao normal a estacao NAO usa este arquivo: ela busca o mapeamento em /api/visao/catalogo do vision-adapter, montado a cada OS a partir do que o central mandou carregar. Este arquivo serve para dois casos: (1) reserva, quando o adapter nao responde na partida; (2) fonte dos nomes para src/gerar_qrcodes.py. Os nomes tem de ser os de medicamentos.nome no central, senao a etiqueta impressa diz um nome e o sistema diz outro.",
+  "_aruco": "Id do marcador ArUco impresso na MESMA etiqueta, como leitura redundante. O ArUco aguenta angulo, desfoque e pouca luz muito melhor que o QR; o QR aguenta reflexo melhor. Juntos cobrem quase tudo. Deixe null para usar so QR.",
+
+  "medicamentos": [
+    {
+      "qr": "MED-001",
+      "nome": "MIOSAN 5MG",
+      "dispenser": 1,
+      "aruco": 1,
+      "cor": [80, 200, 120]
+    },
+    {
+      "qr": "MED-002",
+      "nome": "FLANCOX 500MG",
+      "dispenser": 2,
+      "aruco": 2,
+      "cor": [230, 180, 60]
+    },
+    {
+      "qr": "MED-003",
+      "nome": "MECLIN 25MG",
+      "dispenser": 3,
+      "aruco": 3,
+      "cor": [90, 160, 235]
+    },
+    {
+      "qr": "MED-004",
+      "nome": "LONIUM 40MG",
+      "dispenser": 4,
+      "aruco": 4,
+      "cor": [190, 120, 220]
+    }
+  ]
+}

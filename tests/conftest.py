@@ -1018,7 +1018,7 @@ class AdapterFake:
                 self._evento(f"{os_id}:visao_mesa:{slot}",
                              tipo="leitura_mesa_divergencia",
                              quantidade_esperada=esperada,
-                             quantidade_detectada=max(0, esperada - 1),
+                             quantidade_detectada=esperada + 1,
                              confianca=0.85, falha_injetada=True)
             else:
                 self._evento(f"{os_id}:visao_mesa:{slot}", tipo="leitura_mesa_ok",

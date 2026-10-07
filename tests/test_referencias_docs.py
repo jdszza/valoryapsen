@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -63,18 +64,29 @@ def _ler(caminho: Path) -> str:
 
 
 def _existe(referencia: str, origem: Path) -> bool:
-    """O alvo resolve a partir da raiz do repo, do diretório de quem cita, ou
-    de `docs/`.
+    """O alvo resolve a partir da raiz do repo, de `docs/`, ou do diretório de
+    quem cita e de qualquer diretório ACIMA dele.
 
-    A terceira base cobre o caminho montado por partes —
+    `docs/` cobre o caminho montado por partes —
     `RAIZ_REPO / "docs" / "PROTOCOLO_SERIAL.md"` — em que a varredura só enxerga
     o nome do arquivo. Um nome que exista em `docs/` é um ponteiro que o leitor
     resolve sozinho; o que este teste caça é o nome que não existe em lugar
     nenhum.
+
+    Subir a partir de quem cita cobre o projeto que tem a documentação na raiz
+    dele e o código numa subpasta: `vision/visao/tests/test_v2.py` cita
+    `ROBUSTEZ.md`, que mora em `vision/visao/`. Para quem lê, o ponteiro
+    resolve — é a raiz do projeto que ele tem aberto —, e o arquivo que cita
+    não pode ser corrigido daqui (ver `tests/test_visao_intocada.py`). Subir,
+    e não procurar ao lado: a pasta VIZINHA não é contexto de quem cita, e
+    aceitá-la deixaria passar o ponteiro que só resolve por coincidência.
     """
-    return ((RAIZ_REPO / referencia).is_file()
-            or (origem.parent / referencia).is_file()
-            or (RAIZ_REPO / "docs" / referencia).is_file())
+    bases = [RAIZ_REPO, RAIZ_REPO / "docs"]
+    pasta = origem.parent
+    while pasta != RAIZ_REPO and RAIZ_REPO in pasta.parents:
+        bases.append(pasta)
+        pasta = pasta.parent
+    return any((base / referencia).is_file() for base in bases)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -240,7 +252,26 @@ def test_a_varredura_reprovaria_um_ponteiro_morto():
         ["Seção Que Não Existe"]
 
 
+def test_o_ponteiro_resolve_subindo_de_quem_cita_e_nao_ao_lado(tmp_path, monkeypatch):
+    """Subir até a raiz do projeto resolve; uma pasta vizinha, não."""
+    monkeypatch.setattr(sys.modules[__name__], "RAIZ_REPO", tmp_path)
+    (tmp_path / "projeto" / "tests").mkdir(parents=True)
+    (tmp_path / "projeto" / "GUIA.md").write_text("x", encoding="utf-8")
+    (tmp_path / "vizinho").mkdir()
+    (tmp_path / "vizinho" / "SO_AQUI.md").write_text("x", encoding="utf-8")
+    quem_cita = tmp_path / "projeto" / "tests" / "test_x.py"
+
+    assert _existe("GUIA.md", quem_cita)
+    assert not _existe("SO_AQUI.md", quem_cita)
+    assert not _existe("GUIA.md", tmp_path / "vizinho" / "x.py")
+
+
 def test_os_documentos_que_o_codigo_cita_existem_mesmo():
-    """Piso nominal: se `docs/` sumir num merge, isto acusa antes do leitor."""
-    for esperado in ("README.md", "docs/PROTOCOLO_SERIAL.md", "TASKS.md"):
+    """Piso nominal: se `docs/` sumir num merge, isto acusa antes do leitor.
+
+    Só documento VERSIONADO entra aqui. O `TASKS.md` esteve na lista e saiu:
+    o `.gitignore` ignora `TASKS*.md`, então ele existia só no disco de quem o
+    escreveu — e, apagado, deixou este teste e um link do README vermelhos.
+    """
+    for esperado in ("README.md", "docs/PROTOCOLO_SERIAL.md", "docs/DEPLOY_WINDOWS.md"):
         assert (RAIZ_REPO / esperado).is_file(), esperado

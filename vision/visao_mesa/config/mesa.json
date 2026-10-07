@@ -1,0 +1,119 @@
+{
+  "camera": {
+    "indice": 1,
+    "largura": 1280,
+    "altura": 720,
+    "fps": 30,
+    "fourcc": "MJPG",
+    "autofoco": true,
+    "foco": 30,
+    "autoexposicao": false,
+    "exposicao": -6,
+    "autobalanco_branco": false,
+    "temperatura_cor": 4000,
+    "ganho": -1,
+    "brilho": -1,
+    "contraste": -1,
+    "espelhar": false,
+    "frames_aquecimento": 20
+  },
+  "fundo": {
+    "modo": "manual",
+    "roi": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+    ],
+    "escala_px_por_mm": 2.0,
+    "cantos_manuais": [
+      [
+        0.026310482621192934,
+        0.183870972527398
+      ],
+      [
+        0.6668346881866455,
+        0.183870972527398
+      ],
+      [
+        0.7575604915618896,
+        0.8758064270019531
+      ],
+      [
+        0.0,
+        0.9887096828884548
+      ]
+    ],
+    "metodo": "borda",
+    "limiar": 90,
+    "limiar_minimo": 20,
+    "limiar_maximo": 220,
+    "lock": false,
+    "desfoque": 5,
+    "dilatacao": 3,
+    "epsilon_poligono": 0.02,
+    "area_minima_frac": 0.06,
+    "area_maxima_frac": 0.98,
+    "comprimento_mm": 300.0,
+    "largura_mm": 200.0,
+    "px_por_mm": 2.0,
+    "suavizacao": 0.7,
+    "frames_validade": 60
+  },
+  "conteudo": {
+    "metodo": "otsu_desloc",
+    "limiar": 184,
+    "limiar_minimo": 40,
+    "limiar_maximo": 220,
+    "lock": true,
+    "inverter": false,
+    "metodos_auto": [
+      "otsu_desloc",
+      "otsu_desloc+norm",
+      "adaptativo",
+      "adaptativo+norm"
+    ],
+    "normalizar_iluminacao": false,
+    "sigma_iluminacao_mm": 25.0,
+    "desfoque": 3,
+    "adaptativo_bloco": 51,
+    "abertura_mm": 1.0,
+    "fechamento_mm": 1.0,
+    "preencher_buracos": true,
+    "margem_interna_mm": 4.0,
+    "area_min_mm2": 1500.0,
+    "area_max_mm2": 15000.0,
+    "lado_min_mm": 25.0,
+    "lado_max_mm": 200.0,
+    "razao_aspecto_max": 4.0,
+    "preenchimento_min": 0.7,
+    "separar_encostadas": true,
+    "limiar_distancia": 0.45,
+    "cortar_juncoes": true,
+    "juncao_comprimento_min_mm": 15.0,
+    "juncao_espessura_mm": 0.8,
+    "juncao_margem_mm": 1.5,
+    "juncao_sensibilidade": 40,
+    "juncao_uniformidade": 0.6
+  },
+  "auto": {
+    "patamar_minimo": 12,
+    "hotspot_critico": 0.24,
+    "saturacao_critica": 0.1,
+    "cobertura_minima": 0.6,
+    "nitidez_minima": 0.15
+  },
+  "desempenho": {
+    "escala_varredura": 0.5,
+    "passo_grosso": 8,
+    "passo_fino": 4,
+    "raio_refino": 20,
+    "max_componentes": 250,
+    "gate_mudanca": true,
+    "lado_miniatura": 32,
+    "limiar_mudanca": 12.0,
+    "intervalo_forcado_s": 3.0,
+    "intervalo_auto_s": 0.7
+  },
+  "_comentario": "Visao da mesa. Gerado por src/calibrar.py. fundo.limiar e conteudo.limiar sao os dois sliders; lock=true entrega o limiar ao ajuste automatico."
+}

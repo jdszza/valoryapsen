@@ -1,0 +1,24 @@
+# Camada de integracao com o PC central APSEN.
+#
+#   pip install -r integracao_apsen/requirements.txt
+#
+# ATENCAO: isto e um ADICIONAL ao requirements.txt da raiz (opencv e numpy),
+# que continua sendo o que a visao precisa para contar. Instale os dois.
+#
+# Versoes fixas, como pede o documento de integracao. Foram as testadas; se o
+# seu Python nao achar alguma, a faixa compativel esta no comentario ao lado.
+
+# Servidor HTTP. Mesma pilha do resto do sistema APSEN.
+fastapi==0.142.2          # faixa compativel: >=0.110,<1.0
+uvicorn==0.46.0           # faixa compativel: >=0.27,<1.0
+
+# Cliente HTTP para mandar o evento ao adapter.
+requests==2.33.1          # faixa compativel: >=2.31,<3.0
+
+# Vem junto com o FastAPI, listado aqui so para ficar explicito de onde vem a
+# validacao do corpo do comando (e o que devolve HTTP 422 sozinho).
+pydantic==2.13.3          # faixa compativel: >=2.5,<3.0
+
+# So para rodar integracao_apsen/testes/test_integracao.py (TestClient).
+# Em producao nao e necessario.
+httpx==0.28.1             # faixa compativel: >=0.27,<1.0

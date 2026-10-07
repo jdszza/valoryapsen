@@ -132,6 +132,47 @@ def _num_slots() -> int:
     return valor
 
 
+def _visao_mesa_posicoes() -> frozenset:
+    """Slots em que a câmera da mesa vê a caixa de coleta INTEIRA.
+
+    A câmera é fixa num poste, inclinada, e a caixa anda com a CNC: em algumas
+    paradas parte da caixa sai do quadro. Nessas o central não pede foto — a
+    contagem desse slot é conferida junto com a do próximo slot visível. O
+    valor sai de medida de bancada (Procedimento de bancada, M4, no
+    TASKS_VISAO.md); o default é todas, que é o comportamento de antes.
+
+    Inválido (não inteiro, fora de 1..NUM_SLOTS, repetido, vazio) cai no
+    default com ERROR: um mapa errado faria a câmera conferir no lugar errado,
+    e isso não pode passar com um warning que ninguém lê.
+    """
+    num_slots = _num_slots()
+    todas = frozenset(range(1, num_slots + 1))
+    bruto = os.getenv("VISAO_MESA_POSICOES", "")
+    if not bruto.strip():
+        return todas
+    try:
+        valores = [int(p) for p in bruto.split(",") if p.strip()]
+    except ValueError:
+        valores = []
+    if (not valores or len(set(valores)) != len(valores)
+            or any(not 1 <= v <= num_slots for v in valores)):
+        _cfg_logger.error(
+            "VISAO_MESA_POSICOES=%r inválido (inteiros 1..%d, sem repetir) — "
+            "usando todas as posições.", bruto, num_slots)
+        return todas
+    return frozenset(valores)
+
+
+def _visao_mesa_final() -> str:
+    """"" (desligado) ou "HOME": conferir no HOME o que nenhuma parada conferiu."""
+    bruto = os.getenv("VISAO_MESA_FINAL", "")
+    valor = bruto.strip().upper()
+    if valor not in ("", "HOME"):
+        _cfg_logger.error("VISAO_MESA_FINAL=%r inválido (vazio ou HOME) — desligado.", bruto)
+        return ""
+    return valor
+
+
 def _mysql_pool_max() -> int:
     """Quantas conexões MySQL o central guarda abertas. Faixa válida: 1..64.
 
@@ -181,6 +222,20 @@ def _modo_apresentacao() -> bool:
     alguém confundir demo sem imprevisto com hardware perfeito.
     """
     return os.getenv("MODO_APRESENTACAO", "0").strip().lower() in (
+        "1", "true", "yes", "sim", "on",
+    )
+
+
+def _visao_sku_habilitada() -> bool:
+    """A câmera dos dispensers confere o SKU de cada slot? Default: sim.
+
+    Mesmas grafias de `_modo_apresentacao`, mas com o default invertido: o
+    normal é conferir. Desligar é para a bancada sem as câmeras dos dispensers —
+    sem a chave, o central mandaria o comando a cada slot, tomaria a recusa e
+    retentaria 3× (`_post` retenta 5xx) só para chegar ao mesmo desfecho: o slot
+    segue sem conferência de produto.
+    """
+    return os.getenv("VISAO_SKU_HABILITADA", "1").strip().lower() in (
         "1", "true", "yes", "sim", "on",
     )
 
@@ -424,6 +479,16 @@ class Settings:
 
     # ── Triple Check ──────────────────────────────────────────────────────────
     TRIPLE_CHECK_MIN_DIVERGENCIAS: int = _limiar_triple_check()
+    # Conferência de SKU pela câmera dos dispensers (passo 3b). 0 = os slots
+    # seguem sem conferência de produto, sem nem mandar o comando.
+    VISAO_SKU_HABILITADA: bool = field(default_factory=_visao_sku_habilitada)
+
+    # ── Câmera da mesa: onde ela vê a caixa inteira ───────────────────────────
+    # Fora destas posições o central não pede foto, e o slot é conferido junto
+    # com o próximo visível. Ver `_visao_mesa_posicoes`.
+    VISAO_MESA_POSICOES: frozenset = field(default_factory=_visao_mesa_posicoes)
+    # "HOME": no fim da OS, com a mesa no HOME, confere o que ficou pendente.
+    VISAO_MESA_FINAL: str = field(default_factory=_visao_mesa_final)
 
     # ── Backpressure da fila de OS ────────────────────────────────────────────
     MAX_FILA_OS: int = _max_fila_os()

@@ -277,6 +277,27 @@ def test_a_url_de_cada_adapter_e_sobrescrivivel_pelo_env(servicos, variavel, def
     )
 
 
+# O mesmo vale para o vision-adapter, mas no ambiente DELE: na célula montada
+# a estação da mesa roda no host (dona da webcam), e o adapter a alcança por
+# `host.docker.internal:8212` — de novo, um valor que só pode vir do `.env`.
+# Os defaults são os de antes da estação existir: sem `.env`, nada muda.
+_VARIAVEIS_DO_VISION_ADAPTER = {
+    "VISION_SIM_URL":        "http://vision-simulator:8202",
+    "NUM_SLOTS":             "8",
+    "VISAO_MESA_FONTE":      "simulador",
+    "VISAO_DISPENSER_FONTE": "simulador",
+}
+
+
+@pytest.mark.parametrize("variavel,default", sorted(_VARIAVEIS_DO_VISION_ADAPTER.items()))
+def test_o_vision_adapter_e_configuravel_pelo_env(servicos, variavel, default):
+    valor = str(servicos["vision-adapter"]["environment"][variavel])
+    assert valor == "${" + variavel + ":-" + default + "}", (
+        f"{variavel} precisa ser ${{{variavel}:-{default}}} para o .env valer; "
+        f"está {valor!r}"
+    )
+
+
 # As cinco que o CLAUDE.md descreve como "estão no `.env` de quem já roda a
 # planta" — e que estavam fixas no compose, ou seja, não estavam em `.env`
 # nenhum. `INTERVALO_OS` é a que decide se o gerador fica calado durante uma
@@ -318,7 +339,7 @@ def test_o_que_a_bancada_substitui_esta_no_profile_simulado(servicos):
 
 
 def test_o_que_roda_em_container_na_bancada_nao_tem_profile(servicos):
-    """A visão fica: é HTTP, e o simulador serve a bancada até a estação real."""
+    """A visão fica: é HTTP, e o simulador é o rollback das estações reais."""
     assert set(servicos) == SIMULADO | SEMPRE_EM_CONTAINER
     for nome in sorted(SEMPRE_EM_CONTAINER):
         assert not servicos[nome].get("profiles"), nome

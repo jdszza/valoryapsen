@@ -1,0 +1,41 @@
+{
+  "_comentario": "Zonas dos dispensers em pixels. Geradas por src/calibrar.py. Se a resolucao da camera mudar, o sistema reescala automaticamente.",
+  "resolucao": [
+    1280,
+    720
+  ],
+  "zonas": [
+    {
+      "dispenser": 1,
+      "x": 60,
+      "y": 130,
+      "largura": 272,
+      "altura": 500,
+      "rotulo": ""
+    },
+    {
+      "dispenser": 2,
+      "x": 356,
+      "y": 130,
+      "largura": 272,
+      "altura": 500,
+      "rotulo": ""
+    },
+    {
+      "dispenser": 3,
+      "x": 652,
+      "y": 130,
+      "largura": 272,
+      "altura": 500,
+      "rotulo": ""
+    },
+    {
+      "dispenser": 4,
+      "x": 948,
+      "y": 130,
+      "largura": 272,
+      "altura": 500,
+      "rotulo": ""
+    }
+  ]
+}

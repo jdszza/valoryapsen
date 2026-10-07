@@ -93,9 +93,11 @@ TIPOS: dict[str, dict] = {
     },
     TIPO_DIVERGENCIA_MESA: {
         "rotulo":     "Divergência de contagem na câmera da balança",
-        "efeito":     ("A câmera da mesa conta um a menos do que o esperado. "
+        "efeito":     ("A câmera da mesa conta um a mais do que o esperado. "
                        "É UMA fonte do Triple Check divergindo — com o limiar "
-                       "padrão de 1, já trava a OS."),
+                       "padrão de 1, já trava a OS. (A menos não serviria: a "
+                       "câmera contando a menos, sozinha, vira alarme, porque "
+                       "pode ser caixinha escondida.)"),
         "comando":    "/comandos/capturar/mesa",
         "simulador":  "vision",
         "evento":     "leitura_mesa_divergencia",

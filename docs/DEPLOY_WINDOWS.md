@@ -21,7 +21,10 @@ mini PC HP (Windows) ─┬─ COM_A  dispenser      (os 8 mecanismos)     ┐
                       ├─ COM_D  weight         (a balança HX711)        weight-adapter     (host)
                       └─ COM_E  display de 7"  (a bancada)              painel_operador    (host)
 
-câmeras: HTTP/Ethernet (vision-adapter, sem serial — em container)
+câmeras (USB) ─┬─ webcam da mesa          estação da mesa          (host) :8212
+               ├─ webcam fileira esq.    estação dispensers esq   (host) :8301
+               └─ webcam fileira dir.    estação dispensers dir   (host) :8302
+                  as três falam HTTP com o vision-adapter, que fica em container
 alimentação: fonte externa. O USB do mini PC carrega SÓ dados.
 ```
 
@@ -38,7 +41,9 @@ não pendência"*).
 | Processo | Onde | Por quê |
 |---|---|---|
 | `mysql`, `central-computer`, `dashboard`, `manut_web`, `erp-simulator` | container | não tocam em porta nenhuma |
-| `vision-adapter`, `vision-simulator` | container | a visão é HTTP/Ethernet; o simulador serve a bancada até a estação de câmeras existir |
+| `vision-adapter`, `vision-simulator` | container | a visão é HTTP; o simulador continua subindo como rollback das câmeras reais |
+| estação da mesa (`vision/visao_mesa`) | **host** | dona da webcam da mesa — o Docker Desktop não repassa USB |
+| estações dos dispensers, esquerda e direita (`vision/visao`, duas pastas) | **host** | donas das duas webcams das fileiras |
 | `dispenser-adapter` (duas COM: mecanismos + telas TFT) | **host** | dono de COM_A e COM_B |
 | `cnc-adapter` | **host** | dono de COM_C |
 | `weight-adapter` | **host** | dono de COM_D |
@@ -203,6 +208,63 @@ publicava: nada muda para o central, o dashboard ou o pré-voo.
 > rodar a planta agora, `set CNC_TRANSPORTE=http` antes de chamá-lo.
 > Ver [`../cnc/README.md`](../cnc/README.md).
 
+### As três estações de visão
+
+Rodam no host pelo mesmo motivo dos adapters: são donas de um dispositivo USB.
+Todas falam com o vision-adapter (container) pela porta **publicada**,
+`http://127.0.0.1:8102`, e o vision-adapter fala com elas por
+`host.docker.internal`.
+
+| Processo | Arquivo | Porta HTTP |
+|---|---|---|
+| estação da mesa | `vision\visao_mesa\integracao_apsen\iniciar_estacao.bat` | 8212 |
+| estação dispensers esquerda (D1–D4) | `vision\iniciar_dispensers.bat esq` | 8301 |
+| estação dispensers direita (D5–D8) | `vision\iniciar_dispensers.bat dir` | 8302 |
+
+**Nunca `vision\iniciar_visao.bat`**: ele sobe a estação na porta 8000, que é a
+do central.
+
+**Estação da mesa — `vision\visao_mesa\integracao_apsen\.env`** (não versionado;
+o `.bat` dela avisa se faltar):
+
+```bash
+ADAPTER_URL=http://127.0.0.1:8102
+# 8212, e não a 8202 do default: a 8202 é publicada pelo vision-simulator, que
+# continua no ar como rollback.
+PORTA=8212
+HOST=0.0.0.0
+# Espera depois de o comando chegar, para a mesa parar de balançar. Comece com
+# 1.0 e suba se os eventos vierem com falha "fora de foco" (ver o procedimento
+# de bancada M3 no TASKS_VISAO.md).
+T_ASSENTAMENTO_S=1.0
+FRAMES_POR_CAPTURA=5
+```
+
+**Estações dos dispensers.** `iniciar_dispensers.bat <esq|dir>` cria, na
+primeira vez, `vision\visao_esq\` ou `vision\visao_dir\` como cópia de
+`vision\visao\`; a cada execução espelha só o código (`src\`), sem tocar na
+calibração (`config\`) nem no banco de eventos (`dados\`). O Python é o do
+`vision\visao\.venv`, criado uma vez. Antes de operar, em cada pasta:
+`python src\camera.py`, `python src\calibrar.py` com as zonas numeradas pelo
+slot REAL (direita: 5 a 8), e conferir em `config\parametros.json`:
+`backend.ativo=true`, `backend.url=http://127.0.0.1:8102`,
+`backend.intervalo_catalogo=2`. O `.bat` confere esses três e para, em
+vermelho, se algum estiver diferente — o intervalo tem de ser igual ao
+`VISAO_DISP_INTERVALO_CATALOGO_S` do vision-adapter.
+
+**O `.env` da raiz, na célula montada** (o do compose; não versionado):
+
+```bash
+VISION_SIM_URL=http://host.docker.internal:8212
+VISAO_MESA_FONTE=estacao
+VISAO_DISPENSER_FONTE=estacao
+# Slots em que a câmera da mesa vê a caixa INTEIRA — medido na bancada
+# (procedimento M4 no TASKS_VISAO.md). Sem a linha, todos.
+VISAO_MESA_POSICOES=<medido na bancada>
+```
+
+Voltar ao simulador é tirar essas linhas: os defaults são os de antes.
+
 ### Consequências no compose
 
 - os três adapters seriais e os quatro simuladores estão atrás do profile
@@ -216,14 +278,18 @@ publicava: nada muda para o central, o dashboard ou o pré-voo.
 
 ## Subir no boot
 
-Cinco processos precisam subir sozinhos, e **antes** de o compose emitir a
+Oito processos precisam subir sozinhos, e **antes** de o compose emitir a
 primeira OS. Na ordem:
 
 1. Docker Desktop (inicia com o Windows; marque *Start Docker Desktop when you
    sign in*) e `docker compose up -d` — os containers com `restart:
    unless-stopped` voltam sozinhos;
 2. os três adapters do host;
-3. o painel de bancada (`painel_operador\iniciar_backend.bat`).
+3. o painel de bancada (`painel_operador\iniciar_backend.bat`);
+4. as três estações de visão (`iniciar_estacao.bat` da mesa,
+   `iniciar_dispensers.bat esq` e `iniciar_dispensers.bat dir`). Depois do
+   Docker: as dos dispensers buscam o catálogo no vision-adapter, e sem ele
+   sobem com o catálogo local de reserva até a primeira busca dar certo.
 
 Use o **Agendador de Tarefas** (uma tarefa por processo, gatilho *Ao iniciar a
 sessão*, *Executar somente quando o usuário estiver conectado*, com o `.bat` de
@@ -235,6 +301,29 @@ visível, e "fechou a janela" é um sintoma que qualquer um da bancada lê.
 `restart: unless-stopped` não existe para processo do host: um adapter que morra
 **não volta sozinho**. Enquanto não houver supervisor de processo, o sintoma no
 pré-voo é `:810x` vermelho — e o `.bat` com `cmd /k` deixa o traceback na tela.
+
+## Firewall: o container alcançando o host
+
+O central e o vision-adapter, em container, alcançam os processos do host por
+`host.docker.internal`, e para o Windows isso é tráfego de **entrada** nas
+portas do host. Nenhuma regra estava documentada para os adapters
+(`:8100`, `:8101`, `:8103`), então a mesma regra cobre as estações (`:8212`,
+`:8301`, `:8302`). Como Administrador:
+
+```bat
+netsh advfirewall firewall add rule name="APSEN adapters e estacoes" dir=in action=allow protocol=TCP localport=8100,8101,8103,8212,8301,8302 profile=private
+```
+
+Teste de dentro do container (um por porta — troque `8212` por `8301`/`8302`):
+
+```bash
+docker compose exec vision-adapter python -c "import urllib.request;print(urllib.request.urlopen('http://host.docker.internal:8212/ping',timeout=3).read())"
+```
+
+As estações dos dispensers não têm `/ping`: para elas o caminho é
+`/api/saude`. Se o teste der timeout com a regra criada, confira o perfil da
+interface `vEthernet (WSL)` em *Configurações → Rede*: o Windows às vezes a
+classifica como **pública**, e a regra acima vale só para o perfil privado.
 
 ## Armadilhas conhecidas
 

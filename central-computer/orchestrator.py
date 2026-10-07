@@ -638,6 +638,19 @@ class ResultadoTripleCheck(NamedTuple):
     # ("dispenser divergente", "contagem divergente", "divergência de peso").
     # É daqui — e não do texto — que sai o `trava_resumo` das telas TFT.
     categorias: tuple = ()
+    # O que não trava mas precisa de alguém olhando: hoje, a câmera da mesa
+    # contando A MENOS sem nenhuma outra fonte acusar (possível oclusão). Vira
+    # o alarme `contagem_camera_abaixo` no passo 4e.
+    alertas: tuple = ()
+
+
+def _inteiro(valor, padrao: int = 0) -> int:
+    """O número do payload como int, nunca uma exceção — a mesma conversão de
+    `main._inteiro` (o payload do adapter atravessa sem interpretação)."""
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return padrao
 
 
 def avaliar_triple_check(
@@ -646,6 +659,9 @@ def avaliar_triple_check(
     resultado_mesa: Optional[dict],
     resultado_peso: Optional[dict],
     min_divergencias: Optional[int] = None,
+    esperado_camera: Optional[int] = None,
+    slots_camera: tuple = (),
+    motivo_mesa_indisponivel: Optional[str] = None,
 ) -> ResultadoTripleCheck:
     """
     Confronta as 3 fontes independentes de contagem e decide se a OS trava.
@@ -671,6 +687,22 @@ def avaliar_triple_check(
     desligada em campo. O mesmo critério já vale para a câmera do dispenser,
     onde falha de leitura é não-bloqueante e SKU errado é bloqueante.
 
+    **A câmera da mesa contando A MENOS, sozinha, não trava — vira alerta.** A
+    câmera é fixa e inclinada, e a visão não distingue caixinha escondida atrás
+    da parede da caixa de caixinha que não caiu: não há critério de oclusão no
+    `_avaliar` da estação. Contar a menos é divergência só se o dispenser ou a
+    balança também acusarem neste mesmo veredito. Contar A MAIS continua
+    travando: caixinha a mais não se esconde — é unidade extra ou objeto
+    estranho. A diferença é calculada AQUI, dos dois inteiros, e nunca lida do
+    `delta` do payload.
+
+    A câmera pode ter conferido mais de um slot de uma vez (posições em que ela
+    não vê a caixa inteira, ou captura anterior que falhou): `esperado_camera`
+    é o total esperado nessa foto e `slots_camera` os slots que ela cobre.
+    None/() é uma foto de um slot só, contra `quantidade_esperada`.
+    `motivo_mesa_indisponivel` dá o porquê quando `resultado_mesa` é None e não
+    foi timeout (posição sem visão, câmera ressincronizando).
+
     Função PURA: não envia comando, não toca no estado. `min_divergencias`
     sobrepõe o limiar de configuração (usado pelos testes).
     """
@@ -682,6 +714,7 @@ def avaliar_triple_check(
     divergencias: list[str] = []
     categorias: list[str] = []
     indisponiveis: list[str] = []
+    alertas: list[str] = []
 
     # Fonte 1 — dispenser. `None` significa que o `dispensado` NÃO chegou dentro
     # do prazo do cronograma, e isso deixou de abortar a OS quando o ciclo
@@ -694,33 +727,60 @@ def avaliar_triple_check(
     # assumir o alvo, que é o que a versão anterior fazia com o `.get(...,
     # qtd_esperada)`, seria pior: a fonte 1 passaria a CONFIRMAR uma contagem
     # que ninguém fez, e o Triple Check viraria um double check sem avisar.
+    # As três fontes são decididas primeiro e montadas depois, na ordem de
+    # sempre (dispenser, câmera, balança): a câmera a menos depende de saber se
+    # ALGUMA das outras duas acusou, inclusive a balança, que vem depois.
+    div_disp = div_cam = div_peso = None
+    indisponivel_peso = None
+
     if quantidade_dispensada is None:
         indisponiveis.append("dispenser: sem confirmação de dispensa (prazo vencido)")
     elif quantidade_dispensada != quantidade_esperada:
-        divergencias.append(
-            f"dispenser: dispensou {quantidade_dispensada} de {quantidade_esperada} esperados"
-        )
-        categorias.append("dispenser divergente")
-
-    # Fonte 2 — câmera da mesa
-    if resultado_mesa is None:
-        indisponiveis.append("câmera_mesa: sem resposta (timeout)")
-    elif resultado_mesa.get("tipo") == "leitura_mesa_divergencia":
-        det = resultado_mesa.get("quantidade_detectada", "?")
-        divergencias.append(f"câmera_mesa: detectou {det} de {quantidade_esperada}")
-        categorias.append("contagem divergente")
-    elif resultado_mesa.get("tipo") == "leitura_mesa_falha":
-        indisponiveis.append("câmera_mesa: falha de leitura")
+        div_disp = f"dispenser: dispensou {quantidade_dispensada} de {quantidade_esperada} esperados"
 
     # Fonte 3 — balança HX711
     if resultado_peso is None:
-        indisponiveis.append("balança: sem resposta (timeout)")
+        indisponivel_peso = "balança: sem resposta (timeout)"
     elif resultado_peso.get("tipo") == "peso_divergencia":
         desvio = resultado_peso.get("desvio_pct") or 0
-        divergencias.append(f"balança: desvio={desvio:.1f}%")
-        categorias.append("divergência de peso")
+        div_peso = f"balança: desvio={desvio:.1f}%"
     elif resultado_peso.get("tipo") == "erro_sensor":
-        indisponiveis.append("balança: sensor indisponível")
+        indisponivel_peso = "balança: sensor indisponível"
+
+    # Fonte 2 — câmera da mesa
+    if resultado_mesa is None:
+        indisponiveis.append(
+            f"câmera_mesa: {motivo_mesa_indisponivel or 'sem resposta (timeout)'}")
+    elif resultado_mesa.get("tipo") == "leitura_mesa_divergencia":
+        esperado = (quantidade_esperada if esperado_camera is None
+                    else _inteiro(esperado_camera, quantidade_esperada))
+        det = _inteiro(resultado_mesa.get("quantidade_detectada"))
+        delta = det - esperado
+        cobertura = (f" ({'+'.join(f'D{s}' for s in slots_camera)})"
+                     if len(slots_camera) > 1 else "")
+        if delta > 0 or (delta < 0 and (div_disp or div_peso)):
+            div_cam = f"câmera_mesa: detectou {det} de {esperado}{cobertura}"
+        elif delta < 0:
+            alertas.append(f"câmera_mesa: contou {-delta} a menos{cobertura} — possível "
+                           f"oclusão; balança e dispenser não acusaram")
+        else:
+            logger.warning("[ORCH] leitura_mesa_divergencia com contagem igual à esperada "
+                           "(%d de %d) — payload incoerente, câmera tratada como "
+                           "sem medição.", det, esperado)
+            indisponiveis.append("câmera_mesa: divergência sem diferença de contagem "
+                                 "(payload incoerente)")
+    elif resultado_mesa.get("tipo") == "leitura_mesa_falha":
+        indisponiveis.append("câmera_mesa: falha de leitura")
+
+    if indisponivel_peso:
+        indisponiveis.append(indisponivel_peso)
+
+    for texto, categoria in ((div_disp, "dispenser divergente"),
+                             (div_cam, "contagem divergente"),
+                             (div_peso, "divergência de peso")):
+        if texto:
+            divergencias.append(texto)
+            categorias.append(categoria)
 
     return ResultadoTripleCheck(
         travar=len(divergencias) >= limiar,
@@ -728,6 +788,7 @@ def avaliar_triple_check(
         fontes_indisponiveis=indisponiveis,
         limiar=limiar,
         categorias=tuple(categorias),
+        alertas=tuple(alertas),
     )
 
 
@@ -1131,8 +1192,16 @@ async def cmd_visao_dispenser(slot_id: int, sku: str, medicamento: str,
 
 
 async def cmd_visao_mesa(slot_id: int, os_id: str, quantidade: int,
-                          pos_x: float, pos_y: float) -> bool:
-    """Solicita captura da câmera da mesa para validar produtos dispensados."""
+                          pos_x: float, pos_y: float,
+                          slots_cobertos: Optional[list] = None,
+                          quantidade_slot: Optional[int] = None) -> bool:
+    """Solicita captura da câmera da mesa para validar produtos dispensados.
+
+    `quantidade` é o que a câmera deve ver de NOVO desde a última captura que
+    ela registrou — o slot `slot_id` mais os que ficaram sem conferência antes
+    dele. `slots_cobertos` e `quantidade_slot` vão de informação (a estação
+    aceita campos extras e os ignora).
+    """
     return await _post(
         settings.VISION_ADAPTER_URL + "/comandos/capturar/mesa",
         {
@@ -1141,6 +1210,8 @@ async def cmd_visao_mesa(slot_id: int, os_id: str, quantidade: int,
             "quantidade_esperada": quantidade,
             "posicao_x":         pos_x,
             "posicao_y":         pos_y,
+            "slots_cobertos":    slots_cobertos if slots_cobertos is not None else [slot_id],
+            "quantidade_slot":   quantidade if quantidade_slot is None else quantidade_slot,
             **_injecao_para("/comandos/capturar/mesa", slot_id),
         },
         timeout=5.0,
@@ -1188,6 +1259,87 @@ async def cmd_pesar(slot_id: int, os_id: str, quantidade: int, peso_unitario_g: 
         },
         timeout=5.0,
     )
+
+
+# ── Conferência final da câmera da mesa, no HOME ──────────────────────────────
+
+async def _alarme_mesa(tipo: str, descricao: str) -> None:
+    logger.warning("[ORCH] %s", descricao)
+    try:
+        await asyncio.to_thread(salvar_alarme, "camera_mesa", tipo, descricao)
+    except Exception as e:
+        logger.warning("[DB] salvar_alarme %s: %s", tipo, e)
+
+
+async def _conferir_mesa_no_home(os_id: str, pendentes: list, homing_ok: bool,
+                                 cancelar: asyncio.Event) -> None:
+    """Uma foto no HOME para o que nenhuma parada conferiu (VISAO_MESA_FINAL=HOME).
+
+    Só vale se no HOME a câmera vê a caixa inteira — por isso nasce desligado.
+    A estação nunca refotografa um par (os_id, slot) que já recebeu, então a
+    foto usa o slot de um pendente que nunca foi pedido; sem nenhum livre, não
+    há foto possível e o que sobra é o alarme. O desfecho segue a regra do
+    Triple Check para a câmera: a MAIS trava, a menos vira alarme.
+    """
+    slots = [p[0] for p in pendentes]
+    nomes = ", ".join(f"D{s}" for s in slots)
+    if not homing_ok:
+        await _alarme_mesa("conferencia_final_sem_homing",
+                           f"OS {os_id}: câmera da mesa não conferiu {nomes} — homing "
+                           f"não confirmado, a mesa pode não estar no HOME.")
+        return
+    livre = next((p for p in pendentes if not p[2]), None)
+    if livre is None:
+        await _alarme_mesa("conferencia_final_impossivel",
+                           f"OS {os_id}: câmera não conferiu {nomes} (pares já usados).")
+        return
+    espera = settings.CNC_TETO_TRAJETO_S + settings.CNC_MARGEM_CHEGADA_S
+    if not await _dormir_ou_cancelar(espera, cancelar):
+        return
+
+    esperado = sum(p[1] for p in pendentes)
+    chave = f"{os_id}:visao_mesa:{livre[0]}"
+    registrar_evento(chave)
+    logger.info("[ORCH] Câmera mesa no HOME: pedindo captura | OS=%s esperado=%d "
+                "slots_cobertos=%s (par D%d)", os_id, esperado, slots, livre[0])
+    if await cmd_visao_mesa(livre[0], os_id, esperado, HOME[0], HOME[1],
+                            slots_cobertos=slots, quantidade_slot=0):
+        resultado = await aguardar_evento(chave, settings.TIMEOUT_VISAO_MESA)
+    else:
+        _pending_events.pop(chave, None)
+        resultado = None
+
+    tipo = resultado.get("tipo") if resultado else None
+    if tipo == "leitura_mesa_ok":
+        logger.info("[ORCH] Câmera mesa no HOME conferiu %s: OK.", nomes)
+        return
+    if tipo != "leitura_mesa_divergencia":
+        await _alarme_mesa("conferencia_final_sem_leitura",
+                           f"OS {os_id}: câmera da mesa no HOME não conferiu {nomes} "
+                           f"({(resultado or {}).get('motivo') or 'sem resposta'}).")
+        return
+
+    detectado = _inteiro(resultado.get("quantidade_detectada"))
+    delta = detectado - esperado
+    if delta > 0:
+        motivo = (f"Câmera da mesa no HOME contou {detectado} de {esperado} "
+                  f"({'+'.join(f'D{s}' for s in slots)}) — {delta} a mais na caixa de "
+                  f"coleta. Confira a caixa e libere a trava.")
+        logger.error("[ORCH] ⛔ %s", motivo)
+        evento_lib = await _ativar_trava(os_id, livre[0], motivo, resumo="contagem divergente")
+        await _aguardar_liberacao(evento_lib, cancelar)
+        with _lock:
+            _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
+        if _broadcast_fn:
+            _broadcast_fn()
+    elif delta < 0:
+        await _alarme_mesa("contagem_camera_abaixo",
+                           f"OS {os_id}: câmera da mesa no HOME contou {-delta} a menos "
+                           f"em {nomes} ({detectado} de {esperado}) — possível oclusão.")
+    else:
+        await _alarme_mesa("conferencia_final_sem_leitura",
+                           f"OS {os_id}: divergência no HOME sem diferença de contagem "
+                           f"({detectado} de {esperado}) — payload incoerente.")
 
 
 # ── Processamento de uma OS ────────────────────────────────────────────────────
@@ -1393,8 +1545,20 @@ async def _processar_os(os_payload: dict):
     logger.info("[ORCH] Todos os dispensers prontos. Iniciando validação de visão.")
 
     # ── 3b. Scan da câmera dos dispensers (paralelo, não-bloqueante) ─────────
+    # Com a conferência de SKU desligada, nenhum slot é escaneado: o desfecho é
+    # o mesmo de hoje quando o envio falha (slot segue sem validar SKU), sem
+    # as três tentativas por slot contra uma câmera que não está lá.
+    if settings.VISAO_SKU_HABILITADA:
+        atribuicoes_scan = atribuicoes
+    else:
+        atribuicoes_scan = []
+        logger.warning(
+            "[ORCH] OS %s: validação de SKU desligada (VISAO_SKU_HABILITADA=0) — "
+            "slots seguem sem conferência de produto.", os_id,
+        )
+
     # Registrar eventos ANTES de solicitar scans
-    chaves_visao_disp = [f"{os_id}:visao_dispenser:{a['dispenser_id']}" for a in atribuicoes]
+    chaves_visao_disp = [f"{os_id}:visao_dispenser:{a['dispenser_id']}" for a in atribuicoes_scan]
     for chave in chaves_visao_disp:
         registrar_evento(chave)
 
@@ -1406,7 +1570,7 @@ async def _processar_os(os_payload: dict):
             a["dispenser_id"], a.get("sku", ""), a["medicamento"],
             a["quantidade"], os_id,
         )
-        for a in atribuicoes
+        for a in atribuicoes_scan
     ])
 
     # Aqui o envio recusado NÃO aborta a OS, ao contrário do carregamento:
@@ -1416,7 +1580,7 @@ async def _processar_os(os_payload: dict):
     # planta o evento nunca vem, então o `aguardar_evento` seria TIMEOUT_VISAO_
     # DISPENSER de relógio queimado por um resultado que já sabemos que não
     # existe. Resolvemos o slot como `None` na hora, que é onde ele cairia.
-    for a, ok in zip(atribuicoes, envios_scan, strict=True):
+    for a, ok in zip(atribuicoes_scan, envios_scan, strict=True):
         if not ok:
             logger.warning(
                 "[ORCH] Não foi possível solicitar scan câmera dispenser D%d — "
@@ -1437,7 +1601,7 @@ async def _processar_os(os_payload: dict):
     slots_sku_errado: list = []  # lista de (atribuicao, resultado)
 
     for i, res in enumerate(resultados_visao_disp):
-        a = atribuicoes[i]
+        a = atribuicoes_scan[i]
         if res is None:
             logger.warning(
                 "[ORCH] Timeout visão dispenser D%d — sem validação de SKU.", a["dispenser_id"]
@@ -1458,6 +1622,26 @@ async def _processar_os(os_payload: dict):
                 "[ORCH] Visão D%d OK — SKU=%s conf=%.0f%%",
                 a["dispenser_id"], res.get("sku_lido", ""), (res.get("confianca", 0) or 0) * 100,
             )
+
+    # A câmera da mesa só sabe o que caiu num slot pela DIFERENÇA entre o total
+    # que ela vê na caixa agora e o último total que ela mesma registrou nesta
+    # OS. Duas coisas quebram essa conta, e o laço do passo 4 as carrega:
+    #
+    # - `pendentes_mesa`: slots cuja contagem ainda não foi conferida — posição
+    #   em que a câmera não vê a caixa inteira (VISAO_MESA_POSICOES), ou foto
+    #   que falhou sem a estação registrar o total. A próxima foto vê todos eles
+    #   juntos, e é contra a soma que ela tem de ser comparada; comparar com a
+    #   quantidade de um slot só seria divergência falsa. Cada item é
+    #   (slot, quantidade, já_pedido): a estação nunca refotografa um par
+    #   (os_id, slot) que já recebeu, e é isso que decide quem pode ser usado na
+    #   conferência final no HOME.
+    # - `mesa_dessincronizada`: não se sabe se a estação registrou o total da
+    #   última foto (timeout, envio recusado, timeout_processamento — que pode
+    #   terminar depois e atualizar em silêncio), ou alguém pode ter mexido na
+    #   caixa durante uma trava. A próxima divergência não é comparável: vira
+    #   fonte indisponível, e a estação, ao registrar o total, ressincroniza.
+    pendentes_mesa: list[tuple[int, int, bool]] = []
+    mesa_dessincronizada = False
 
     # Loop de bloqueio: mantém trava até todos os slots com SKU errado serem corrigidos
     while slots_sku_errado:
@@ -1489,6 +1673,9 @@ async def _processar_os(os_payload: dict):
             a_err["dispenser_id"], os_id,
         )
         await _aguardar_liberacao(evento_lib, cancelar)
+        # Decisão F: com a trava aberta, alguém pode ter mexido na caixa de
+        # coleta, e o central não tem como saber.
+        mesa_dessincronizada = True
 
         with _lock:
             _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
@@ -1688,7 +1875,6 @@ async def _processar_os(os_payload: dict):
 
         # 4c. Scan da câmera da mesa (não-bloqueante)
         chave_visao_mesa = f"{os_id}:visao_mesa:{disp_id}"
-        registrar_evento(chave_visao_mesa)
 
         # A posição vem da MÁQUINA (o evento `posicionado` carrega a medida do
         # tracker da placa). Só quando ela não vem é que se cai no modelo — e
@@ -1700,29 +1886,84 @@ async def _processar_os(os_payload: dict):
         # chamar aquilo de D5 — divergência de contagem num slot só, que é
         # indistinguível de medicamento faltando.
         pos_x, pos_y = _posicao_do_evento(resultado_pos, disp_id)
-        ok = await cmd_visao_mesa(disp_id, os_id, a["quantidade"], pos_x, pos_y)
-        if not ok:
-            logger.warning("[ORCH] Não foi possível solicitar scan câmera mesa D%d", disp_id)
+        resultado_mesa: Optional[dict] = None
+        motivo_mesa: Optional[str] = None
+        esperado_camera: Optional[int] = None
+        slots_camera: tuple = ()
 
-        resultado_mesa = await aguardar_evento(chave_visao_mesa, settings.TIMEOUT_VISAO_MESA)
-        if resultado_mesa is None:
-            logger.warning(
-                "[ORCH] Timeout câmera mesa D%d — continuando sem validação de contagem.", disp_id
-            )
-        elif resultado_mesa.get("tipo") in ("leitura_mesa_falha", "leitura_mesa_divergencia"):
-            logger.warning(
-                "[ORCH] ALARME câmera mesa D%d: %s | esp=%d det=%d",
-                disp_id, resultado_mesa.get("tipo"),
-                resultado_mesa.get("quantidade_esperada", 0),
-                resultado_mesa.get("quantidade_detectada", 0),
-            )
+        if disp_id not in settings.VISAO_MESA_POSICOES:
+            pendentes_mesa.append((disp_id, qtd_esperada, False))
+            motivo_mesa = ("câmera sem visão completa nesta posição — conferido junto "
+                           "com o próximo slot visível")
+            logger.info("[ORCH] Câmera mesa D%d não fotografada (fora de "
+                        "VISAO_MESA_POSICOES) — pendentes: %s",
+                        disp_id, [p[0] for p in pendentes_mesa])
         else:
-            logger.info(
-                "[ORCH] Câmera mesa D%d OK — detectado=%d conf=%.0f%%",
-                disp_id,
-                resultado_mesa.get("quantidade_detectada", 0),
-                (resultado_mesa.get("confianca", 0) or 0) * 100,
-            )
+            slots_camera = tuple(p[0] for p in pendentes_mesa) + (disp_id,)
+            esperado_camera = qtd_esperada + sum(p[1] for p in pendentes_mesa)
+            registrar_evento(chave_visao_mesa)
+            logger.info("[ORCH] Câmera mesa D%d: pedindo captura | OS=%s esperado=%d "
+                        "slots_cobertos=%s", disp_id, os_id, esperado_camera,
+                        list(slots_camera))
+            ok = await cmd_visao_mesa(disp_id, os_id, esperado_camera, pos_x, pos_y,
+                                      slots_cobertos=list(slots_camera),
+                                      quantidade_slot=qtd_esperada)
+            if not ok:
+                logger.warning("[ORCH] Não foi possível solicitar scan câmera mesa D%d", disp_id)
+
+            resultado_mesa = await aguardar_evento(chave_visao_mesa, settings.TIMEOUT_VISAO_MESA)
+            tipo_mesa = resultado_mesa.get("tipo") if resultado_mesa else None
+            estava_dessincronizada = mesa_dessincronizada
+
+            if tipo_mesa in ("leitura_mesa_ok", "leitura_mesa_divergencia"):
+                # A estação registrou o total que viu: a conta volta a fechar.
+                pendentes_mesa = []
+                mesa_dessincronizada = False
+            elif (tipo_mesa == "leitura_mesa_falha"
+                    and resultado_mesa.get("motivo") != "timeout_processamento"):
+                # Falha que a estação NÃO registrou: o total dela continua o de
+                # antes, e o que caiu aqui entra na próxima foto.
+                pendentes_mesa.append((disp_id, qtd_esperada, True))
+            else:
+                # Timeout, envio recusado ou timeout_processamento: não se sabe
+                # se a estação registrou o total.
+                pendentes_mesa = []
+                mesa_dessincronizada = True
+
+            if (tipo_mesa == "leitura_mesa_divergencia" and estava_dessincronizada):
+                motivo_mesa = ("câmera ressincronizando (captura anterior sem "
+                               "desfecho conhecido)")
+                descricao = (f"Câmera mesa D{disp_id} OS {os_id}: divergência não "
+                             f"conferida — {motivo_mesa}; detectou "
+                             f"{resultado_mesa.get('quantidade_detectada')} de "
+                             f"{esperado_camera}.")
+                logger.warning("[ORCH] %s", descricao)
+                try:
+                    await asyncio.to_thread(salvar_alarme, f"camera_mesa_{disp_id}",
+                                            "camera_mesa_ressincronizando", descricao)
+                except Exception as e:
+                    logger.warning("[DB] salvar_alarme ressincronizando: %s", e)
+                resultado_mesa = None
+
+            if resultado_mesa is None and motivo_mesa is None:
+                logger.warning(
+                    "[ORCH] Timeout câmera mesa D%d — continuando sem validação de contagem.", disp_id
+                )
+            elif tipo_mesa in ("leitura_mesa_falha", "leitura_mesa_divergencia"):
+                logger.warning(
+                    "[ORCH] ALARME câmera mesa D%d: %s | esp=%s det=%s | slots=%s | "
+                    "pendentes=%s",
+                    disp_id, tipo_mesa, esperado_camera,
+                    resultado_mesa.get("quantidade_detectada") if resultado_mesa else "-",
+                    list(slots_camera), [p[0] for p in pendentes_mesa],
+                )
+            elif resultado_mesa is not None:
+                logger.info(
+                    "[ORCH] Câmera mesa D%d OK — detectado=%s de %d %s conf=%.0f%%",
+                    disp_id, resultado_mesa.get("quantidade_detectada", 0),
+                    esperado_camera, list(slots_camera),
+                    (resultado_mesa.get("confianca", 0) or 0) * 100,
+                )
 
         # 4d. Pesagem HX711 (bloqueante se Triple Check divergir)
         chave_peso = f"{os_id}:peso:{disp_id}"
@@ -1769,9 +2010,26 @@ async def _processar_os(os_payload: dict):
             quantidade_dispensada=qtd_dispensada,
             resultado_mesa=resultado_mesa,
             resultado_peso=resultado_peso,
+            esperado_camera=esperado_camera,
+            slots_camera=slots_camera,
+            motivo_mesa_indisponivel=motivo_mesa,
         )
         n_div  = len(veredito.divergencias)
         causas = veredito.divergencias
+
+        if veredito.alertas:
+            # Não trava: a câmera sozinha contando a menos pode ser oclusão.
+            # Mas fica no banco — é a balança que segura esse caso, e alguém
+            # precisa poder ver quantas vezes ele aconteceu.
+            descricao = (f"Triple Check D{disp_id} OS {os_id} (OS prossegue): "
+                         + "; ".join(veredito.alertas))
+            logger.warning("[ORCH] %s", descricao)
+            try:
+                await asyncio.to_thread(
+                    salvar_alarme, "triple_check", "contagem_camera_abaixo", descricao
+                )
+            except Exception as e:
+                logger.warning("[DB] salvar_alarme contagem_camera_abaixo: %s", e)
 
         if veredito.fontes_indisponiveis:
             logger.warning(
@@ -1793,6 +2051,8 @@ async def _processar_os(os_payload: dict):
                                                    resumo=resumo_da_trava(veredito))
             logger.warning("[ORCH] Aguardando liberação da trava (OS %s, D%d)…", os_id, disp_id)
             await _aguardar_liberacao(evento_liberacao, cancelar)
+            # Decisão F: com a trava aberta, alguém pode ter mexido na caixa.
+            mesa_dessincronizada = True
             logger.info("[ORCH] Trava liberada. Retomando OS %s a partir de D%d.", os_id, disp_id)
             with _lock:
                 _estado["trava"] = {"ativa": False, "os_id": None, "slot_id": None, "motivo": ""}
@@ -1828,7 +2088,8 @@ async def _processar_os(os_payload: dict):
     # depois de ter entregue tudo certo. O alarme é o desfecho proporcional —
     # ele manda alguém olhar a mesa antes da OS seguinte.
     logger.info("[ORCH] Ciclo completo. CNC retornando para HOME.")
-    if not await cmd_homing(os_id):
+    homing_ok = await cmd_homing(os_id)
+    if not homing_ok:
         descricao = (
             f"OS {os_id}: comando de homing de fim de ciclo não foi aceito pelo "
             f"cnc-adapter. A mesa pode ter ficado parada no último dispenser, e a "
@@ -1841,6 +2102,14 @@ async def _processar_os(os_payload: dict):
             )
         except Exception as e:
             logger.warning("[DB] salvar_alarme homing_nao_confirmado: %s", e)
+
+    # ── 5b. O que a câmera da mesa não conferiu ──────────────────────────────
+    if pendentes_mesa and settings.VISAO_MESA_FINAL == "HOME":
+        await _conferir_mesa_no_home(os_id, pendentes_mesa, homing_ok, cancelar)
+    elif pendentes_mesa:
+        logger.warning("[ORCH] OS %s termina com %s sem conferência da câmera da mesa "
+                       "(VISAO_MESA_FINAL desligado).", os_id,
+                       ", ".join(f"D{p[0]}" for p in pendentes_mesa))
 
     # ── 6. OS concluída ──────────────────────────────────────────────────────
     try:
