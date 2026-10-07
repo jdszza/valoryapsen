@@ -217,15 +217,33 @@ Todas falam com o vision-adapter (container) pela porta **publicada**,
 
 | Processo | Arquivo | Porta HTTP |
 |---|---|---|
-| estação da mesa | `vision\visao_mesa\integracao_apsen\iniciar_estacao.bat` | 8212 |
+| estação da mesa | `vision\iniciar_mesa.bat` | 8212 |
 | estação dispensers esquerda (D1–D4) | `vision\iniciar_dispensers.bat esq` | 8301 |
 | estação dispensers direita (D5–D8) | `vision\iniciar_dispensers.bat dir` | 8302 |
 
 **Nunca `vision\iniciar_visao.bat`**: ele sobe a estação na porta 8000, que é a
-do central.
+do central. E a estação da mesa sobe pelo `vision\iniciar_mesa.bat`, não pelo
+`iniciar_estacao.bat` que veio dentro dela (que continua lá, intocado): o novo
+roda `vision\conferir_mesa.py` antes de subir e reergue a estação se ela cair.
+
+**Estação da mesa — o venv.** O `vision\visao_mesa\.venv` precisa dos DOIS
+requirements — o da visão (opencv-contrib, numpy) e o da integração (fastapi,
+uvicorn, requests). Sem o segundo, `python -m integracao_apsen.servidor` morre
+no import:
+
+```bash
+cd vision\visao_mesa
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt -r integracao_apsen\requirements.txt
+```
+
+Venv criado em OUTRA máquina não serve: ele aponta para o Python de lá. O
+`conferir_mesa.py` diz isso com a causa; apague a pasta e recrie.
 
 **Estação da mesa — `vision\visao_mesa\integracao_apsen\.env`** (não versionado;
-o `.bat` dela avisa se faltar):
+o `conferir_mesa.py` reprova se faltar ou se algum valor abaixo estiver
+diferente):
 
 ```bash
 ADAPTER_URL=http://127.0.0.1:8102
@@ -235,9 +253,18 @@ PORTA=8212
 HOST=0.0.0.0
 # Espera depois de o comando chegar, para a mesa parar de balançar. Comece com
 # 1.0 e suba se os eventos vierem com falha "fora de foco" (ver o procedimento
-# de bancada M3 no TASKS_VISAO.md).
+# de bancada M3 em docs/BANCADA_VISAO.md).
 T_ASSENTAMENTO_S=1.0
 FRAMES_POR_CAPTURA=5
+# SEMPRE 0. Ligado, a estação devolveria uma contagem SEM medir nem registrar o
+# total, e a foto do slot seguinte veria os dois slots juntos — a trava cairia no
+# slot errado. Com a câmera real, quem injeta a falha da demonstração é o
+# vision-adapter, reescrevendo o evento verdadeiro.
+ACEITAR_INJECAO=0
+# O acumulado da OS vive só na memória da estação e expira neste prazo desde a
+# última foto. Com o default (2 h), uma trava esperando supervisor no almoço
+# apaga a conta, e a foto seguinte compararia a caixa INTEIRA com um slot.
+VALIDADE_OS_H=24
 ```
 
 **Estações dos dispensers.** `iniciar_dispensers.bat <esq|dir>` cria, na
@@ -247,10 +274,21 @@ calibração (`config\`) nem no banco de eventos (`dados\`). O Python é o do
 `vision\visao\.venv`, criado uma vez. Antes de operar, em cada pasta:
 `python src\camera.py`, `python src\calibrar.py` com as zonas numeradas pelo
 slot REAL (direita: 5 a 8), e conferir em `config\parametros.json`:
-`backend.ativo=true`, `backend.url=http://127.0.0.1:8102`,
-`backend.intervalo_catalogo=2`. O `.bat` confere esses três e para, em
-vermelho, se algum estiver diferente — o intervalo tem de ser igual ao
-`VISAO_DISP_INTERVALO_CATALOGO_S` do vision-adapter.
+`backend.ativo=true`, `backend.intervalo_catalogo=2` e o `backend.url` **do
+lado** — `http://127.0.0.1:8102/estacoes/esq` numa pasta,
+`http://127.0.0.1:8102/estacoes/dir` na outra. A estação monta a URL como
+`{backend.url}/api/visao/catalogo`, e é pela rota do lado que o vision-adapter
+PROVA que aquela estação buscou o catálogo da OS corrente (o relógio sozinho só
+supõe). O intervalo tem de ser igual ao `VISAO_DISP_INTERVALO_CATALOGO_S` do
+vision-adapter.
+
+O `.bat` roda `vision\conferir_dispensers.py <lado>` antes de subir e para, em
+vermelho, se as zonas não foram calibradas nesta bancada (idênticas às do
+modelo, ou numeradas fora do lado), se ninguém escolheu a câmera, se a câmera é
+a mesma de outra estação ou se o `backend` está diferente do acima. A câmera é
+a que o `camera.py` gravou, **por nome**: `CAMERA_ESQ`/`CAMERA_DIR` no `.bat`
+ficam vazios, e preenchê-los é escape manual — um número ali vai direto para o
+índice, e índice de webcam USB muda com a ordem de enumeração.
 
 **O `.env` da raiz, na célula montada** (o do compose; não versionado):
 
@@ -259,7 +297,7 @@ VISION_SIM_URL=http://host.docker.internal:8212
 VISAO_MESA_FONTE=estacao
 VISAO_DISPENSER_FONTE=estacao
 # Slots em que a câmera da mesa vê a caixa INTEIRA — medido na bancada
-# (procedimento M4 no TASKS_VISAO.md). Sem a linha, todos.
+# (procedimento M4 em docs/BANCADA_VISAO.md). Sem a linha, todos.
 VISAO_MESA_POSICOES=<medido na bancada>
 ```
 
@@ -286,10 +324,26 @@ primeira OS. Na ordem:
    unless-stopped` voltam sozinhos;
 2. os três adapters do host;
 3. o painel de bancada (`painel_operador\iniciar_backend.bat`);
-4. as três estações de visão (`iniciar_estacao.bat` da mesa,
-   `iniciar_dispensers.bat esq` e `iniciar_dispensers.bat dir`). Depois do
-   Docker: as dos dispensers buscam o catálogo no vision-adapter, e sem ele
-   sobem com o catálogo local de reserva até a primeira busca dar certo.
+4. as três estações de visão (`vision\iniciar_mesa.bat`,
+   `vision\iniciar_dispensers.bat esq` e `vision\iniciar_dispensers.bat dir`).
+   Depois do Docker: as dos dispensers buscam o catálogo no vision-adapter, e
+   sem ele sobem com o catálogo local de reserva até a primeira busca dar certo.
+   O vision-adapter não espera por elas para servir: o `lifespan` só loga a
+   espera, em segundo plano.
+
+**As três estações se reerguem sozinhas.** Os dois `.bat` da visão rodam a
+estação num laço: se ela sair — falha de câmera, ESC na janela, qualquer
+código —, a linha vai para o log de reinícios e ela sobe de novo em 5 s:
+
+| estação | log de reinícios |
+|---|---|
+| mesa | `vision\visao_mesa\dados\reinicios.log` |
+| dispensers esq / dir | `vision\visao_<lado>\logs\reinicios.log` |
+
+Reiniciar a estação da mesa com OS rodando custa uma conferência, não uma trava:
+o vision-adapter nota que ela perdeu o acumulado da OS e marca a foto seguinte
+como `ressincronizar`. Para encerrar uma estação de vez: Ctrl+C na janela e
+responda S.
 
 Use o **Agendador de Tarefas** (uma tarefa por processo, gatilho *Ao iniciar a
 sessão*, *Executar somente quando o usuário estiver conectado*, com o `.bat` de
@@ -299,7 +353,8 @@ Janela separada é melhor que serviço do Windows aqui: o log de cada porta fica
 visível, e "fechou a janela" é um sintoma que qualquer um da bancada lê.
 
 `restart: unless-stopped` não existe para processo do host: um adapter que morra
-**não volta sozinho**. Enquanto não houver supervisor de processo, o sintoma no
+**não volta sozinho** (as estações de visão voltam — o laço do `.bat` é o
+supervisor delas). Enquanto não houver supervisor de processo, o sintoma no
 pré-voo é `:810x` vermelho — e o `.bat` com `cmd /k` deixa o traceback na tela.
 
 ## Firewall: o container alcançando o host

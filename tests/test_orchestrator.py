@@ -581,13 +581,15 @@ PESO_DIVERGENTE  = {"tipo": "peso_divergencia", "desvio_pct": 20.0}
 PESO_ERRO_SENSOR = {"tipo": "erro_sensor"}
 
 
-def _avaliar(orq, dispensado=QTD_ALVO, mesa=MESA_OK, peso=PESO_OK, limiar=None):
+def _avaliar(orq, dispensado=QTD_ALVO, mesa=MESA_OK, peso=PESO_OK, limiar=None,
+             **extras):
     return orq.modulo.avaliar_triple_check(
         quantidade_esperada=QTD_ALVO,
         quantidade_dispensada=dispensado,
         resultado_mesa=mesa,
         resultado_peso=peso,
         min_divergencias=limiar,
+        **extras,
     )
 
 
@@ -2639,7 +2641,9 @@ def _roteiro_mesa(orq, monkeypatch, roteiro: dict):
     """Troca a resposta da câmera da mesa por um roteiro {slot: ação}.
 
     Ação: "ok" | "falha" | "timeout_processamento" | "mudo" | ("div", Δ), com Δ
-    sobre o esperado da foto. Slot fora do roteiro responde "ok".
+    sobre o esperado da foto. Slot fora do roteiro responde "ok". Um terceiro
+    item na tupla — ("div", Δ, {campo: valor}) — são campos extras do evento,
+    como o `ressincronizar` que o vision-adapter acrescenta.
     """
     original = orq.adapter._responder
 
@@ -2657,9 +2661,10 @@ def _roteiro_mesa(orq, monkeypatch, roteiro: dict):
                                 motivo="imagem_fora_de_foco" if acao == "falha" else acao,
                                 quantidade_esperada=esperado, quantidade_detectada=0)
         elif acao != "mudo":
+            extras = acao[2] if len(acao) > 2 else {}
             orq.adapter._evento(chave, tipo="leitura_mesa_divergencia",
                                 quantidade_esperada=esperado,
-                                quantidade_detectada=esperado + acao[1])
+                                quantidade_detectada=esperado + acao[1], **extras)
 
     monkeypatch.setattr(orq.adapter, "_responder", responder)
     monkeypatch.setattr(orq.modulo.settings, "TIMEOUT_VISAO_MESA", 0.01)
@@ -2876,3 +2881,308 @@ def test_visao_mesa_posicoes(carregar_orquestrador, valor, esperado):
 def test_visao_mesa_final(carregar_orquestrador, valor, esperado):
     orq = carregar_orquestrador({"VISAO_MESA_FINAL": valor})
     assert orq.modulo.settings.VISAO_MESA_FINAL == esperado
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A conta da câmera da mesa: o que a auditoria de 07/10 achou
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _espiar_trava(orq, monkeypatch) -> list[str]:
+    motivos: list[str] = []
+    original = orq.modulo._ativar_trava
+
+    async def espia(os_id, slot_id, motivo, resumo=""):
+        motivos.append(motivo)
+        return await original(os_id, slot_id, motivo, resumo=resumo)
+    monkeypatch.setattr(orq.modulo, "_ativar_trava", espia)
+    return motivos
+
+
+def _espiar_esperas(orq, monkeypatch) -> list[str]:
+    chaves: list[str] = []
+    original = orq.modulo.aguardar_evento
+
+    async def espia(chave, timeout):
+        chaves.append(chave)
+        return await original(chave, timeout)
+    monkeypatch.setattr(orq.modulo, "aguardar_evento", espia)
+    return chaves
+
+
+def _espiar_vereditos(orq, monkeypatch) -> list:
+    vereditos = []
+    original = orq.modulo.avaliar_triple_check
+
+    def espia(*args, **kwargs):
+        vereditos.append(original(*args, **kwargs))
+        return vereditos[-1]
+    monkeypatch.setattr(orq.modulo, "avaliar_triple_check", espia)
+    return vereditos
+
+
+# ── Envio recusado à câmera da mesa decide na hora ───────────────────────────
+
+def test_envio_recusado_a_camera_da_mesa_nao_espera_o_evento(carregar_orquestrador,
+                                                             monkeypatch):
+    """Mede CHAMADAS, não tempo de parede: a espera que não pode existir é a
+    `aguardar_evento` da chave da mesa."""
+    orq = carregar_orquestrador()
+    orq.adapter.recusar_rotas.add("/comandos/capturar/mesa")
+    esperas = _espiar_esperas(orq, monkeypatch)
+    vereditos = _espiar_vereditos(orq, monkeypatch)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert not [c for c in esperas if ":visao_mesa:" in c]
+    assert not [c for c in orq.modulo._pending_events if ":visao_mesa:" in c]
+    assert len(vereditos) == 3
+    for v in vereditos:
+        assert v.travar is False and v.divergencias == []
+        assert "câmera_mesa: comando não aceito" in v.fontes_indisponiveis
+    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
+
+
+def test_envio_recusado_no_home_tambem_nao_espera(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1, 2})
+    original = orq.modulo.cmd_visao_mesa
+
+    async def cmd_visao_mesa(*args, **kwargs):
+        # Só a foto do HOME é recusada: as do D1 e D2 seguem normais.
+        if kwargs.get("quantidade_slot") == 0:
+            return False
+        return await original(*args, **kwargs)
+    monkeypatch.setattr(orq.modulo, "cmd_visao_mesa", cmd_visao_mesa)
+    esperas = _espiar_esperas(orq, monkeypatch)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert [c for c in esperas if ":visao_mesa:" in c] == ["OS-M:visao_mesa:1",
+                                                            "OS-M:visao_mesa:2"]
+    assert "conferencia_final_sem_leitura" in _tipos_de_alarme(orq)
+
+
+# ── A conferência final herda a dessincronia ──────────────────────────────────
+
+def test_final_home_depois_de_timeout_nao_compara(carregar_orquestrador, monkeypatch):
+    """A última foto visível deu timeout: o incremento do HOME pode incluir o
+    slot cujo total ninguém sabe se a estação registrou."""
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1, 2})
+    _roteiro_mesa(orq, monkeypatch, {2: "mudo", 3: ("div", +4)})
+    motivos = _espiar_trava(orq, monkeypatch)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert motivos == []
+    assert "conferencia_final_nao_comparavel" in _tipos_de_alarme(orq)
+    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
+
+
+def test_final_home_depois_de_trava_liberada_nao_compara(carregar_orquestrador,
+                                                         monkeypatch):
+    """Decisão F: liberada a trava, alguém pode ter mexido na caixa — e só
+    slots invisíveis vieram depois, então nenhuma foto ressincronizou."""
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1})
+    _roteiro_mesa(orq, monkeypatch, {1: ("div", +2), 2: ("div", +1)})
+    liberacoes = _liberar_trava_automaticamente(orq)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert liberacoes == [True]                      # só a do D1
+    assert "conferencia_final_nao_comparavel" in _tipos_de_alarme(orq)
+
+
+def test_final_home_sincronizado_a_mais_continua_travando(carregar_orquestrador,
+                                                         monkeypatch):
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1, 2})
+    _roteiro_mesa(orq, monkeypatch, {3: ("div", +1)})
+    motivos = _espiar_trava(orq, monkeypatch)
+    _liberar_trava_automaticamente(orq)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert len(motivos) == 1 and "1 a mais" in motivos[0]
+    assert "conferencia_final_nao_comparavel" not in _tipos_de_alarme(orq)
+
+
+# ── Foto da mesa sem a confirmação da dispensa ────────────────────────────────
+
+def _dispenser_mudo_em(orq, monkeypatch, slot_mudo: int) -> None:
+    original = orq.adapter._responder
+
+    def responder(url, payload):
+        if url.endswith("/comandos/dispensar") and payload["dispenser_id"] == slot_mudo:
+            return
+        original(url, payload)
+    monkeypatch.setattr(orq.adapter, "_responder", responder)
+
+
+def test_foto_sem_dispensado_faz_a_proxima_nao_ser_comparada(carregar_orquestrador,
+                                                            monkeypatch):
+    """Unidade atrasada do D1 apareceria como "a mais" no D2 — trava no slot
+    errado, com o D1 marcado OK."""
+    orq = carregar_orquestrador()
+    _roteiro_mesa(orq, monkeypatch, {2: ("div", +1)})
+    _dispenser_mudo_em(orq, monkeypatch, 1)
+    motivos = _espiar_trava(orq, monkeypatch)
+    vereditos = _espiar_vereditos(orq, monkeypatch)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert motivos == []
+    assert any(f.startswith("câmera_mesa: câmera ressincronizando")
+               for f in vereditos[1].fontes_indisponiveis)
+    assert "camera_mesa_ressincronizando" in _tipos_de_alarme(orq)
+
+
+def test_foto_com_dispensado_continua_comparando(carregar_orquestrador, monkeypatch):
+    """Regressão: com o `dispensado` no prazo, o +1 no D2 trava como antes — e
+    as fotos pedidas são as mesmas do caso sem confirmação."""
+    def rodar(mudo: bool):
+        orq = carregar_orquestrador()
+        _roteiro_mesa(orq, monkeypatch, {2: ("div", +1)})
+        if mudo:
+            _dispenser_mudo_em(orq, monkeypatch, 1)
+        motivos = _espiar_trava(orq, monkeypatch)
+        _liberar_trava_automaticamente(orq)
+        asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+        return motivos, [(f["slot_id"], f["quantidade_esperada"]) for f in _fotos(orq)]
+
+    motivos_ok, fotos_ok = rodar(mudo=False)
+    _, fotos_mudo = rodar(mudo=True)
+
+    assert len(motivos_ok) == 1 and "D2" in motivos_ok[0]
+    assert fotos_ok == fotos_mudo
+
+
+# ── A caixinha escondida que reaparece ────────────────────────────────────────
+
+def test_tolerancia_absorve_o_que_reapareceu_e_so_o_excedente_trava(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    mesa = {"tipo": "leitura_mesa_divergencia", "quantidade_detectada": QTD_ALVO + 1}
+
+    absorvido = _avaliar(orq, mesa=mesa, tolerancia_camera_mais=1)
+    excedente = _avaliar(orq, mesa={**mesa, "quantidade_detectada": QTD_ALVO + 2},
+                         tolerancia_camera_mais=1)
+    sem_tolerancia = _avaliar(orq, mesa=mesa)
+
+    assert absorvido.travar is False and absorvido.reconciliado == 1
+    assert absorvido.alertas == () and absorvido.informativos
+    assert excedente.travar is True and excedente.reconciliado == 1
+    assert "1 a mais além de 1" in excedente.divergencias[0]
+    assert sem_tolerancia.travar is True and sem_tolerancia.reconciliado == 0
+
+
+def test_a_menos_sozinha_informa_a_oclusao(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    v = _avaliar(orq, mesa={"tipo": "leitura_mesa_divergencia",
+                            "quantidade_detectada": QTD_ALVO - 2})
+    assert v.travar is False and v.oclusao == 2 and v.reconciliado == 0
+
+
+@pytest.mark.parametrize("roteiro,travas,texto", [
+    # a menos 1 em D1, +1 em D2: era a caixinha escondida — sem trava.
+    ({1: ("div", -1), 2: ("div", +1)}, 0, None),
+    # ... e o déficit volta a 0: um +1 no D3 depois disso trava.
+    ({1: ("div", -1), 2: ("div", +1), 3: ("div", +1)}, 1, "D3"),
+    # a menos 1, depois +2: só UMA é a escondida — trava citando 1 a mais.
+    ({1: ("div", -1), 2: ("div", +2)}, 1, "1 a mais além de 1"),
+    # a menos 1, timeout, +1: a dessincronia zerou o déficit e o D3 não compara.
+    ({1: ("div", -1), 2: "mudo", 3: ("div", +1)}, 0, None),
+    # sem a menos antes, +1 trava como sempre.
+    ({2: ("div", +1)}, 1, "D2"),
+])
+def test_deficit_da_camera_da_mesa(carregar_orquestrador, monkeypatch, roteiro,
+                                   travas, texto):
+    orq = carregar_orquestrador()
+    _roteiro_mesa(orq, monkeypatch, roteiro)
+    motivos = _espiar_trava(orq, monkeypatch)
+    _liberar_trava_automaticamente(orq)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert len(motivos) == travas, motivos
+    if texto:
+        assert texto in motivos[0]
+    if roteiro.get(1) == ("div", -1):
+        # O alarme da oclusão continua sendo gravado na hora; a reconciliação
+        # não grava alarme nenhum.
+        assert _tipos_de_alarme(orq).count("contagem_camera_abaixo") == 1
+
+
+def test_final_home_tolera_o_que_reapareceu(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1, 2})
+    _roteiro_mesa(orq, monkeypatch, {2: ("div", -1), 3: ("div", +1)})
+    motivos = _espiar_trava(orq, monkeypatch)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert motivos == []
+    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
+
+
+# ── Estação da mesa sem o acumulado da OS ─────────────────────────────────────
+
+def test_divergencia_com_ressincronizar_nao_trava(carregar_orquestrador, monkeypatch):
+    """A estação reiniciou (ou a OS expirou nela): a foto comparou a caixa
+    INTEIRA com o esperado de um slot."""
+    orq = carregar_orquestrador()
+    _roteiro_mesa(orq, monkeypatch, {2: ("div", +3, {"ressincronizar": True})})
+    motivos = _espiar_trava(orq, monkeypatch)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert motivos == []
+    descricoes = [c["args"][2] for c in orq.banco.chamadas_de("salvar_alarme")
+                  if c["args"][1] == "camera_mesa_ressincronizando"]
+    assert len(descricoes) == 1 and "sem o acumulado desta OS" in descricoes[0]
+
+
+def test_ressincronizar_zera_o_deficit(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    _roteiro_mesa(orq, monkeypatch, {1: ("div", -1),
+                                     2: ("div", +2, {"ressincronizar": True}),
+                                     3: ("div", +1)})
+    motivos = _espiar_trava(orq, monkeypatch)
+    _liberar_trava_automaticamente(orq)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert len(motivos) == 1 and "D3" in motivos[0]
+
+
+def test_final_home_com_ressincronizar_nao_trava(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    _com_final_home(orq, monkeypatch, {1, 2})
+    _roteiro_mesa(orq, monkeypatch, {3: ("div", +5, {"ressincronizar": True})})
+    motivos = _espiar_trava(orq, monkeypatch)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert motivos == []
+    assert "conferencia_final_nao_comparavel" in _tipos_de_alarme(orq)
+
+
+# ── Toda divergência da mesa termina em UM alarme ou numa trava ──────────────
+# O handler do central deixou de gravar alarme para `leitura_mesa_divergencia`
+# (gravava "contagem incorreta" até quando o orquestrador decidia que não era).
+
+@pytest.mark.parametrize("roteiro,alarme", [
+    ({2: ("div", 0)}, "leitura_mesa_incoerente"),
+    ({2: ("div", -1)}, "contagem_camera_abaixo"),
+    ({2: "mudo", 3: ("div", +1)}, "camera_mesa_ressincronizando"),
+])
+def test_divergencia_da_mesa_sem_trava_grava_exatamente_um_alarme(
+        carregar_orquestrador, monkeypatch, roteiro, alarme):
+    orq = carregar_orquestrador()
+    _roteiro_mesa(orq, monkeypatch, roteiro)
+    motivos = _espiar_trava(orq, monkeypatch)
+
+    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
+
+    assert motivos == []
+    assert _tipos_de_alarme(orq) == [alarme]

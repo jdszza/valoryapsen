@@ -138,8 +138,8 @@ def _visao_mesa_posicoes() -> frozenset:
     A câmera é fixa num poste, inclinada, e a caixa anda com a CNC: em algumas
     paradas parte da caixa sai do quadro. Nessas o central não pede foto — a
     contagem desse slot é conferida junto com a do próximo slot visível. O
-    valor sai de medida de bancada (Procedimento de bancada, M4, no
-    TASKS_VISAO.md); o default é todas, que é o comportamento de antes.
+    valor sai de medida de bancada (docs/BANCADA_VISAO.md, M4); o default é
+    todas, que é o comportamento de antes.
 
     Inválido (não inteiro, fora de 1..NUM_SLOTS, repetido, vazio) cai no
     default com ERROR: um mapa errado faria a câmera conferir no lugar errado,
@@ -302,6 +302,18 @@ def _cronograma_s(nome: str, default: float, minimo: float, maximo: float) -> fl
     return valor * _folga_timeout()
 
 
+def _timeout_s(nome: str, default: float) -> float:
+    """Um TIMEOUT_* do orquestrador: a mesma leitura de `_cronograma_s`.
+
+    Os seis `TIMEOUT_*` eram `float(os.getenv(...))` cru — fixos no compose
+    hoje, mas um `30,0` no `.env` derrubaria o central no import com o
+    traceback apontando para este arquivo, e um zero faria toda espera vencer
+    na hora. A faixa (1 s a 1 h) é larga de propósito: é teto de espera por um
+    adapter travado, não parte do ciclo.
+    """
+    return _cronograma_s(nome, default, 1.0, 3600.0)
+
+
 def _folga_timeout() -> float:
     """Fator aplicado aos TIMEOUT_* do orquestrador. Nunca menor que 1.0.
 
@@ -406,7 +418,7 @@ class Settings:
     # narrar a demo, um teto fixo abortaria a OS por timeout de um passo que
     # está apenas demorando o que se pediu. Ver a docstring de `_folga_timeout`
     # para por que o fator só aumenta, nunca reduz.
-    TIMEOUT_CARREGAMENTO:        float = float(os.getenv("TIMEOUT_CARREGAMENTO",        "180")) * _folga_timeout()
+    TIMEOUT_CARREGAMENTO:        float = _timeout_s("TIMEOUT_CARREGAMENTO", 180.0)
     # Estes dois NÃO governam mais o ciclo da mesa — o ciclo agora é por
     # RELÓGIO (ver `cronograma_do_ciclo` no orquestrador), e o evento da placa
     # registra ou cancela, nunca autoriza o passo seguinte.
@@ -421,12 +433,12 @@ class Settings:
     # Deixá-los aqui com o comentário trocado é deliberado: um timeout que
     # ninguém usa mas continua no `.env` é uma alavanca que o operador vai
     # girar esperando efeito, e depois vai procurar o problema em outro lugar.
-    TIMEOUT_POSICIONAMENTO:      float = float(os.getenv("TIMEOUT_POSICIONAMENTO",      "120")) * _folga_timeout()
-    TIMEOUT_DISPENSA:            float = float(os.getenv("TIMEOUT_DISPENSA",            "120")) * _folga_timeout()
-    TIMEOUT_VISAO_DISPENSER:     float = float(os.getenv("TIMEOUT_VISAO_DISPENSER",     "30"))  * _folga_timeout()
-    TIMEOUT_VISAO_MESA:          float = float(os.getenv("TIMEOUT_VISAO_MESA",          "30"))  * _folga_timeout()
-    TIMEOUT_PESO:                float = float(os.getenv("TIMEOUT_PESO",                "15"))  * _folga_timeout()
-    TIMEOUT_LIMPEZA:             float = float(os.getenv("TIMEOUT_LIMPEZA",             "60"))  * _folga_timeout()
+    TIMEOUT_POSICIONAMENTO:      float = _timeout_s("TIMEOUT_POSICIONAMENTO", 120.0)
+    TIMEOUT_DISPENSA:            float = _timeout_s("TIMEOUT_DISPENSA", 120.0)
+    TIMEOUT_VISAO_DISPENSER:     float = _timeout_s("TIMEOUT_VISAO_DISPENSER", 30.0)
+    TIMEOUT_VISAO_MESA:          float = _timeout_s("TIMEOUT_VISAO_MESA", 30.0)
+    TIMEOUT_PESO:                float = _timeout_s("TIMEOUT_PESO", 15.0)
+    TIMEOUT_LIMPEZA:             float = _timeout_s("TIMEOUT_LIMPEZA", 60.0)
 
     # ── O cronograma do ciclo da mesa (segundos) ──────────────────────────────
     #
@@ -487,6 +499,11 @@ class Settings:
     # Fora destas posições o central não pede foto, e o slot é conferido junto
     # com o próximo visível. Ver `_visao_mesa_posicoes`.
     VISAO_MESA_POSICOES: frozenset = field(default_factory=_visao_mesa_posicoes)
+    # Se alguém DEFINIU o mapa (o valor é o mesmo "todas" nos dois casos, mas
+    # com a câmera real o default põe foto em posição onde a caixa não aparece
+    # inteira — o pré-voo avisa).
+    VISAO_MESA_POSICOES_DEFINIDA: bool = field(
+        default_factory=lambda: bool(os.getenv("VISAO_MESA_POSICOES", "").strip()))
     # "HOME": no fim da OS, com a mesa no HOME, confere o que ficou pendente.
     VISAO_MESA_FINAL: str = field(default_factory=_visao_mesa_final)
 

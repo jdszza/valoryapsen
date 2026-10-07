@@ -169,7 +169,9 @@ services:
       VISAO_SKU_HABILITADA: ${VISAO_SKU_HABILITADA:-1}
       # Slots em que a câmera da mesa vê a caixa INTEIRA (medido na bancada).
       # Fora deles não há foto: o slot é conferido junto com o próximo visível.
-      VISAO_MESA_POSICOES: ${VISAO_MESA_POSICOES:-1,2,3,4,5,6,7,8}
+      # Vazio = todas — e o pré-voo avisa quando a câmera da mesa é a real e o
+      # mapa ainda não foi medido (por isso o default é vazio, e não "1,...,8").
+      VISAO_MESA_POSICOES: ${VISAO_MESA_POSICOES:-}
       # Vazio = desligado; HOME = confere no HOME o que ficou sem conferência.
       VISAO_MESA_FINAL: ${VISAO_MESA_FINAL:-}
       # Teto de OS ESPERANDO na fila (a em execução já saiu dela). Atingido o
@@ -330,6 +332,14 @@ services:
       VISAO_DISP_ASSENTAMENTO_S:       ${VISAO_DISP_ASSENTAMENTO_S:-2}
       # Teto para emitir a leitura; o central espera 30 s.
       VISAO_DISP_PRAZO_S:              ${VISAO_DISP_PRAZO_S:-20}
+      # Janela de estabilidade: o veredito da estação é por FRAME, então a
+      # leitura junta pelo menos 3 momentos distintos antes de decidir — um
+      # frame com a mão do operador não trava a OS.
+      VISAO_DISP_JANELA_S:             ${VISAO_DISP_JANELA_S:-3}
+      # Código lido na zona que não está na tabela de etiquetas (QR de bula
+      # digital, etiqueta de outro sistema): "falha" (não trava, alarme
+      # codigo_desconhecido_dispenser) ou "divergencia" (trava, como antes).
+      VISAO_DISP_NAO_CADASTRADO:       ${VISAO_DISP_NAO_CADASTRADO:-falha}
       # Nome do central → QR/ArUco impressos. Está na imagem (COPY . .).
       VISAO_ETIQUETAS_ARQ: ${VISAO_ETIQUETAS_ARQ:-/app/etiquetas.json}
       TIMEOUT_CMD:    20
@@ -341,8 +351,9 @@ services:
         condition: service_healthy
     healthcheck:
       <<: *healthcheck-padrao
-      # o lifespan espera o simulador por até 60s antes de servir.
-      start_period: 70s
+      # start_period no padrão: o lifespan não espera mais o upstream (ele só
+      # loga, em segundo plano). Na célula montada as estações sobem DEPOIS do
+      # Docker, e esperar aqui deixava o adapter sem servir por até ~150 s.
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8102/ping', timeout=3)"]
     networks:
       - apsen-net

@@ -638,3 +638,50 @@ def test_a_tela_de_senha_pede_para_nao_ser_indexada(console):
 
 def test_a_pagina_do_console_pede_para_nao_ser_indexada(logado):
     assert 'name="robots"' in logado.cliente.get("/console").text
+
+
+# ── Injeção na câmera da mesa só em slot que ela fotografa ───────────────────
+
+def test_divergencia_mesa_fora_das_posicoes_e_recusada(logado, monkeypatch):
+    """Slot que a câmera não fotografa nunca consome o gatilho: ele ficaria
+    "armado" para sempre."""
+    monkeypatch.setattr(logado.modulo.settings, "VISAO_MESA_POSICOES", frozenset({1, 3}))
+    logado.modulo.injecao.resetar()
+
+    recusada = logado.cliente.post("/console/api/injecao",
+                                   json={"tipo": "divergencia_mesa", "slot_id": 2})
+    aceita = logado.cliente.post("/console/api/injecao",
+                                 json={"tipo": "divergencia_mesa", "slot_id": 3})
+    outro_tipo = logado.cliente.post("/console/api/injecao",
+                                     json={"tipo": "divergencia_peso", "slot_id": 2})
+
+    assert recusada.status_code == 400
+    assert recusada.json()["erro"] == "slot_sem_foto_da_mesa"
+    assert "D1, D3" in recusada.json()["mensagem"]
+    assert aceita.status_code == 200
+    assert outro_tipo.status_code == 200
+    logado.modulo.injecao.resetar()
+
+
+def test_prevoo_inclui_a_visao_com_uma_sonda_so(logado, monkeypatch):
+    """A rota monta o bloco Visão a partir do `/health` do vision-adapter — e,
+    com o adapter fora, é UM item vermelho."""
+    modulo = logado.modulo
+
+    async def servicos(_cliente, timeout=None):
+        return []
+
+    async def banco():
+        return None
+
+    async def visao(_cliente):
+        return None
+    monkeypatch.setattr(modulo.prevoo, "sondar_servicos", servicos)
+    monkeypatch.setattr(modulo, "_prevoo_banco", banco)
+    monkeypatch.setattr(modulo, "_prevoo_visao", visao)
+
+    corpo = logado.cliente.get("/console/api/prevoo").json()
+
+    da_visao = [i for i in corpo["itens"] if i["grupo"] == "Visão"]
+    assert [i["id"] for i in da_visao] == ["visao"]
+    assert da_visao[0]["estado"] == "falha"

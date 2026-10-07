@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -82,11 +83,11 @@ def carregar_etiquetas(caminho: str | Path) -> list[dict]:
     vistos_nome: set[str] = set()
     vistos_qr: set[str] = set()
     vistos_aruco: set[int] = set()
-    for posicao, item in enumerate(brutos, start=1):
+    for posicao, bruto in enumerate(brutos, start=1):
         problema = None
-        if not isinstance(item, dict):
+        item = bruto if isinstance(bruto, dict) else {}
+        if not isinstance(bruto, dict):
             problema = "não é um objeto"
-            item = {}
         nome = normalizar_nome(item.get("nome"))
         qr = str(item.get("qr") or "").strip()
         aruco = item.get("aruco")
@@ -221,10 +222,22 @@ def linha_do_slot(estado: dict, slot: int) -> dict | None:
 
 SKU_DESCONHECIDO = "desconhecido (codigo fora da tabela de etiquetas)"
 
-_DIVERGENTES = ("ERRO_POSICAO", "DIVERGENCIA", "NAO_CADASTRADO")
+_DIVERGENTES = ("ERRO_POSICAO", "DIVERGENCIA")
+
+# O que fazer com NAO_CADASTRADO — código lido que não está no catálogo. Na
+# estação, QR desconhecido é estado de erro e VENCE a ocorrência certa na mesma
+# zona; a embalagem real traz cada vez mais QR impresso (bula digital), e
+# qualquer QR alheio na zona travaria a OS com o medicamento CERTO. O ganho de
+# tratá-lo como divergência é pequeno: caixa errada sem etiqueta e sem QR já sai
+# VAZIO (falha). "falha" é o default; "divergencia" é o comportamento antigo.
+NAO_CADASTRADO_FALHA = "falha"
+NAO_CADASTRADO_DIVERGENCIA = "divergencia"
+MODOS_NAO_CADASTRADO = (NAO_CADASTRADO_FALHA, NAO_CADASTRADO_DIVERGENCIA)
+MOTIVO_CODIGO_DESCONHECIDO = "codigo_desconhecido_na_zona"
 
 
-def traduzir(linha: dict, esperado: str) -> tuple[str, str | None]:
+def traduzir(linha: dict, esperado: str,
+             nao_cadastrado: str = NAO_CADASTRADO_FALHA) -> tuple[str, str | None]:
     """(tipo do evento, motivo de falha) para a linha do slot.
 
     Leitura incerta é FALHA, nunca divergência: divergência trava a OS e chama
@@ -240,6 +253,68 @@ def traduzir(linha: dict, esperado: str) -> tuple[str, str | None]:
         return "leitura_dispenser_divergencia", None
     if veredito in _DIVERGENTES:
         return "leitura_dispenser_divergencia", None
+    if veredito == "NAO_CADASTRADO":
+        if nao_cadastrado == NAO_CADASTRADO_DIVERGENCIA:
+            return "leitura_dispenser_divergencia", None
+        return "leitura_dispenser_falha", MOTIVO_CODIGO_DESCONHECIDO
     if veredito == "VAZIO":
         return "leitura_dispenser_falha", "produto_nao_identificado"
     return "leitura_dispenser_falha", "leitura_inconclusiva"
+
+
+# ── A janela de estabilidade ──────────────────────────────────────────────────
+#
+# O `/api/estado` da estação é a fotografia de UM frame: o veredito é gravado a
+# cada `processar`, e o `frames_para_confirmar` dela governa só o alerta
+# sonoro. Na zona vence o pior caso, então um único frame com um ArUco falso de
+# id conhecido (e, com os fantasmas, todo medicamento etiquetado é conhecido),
+# a mão do operador ou um reflexo vira ERRO_POSICAO — e a OS trava. Por isso o
+# adapter colhe várias amostras, de `momento`s distintos, e decide sobre elas.
+
+MOTIVO_INSTAVEL = "leitura_instavel"
+
+
+def _rotulo(linha: dict) -> str:
+    """Veredito + medicamento: o que identifica UMA leitura entre amostras."""
+    veredito = str(linha.get("veredito") or "?")
+    nome = normalizar_nome(linha.get("medicamento"))
+    return f"{veredito}:{nome}" if nome else veredito
+
+
+def decidir(amostras: list[dict], esperado: str,
+            nao_cadastrado: str = NAO_CADASTRADO_FALHA
+            ) -> tuple[str, str | None, dict, dict]:
+    """(tipo, motivo, linha, contagens) para a janela de amostras do slot.
+
+    - divergência só se a MESMA leitura divergente (veredito + medicamento)
+      aparece em pelo menos 2/3 das amostras E na última;
+    - ok se a maioria é OK com o medicamento esperado e nenhuma divergência se
+      repete;
+    - falha com o motivo de sempre se todas as amostras dão a mesma falha;
+    - qualquer outra coisa: falha `leitura_instavel`.
+
+    `linha` é a amostra que representa a decisão (vai no evento); `contagens`
+    é {rótulo: quantas amostras} — o campo `amostras` do evento.
+    """
+    if not amostras:
+        raise ValueError("decidir() sem amostras")
+    traducoes = [traduzir(a, esperado, nao_cadastrado) for a in amostras]
+    contagens = dict(Counter(_rotulo(a) for a in amostras))
+    total = len(amostras)
+    ultima, (tipo_ultima, _) = amostras[-1], traducoes[-1]
+
+    divergentes = Counter(_rotulo(a) for a, (t, _) in zip(amostras, traducoes, strict=True)
+                          if t == "leitura_dispenser_divergencia")
+    if tipo_ultima == "leitura_dispenser_divergencia":
+        if 3 * divergentes[_rotulo(ultima)] >= 2 * total:
+            return "leitura_dispenser_divergencia", None, ultima, contagens
+
+    oks = [a for a, (t, _) in zip(amostras, traducoes, strict=True)
+           if t == "leitura_dispenser_ok"]
+    repetida = any(n >= 2 for n in divergentes.values())
+    if 2 * len(oks) > total and not repetida:
+        return "leitura_dispenser_ok", None, oks[-1], contagens
+
+    if len(set(traducoes)) == 1 and tipo_ultima == "leitura_dispenser_falha":
+        return "leitura_dispenser_falha", traducoes[-1][1], ultima, contagens
+    return "leitura_dispenser_falha", MOTIVO_INSTAVEL, ultima, contagens

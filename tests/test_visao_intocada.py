@@ -35,7 +35,7 @@ import pytest
 RAIZ_REPO = Path(__file__).resolve().parent.parent
 
 MOTIVO = ("o código da visão não é editado por este repositório — "
-          "ver TASKS_VISAO.md, Regra nº 1")
+          "ver CLAUDE.md, 'A visão real: o adapter traduz, a estação não muda'")
 
 # Pastas varridas em profundidade (`rglob`) e pasta varrida só no nível de cima.
 # A raiz de `visao_mesa` é rasa de propósito: abaixo dela estão `.venv/` e

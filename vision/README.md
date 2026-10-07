@@ -39,7 +39,8 @@ lado de cá: no `vision-adapter`, no orquestrador e na configuração.
             /executar/capturar/mesa      │ eventos│
                                 ▼        │        ▼
                     estação da mesa :8212     estações dos dispensers :8301 (esq) / :8302 (dir)
-                    (contrato do simulador)    │ GET /api/visao/catalogo, POST /api/visao/estoque
+                    (contrato do simulador)    │ GET  /estacoes/<lado>/api/visao/catalogo
+                                               │ POST /estacoes/<lado>/api/visao/estoque
                                                └──▶ vision-adapter :8102
 ```
 
@@ -52,9 +53,12 @@ lado de cá: no `vision-adapter`, no orquestrador e na configuração.
   contra um catálogo que busca no adapter a cada 2 s. O adapter monta esse
   catálogo com o que o central mandou carregar NA OS CORRENTE (mais todo outro
   medicamento etiquetado, com um número "fantasma" sem zona, para a estação
-  dizer o que achou), espera a estação julgar com ele, lê o `/api/estado` e
-  emite o `leitura_dispenser_*` para o central. O estoque que a estação mede é
-  aceito e descartado: quem manda no estoque é o central.
+  dizer o que achou), espera a estação do lado BUSCAR esse catálogo (cada uma
+  aponta o `backend.url` para `http://127.0.0.1:8102/estacoes/<lado>`, e é pela
+  rota do lado que o adapter prova a busca), lê o `/api/estado` em uma janela
+  de pelo menos 3 momentos distintos (o veredito dela é por frame) e emite o
+  `leitura_dispenser_*` para o central. O estoque que a estação mede é aceito e
+  descartado: quem manda no estoque é o central.
 
 O porquê de cada uma dessas escolhas está no `CLAUDE.md`, seção "A visão real:
 o adapter traduz, a estação não muda".
@@ -70,10 +74,18 @@ o adapter traduz, a estação não muda".
 
 ## Como subir as estações
 
-Ver [docs/DEPLOY_WINDOWS.md](../docs/DEPLOY_WINDOWS.md), seção "As três
-estações de visão": `vision\iniciar_dispensers.bat esq|dir` para as câmeras dos
-dispensers e `vision\visao_mesa\integracao_apsen\iniciar_estacao.bat` para a da
-mesa, com os `.env` de cada lado.
+| estação | como subir | confere antes de subir | reinícios |
+|---|---|---|---|
+| mesa | `vision\iniciar_mesa.bat` | `vision\conferir_mesa.py` | `vision\visao_mesa\dados\reinicios.log` |
+| dispensers esquerda | `vision\iniciar_dispensers.bat esq` | `vision\conferir_dispensers.py esq` | `vision\visao_esq\logs\reinicios.log` |
+| dispensers direita | `vision\iniciar_dispensers.bat dir` | `vision\conferir_dispensers.py dir` | `vision\visao_dir\logs\reinicios.log` |
+
+Os dois `.bat` rodam o conferidor uma vez e param em vermelho se ele reprovar;
+passando, sobem a estação num laço que a reergue em 5 s se ela cair. O
+`iniciar_estacao.bat` que veio dentro de `visao_mesa\integracao_apsen\`
+continua lá, intocado — use o `vision\iniciar_mesa.bat`. Detalhes, `.env` e
+venv: [docs/DEPLOY_WINDOWS.md](../docs/DEPLOY_WINDOWS.md), seção "As três
+estações de visão"; calibração: [docs/BANCADA_VISAO.md](../docs/BANCADA_VISAO.md).
 
 **Não use `vision\iniciar_visao.bat`.** Ele veio no pacote original e sobe a
 estação na porta 8000, que é a do central — a estação e o central disputariam a

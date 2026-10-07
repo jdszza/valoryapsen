@@ -56,7 +56,6 @@ Desktop.ini
 *.tmp
 *.bak
 test_sync*.txt
-CLAUDE.md
 
 # Banco da bancada (contem PINs de operador) — nunca versionar
 TASKS.md
@@ -79,6 +78,12 @@ weight/TASK_VALIDAR_BALANCA_2_5.md
 !/vision/iniciar_dispensers.bat
 !/vision/ensaio_dispensers.py
 !/vision/ensaio_mesa.py
+# Os conferidores e o .bat da mesa: código DESTE repositório, fora das pastas
+# das estações (que não são editadas daqui).
+!/vision/conferencia.py
+!/vision/conferir_mesa.py
+!/vision/conferir_dispensers.py
+!/vision/iniciar_mesa.bat
 # Saída de execução das estações: bancos de eventos, logs e a calibração de
 # estoque gerada em campo.
 /vision/visao_mesa/dados/

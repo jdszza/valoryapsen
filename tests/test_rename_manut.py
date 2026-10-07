@@ -104,7 +104,9 @@ def test_nenhum_arquivo_versionado_menciona_a_sigla_antiga(versionados):
 # confrontando os campos. O que a lista guarda é o LUGAR onde firmware pode
 # existir; quem cobra o PROTOCOLO é o teste seguinte, e é ele que impede a
 # exceção de virar porta aberta.
-FIRMWARE_PERMITIDO = ("weight/", "dispenser/")
+# `cnc/` pelo mesmo critério: é o firmware da mesa, fala serial com o
+# cnc-adapter e nenhuma API MQTT — o teste seguinte continua cobrindo isso.
+FIRMWARE_PERMITIDO = ("weight/", "dispenser/", "cnc/")
 
 # Marcas de API, nunca a palavra solta: o `main.cpp` do display cita "MQTT"
 # em dois comentarios que explicam a migracao, e sao justamente os comentarios

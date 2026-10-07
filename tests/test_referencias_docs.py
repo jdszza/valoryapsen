@@ -118,6 +118,51 @@ def test_todo_md_citado_no_codigo_existe():
     )
 
 
+def _alvos_no_disco(referencia: str, origem: Path) -> list[Path]:
+    """Os mesmos candidatos de `_existe`, devolvendo os que existem."""
+    bases = [RAIZ_REPO, RAIZ_REPO / "docs"]
+    pasta = origem.parent
+    while pasta != RAIZ_REPO and RAIZ_REPO in pasta.parents:
+        bases.append(pasta)
+        pasta = pasta.parent
+    return [base / referencia for base in bases if (base / referencia).is_file()]
+
+
+def test_nenhum_ponteiro_aponta_para_documento_ignorado_pelo_git():
+    """O buraco que o teste acima não tapa: ele confere o DISCO.
+
+    O `CLAUDE.md` ficou anos fora do índice, com vinte arquivos versionados
+    apontando para ele, e o `config.py` apontava para um arquivo de tasks. No disco
+    de quem escreveu, os dois existiam e a suíte ficava verde; num clone novo
+    (CI, outra máquina, disco que morre) os ponteiros morriam todos de uma vez,
+    junto com o procedimento de bancada que só morava num deles. Documento que
+    o código cita tem que viajar com o código.
+    """
+    candidatos: dict[str, str] = {}
+    for arquivo in _versionados(".py", ".md", ".bat"):
+        if arquivo.resolve() == _PROPRIO:
+            continue
+        for referencia in set(_ARQUIVO_MD.findall(_ler(arquivo))):
+            for alvo in _alvos_no_disco(referencia, arquivo):
+                relativo = alvo.resolve().relative_to(RAIZ_REPO).as_posix()
+                candidatos.setdefault(relativo, str(arquivo.relative_to(RAIZ_REPO)))
+    if not candidatos:
+        pytest.skip("nenhuma referência a .md resolveu no disco")
+    # `-z` nos dois sentidos: em modo texto, no Windows, o `\n` da entrada
+    # chegaria ao git como `\r\n` e o `\r` viraria parte do caminho.
+    saida = subprocess.run(["git", "check-ignore", "--stdin", "-z"], cwd=RAIZ_REPO,
+                           input="\0".join(candidatos).encode("utf-8"),
+                           capture_output=True, check=False)
+    if saida.returncode not in (0, 1):
+        pytest.skip(f"git check-ignore indisponível: {saida.stderr!r}")
+    ignorados = sorted(f"{candidatos[c]} → {c}"
+                       for c in saida.stdout.decode("utf-8").split("\0") if c)
+    assert not ignorados, (
+        f"código apontando para documento que o .gitignore deixa fora do "
+        f"repositório: {ignorados}"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. Link markdown entre documentos
 # ══════════════════════════════════════════════════════════════════════════════

@@ -848,9 +848,31 @@ async def _handle_evento_visao(payload: dict):
                 None, None, payload.get("motivo"),
             )))
 
-            if tipo == "leitura_dispenser_falha":
+            motivo = payload.get("motivo")
+            if tipo == "leitura_dispenser_falha" and motivo == "sem_etiqueta_cadastrada":
+                # Medicamento sem etiqueta impressa: é COBERTURA, não falha de
+                # hardware. Hoje 40 dos 46 itens das ordens padrão estão assim,
+                # e um alarme por item enchia o badge e a tela de necessidades
+                # com pendências que ninguém tem como resolver — empurrando
+                # para fora da tela o alarme que importa. A leitura continua
+                # no histórico; a cobertura é um número no pré-voo.
+                logger.info("[VISAO] D%s sem conferência de SKU: medicamento sem "
+                            "etiqueta cadastrada.", slot_id)
+            elif tipo == "leitura_dispenser_falha" and motivo == "codigo_desconhecido_na_zona":
+                # Código que a estação leu e não está na tabela de etiquetas (QR
+                # de bula digital, etiqueta de outro sistema). Alarme PRÓPRIO
+                # para dar para contar quantas vezes acontece em campo — é o
+                # número que decide VISAO_DISP_NAO_CADASTRADO no vision-adapter.
+                descricao = (f"Código desconhecido na zona da câmera {_LADO[cam]} "
+                             f"slot {slot_id}: a estação leu um código fora da tabela "
+                             f"de etiquetas — slot sem conferência de SKU.")
+                db_tasks.append((salvar_alarme,
+                                 (f"camera_{cam}_{slot_id}",
+                                  "codigo_desconhecido_dispenser", descricao)))
+                _log("alarme", descricao)
+            elif tipo == "leitura_dispenser_falha":
                 descricao = (f"Falha câmera {_LADO[cam]} slot {slot_id}: "
-                             f"{payload.get('motivo', 'desconhecido')}")
+                             f"{motivo or 'desconhecido'}")
                 db_tasks.append((salvar_alarme,
                                  (f"camera_{cam}_{slot_id}",
                                   "falha_leitura_dispenser", descricao)))
@@ -897,22 +919,23 @@ async def _handle_evento_visao(payload: dict):
                 _log("alarme", descricao)
 
             elif tipo == "leitura_mesa_divergencia":
-                # `:+d` exige INT, e o que chega aqui é JSON de um adapter: um
-                # `null` ou um `10.0` derrubava o endpoint com 500 — e aí o
-                # adapter retenta 3×, então o mesmo evento derruba a rota três
-                # vezes e o orquestrador nunca é notificado da divergência que
-                # o evento veio contar. A divergência de contagem é uma das
-                # três fontes do Triple Check: perdê-la por causa de uma
-                # formatação é perder a trava.
+                # SEM alarme aqui: quem decide o que a divergência da mesa
+                # significa é o orquestrador — trava (Triple Check), oclusão
+                # (`contagem_camera_abaixo`), dessincronia
+                # (`camera_mesa_ressincronizando`), conferência final — e ele já
+                # grava o alarme certo em cada caso. Gravar também aqui dava
+                # dois alarmes para o mesmo evento, e o daqui afirmava "contagem
+                # incorreta" justamente quando o sistema decidiu que não era.
+                #
+                # A linha de log fica, e por isso a conversão por `_inteiro`:
+                # `:+d` exige INT, e o que chega aqui é JSON de um adapter — um
+                # `null` ou um `10.0` derrubava o endpoint com 500, o adapter
+                # retentava 3×, e o orquestrador nunca era notificado da
+                # divergência que o evento veio contar.
                 det = _inteiro(payload.get("quantidade_detectada"))
                 esp = _inteiro(payload.get("quantidade_esperada"))
-                descricao = (f"Contagem incorreta slot {slot_id}: "
-                             f"esperado={esp} detectado={det} "
-                             f"(Δ={det - esp:+d})")
-                db_tasks.append((salvar_alarme,
-                                 (f"camera_mesa_{slot_id}",
-                                  "divergencia_contagem", descricao)))
-                _log("alarme", descricao)
+                _log("visao", f"Câmera mesa slot {slot_id}: esperado={esp} "
+                              f"detectado={det} (Δ={det - esp:+d}) — o orquestrador decide")
 
         # ── Telemetria das câmeras ──────────────────────────────────────────
         elif tipo == "telemetria":
@@ -2651,6 +2674,19 @@ def console_injecao_catalogo(request: Request):
 def console_injecao_armar(request: Request, req: ConsoleInjecaoReq):
     """Arma a próxima falha. Substitui o gatilho anterior, se houver."""
     _console_exigir_sessao(request)
+    if (req.tipo == injecao.TIPO_DIVERGENCIA_MESA
+            and req.slot_id not in settings.VISAO_MESA_POSICOES):
+        # O slot nunca é fotografado (a câmera não vê a caixa inteira ali), então
+        # o gatilho nunca seria consumido e ficaria "armado" para sempre. A
+        # checagem mora aqui, e não em `injecao.py`: ele não sabe de posições.
+        return JSONResponse(
+            status_code=400,
+            content={"erro": "slot_sem_foto_da_mesa",
+                     "mensagem": f"D{req.slot_id} está fora de VISAO_MESA_POSICOES "
+                                 f"— a câmera da mesa não fotografa esse slot, e a "
+                                 f"falha nunca dispararia. Escolha um destes: "
+                                 f"{', '.join(f'D{s}' for s in sorted(settings.VISAO_MESA_POSICOES))}."},
+        )
     try:
         gatilho = injecao.armar(req.tipo, req.slot_id)
     except injecao.InjecaoInvalida as exc:
@@ -2784,6 +2820,18 @@ def console_prevoo_pagina(request: Request):
     return HTMLResponse(console.pagina_prevoo())
 
 
+async def _prevoo_visao(cliente) -> dict | None:
+    """O `/health` do vision-adapter, ou `None`. Uma sonda só para a visão: o
+    adapter já fala com as três estações."""
+    try:
+        resposta = await cliente.get(settings.VISION_ADAPTER_URL + "/health",
+                                     timeout=prevoo.TIMEOUT_SONDA_S * 2)
+        return resposta.json() if resposta.status_code < 300 else None
+    except Exception as exc:
+        logger.warning("[PREVOO] /health do vision-adapter indisponível: %s", exc)
+        return None
+
+
 async def _prevoo_banco() -> dict | None:
     """Fatos do banco, ou `None` se ele não respondeu.
 
@@ -2813,8 +2861,9 @@ async def console_prevoo(request: Request):
         # Banco e sondas HTTP juntos: o banco é I/O como as outras, e esperá-lo
         # antes somaria o tempo dele ao da sonda mais lenta.
         try:
-            servicos, banco = await asyncio.wait_for(
-                asyncio.gather(prevoo.sondar_servicos(cliente), _prevoo_banco()),
+            servicos, banco, visao = await asyncio.wait_for(
+                asyncio.gather(prevoo.sondar_servicos(cliente), _prevoo_banco(),
+                               _prevoo_visao(cliente)),
                 timeout=prevoo.TIMEOUT_TOTAL_S,
             )
         except asyncio.TimeoutError:
@@ -2849,6 +2898,8 @@ async def console_prevoo(request: Request):
                                  catalogo is not None)]
         + [prevoo.item_fila(fila["tamanho"], fila["capacidade"])]
         + prevoo.itens_celula(snapshot, orch.HOME)
+        + prevoo.itens_visao(visao, settings.VISAO_MESA_POSICOES_DEFINIDA,
+                             os_templates.listar())
         + prevoo.itens_modo(settings.MODO_APRESENTACAO, settings.FATOR_VELOCIDADE,
                             injecao.armada(), len(_ws_manager.active))
     )

@@ -485,7 +485,7 @@ def test_ordem_dos_grupos_da_pagina_cobre_os_grupos_emitidos():
     achado = re.search(r"var ORDEM_GRUPOS = \[(.*?)\];", pagina, re.S)
     assert achado
     da_pagina = set(re.findall(r'"([^"]+)"', achado.group(1)))
-    assert da_pagina == {"Serviços", "Banco", "Ordens", "Célula", "Modo"}
+    assert da_pagina == {"Serviços", "Banco", "Ordens", "Célula", "Visão", "Modo"}
 
 
 def test_pagina_e_servida_pelo_console():
@@ -494,3 +494,99 @@ def test_pagina_e_servida_pelo_console():
     assert "console_prevoo.html" in fonte
     assert "def pagina_prevoo" in fonte
     assert (CENTRAL_DIR / "console_prevoo.html").is_file()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Visão real: uma sonda só, o /health do vision-adapter
+# ══════════════════════════════════════════════════════════════════════════════
+
+TEMPLATES_VISAO = [
+    {"template_id": "OS-A", "itens": [{"medicamento": "MIOSAN 5MG"},
+                                      {"medicamento": "RETEMIC 5MG"}]},
+    {"template_id": "OS-B", "itens": [{"medicamento": "DONAREN 50MG"}]},
+]
+
+
+def _saude(mesa="estacao", dispensers="estacao", confere=True, pronta=True,
+           checks=None, etiquetas=("MIOSAN 5MG",)):
+    return {
+        "status": "ok",
+        "checks": checks if checks is not None else {
+            "estacao-dispensers-esq": "ok", "estacao-dispensers-dir": "ok"},
+        "fontes": {"mesa": mesa, "dispensers": dispensers},
+        "identidade_mesa": {"esperado": "apsen-vision-station",
+                            "recebido": "apsen-vision-station" if confere else (
+                                None if confere is None else "apsen-vision-simulator"),
+                            "confere": confere},
+        "comandos_mesa_para": "http://host.docker.internal:8212",
+        "etiquetas": {"quantidade": len(etiquetas), "nomes": list(etiquetas)},
+        "estacao_mesa": None if confere is None else
+        {"pronta": pronta, "fila": 0, "envios_falhados": 0},
+    }
+
+
+def test_visao_saudavel_nao_tem_vermelho(prevoo):
+    itens = prevoo.itens_visao(_saude(), True, TEMPLATES_VISAO)
+    assert not [i for i in itens if i["estado"] in (prevoo.FALHA, prevoo.ALERTA)]
+
+
+def test_adapter_fora_vira_um_item_so(prevoo):
+    itens = prevoo.itens_visao(None, False, TEMPLATES_VISAO)
+    assert len(itens) == 1 and itens[0]["estado"] == prevoo.FALHA
+    assert "vision-adapter" in itens[0]["acao"]
+
+
+def test_identidade_divergente_e_falha(prevoo):
+    itens = _por_id(prevoo.itens_visao(_saude(confere=False), True, TEMPLATES_VISAO))
+    assert itens["visao_identidade"]["estado"] == prevoo.FALHA
+    assert "VISION_SIM_URL" in itens["visao_identidade"]["acao"]
+
+
+def test_estacao_de_dispenser_fora_aponta_o_bat_do_lado(prevoo):
+    checks = {"estacao-dispensers-esq": "ok", "estacao-dispensers-dir": "erro: x"}
+    itens = _por_id(prevoo.itens_visao(_saude(checks=checks), True, TEMPLATES_VISAO))
+    assert itens["visao_disp_esq"]["estado"] == prevoo.OK
+    assert itens["visao_disp_dir"]["estado"] == prevoo.FALHA
+    assert "iniciar_dispensers.bat dir" in itens["visao_disp_dir"]["acao"]
+
+
+def test_estacao_da_mesa_inacessivel_e_falha_e_camera_nao_pronta_e_alerta(prevoo):
+    fora = _por_id(prevoo.itens_visao(_saude(confere=None), True, TEMPLATES_VISAO))
+    nao_pronta = _por_id(prevoo.itens_visao(_saude(pronta=False), True, TEMPLATES_VISAO))
+    assert fora["visao_mesa"]["estado"] == prevoo.FALHA
+    assert nao_pronta["visao_mesa"]["estado"] == prevoo.ALERTA
+
+
+def test_posicoes_nao_medidas_com_a_camera_real_e_alerta(prevoo):
+    sem = _por_id(prevoo.itens_visao(_saude(), False, TEMPLATES_VISAO))
+    simulada = _por_id(prevoo.itens_visao(_saude(mesa="simulador"), False,
+                                          TEMPLATES_VISAO))
+    assert sem["visao_mesa_posicoes"]["estado"] == prevoo.ALERTA
+    assert "M4" in sem["visao_mesa_posicoes"]["acao"]
+    assert "visao_mesa_posicoes" not in simulada
+
+
+def test_com_tudo_no_simulador_so_ha_informacao(prevoo):
+    itens = prevoo.itens_visao(_saude(mesa="simulador", dispensers="simulador",
+                                      confere=True), False, TEMPLATES_VISAO)
+    assert {i["id"] for i in itens} == {"visao_fontes", "visao_etiquetas"}
+
+
+def test_cobertura_de_etiquetas(prevoo):
+    item = prevoo.item_cobertura_etiquetas([" miosan  5mg "], TEMPLATES_VISAO)
+    assert item["estado"] == prevoo.INFO and not item["acao"]
+    assert item["detalhe"].startswith("1 de 3 medicamentos")
+    assert "OS-B" in item["detalhe"] and "DONAREN 50MG" in item["detalhe"]
+
+
+def test_itens_da_visao_seguem_a_regra_da_acao_e_a_forma(prevoo):
+    cenarios = [None, _saude(), _saude(confere=False), _saude(confere=None),
+                _saude(pronta=False), _saude(checks={})]
+    itens = [i for s in cenarios for i in prevoo.itens_visao(s, False, TEMPLATES_VISAO)]
+    for item in itens:
+        assert set(item) == {"id", "grupo", "titulo", "estado", "detalhe", "acao"}
+        assert item["grupo"] == "Visão"
+        if item["estado"] in (prevoo.FALHA, prevoo.ALERTA):
+            assert item["acao"], item
+        if item["estado"] == prevoo.OK:
+            assert not item["acao"], item

@@ -108,3 +108,24 @@ def test_valor_absurdamente_alto_cai_no_default(carregar_orquestrador, campo,
     padroes = {"CNC_TETO_TRAJETO_S": 2.5, "CNC_MARGEM_CHEGADA_S": 0.75,
                "DISPENSA_S_POR_UNIDADE": 1.0, "DISPENSA_FOLGA_S": 1.0}
     assert getattr(orq.modulo.settings, campo) == padroes[campo]
+
+
+# ── Os TIMEOUT_* do orquestrador passam pela mesma leitura ───────────────────
+
+TIMEOUTS = {
+    "TIMEOUT_CARREGAMENTO": 180.0, "TIMEOUT_POSICIONAMENTO": 120.0,
+    "TIMEOUT_DISPENSA": 120.0, "TIMEOUT_VISAO_DISPENSER": 30.0,
+    "TIMEOUT_VISAO_MESA": 30.0, "TIMEOUT_PESO": 15.0, "TIMEOUT_LIMPEZA": 60.0,
+}
+
+
+@pytest.mark.parametrize("valor", VALORES_RUINS)
+def test_timeout_ruim_cai_no_default_sem_derrubar_o_import(carregar_orquestrador, valor):
+    orq = carregar_orquestrador(env={nome: valor for nome in TIMEOUTS})
+    for nome, padrao in TIMEOUTS.items():
+        assert getattr(orq.modulo.settings, nome) == padrao, nome
+
+
+def test_timeout_valido_do_ambiente_e_respeitado(carregar_orquestrador):
+    orq = carregar_orquestrador(env={"TIMEOUT_PESO": "20"})
+    assert orq.modulo.settings.TIMEOUT_PESO == 20.0

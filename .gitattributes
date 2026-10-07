@@ -1,0 +1,16 @@
+# Fim de linha decidido pelo repositório, não pelo core.autocrlf de cada
+# máquina: LF no índice para todo texto (o Makefile quebra com CRLF, e um
+# commit feito de uma máquina sem conversão reescreveria arquivos inteiros —
+# o `git blame` passaria a apontar tudo para um commit só).
+* text=auto eol=lf
+
+# O cmd.exe lê .bat em LF errado quando há rótulo/goto: o checkout os escreve
+# em CRLF em qualquer sistema (no índice continuam LF, como todo texto).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binários versionados: nunca convertidos.
+*.png binary
+*.jpg binary
+*.pdf binary
+*.bin binary

@@ -12,16 +12,21 @@ rem  vision\visao_<lado>\, porque tudo na estacao e relativo a pasta: config\,
 rem  dados\eventos.db, config\pilhas.json. Duas estacoes na mesma pasta
 rem  dividiriam a calibracao e o banco de eventos.
 rem
+rem  A estacao se REERGUE sozinha: se ela sair (falha de camera, ESC na janela,
+rem  qualquer codigo), o laco registra em vision\visao_<lado>\logs\reinicios.log
+rem  e sobe de novo em 5 s. Para encerrar de vez: Ctrl+C e responda S.
+rem
 rem  NAO use vision\iniciar_visao.bat: ele sobe a estacao na porta 8000, que e a
 rem  do central.
 rem ===========================================================================
 
 rem ---- As linhas que voce edita ---------------------------------------------
-rem  Camera de cada lado: o indice (0, 1, 2...) ou parte do nome da webcam
-rem  (o estacao.py aceita os dois em --camera). `python src\camera.py`, dentro
-rem  da pasta do lado, lista as cameras.
-set CAMERA_ESQ=0
-set CAMERA_DIR=1
+rem  Camera de cada lado. VAZIO (o padrao) = a camera que `python src\camera.py`
+rem  gravou no parametros.json da pasta do lado, procurada pelo NOME (o indice
+rem  de webcam USB muda com a ordem em que o Windows as enumera). Preencha so
+rem  como escape manual: um numero aqui vai direto para o indice e PULA o nome.
+set CAMERA_ESQ=
+set CAMERA_DIR=
 rem  Portas HTTP das estacoes. O vision-adapter le o /api/estado delas por
 rem  VISAO_DISP_ESQ_URL / VISAO_DISP_DIR_URL (http://host.docker.internal:<porta>).
 set PORTA_ESQ=8301
@@ -80,30 +85,36 @@ if errorlevel 8 (
     exit /b 1
 )
 
-cd /d "%PASTA%"
-
-rem  O catalogo vem do vision-adapter, e o adapter conta o tempo ate a estacao
-rem  usar o catalogo novo com o MESMO intervalo. backend.url errado faz a estacao
-rem  julgar pelo catalogo local; intervalo diferente faz a leitura sair antes do
-rem  catalogo da OS valer. Este arquivo avisa e para — nao edita o json.
-"%PYTHON%" -c "import json,sys; b=json.load(open('config/parametros.json',encoding='utf-8')).get('backend',{}); sys.exit(0 if b.get('ativo') is True and str(b.get('url','')).rstrip('/')=='http://127.0.0.1:8102' and float(b.get('intervalo_catalogo',0))==2 else 1)"
+rem  A conferencia roda UMA vez, antes do laco: zonas calibradas e numeradas
+rem  pelo lado, camera escolhida por alguem e diferente das outras duas
+rem  estacoes, backend.url com o lado (/estacoes/<lado>) e intervalo do
+rem  catalogo igual ao do vision-adapter. Ela avisa e para — nao edita nada.
+"%PYTHON%" "%~dp0conferir_dispensers.py" %LADO%
 if errorlevel 1 (
-    powershell -NoProfile -Command "Write-Host 'ATENCAO: %PASTA%\config\parametros.json precisa de backend.ativo=true, backend.url=http://127.0.0.1:8102 e backend.intervalo_catalogo=2. Corrija o arquivo e rode de novo.' -ForegroundColor Red"
+    powershell -NoProfile -Command "Write-Host 'A estacao %LADO% NAO subiu: corrija o que esta listado acima e rode de novo.' -ForegroundColor Red"
     pause
     exit /b 1
 )
 
+cd /d "%PASTA%"
+if not exist "logs" mkdir logs
+
+set ARG_CAMERA=
+if not "%CAMERA%"=="" set ARG_CAMERA=--camera %CAMERA%
+
 echo.
 echo   estacao dos dispensers ^(%LADO%^) no host
 echo   pasta   : %PASTA%
-echo   camera  : %CAMERA%
+if "%CAMERA%"=="" (echo   camera  : a gravada no parametros.json ^(por nome^)) else (echo   camera  : %CAMERA% ^(escape manual^))
 echo   painel  : http://localhost:%PORTA%
-echo   catalogo: http://127.0.0.1:8102/api/visao/catalogo
+echo   catalogo: http://127.0.0.1:8102/estacoes/%LADO%/api/visao/catalogo
+echo   teclas  : ESC encerra ^(o laco sobe de novo^) - p pausa ^(a conferencia de SKU para^)
 echo.
 
-"%PYTHON%" -u src\estacao.py --camera %CAMERA% --estacao dispensers-%LADO% --porta %PORTA%
-if errorlevel 1 (
-    echo.
-    echo A estacao terminou com erro ^(codigo %errorlevel%^).
-    pause
-)
+:laco
+"%PYTHON%" -u src\estacao.py %ARG_CAMERA% --estacao dispensers-%LADO% --porta %PORTA%
+set CODIGO=!errorlevel!
+echo %date% %time% estacao %LADO% saiu com codigo !CODIGO! >> "%PASTA%\logs\reinicios.log"
+powershell -NoProfile -Command "Write-Host 'estacao %LADO% caiu (codigo !CODIGO!) - reiniciando em 5 s. Ctrl+C para encerrar.' -ForegroundColor Red"
+timeout /t 5 /nobreak >nul
+goto laco

@@ -17,7 +17,11 @@ serve muda de uma OS para a outra.
   3. sobe a estação de verdade lendo o vídeo;
   4. OS-A pede os quatro medicamentos onde eles estão → espera 4 ok;
   5. OS-B pede FLANCOX no D1 e MIOSAN no D2 (trocados) → espera divergência
-     nos dois. Se não vier, a premissa da ponte é falsa.
+     nos dois. Se não vier, a premissa da ponte é falsa;
+  6. a estação foi configurada com o backend.url DO LADO
+     (`/estacoes/esq`), como na bancada: o `/health` do adapter tem de mostrar
+     que ela buscou o catálogo por essa rota — é a prova que o adapter exige
+     antes de aceitar uma leitura.
 
 O adapter roda com o Python que roda este script (precisa de fastapi/uvicorn);
 a estação, com `--python-estacao` (precisa de opencv/qrcode/numpy) — por
@@ -196,9 +200,10 @@ def main() -> int:
 
         parametros = copia / "config" / "parametros.json"
         cfg = json.loads(parametros.read_text(encoding="utf-8"))
-        cfg["backend"].update({"ativo": True, "url": adapter_url, "intervalo_catalogo": 2})
+        url_do_lado = f"{adapter_url}/estacoes/esq"
+        cfg["backend"].update({"ativo": True, "url": url_do_lado, "intervalo_catalogo": 2})
         parametros.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"[1] parametros.json da cópia: backend.url={adapter_url} intervalo_catalogo=2")
+        print(f"[1] parametros.json da cópia: backend.url={url_do_lado} intervalo_catalogo=2")
 
         print(f"[2] central falso em {central_url}; vision-adapter em {adapter_url}")
         env = {**os.environ, "CENTRAL_URL": central_url, "VISION_SIM_URL": central_url,
@@ -244,6 +249,13 @@ def main() -> int:
                   all(e["tipo"] == "leitura_dispenser_divergencia" for e in eventos.values()))
         print(f"    PASSO 5: {'OK' if passo5 else 'FALHOU — a premissa da ponte é falsa'}")
         ok &= passo5
+
+        idade = (http_json(adapter_url + "/health", timeout=15)
+                 .get("busca_catalogo_idade_s", {}).get("esq"))
+        passo6 = idade is not None
+        print(f"[6] última busca da estação pela rota /estacoes/esq: há {idade} s")
+        print(f"    PASSO 6: {'OK' if passo6 else 'FALHOU — a estação não usou a rota do lado'}")
+        ok &= passo6
 
         if estacao.poll() is not None:
             print("    (a estação terminou o vídeo durante o ensaio)")

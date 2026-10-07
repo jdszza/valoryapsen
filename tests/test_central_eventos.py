@@ -806,6 +806,44 @@ def test_falha_de_leitura_nomeia_o_lado_na_descricao(carregar_central):
     assert "direita" in descricao
 
 
+# ── Um evento, no máximo um alarme — e o certo ───────────────────────────────
+# A enxurrada: um alarme por item sem etiqueta (40 de 46 nas ordens padrão), e
+# dois alarmes para cada divergência da mesa (um daqui, um do orquestrador).
+
+@pytest.mark.parametrize("evento,alarmes", [
+    (_leitura_dispenser(SLOT_DIR, "dispenser_dir", "leitura_dispenser_falha",
+                        motivo="sem_etiqueta_cadastrada"), []),
+    (_leitura_dispenser(SLOT_DIR, "dispenser_dir", "leitura_dispenser_falha",
+                        motivo="codigo_desconhecido_na_zona"),
+     ["codigo_desconhecido_dispenser"]),
+    (_leitura_dispenser(SLOT_DIR, "dispenser_dir", "leitura_dispenser_falha",
+                        motivo="camera_indisponivel"), ["falha_leitura_dispenser"]),
+    (_leitura_dispenser(SLOT_DIR, "dispenser_dir", "leitura_dispenser_divergencia",
+                        sku_lido="X"), ["divergencia_sku"]),
+    ({"tipo": "leitura_mesa_divergencia", "camera": "mesa", "slot_id": 2,
+      "os_id": "OS-1", "quantidade_detectada": 5, "quantidade_esperada": 4}, []),
+], ids=["sem-etiqueta", "codigo-desconhecido", "falha-comum", "sku-errado",
+        "mesa-divergente"])
+def test_cada_evento_de_visao_grava_no_maximo_o_alarme_certo(carregar_central,
+                                                             evento, alarmes):
+    central = carregar_central()
+
+    _evento_visao(central, evento)
+
+    assert [c["args"][1] for c in central.banco.chamadas_de("salvar_alarme")] == alarmes
+    # A leitura vai para o histórico em todos os casos.
+    assert len(central.banco.chamadas_de("salvar_leitura_visao")) == 1
+
+
+def test_codigo_desconhecido_aponta_a_lente(carregar_central):
+    central = carregar_central()
+    _evento_visao(central, _leitura_dispenser(
+        SLOT_DIR, "dispenser_dir", "leitura_dispenser_falha",
+        motivo="codigo_desconhecido_na_zona"))
+    (alarme,) = central.banco.chamadas_de("salvar_alarme")
+    assert alarme["args"][0] == f"camera_dispenser_dir_{SLOT_DIR}"
+
+
 # ── Telemetria da balança: o peso ao vivo chega ao estado e ao banco ─────────
 # `docs/PROTOCOLO_SERIAL.md` §5 declara o evento `telemetria` da balança com
 # `componente`, `temperatura_c`, `peso_atual_g` e `ts`. O handler gravava só a
@@ -1164,8 +1202,10 @@ def test_divergencia_de_mesa_com_campo_torto_nao_levanta(carregar_central,
         "quantidade_detectada": detectada, "quantidade_esperada": esperada,
     }))
 
-    (alarme,) = [c["args"] for c in central.banco.chamadas_de("salvar_alarme")]
-    assert alarme[1] == "divergencia_contagem"
+    # O handler não grava alarme da divergência da mesa (quem decide o que ela
+    # significa é o orquestrador), mas a leitura vai para o histórico.
+    assert central.banco.chamadas_de("salvar_alarme") == []
+    assert len(central.banco.chamadas_de("salvar_leitura_visao")) == 1
 
 
 def test_a_divergencia_de_mesa_avisa_o_orquestrador_mesmo_com_campo_torto(
@@ -1194,9 +1234,10 @@ def test_o_numero_certo_continua_aparecendo_na_descricao(carregar_central):
         "os_id": "OS-1", "quantidade_detectada": 8, "quantidade_esperada": 10,
     }))
 
-    (alarme,) = [c["args"] for c in central.banco.chamadas_de("salvar_alarme")]
-    assert "esperado=10 detectado=8" in alarme[2]
-    assert "-2" in alarme[2]
+    # A linha de log (que alimenta `/log/eventos`) é onde o número aparece desde
+    # que o alarme da divergência da mesa passou a ser do orquestrador.
+    linhas = [e["msg"] for e in central.modulo._log_eventos if e["tipo"] == "visao"]
+    assert any("esperado=10 detectado=8" in m and "-2" in m for m in linhas), linhas
 
 
 # ── O WebSocket não vaza conexão ─────────────────────────────────────────────

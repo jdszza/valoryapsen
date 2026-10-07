@@ -112,8 +112,8 @@ class EstacaoFalsa:
         t = self.relogio.t if self.congelada_em is None else self.congelada_em
         momento = (EPOCA_ESTACAO + timedelta(seconds=int(t))).isoformat(timespec="seconds")
         linhas = []
-        for slot, dados in self.linhas.items():
-            dados = dados(self.relogio.t) if callable(dados) else dados
+        for slot, fonte in self.linhas.items():
+            dados = fonte(self.relogio.t) if callable(fonte) else fonte
             linhas.append({"estacao": self.nome, "dispenser": slot, "momento": momento,
                            "confianca": 0.7, "caixas": None, "fracao": None,
                            "unidades": 1, "precisa_repor": 0, **dados})
@@ -187,14 +187,17 @@ class Ponte:
 
 @pytest.fixture
 def carregar_ponte(carregar_adapter, monkeypatch):
-    def _carregar(linhas_esq=None, linhas_dir=None, medicamentos=None, fonte="estacao"):
+    def _carregar(linhas_esq=None, linhas_dir=None, medicamentos=None, fonte="estacao",
+                  env=None):
         for nome in ("VISAO_MESA_FONTE", "VISAO_ETIQUETAS_ARQ", "NUM_SLOTS",
                      "VISAO_DISP_INTERVALO_CATALOGO_S", "VISAO_DISP_ASSENTAMENTO_S",
-                     "VISAO_DISP_PRAZO_S"):
+                     "VISAO_DISP_PRAZO_S", "VISAO_DISP_JANELA_S",
+                     "VISAO_DISP_NAO_CADASTRADO", "TIMEOUT_VISAO_DISPENSER"):
             monkeypatch.delenv(nome, raising=False)
         modulo = carregar_adapter("vision", {
             "VISAO_DISPENSER_FONTE": fonte,
             "VISAO_DISP_ESQ_URL": ESQ, "VISAO_DISP_DIR_URL": DIR,
+            **(env or {}),
         })
         relogio = Relogio()
         esq = EstacaoFalsa(relogio, linhas_esq or {})
@@ -370,7 +373,9 @@ def test_o_endpoint_serve_o_catalogo_sem_token(carregar_ponte):
     modulo._registrar_na_os("OS-1", 3, "MECLIN 25MG")
     resposta = TestClient(modulo.app).get("/api/visao/catalogo")
     assert resposta.status_code == 200
-    assert resposta.json() == modulo._catalogo
+    # Só `medicamentos`: `incompletos` é uso interno — a estação imprimiria uma
+    # linha por item a cada busca.
+    assert resposta.json() == {"medicamentos": modulo._catalogo["medicamentos"]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -438,7 +443,9 @@ def test_rescan_com_catalogo_antigo_so_espera_o_assentamento(carregar_ponte):
     evento = p.ler(3, "MECLIN 25MG")
 
     assert evento["tipo"] == "leitura_dispenser_ok"
-    assert 162.0 <= p.relogio.t < 164.0      # só os 2 s de assentamento
+    # Só os 2 s de assentamento, mais a janela de 3 momentos distintos — não o
+    # intervalo do catálogo, que não mudou.
+    assert 162.0 <= p.relogio.t < 166.0
 
 
 def test_linha_de_estacao_antiga_com_momento_parado_e_ignorada(carregar_ponte):
@@ -467,7 +474,7 @@ def test_linha_de_estacao_antiga_com_momento_parado_e_ignorada(carregar_ponte):
     (_linha("OK", "LONIUM 40MG", "MED-004"),           "leitura_dispenser_divergencia", None),
     (_linha("ERRO_POSICAO", "LONIUM 40MG", "MED-004"), "leitura_dispenser_divergencia", None),
     (_linha("DIVERGENCIA", "MIOSAN 5MG", "MED-001"),   "leitura_dispenser_divergencia", None),
-    (_linha("NAO_CADASTRADO"),                         "leitura_dispenser_divergencia", None),
+    (_linha("NAO_CADASTRADO"),                         "leitura_dispenser_falha", "codigo_desconhecido_na_zona"),
     (_linha("VAZIO"),                                  "leitura_dispenser_falha", "produto_nao_identificado"),
     (_linha("INDETERMINADO", "MIOSAN 5MG", "MED-001"), "leitura_dispenser_falha", "leitura_inconclusiva"),
     (_linha("VEREDITO_NOVO", "MIOSAN 5MG", "MED-001"), "leitura_dispenser_falha", "leitura_inconclusiva"),
@@ -513,8 +520,13 @@ def test_nome_que_o_central_nao_tem_vai_com_o_codigo_da_etiqueta(carregar_ponte)
 
 
 def test_nada_identificado_diz_que_e_desconhecido(carregar_ponte):
-    p = carregar_ponte(linhas_esq={1: _linha("NAO_CADASTRADO")})
-    assert p.ler(1, "MIOSAN 5MG")["sku_lido"] == p.modulo.ponte.SKU_DESCONHECIDO
+    """Com o modo antigo (NAO_CADASTRADO é divergência), a trava diz que o código
+    lido é desconhecido."""
+    p = carregar_ponte(linhas_esq={1: _linha("NAO_CADASTRADO")},
+                       env={"VISAO_DISP_NAO_CADASTRADO": "divergencia"})
+    evento = p.ler(1, "MIOSAN 5MG")
+    assert evento["tipo"] == "leitura_dispenser_divergencia"
+    assert evento["sku_lido"] == p.modulo.ponte.SKU_DESCONHECIDO
 
 
 def test_estacao_fora_do_ar_vira_camera_indisponivel(carregar_ponte):
@@ -577,8 +589,11 @@ def test_comando_responde_na_hora_e_le_em_segundo_plano(carregar_ponte, caplog):
 
     assert resposta == {"ok": True, "camera": "dispenser_dir", "slot_id": 6,
                         "msg": "Lendo dispenser 6 na estação dispenser_dir"}
-    assert [e["tipo"] for e in p.cliente.eventos] == ["leitura_dispenser_ok"]
-    assert "a estação real reporta o que a câmera viu" in caplog.text
+    # A injeção, com a câmera real, é feita pelo adapter sobre a leitura
+    # verdadeira (que aqui foi OK).
+    (evento,) = p.cliente.eventos
+    assert (evento["tipo"], evento["sku_lido"], evento["falha_injetada"]) == \
+        ("leitura_dispenser_divergencia", "APSEN-INJETADO-000", True)
 
 
 def test_modo_simulador_continua_mandando_para_o_vision_sim(carregar_ponte):
@@ -587,3 +602,195 @@ def test_modo_simulador_continua_mandando_para_o_vision_sim(carregar_ponte):
     assert [x["url"] for x in p.cliente.posts] == [
         p.modulo.VISION_SIM_URL + "/executar/capturar/dispenser"]
     assert p.modulo._slots_os == {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A janela de estabilidade — o veredito da estação é a fotografia de um frame
+# ══════════════════════════════════════════════════════════════════════════════
+
+ERRO_LONIUM = _linha("ERRO_POSICAO", "LONIUM 40MG", "MED-004")
+ERRO_MECLIN = _linha("ERRO_POSICAO", "MECLIN 25MG", "MED-003")
+OK_MIOSAN = _linha("OK", "MIOSAN 5MG", "MED-001")
+
+
+@pytest.mark.parametrize("amostras,tipo,motivo", [
+    ([OK_MIOSAN, ERRO_LONIUM, OK_MIOSAN], "leitura_dispenser_ok", None),
+    ([ERRO_LONIUM, ERRO_LONIUM, OK_MIOSAN], "leitura_dispenser_falha", "leitura_instavel"),
+    ([OK_MIOSAN, ERRO_LONIUM, ERRO_LONIUM], "leitura_dispenser_divergencia", None),
+    ([ERRO_LONIUM, ERRO_LONIUM, ERRO_MECLIN], "leitura_dispenser_falha", "leitura_instavel"),
+    ([_linha("VAZIO"), _linha("VAZIO"), OK_MIOSAN], "leitura_dispenser_falha",
+     "leitura_instavel"),
+    ([_linha("VAZIO")] * 3, "leitura_dispenser_falha", "produto_nao_identificado"),
+    ([OK_MIOSAN] * 3, "leitura_dispenser_ok", None),
+    ([ERRO_LONIUM] * 3, "leitura_dispenser_divergencia", None),
+], ids=["um-frame-ruim", "ultima-nao-confirma", "confirmada", "medicamentos-diferentes",
+        "vazio-instavel", "vazio-estavel", "ok-estavel", "erro-estavel"])
+def test_decisao_da_janela(carregar_ponte, amostras, tipo, motivo):
+    ponte = carregar_ponte().modulo.ponte
+    t, m, linha, contagens = ponte.decidir(amostras, "MIOSAN 5MG")
+    assert (t, m) == (tipo, motivo)
+    assert sum(contagens.values()) == len(amostras)
+    assert linha in amostras
+
+
+def test_um_frame_com_erro_deixa_de_travar(carregar_ponte):
+    """A mão do operador num frame: antes, a primeira amostra fresca decidia."""
+    def linha(t):
+        return ERRO_LONIUM if 104.0 <= t < 105.0 else OK_MIOSAN
+    p = carregar_ponte(linhas_esq={1: linha})
+
+    evento = p.ler(1, "MIOSAN 5MG")
+
+    assert evento["tipo"] == "leitura_dispenser_ok"
+    assert evento["amostras"] == {"OK:MIOSAN 5MG": 2, "ERRO_POSICAO:LONIUM 40MG": 1}
+
+
+def test_janela_conta_momentos_distintos(carregar_ponte):
+    """Sondagem a cada 0,5 s e `momento` de 1 s: a mesma linha lida duas vezes
+    não é duas amostras."""
+    p = carregar_ponte(linhas_esq={1: OK_MIOSAN})
+    evento = p.ler(1, "MIOSAN 5MG")
+    assert sum(evento["amostras"].values()) == 3
+    assert p.relogio.t >= 106.0               # 4 s de frescor + 2 momentos a mais
+
+
+def test_janela_que_nao_fecha_no_prazo_falha_com_o_motivo_de_hoje(carregar_ponte):
+    p = carregar_ponte(linhas_esq={1: OK_MIOSAN})
+    # A câmera congela logo depois da primeira amostra fresca.
+    p.relogio.ganchos.append((104.6, lambda: setattr(p.esq, "congelada_em", 104.6)))
+
+    evento = p.ler(1, "MIOSAN 5MG")
+
+    assert (evento["tipo"], evento["motivo"]) == ("leitura_dispenser_falha",
+                                                  "camera_sem_imagem")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A estação PROVA que buscou o catálogo desta OS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _buscar(p, lado):
+    return lambda: p.modulo.visao_catalogo_do_lado(lado)
+
+
+def test_busca_depois_da_mudanca_libera(carregar_ponte):
+    p = carregar_ponte(linhas_esq={1: OK_MIOSAN})
+    p.relogio.ganchos.append((102.0, _buscar(p, "esq")))
+
+    assert p.ler(1, "MIOSAN 5MG")["tipo"] == "leitura_dispenser_ok"
+
+
+def test_busca_antes_da_mudanca_nao_libera(carregar_ponte):
+    """Ela buscou — o catálogo da OS ANTERIOR. O relógio diria que já vale."""
+    p = carregar_ponte(linhas_esq={1: OK_MIOSAN})
+    p.modulo._ultima_busca["esq"] = 99.0
+
+    evento = p.ler(1, "MIOSAN 5MG")
+
+    assert (evento["tipo"], evento["motivo"]) == ("leitura_dispenser_falha",
+                                                  "estacao_sem_catalogo_atual")
+
+
+def test_busca_do_outro_lado_nao_libera(carregar_ponte):
+    p = carregar_ponte(linhas_esq={1: OK_MIOSAN})
+    p.modulo._ultima_busca["esq"] = 50.0
+    p.relogio.ganchos.append((102.0, _buscar(p, "dir")))
+
+    evento = p.ler(1, "MIOSAN 5MG")
+
+    assert evento["motivo"] == "estacao_sem_catalogo_atual"
+
+
+def test_estacao_na_url_antiga_cai_no_criterio_de_antes_com_um_aviso(carregar_ponte,
+                                                                    caplog):
+    p = carregar_ponte(linhas_esq={1: OK_MIOSAN, 2: _linha("OK", "FLANCOX 500MG",
+                                                           "MED-002")})
+    with caplog.at_level(logging.WARNING):
+        assert p.ler(1, "MIOSAN 5MG")["tipo"] == "leitura_dispenser_ok"
+        assert p.ler(2, "FLANCOX 500MG")["tipo"] == "leitura_dispenser_ok"
+
+    avisos = [r for r in caplog.records if "/estacoes/esq/api/visao/catalogo" in r.getMessage()]
+    assert len(avisos) == 1
+
+
+def test_rota_por_lado_registra_e_rejeita_lado_desconhecido(carregar_ponte):
+    p = carregar_ponte()
+    cliente = TestClient(p.modulo.app)
+    assert cliente.get("/estacoes/dir/api/visao/catalogo").status_code == 200
+    assert p.modulo._ultima_busca == {"dir": p.relogio.t}
+    assert cliente.get("/estacoes/meio/api/visao/catalogo").status_code == 404
+    assert cliente.post("/estacoes/esq/api/visao/estoque", json={}).json() == \
+        {"ok": True, "resultados": []}
+
+
+def test_o_catalogo_servido_pela_rota_do_lado_e_aceito_pela_estacao(carregar_ponte, Catalogo):
+    p = carregar_ponte()
+    p.modulo._registrar_na_os("OS-1", 1, "MIOSAN 5MG")
+    p.modulo._registrar_na_os("OS-1", 2, "RETEMIC 5MG")      # sem etiqueta
+    servido = TestClient(p.modulo.app).get("/estacoes/esq/api/visao/catalogo").json()
+    assert set(servido) == {"medicamentos"}
+    Catalogo.de_itens(servido["medicamentos"])               # levanta se recusar
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QR alheio na zona: VISAO_DISP_NAO_CADASTRADO
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("modo,tipo,motivo", [
+    ("falha", "leitura_dispenser_falha", "codigo_desconhecido_na_zona"),
+    ("divergencia", "leitura_dispenser_divergencia", None),
+])
+def test_nao_cadastrado_nos_dois_modos(carregar_ponte, modo, tipo, motivo):
+    p = carregar_ponte(linhas_esq={1: _linha("NAO_CADASTRADO")},
+                       env={"VISAO_DISP_NAO_CADASTRADO": modo})
+    evento = p.ler(1, "MIOSAN 5MG")
+    assert (evento["tipo"], evento.get("motivo")) == (tipo, motivo)
+
+
+def test_nao_cadastrado_invalido_cai_em_falha_com_erro(carregar_ponte, caplog):
+    with caplog.at_level(logging.ERROR):
+        p = carregar_ponte(env={"VISAO_DISP_NAO_CADASTRADO": "trava"})
+    assert p.modulo.VISAO_DISP_NAO_CADASTRADO == "falha"
+    assert "VISAO_DISP_NAO_CADASTRADO" in caplog.text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Injeção de falha com a câmera REAL dos dispensers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ler_com_injecao(p, slot, medicamento, injetar):
+    req = p.req(slot, medicamento, injetar_falha=injetar)
+    p.modulo._registrar_na_os("OS-1", slot, medicamento)
+    camera = p.modulo.ponte.camera_do_slot(slot, p.modulo.NUM_SLOTS)
+    asyncio.run(p.modulo._ler_e_emitir(req, camera))
+    (evento,) = p.cliente.eventos
+    return evento
+
+
+def test_injecao_de_sku_errado_reescreve_a_leitura_real(carregar_ponte):
+    p = carregar_ponte(linhas_esq={1: OK_MIOSAN})
+    evento = _ler_com_injecao(p, 1, "MIOSAN 5MG", "sku_dispenser")
+    assert (evento["tipo"], evento["sku_lido"], evento["falha_injetada"]) == \
+        ("leitura_dispenser_divergencia", "APSEN-INJETADO-000", True)
+
+
+def test_injecao_de_falha_de_leitura_reescreve_a_leitura_real(carregar_ponte):
+    p = carregar_ponte(linhas_esq={1: OK_MIOSAN})
+    evento = _ler_com_injecao(p, 1, "MIOSAN 5MG", "falha_leitura_dispenser")
+    assert (evento["tipo"], evento["motivo"], evento["falha_injetada"]) == \
+        ("leitura_dispenser_falha", "injetada", True)
+
+
+def test_sem_injecao_o_evento_nao_e_marcado(carregar_ponte):
+    p = carregar_ponte(linhas_esq={1: OK_MIOSAN})
+    assert p.ler(1, "MIOSAN 5MG")["falha_injetada"] is False
+
+
+def test_as_strings_de_injecao_do_adapter_batem_com_o_catalogo(carregar_ponte,
+                                                               carregar_orquestrador):
+    """A quinta cópia das strings (as outras quatro: `tests/test_injecao.py`)."""
+    injecao = carregar_orquestrador().injecao
+    modulo = carregar_ponte().modulo
+    assert modulo.INJECAO_SKU_DISPENSER == injecao.TIPO_SKU_DISPENSER
+    assert modulo.INJECAO_FALHA_LEITURA_DISPENSER == injecao.TIPO_FALHA_LEITURA_DISP
+    assert modulo.INJECAO_DIVERGENCIA_MESA == injecao.TIPO_DIVERGENCIA_MESA

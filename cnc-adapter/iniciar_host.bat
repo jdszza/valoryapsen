@@ -15,7 +15,7 @@ rem  `{"cmd":...}`. Com CNC_TRANSPORTE=serial e a COM fixada, este adapter ABRE
 rem  a porta e se da por CONECTADO — a URL fixa dispensa a sondagem por ping —,
 rem  mas nenhum comando e executado e o ACK nunca vem: /comandos/mover falha no
 rem  CNC_ACK_TIMEOUT_S e a OS aborta com a placa parecendo saudavel no /health.
-rem  Ate a voz de maquina entrar (TASKS_CNC.md, tasks 3 a 5), use a mesa pelo
+rem  Ate a voz de maquina entrar no firmware (cnc\README.md), use a mesa pelo
 rem  Monitor Serial e deixe a planta no simulador: set CNC_TRANSPORTE=http.
 rem
 rem  Manual da placa: cnc\README.md

@@ -1,0 +1,6 @@
+# As duas estações de visão vieram prontas de um pacote externo e o código delas
+# não é editado por este repositório (CLAUDE.md, "A visão real: o adapter
+# traduz, a estação não muda"; tests/test_visao_intocada.py prende o sha256).
+# Achado de lint lá dentro não tem correção possível daqui, e deixá-lo na saída
+# esconderia o achado novo do lado de cá no meio de trinta antigos.
+extend-exclude = ["vision/visao", "vision/visao_mesa"]

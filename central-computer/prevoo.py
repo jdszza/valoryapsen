@@ -386,6 +386,112 @@ def itens_modo(modo_apresentacao: bool, fator_velocidade: float,
     return itens
 
 
+# ── Visão real ────────────────────────────────────────────────────────────────
+
+def _normalizar_nome(nome) -> str:
+    """A mesma comparação de nome do vision-adapter (`ponte.normalizar_nome`)."""
+    return " ".join(str(nome or "").split()).upper()
+
+
+def itens_visao(saude: dict | None, posicoes_definidas: bool,
+                templates: list[dict]) -> list[dict]:
+    """Os itens da visão, a partir de UMA sonda: o `/health` do vision-adapter.
+
+    O adapter já fala com as três estações; sondá-las daqui seria repetir o
+    trabalho por um caminho que o central nem enxerga (elas rodam no host). E
+    `saude=None` (adapter fora) é UM item, não quatro: o resto seria derivado
+    da mesma causa.
+    """
+    if saude is None:
+        return [_item("visao", "Visão", "Visão", FALHA,
+                      "o /health do vision-adapter não respondeu — sem ele não "
+                      "dá para conferir câmera nenhuma",
+                      "Suba o adapter: `docker compose up -d vision-adapter`, e "
+                      "veja `docker compose logs --tail=50 vision-adapter`.")]
+
+    fontes = saude.get("fontes") or {}
+    mesa, dispensers = fontes.get("mesa", "?"), fontes.get("dispensers", "?")
+    itens = [_item("visao_fontes", "Visão", "Fonte das câmeras", INFO,
+                   f"mesa: {mesa} · dispensers: {dispensers}")]
+
+    identidade = saude.get("identidade_mesa") or {}
+    if identidade.get("confere") is False:
+        itens.append(_item(
+            "visao_identidade", "Visão", "Quem responde pela câmera da mesa", FALHA,
+            f"VISAO_MESA_FONTE={mesa} espera {identidade.get('esperado')!r}, mas "
+            f"{saude.get('comandos_mesa_para')} responde como "
+            f"{identidade.get('recebido')!r} — o adapter está recusando a captura",
+            "Corrija VISION_SIM_URL ou VISAO_MESA_FONTE no .env e recrie o "
+            "vision-adapter (`docker compose up -d vision-adapter`)."))
+
+    if dispensers == "estacao":
+        checks = saude.get("checks") or {}
+        for lado in ("esq", "dir"):
+            estado = checks.get(f"estacao-dispensers-{lado}")
+            if estado == "ok":
+                itens.append(_item(f"visao_disp_{lado}", "Visão",
+                                   f"Estação dos dispensers ({lado})", OK,
+                                   "respondendo"))
+            else:
+                itens.append(_item(
+                    f"visao_disp_{lado}", "Visão", f"Estação dos dispensers ({lado})",
+                    FALHA, f"inacessível ({estado or 'sem resposta'})",
+                    f"No mini PC: `vision\\iniciar_dispensers.bat {lado}`."))
+
+    if mesa == "estacao":
+        estacao = saude.get("estacao_mesa")
+        if estacao is None or identidade.get("confere") is None:
+            itens.append(_item(
+                "visao_mesa", "Visão", "Estação da mesa", FALHA,
+                f"inacessível em {saude.get('comandos_mesa_para')}",
+                "No mini PC: `vision\\iniciar_mesa.bat`; e confira a regra de "
+                "firewall da porta 8212 (docs/DEPLOY_WINDOWS.md)."))
+        elif not estacao.get("pronta"):
+            itens.append(_item(
+                "visao_mesa", "Visão", "Estação da mesa", ALERTA,
+                "no ar, mas a câmera NÃO está pronta",
+                "Confira a webcam da mesa (cabo, outro programa usando) e "
+                "reinicie a estação entre OSs."))
+        else:
+            itens.append(_item("visao_mesa", "Visão", "Estação da mesa", OK,
+                               f"câmera pronta · fila {estacao.get('fila', 0)} · "
+                               f"{estacao.get('envios_falhados', 0)} envio(s) falhado(s)"))
+        if not posicoes_definidas:
+            itens.append(_item(
+                "visao_mesa_posicoes", "Visão", "Posições da câmera da mesa", ALERTA,
+                "VISAO_MESA_POSICOES não definida: a câmera real fotografa em todas "
+                "as paradas, inclusive onde a caixa não aparece inteira",
+                "Meça as posições (docs/BANCADA_VISAO.md, M4) e defina "
+                "VISAO_MESA_POSICOES no .env."))
+
+    itens.append(item_cobertura_etiquetas(
+        (saude.get("etiquetas") or {}).get("nomes") or [], templates))
+    return itens
+
+
+def item_cobertura_etiquetas(etiquetados: list[str], templates: list[dict]) -> dict:
+    """Quantos medicamentos das ordens padrão têm etiqueta para a câmera.
+
+    Sem etiqueta não é falha de hardware: é COBERTURA — o slot segue sem
+    conferência de SKU, e o central já não grava alarme por isso. Daí ser um
+    número informativo, e não um vermelho que ninguém tem como apagar hoje.
+    """
+    com_etiqueta = {_normalizar_nome(n) for n in etiquetados}
+    medicamentos = sorted({_normalizar_nome(i.get("medicamento"))
+                           for t in templates for i in t.get("itens", [])})
+    cobertos = [m for m in medicamentos if m in com_etiqueta]
+    sem_nenhum = [t.get("template_id") for t in templates
+                  if not any(_normalizar_nome(i.get("medicamento")) in com_etiqueta
+                             for i in t.get("itens", []))]
+    detalhe = (f"{len(cobertos)} de {len(medicamentos)} medicamentos das ordens "
+               f"padrão têm etiqueta")
+    if sem_nenhum:
+        faltam = [m for m in medicamentos if m not in com_etiqueta]
+        detalhe += (f" · {len(sem_nenhum)} ordem(ns) sem nenhum item etiquetado "
+                    f"({', '.join(sem_nenhum)}) · sem etiqueta: {', '.join(faltam)}")
+    return _item("visao_etiquetas", "Visão", "Cobertura de etiquetas", INFO, detalhe)
+
+
 # ── Resumo ────────────────────────────────────────────────────────────────────
 
 def resumo(itens: list[dict]) -> dict:
