@@ -115,26 +115,33 @@ A estação dos dispensers só reconhece caixa com a etiqueta impressa pelo
    adapter, e `tests/test_vision_adapter_ponte.py` reprova nome que o central
    não tem. A tabela vai na imagem do adapter: recrie o container.
 3. **Imprima a etiqueta.** O gerador lê o `config/medicamentos.json` da pasta
-   em que roda, e esse arquivo é também o catálogo de reserva da estação e a
-   fonte da cena sintética de teste. Então gere numa CÓPIA da pasta:
+   em que roda, e o da pasta `visao` versionada é também o catálogo de reserva
+   da estação e a fonte da cena sintética de teste — não mexa nele. Gere numa
+   CÓPIA da pasta, com o `medicamentos.json` GERADO da tabela:
 
    ```bat
-   robocopy vision\visao %TEMP%\etiquetas /E /XD dados logs .venv __pycache__
+   robocopy vision\visao %TEMP%\etiquetas /E /XD dados logs .venv __pycache__ qrcodes
+   python vision\medicamentos_impressao.py %TEMP%\etiquetas\config\medicamentos.json
    cd %TEMP%\etiquetas
-   rem edite config\medicamentos.json: um item por etiqueta a imprimir
    python src\gerar_qrcodes.py
    ```
 
    O resultado sai em `qrcodes/folha_etiquetas.pdf` da cópia. Imprima em 100%
-   ("Tamanho real").
+   ("Tamanho real"). Para reimprimir só algumas, passe `--qr MED-005,MED-021`
+   ao `medicamentos_impressao.py`: o número de cada uma não muda.
+
+   O `medicamentos.json` de impressão **não se edita à mão**: o script copia
+   `qr`, `nome` e `aruco` da tabela e recusa gerar (sai 1) se a tabela tiver
+   linha que o adapter descartaria — imprimir a etiqueta dessa linha seria
+   imprimir um código desconhecido. `tests/test_medicamentos_impressao.py`
+   confere o arquivo contra a tabela, o `Catalogo` da estação e o adapter.
 
 **O "DISPENSER n" impresso na etiqueta não vale.** O slot de cada medicamento
 muda a cada OS, e quem diz qual é o certo é o catálogo que o adapter serve. O
 gerador exige um número de dispenser **diferente** por item (é a regra de
-`Catalogo.carregar`), mas não tem teto: para imprimir várias etiquetas de uma
-vez, use para cada uma o mesmo número do catálogo, 1000 + a posição dela na
-tabela (MIOSAN 5MG = 1001, …). Isso é limitação da ferramenta da visão, e ela
-não é alterada por este repositório.
+`Catalogo.carregar`), e o script usa o mesmo número do catálogo do adapter:
+1000 + a posição na tabela (MIOSAN 5MG = 1001, …). Isso é limitação da
+ferramenta da visão, e ela não é alterada por este repositório.
 
 ## Ensaio sem câmera
 

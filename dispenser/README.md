@@ -212,7 +212,10 @@ que impede o mesmo comprimido de ser contado duas vezes por tremida do sensor.
 
 | constante | valor | o que é |
 |---|---|---|
-| `DISPENSA_SERVO_MS` | 250 ms | quanto o braço leva de um extremo ao outro, com carga |
+| `DISPENSA_IDA_MS` | 400 ms | empurrão em rampa até o max (em salto, o braço arremessava a caixa); os últimos `DISPENSA_SALTO_FINAL_GRAUS` (30°; 60° em D2 e D3, pela tabela `SALTO_FINAL_GRAUS`) saem em salto, senão o braço com carga para antes do fim |
+| `DISPENSA_SEGURA_MS` | 150 ms | parado no max, a caixa termina de sair |
+| `DISPENSA_VOLTA_MS` | 200 ms | volta em rampa até o min |
+| `DISPENSA_PAUSA_MS` | 150 ms | intervalo antes da unidade seguinte |
 | `DISPENSA_TIMEOUT_UNIDADE_MS` | 1500 ms | prazo do pulso, contado do **início** do ciclo |
 
 > Os dois são **A CONFIRMAR NA BANCADA**: eles saem de medida, não de gosto.
@@ -226,6 +229,15 @@ não segue para o próximo: se o mecanismo atolou, insistir agrava. O evento sai
 com `quantidade_dispensada` = o que o IR contou, `falha_mecanica: true` e
 `motivo_falha: "falha_mecanica"`, e quem decide o que fazer com o déficit é o
 Triple Check, com três fontes.
+
+**Bancada sem sensores: `CONTAR_PELO_IR 0`.** Com os IR desligados ou ausentes
+eles ficam em `DET` (o `SHOW` mostra `IR-n DET` em todas as linhas) e nunca
+pulsam, então toda dispensa sai `0/N` na primeira unidade e o Triple Check trava
+em "dispenser divergente". Com a chave em 0, cada ciclo `min → max → min` conta
+como uma unidade. O preço: `quantidade_dispensada` passa a ser o que o servo
+**tentou**, não o que caiu, e mecanismo atolado deixa de ser detectado na placa
+— quem o pega é a balança e a câmera da mesa. O boot imprime um `AVISO`
+enquanto ela estiver em 0; volte para 1 quando os sensores forem ligados.
 
 O servo volta ao **min calibrado** em toda saída, inclusive na falha, e o
 movimento usa `moverCalibrado`, nunca `moverRaw`: fora do `MANUT` é a
@@ -443,6 +455,6 @@ Nenhuma destas se decide no editor. Elas estão marcadas assim também no códig
 |---|---|---|
 | **Os pinos do I²C do PCA9685** | `servos_hub.ino`, `PCA_SDA` / `PCA_SCL` | o esquemático da REV 1.0 mostra D21/D22 como NC e o código diz GPIO23/GPIO22. Quem decide é o multímetro. As mensagens do boot imprimem os valores das constantes com `%d` — mensagem de erro que aponta para o pino errado manda quem lê procurar no lugar errado |
 | **Calibrar os 8 servos** e colar o `EXPORT` no `CAL_BACKUP` | terminal `MANUT` | sem calibração própria o `min` é 0° e pode estar **além** do fim de curso. O boot **não move** servo não calibrado, de propósito, e avisa no log |
-| **`DISPENSA_TIMEOUT_UNIDADE_MS`** e **`DISPENSA_SERVO_MS`** | `servos_hub.ino` | medir o intervalo real entre o ciclo e o pulso do IR, com o medicamento de verdade |
+| **`DISPENSA_TIMEOUT_UNIDADE_MS`** e os quatro `DISPENSA_*_MS` do ciclo | `servos_hub.ino` | medir o intervalo real entre o ciclo e o pulso do IR, com o medicamento de verdade |
 | **Conferir as 39 imagens** com `img <slot> <n>` contra a lista de `catalogo_imagens.h` | Monitor Serial da placa das telas | a ordem veio de fora do repositório; o teste confere contagem e nomes, não o desenho |
 | **Fixar as duas COM** e preencher `DISPENSER_SERIAL_URL` / `DISPENSER_TFT_SERIAL_URL` | `.env` do host | ver acima |

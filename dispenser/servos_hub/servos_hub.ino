@@ -104,14 +104,14 @@ struct ServoCal {
 #define NUM_SERVOS 8
 
 const ServoCal CAL_BACKUP[NUM_SERVOS] = {
-  {   0, 180 },  // servo 0  (IR-1)
-  {   0, 180 },  // servo 1  (IR-2)
-  {   0, 180 },  // servo 2  (IR-3)
-  {   0, 180 },  // servo 3  (IR-4)
-  {   0, 180 },  // servo 4  (IR-5)
-  {   0, 180 },  // servo 5  (IR-6)
-  {   0, 180 },  // servo 6  (IR-7)
-  {   0, 180 },  // servo 7  (IR-8)
+  {   0, 180 },  // servo 0  (IR-1)  NAO CALIBRADO - curso inteiro
+  { 100, 180 },  // servo 1  (IR-2)
+  {   0, 110 },  // servo 2  (IR-3)
+  {   0, 110 },  // servo 3  (IR-4)
+  {   0, 145 },  // servo 4  (IR-5)
+  {   0, 140 },  // servo 5  (IR-6)
+  {   20, 150 },  // servo 6  (IR-7)
+  {  40, 140 },  // servo 7  (IR-8)
 };
 
 // ---------------------------------------------------------------------
@@ -233,15 +233,69 @@ static int canalEmOperacao = -1;
 
 // Uma unidade por ciclo de servo, e o ciclo e min -> max -> min.
 //
-// A CONFIRMAR NA BANCADA: os dois numeros abaixo saem de MEDIDA, nao de gosto.
-// DISPENSA_SERVO_MS e quanto o braco leva de um extremo ao outro com carga;
+// O EMPURRAO E EM RAMPA, nao em salto. `moverCalibrado(max)` direto manda o
+// servo a velocidade maxima dele, e o braco ARREMESSA a caixa em vez de
+// empurra-la — foi o que se viu na bancada. Hoje a ida percorre o curso em
+// passos ao longo de DISPENSA_IDA_MS, segura no max por DISPENSA_SEGURA_MS
+// (a caixa termina de sair), volta em DISPENSA_VOLTA_MS (sem carga, pode ser
+// mais rapida) e espera DISPENSA_PAUSA_MS antes da unidade seguinte, para a
+// pilha assentar e as caixas nao cairem coladas uma na outra.
+//
+// O CICLO INTEIRO TEM DE CABER EM 1 s. O central nao espera o `dispensado`:
+// ele reserva `quantidade x DISPENSA_S_POR_UNIDADE` (1,0 s) + folga, e a CNC
+// grava o dwell como `(qtd + 1) x 1000 ms` no `WP()`. Um ciclo mais longo que
+// isso faz a mesa sair andando com caixa ainda caindo — no chao, nao na caixa
+// de coleta. Para ir alem de 1 s por unidade, mude os TRES juntos
+// (`DISPENSA_S_POR_UNIDADE` no .env do central, o `WP()` da CNC e estes); o
+// static_assert abaixo segura o firmware dentro do orcamento atual.
+//
 // DISPENSA_TIMEOUT_UNIDADE_MS e o prazo para o pulso do IR daquele slot chegar,
-// contado do INICIO do ciclo. Comecam em 250 ms e 1500 ms, que e folga larga
-// sobre um servo de hobby; o roteiro de PRIMEIRO_ENSAIO.md manda medir o par
-// real e apertar. Curto demais e falha mecanica onde nao houve; longo demais
-// gasta o TIMEOUT_DISPENSA do orquestrador, que corre do outro lado.
-#define DISPENSA_SERVO_MS            250
+// contado do INICIO do ciclo, e por isso precisa ser maior que a ida + o tempo
+// de queda. A CONFIRMAR NA BANCADA (roteiro de PRIMEIRO_ENSAIO.md).
+#define DISPENSA_IDA_MS             400
+#define DISPENSA_SEGURA_MS          150
+#define DISPENSA_VOLTA_MS           200
+#define DISPENSA_PAUSA_MS           150
+#define DISPENSA_PASSO_RAMPA_MS      20   // 50 atualizacoes/s = periodo do PWM
+#define DISPENSA_SALTO_FINAL_GRAUS   35   // ultimo trecho em salto (ver moverEmRampa)
+
+// Salto final POR SERVO, para os que precisam de mais forca. Quanto maior o
+// salto, menor o trecho em rampa e mais cedo o servo faz forca total; o
+// maximo possivel e o curso inteiro em salto (rampa nenhuma), que e o mesmo
+// movimento de antes da rampa. Software nao passa disso: a forca maxima e a
+// do servo, e D2/D3 ja eram fracos com salto direto — o resto e hardware
+// (servo, alimentacao no conector ou mecanismo; ver dispenser/README.md).
+// D2 (servo 1) tem 80 graus de curso, entao 60 deixa so 20 em rampa.
+const uint8_t SALTO_FINAL_GRAUS[NUM_SERVOS] = {
+  DISPENSA_SALTO_FINAL_GRAUS,  // servo 0  (D1)
+  60,                          // servo 1  (D2) - fraco na bancada
+  60,                          // servo 2  (D3) - fraco na bancada
+  DISPENSA_SALTO_FINAL_GRAUS,  // servo 3  (D4)
+  DISPENSA_SALTO_FINAL_GRAUS,  // servo 4  (D5)
+  DISPENSA_SALTO_FINAL_GRAUS,  // servo 5  (D6)
+  DISPENSA_SALTO_FINAL_GRAUS,  // servo 6  (D7)
+  DISPENSA_SALTO_FINAL_GRAUS,  // servo 7  (D8)
+};
+#define DISPENSA_ORCAMENTO_MS      1000   // = DISPENSA_S_POR_UNIDADE do central
 #define DISPENSA_TIMEOUT_UNIDADE_MS 1500
+static_assert(DISPENSA_IDA_MS + DISPENSA_SEGURA_MS + DISPENSA_VOLTA_MS +
+              DISPENSA_PAUSA_MS <= DISPENSA_ORCAMENTO_MS - 50,
+              "ciclo de dispensa nao cabe no 1 s por unidade do central/CNC");
+
+// QUEM CONTA A UNIDADE. 1 = o pulso do IR do slot (o desenho final da
+// celula). 0 = cada ciclo min -> max -> min conta como uma unidade, sem olhar
+// sensor nenhum — e o modo da bancada enquanto os sensores nao estao montados.
+//
+// Com 0, um IR desligado nao interrompe mais nada; com 1 e sem sensor, TODA
+// dispensa sai 0/N na primeira unidade (o IR fica em DET e nunca pulsa), e o
+// Triple Check trava em "dispenser divergente" em toda OS.
+//
+// O preco do 0 tem de ficar escrito: `quantidade_dispensada` passa a ser o que
+// o servo TENTOU, nao o que caiu. Mecanismo atolado nao e mais detectado aqui
+// — quem o pega e a balanca e a camera da mesa, que continuam no Triple
+// Check. Volte para 1 no dia em que os sensores forem ligados; o boot avisa
+// enquanto estiver em 0.
+#define CONTAR_PELO_IR 0
 
 // O UNICO valor de `injetar_falha` que esta placa reconhece. E o mesmo de
 // `central-computer/injecao.TIPO_FALHA_MECANICA` e de
@@ -977,6 +1031,35 @@ static void emitErroSlot(int slot_1a8, const char* os_id, const char* codigo,
 
 // -- A mecanica: uma unidade por ciclo, confirmada pelo IR --------------------
 
+// Leva o servo de onde ele esta ate `alvo` em `duracao_ms`, sempre dentro da
+// calibracao. Continua lendo IR e serial entre os passos, como qualquer espera
+// do laco de dispensa.
+//
+// A rampa para SALTO_FINAL_GRAUS[canal] antes do alvo, e o resto e um SALTO.
+// Rampa ate o fim nao chega ao fim com carga: o servo de hobby faz forca
+// proporcional ao ERRO, e em passos pequenos o erro e sempre pequeno — o braco
+// para alguns graus antes, segurado pelo atrito da caixa. O `MOVE` do MANUT
+// nunca mostrou isso porque ele e um salto so: erro grande, forca total, e o
+// braco chega embalado. O trecho em rampa e o que tira o arremesso; o salto
+// curto no fim e o que garante o curso calibrado.
+static void moverEmRampa(uint8_t canal_0a7, int alvo, unsigned long duracao_ms) {
+  const int de = angAtual[canal_0a7];
+  const int distancia = abs(alvo - de);
+  const int salto = SALTO_FINAL_GRAUS[canal_0a7];
+  const int passos = (int)(duracao_ms / DISPENSA_PASSO_RAMPA_MS);
+  if (passos <= 1 || de < 0 || distancia <= salto) {
+    moverCalibrado(canal_0a7, alvo);
+    esperarLendoSerial(duracao_ms);
+    return;
+  }
+  const int ate = alvo - (alvo > de ? salto : -salto);
+  for (int i = 1; i <= passos; i++) {
+    moverCalibrado(canal_0a7, de + (int)((long)(ate - de) * i / passos));
+    esperarLendoSerial(DISPENSA_PASSO_RAMPA_MS);
+  }
+  moverCalibrado(canal_0a7, alvo);
+}
+
 static bool soltarUmaUnidade(uint8_t canal_0a7) {
   const uint32_t antes = irContagem[canal_0a7];
   const unsigned long t0 = millis();
@@ -984,10 +1067,13 @@ static bool soltarUmaUnidade(uint8_t canal_0a7) {
   // `moverCalibrado`, NUNCA `moverRaw`: fora do MANUT o movimento respeita a
   // calibracao, e e ela que impede o servo de bater no fim de curso no meio de
   // uma OS. O ciclo sempre TERMINA no min, inclusive quando o pulso nao vem.
-  moverCalibrado(canal_0a7, cal[canal_0a7].angMax);
-  esperarLendoSerial(DISPENSA_SERVO_MS);
-  moverCalibrado(canal_0a7, cal[canal_0a7].angMin);
-  esperarLendoSerial(DISPENSA_SERVO_MS);
+  moverEmRampa(canal_0a7, cal[canal_0a7].angMax, DISPENSA_IDA_MS);
+  esperarLendoSerial(DISPENSA_SEGURA_MS);
+  moverEmRampa(canal_0a7, cal[canal_0a7].angMin, DISPENSA_VOLTA_MS);
+
+  // Sem IR, o ciclo completo E a unidade (ver CONTAR_PELO_IR). A pausa vem
+  // DEPOIS de o braco voltar: e o intervalo entre uma caixa e a seguinte.
+  if (!CONTAR_PELO_IR) { esperarLendoSerial(DISPENSA_PAUSA_MS); return true; }
 
   // O pulso pode ter chegado durante a ida ou durante a volta; o que conta e a
   // contagem daquele sensor ter mudado dentro do prazo, contado do INICIO do
@@ -997,6 +1083,7 @@ static bool soltarUmaUnidade(uint8_t canal_0a7) {
     if (millis() - t0 >= DISPENSA_TIMEOUT_UNIDADE_MS) return false;
     esperarLendoSerial(4);
   }
+  esperarLendoSerial(DISPENSA_PAUSA_MS);
   return true;
 }
 
@@ -1409,6 +1496,10 @@ void setup() {
 
   irInit();
   logMsg("BOOT", "sensores IR-1..8 nos GPIO 13,12,14,27,26,25,33,32");
+  if (!CONTAR_PELO_IR) {
+    logMsg("AVISO", "CONTAR_PELO_IR=0: a dispensa conta pelo ciclo do servo, "
+         "NAO pelo IR. Volte para 1 quando os sensores forem ligados.");
+  }
 
   carregarCalibracao();
 

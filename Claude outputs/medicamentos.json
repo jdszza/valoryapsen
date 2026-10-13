@@ -1,0 +1,434 @@
+{
+  "_comentario": "GERADO por vision/medicamentos_impressao.py a partir de vision-adapter/etiquetas.json — não edite: altere a tabela e gere de novo. Serve só para o gerar_qrcodes.py imprimir as etiquetas; o 'dispenser' é o número fantasma do adapter (1000 + posição na tabela) e o impresso na etiqueta não vale.",
+  "medicamentos": [
+    {
+      "qr": "MED-001",
+      "nome": "MIOSAN 5MG",
+      "dispenser": 1001,
+      "aruco": 1,
+      "cor": [
+        92,
+        132,
+        230
+      ]
+    },
+    {
+      "qr": "MED-002",
+      "nome": "FLANCOX 500MG",
+      "dispenser": 1002,
+      "aruco": 2,
+      "cor": [
+        172,
+        230,
+        92
+      ]
+    },
+    {
+      "qr": "MED-003",
+      "nome": "MECLIN 25MG",
+      "dispenser": 1003,
+      "aruco": 3,
+      "cor": [
+        230,
+        92,
+        212
+      ]
+    },
+    {
+      "qr": "MED-004",
+      "nome": "LONIUM 40MG",
+      "dispenser": 1004,
+      "aruco": 4,
+      "cor": [
+        92,
+        230,
+        206
+      ]
+    },
+    {
+      "qr": "MED-005",
+      "nome": "RETEMIC 5MG",
+      "dispenser": 1005,
+      "aruco": 5,
+      "cor": [
+        230,
+        166,
+        92
+      ]
+    },
+    {
+      "qr": "MED-006",
+      "nome": "UNOPROST 2MG",
+      "dispenser": 1006,
+      "aruco": 6,
+      "cor": [
+        126,
+        92,
+        230
+      ]
+    },
+    {
+      "qr": "MED-007",
+      "nome": "ARPADOL 400MG",
+      "dispenser": 1007,
+      "aruco": 7,
+      "cor": [
+        98,
+        230,
+        92
+      ]
+    },
+    {
+      "qr": "MED-008",
+      "nome": "COLCHIS 0,5MG",
+      "dispenser": 1008,
+      "aruco": 8,
+      "cor": [
+        230,
+        92,
+        138
+      ]
+    },
+    {
+      "qr": "MED-009",
+      "nome": "DESOL",
+      "dispenser": 1009,
+      "aruco": 9,
+      "cor": [
+        92,
+        178,
+        230
+      ]
+    },
+    {
+      "qr": "MED-010",
+      "nome": "INPRUV DK 7000UI",
+      "dispenser": 1010,
+      "aruco": 10,
+      "cor": [
+        218,
+        230,
+        92
+      ]
+    },
+    {
+      "qr": "MED-011",
+      "nome": "EXTIMA CHOCOLATE",
+      "dispenser": 1011,
+      "aruco": 11,
+      "cor": [
+        201,
+        92,
+        230
+      ]
+    },
+    {
+      "qr": "MED-012",
+      "nome": "INILOK 40MG",
+      "dispenser": 1012,
+      "aruco": 12,
+      "cor": [
+        92,
+        230,
+        160
+      ]
+    },
+    {
+      "qr": "MED-013",
+      "nome": "MOTILEX",
+      "dispenser": 1013,
+      "aruco": 13,
+      "cor": [
+        230,
+        120,
+        92
+      ]
+    },
+    {
+      "qr": "MED-014",
+      "nome": "MAG B",
+      "dispenser": 1014,
+      "aruco": 14,
+      "cor": [
+        92,
+        104,
+        230
+      ]
+    },
+    {
+      "qr": "MED-015",
+      "nome": "ALOIS 10MG",
+      "dispenser": 1015,
+      "aruco": 15,
+      "cor": [
+        144,
+        230,
+        92
+      ]
+    },
+    {
+      "qr": "MED-016",
+      "nome": "INSIT 50MG",
+      "dispenser": 1016,
+      "aruco": 16,
+      "cor": [
+        230,
+        92,
+        184
+      ]
+    },
+    {
+      "qr": "MED-017",
+      "nome": "PAXORAL 7MG",
+      "dispenser": 1017,
+      "aruco": 17,
+      "cor": [
+        92,
+        224,
+        230
+      ]
+    },
+    {
+      "qr": "MED-018",
+      "nome": "LENIX 50MG",
+      "dispenser": 1018,
+      "aruco": 18,
+      "cor": [
+        230,
+        195,
+        92
+      ]
+    },
+    {
+      "qr": "MED-019",
+      "nome": "ZANIDIP 10MG",
+      "dispenser": 1019,
+      "aruco": 19,
+      "cor": [
+        155,
+        92,
+        230
+      ]
+    },
+    {
+      "qr": "MED-020",
+      "nome": "XAFAC 2,5MG",
+      "dispenser": 1020,
+      "aruco": 20,
+      "cor": [
+        92,
+        230,
+        114
+      ]
+    },
+    {
+      "qr": "MED-021",
+      "nome": "XAFAC 10MG",
+      "dispenser": 1021,
+      "aruco": 21,
+      "cor": [
+        230,
+        92,
+        109
+      ]
+    },
+    {
+      "qr": "MED-022",
+      "nome": "XAFAC 20MG",
+      "dispenser": 1022,
+      "aruco": 22,
+      "cor": [
+        92,
+        150,
+        230
+      ]
+    },
+    {
+      "qr": "MED-023",
+      "nome": "DOBEVEN 500MG",
+      "dispenser": 1023,
+      "aruco": 23,
+      "cor": [
+        190,
+        230,
+        92
+      ]
+    },
+    {
+      "qr": "MED-024",
+      "nome": "DONAREN 50MG",
+      "dispenser": 1024,
+      "aruco": 24,
+      "cor": [
+        229,
+        92,
+        230
+      ]
+    },
+    {
+      "qr": "MED-025",
+      "nome": "ATENTAH 18MG",
+      "dispenser": 1025,
+      "aruco": 25,
+      "cor": [
+        92,
+        230,
+        189
+      ]
+    },
+    {
+      "qr": "MED-026",
+      "nome": "COBI-12 1000MCG",
+      "dispenser": 1026,
+      "aruco": 26,
+      "cor": [
+        230,
+        149,
+        92
+      ]
+    },
+    {
+      "qr": "MED-027",
+      "nome": "LACTOSIL 4500 COMP",
+      "dispenser": 1027,
+      "aruco": 27,
+      "cor": [
+        109,
+        92,
+        230
+      ]
+    },
+    {
+      "qr": "MED-028",
+      "nome": "LACTOSIL 10000 COMP",
+      "dispenser": 1028,
+      "aruco": 28,
+      "cor": [
+        115,
+        230,
+        92
+      ]
+    },
+    {
+      "qr": "MED-029",
+      "nome": "LACTOSIL FLORA",
+      "dispenser": 1029,
+      "aruco": 29,
+      "cor": [
+        230,
+        92,
+        155
+      ]
+    },
+    {
+      "qr": "MED-030",
+      "nome": "PROBID",
+      "dispenser": 1030,
+      "aruco": 30,
+      "cor": [
+        92,
+        196,
+        230
+      ]
+    },
+    {
+      "qr": "MED-031",
+      "nome": "PROBIANS",
+      "dispenser": 1031,
+      "aruco": 31,
+      "cor": [
+        230,
+        223,
+        92
+      ]
+    },
+    {
+      "qr": "MED-032",
+      "nome": "FLORACOL",
+      "dispenser": 1032,
+      "aruco": 32,
+      "cor": [
+        183,
+        92,
+        230
+      ]
+    },
+    {
+      "qr": "MED-033",
+      "nome": "LEVOXIN 500MG",
+      "dispenser": 1033,
+      "aruco": 33,
+      "cor": [
+        92,
+        230,
+        143
+      ]
+    },
+    {
+      "qr": "MED-034",
+      "nome": "LEVOXIN 750MG",
+      "dispenser": 1034,
+      "aruco": 34,
+      "cor": [
+        230,
+        103,
+        92
+      ]
+    },
+    {
+      "qr": "MED-035",
+      "nome": "LECZA XR 500MG",
+      "dispenser": 1035,
+      "aruco": 35,
+      "cor": [
+        92,
+        121,
+        230
+      ]
+    },
+    {
+      "qr": "MED-036",
+      "nome": "SIL-HP 4MG",
+      "dispenser": 1036,
+      "aruco": 36,
+      "cor": [
+        161,
+        230,
+        92
+      ]
+    },
+    {
+      "qr": "MED-037",
+      "nome": "SIL-HP 8MG",
+      "dispenser": 1037,
+      "aruco": 37,
+      "cor": [
+        230,
+        92,
+        201
+      ]
+    },
+    {
+      "qr": "MED-038",
+      "nome": "DUEPOLI ER 500MG",
+      "dispenser": 1038,
+      "aruco": 38,
+      "cor": [
+        92,
+        230,
+        217
+      ]
+    },
+    {
+      "qr": "MED-039",
+      "nome": "LURATT 20MG",
+      "dispenser": 1039,
+      "aruco": 39,
+      "cor": [
+        230,
+        177,
+        92
+      ]
+    }
+  ]
+}

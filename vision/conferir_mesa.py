@@ -94,7 +94,8 @@ def conferir(mesa_json: dict, env: dict | None, pacotes: set[str] | None,
     if camera.get("autofoco") is True:
         problemas.append(Problema(
             ALERTA, "camera.autofoco = true — o foco caça a cada parada da mesa",
-            "Fixe um foco médio que sirva às 8 paradas (NOTAS_CALIBRAGEM.md) e "
+            "Fixe um foco médio que sirva às 8 paradas "
+            "(vision/visao_mesa/NOTAS_CALIBRAGEM.md) e "
             "confira a nitidez nos eventos."))
 
     if env is None:

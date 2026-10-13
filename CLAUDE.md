@@ -3002,14 +3002,27 @@ sem QR já sai `VAZIO` (falha). Hoje `NAO_CADASTRADO` é falha
 campo; `divergencia` é o comportamento antigo, e o procedimento D6 de
 docs/BANCADA_VISAO.md é o que decide entre os dois.
 
-**Sem etiqueta é COBERTURA, não falha de hardware.** Só 4 medicamentos têm
-etiqueta, e eles cobrem 6 dos 46 itens das ordens padrão. Um alarme
+**Sem etiqueta é COBERTURA, não falha de hardware.** Quando esta regra nasceu,
+só 4 medicamentos tinham etiqueta e eles cobriam 6 dos 46 itens das ordens
+padrão. Um alarme
 `falha_leitura_dispenser` por item `sem_etiqueta_cadastrada` eram ~4 alarmes
 abertos por OS, para sempre (não há o que resolver), empurrando para fora da
 tela de necessidades o alarme que importa. Hoje esse motivo grava a leitura e
 um log INFO; a cobertura é um número informativo no pré-voo ("N de M
 medicamentos das ordens padrão têm etiqueta", com as ordens sem nenhum item
-etiquetado). Pelo mesmo motivo de "um evento, um alarme", o handler do central
+etiquetado).
+
+Hoje a tabela cobre os 39 medicamentos das ordens padrão (MED-001..MED-039,
+ArUco 1..39), e `tests/test_vision_adapter_ponte.py` reprova item de ordem
+padrão sem linha na tabela. A ordem é **cadastrar e só depois imprimir**:
+etiqueta impressa sem linha na tabela é lida como código desconhecido na zona.
+O `DICT_4X4_50` tem 50 ids e sobram 11 (0 e 40..49): medicamento novo fora das
+ordens padrão compete por eles, e o dia em que acabarem pede trocar o
+dicionário — que é exatamente a troca que o `estacao.py` não acompanha (ver
+abaixo). `sem_etiqueta_cadastrada` continua existindo para medicamento do
+catálogo que nenhuma ordem padrão usa.
+
+Pelo mesmo motivo de "um evento, um alarme", o handler do central
 deixou de gravar `divergencia_contagem` para `leitura_mesa_divergencia`: quem
 decide o que ela significa é o orquestrador (trava, oclusão, dessincronia,
 payload incoerente), e ele grava o alarme certo — o do handler afirmava

@@ -9,6 +9,7 @@ Estes testes valem por leitura estática (PyYAML), sem Docker: prendem o que
 some fácil num merge — healthcheck removido, ciclo de dependência e porta
 duplicada.
 """
+import re
 from pathlib import Path
 
 import pytest
@@ -420,19 +421,56 @@ def test_o_quickstart_do_readme_ativa_o_profile_na_linha_de_comando():
     assert "docker compose --profile simulado up -d --build" in texto
 
 
-def test_nenhum_comando_geral_de_up_no_readme_ficou_sem_o_profile():
+SECAO_CELULA = "## Rodar tudo integrado, passo a passo"
+
+
+def _secoes_do_readme() -> tuple[list[str], list[str]]:
+    """(linhas fora da seção da célula montada, linhas dentro dela)."""
+    linhas = README.read_text(encoding="utf-8").splitlines()
+    inicio = linhas.index(SECAO_CELULA)
+    fim = next(i for i in range(inicio + 1, len(linhas)) if linhas[i].startswith("## "))
+    return linhas[:inicio] + linhas[fim:], linhas[inicio:fim]
+
+
+def _up_geral(linha: str, servicos: dict) -> bool:
+    """`docker compose up -d` sem nomear serviço. Nomear um serviço único não
+    depende do profile: o caminho nunca precisou dele para funcionar."""
+    if "docker compose up -d" not in linha:
+        return False
+    resto = linha.split("docker compose up -d", 1)[1]
+    return not any(re.search(rf"(?<![\w-]){re.escape(nome)}(?![\w-])", resto)
+                   for nome in servicos)
+
+
+def test_nenhum_comando_geral_de_up_no_readme_ficou_sem_o_profile(servicos):
     """Todo `docker compose up` de escopo GERAL (sem nomear um serviço
-    específico) no README carrega `--profile simulado` — nomear um serviço
-    único (ex.: `central-computer`, que não tem profile) não precisa, porque
-    esse caminho nunca dependeu do profile para funcionar."""
-    texto = README.read_text(encoding="utf-8")
-    linhas_sem_profile = [
-        linha for linha in texto.splitlines()
-        if "docker compose up -d" in linha
-        and "--profile simulado" not in linha
-        and "central-computer" not in linha
-    ]
+    específico) no README carrega `--profile simulado` — FORA da seção da
+    célula montada, que tem a regra oposta (o teste seguinte)."""
+    fora, _ = _secoes_do_readme()
+    linhas_sem_profile = [l for l in fora
+                          if _up_geral(l, servicos) and "--profile simulado" not in l]
     assert not linhas_sem_profile, linhas_sem_profile
+
+
+def test_na_celula_montada_o_up_geral_zera_o_profile(servicos):
+    """O caminho inverso, como o `make up-bancada`: no mini PC, `up` geral com o
+    profile ligado (no comando OU esquecido no `.env`) sobe adapters e
+    simuladores em container por cima dos do host — e a célula física fica
+    parada com o dashboard todo verde. Por isso todo `up` geral da seção zera a
+    variável na mesma linha ou logo antes, e nenhum carrega `--profile`."""
+    _, dentro = _secoes_do_readme()
+    culpados = []
+    for i, linha in enumerate(dentro):
+        if not _up_geral(linha, servicos):
+            continue
+        contexto = " ".join(dentro[max(0, i - 2):i + 1])
+        if "--profile simulado" in linha or "COMPOSE_PROFILES=" not in contexto \
+                or "COMPOSE_PROFILES=simulado" in contexto.replace(
+                    "tire `COMPOSE_PROFILES=simulado`", ""):
+            culpados.append(linha)
+    assert not culpados, culpados
+    assert any(_up_geral(l, servicos) for l in dentro), \
+        "a seção da célula montada não tem mais o `up` — o extrator quebrou?"
 
 
 def test_nenhum_servico_mapeia_device_de_verdade(servicos):

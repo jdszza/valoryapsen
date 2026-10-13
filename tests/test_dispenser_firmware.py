@@ -361,12 +361,23 @@ def test_o_documento_e_as_placas_falsas_concordam_com_o_firmware(firmware):
 
 def test_a_dispensa_usa_mover_calibrado_e_nunca_mover_raw(firmware):
     """Fora do MANUT o movimento respeita a calibração, e é ela que impede o
-    servo de bater no fim de curso no meio de uma OS."""
+    servo de bater no fim de curso no meio de uma OS.
+
+    O ciclo move o braço pela rampa (`moverEmRampa`, que empurra a caixa em vez
+    de arremessá-la), e é a rampa que escreve no PWM — então a regra é cobrada
+    nas duas funções."""
     texto = sem_comentarios(firmware["dispenser"])
-    corpo = texto[texto.index("static bool soltarUmaUnidade"):]
-    corpo = corpo[: corpo.index("\n}\n")]
-    assert "moverCalibrado" in corpo
-    assert "moverRaw" not in corpo
+
+    def corpo_de(assinatura):
+        corpo = texto[texto.index(assinatura):]
+        return corpo[: corpo.index("\n}\n")]
+
+    ciclo = corpo_de("static bool soltarUmaUnidade")
+    rampa = corpo_de("static void moverEmRampa")
+    assert "moverEmRampa" in ciclo
+    assert "moverCalibrado" in rampa
+    assert "moverRaw" not in ciclo
+    assert "moverRaw" not in rampa
 
 
 def test_o_pulso_que_nao_vem_interrompe_a_dispensa(firmware):

@@ -58,6 +58,24 @@ def _seed_do_central() -> dict[str, str]:
 SEED = _seed_do_central()
 
 
+def _sem_etiqueta() -> tuple[str, str]:
+    """Dois medicamentos do catálogo que NÃO estão na tabela versionada.
+
+    Calculados, e não escritos à mão: o exemplo de "sem etiqueta" que estava
+    aqui (RETEMIC 5MG, DONAREN 50MG) ganhou etiqueta quando a tabela passou a
+    cobrir as ordens padrão, e os testes de "slot sem etiqueta" passaram a
+    testar outra coisa sem ninguém notar. Com a tabela cobrindo o catálogo
+    inteiro, não sobra exemplo — e aí o assert diz por quê.
+    """
+    rotulados = {e["nome"] for e in json.loads(ETIQUETAS.read_text(encoding="utf-8"))["etiquetas"]}
+    livres = [nome for nome in SEED if nome not in rotulados]
+    assert len(livres) >= 2, "todo medicamento do catálogo tem etiqueta: troque estes testes"
+    return livres[0], livres[1]
+
+
+SEM_ETIQUETA, SEM_ETIQUETA_2 = _sem_etiqueta()
+
+
 @pytest.fixture(scope="module")
 def Catalogo():
     """O `Catalogo` DA ESTAÇÃO, importado por caminho — nunca uma cópia da regra."""
@@ -243,6 +261,21 @@ def test_todo_nome_da_tabela_existe_no_catalogo_do_central():
     assert not fora, f"nomes da tabela que o central não tem: {fora}"
 
 
+def test_todo_medicamento_das_ordens_padrao_tem_etiqueta():
+    """Item de ordem padrão sem etiqueta sai como `sem_etiqueta_cadastrada`:
+    a OS anda, mas a conferência de SKU daquele slot simplesmente não acontece.
+    Ordem nova (ou medicamento trocado num template) entra com a linha aqui
+    JUNTO — e a etiqueta é impressa depois do cadastro, nunca antes: impressa
+    sem linha na tabela, ela é lida como código desconhecido na zona."""
+    spec = importlib.util.spec_from_file_location(
+        "os_templates_cobertura", RAIZ_REPO / "central-computer" / "os_templates.py")
+    templates = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(templates)
+    rotulados = {e["nome"] for e in json.loads(ETIQUETAS.read_text(encoding="utf-8"))["etiquetas"]}
+    faltando = sorted(set(templates.nomes_usados()) - rotulados)
+    assert not faltando, f"medicamentos das ordens padrão sem etiqueta: {faltando}"
+
+
 def test_tabela_com_erros_descarta_so_a_linha_ruim(carregar_ponte, tmp_path, caplog):
     ponte = carregar_ponte().modulo.ponte
     arquivo = tmp_path / "etiquetas.json"
@@ -297,9 +330,9 @@ def test_o_lado_do_slot_bate_com_o_do_vision_simulator(carregar_ponte, carregar_
 CENARIOS = {
     "OS normal":            {1: "MIOSAN 5MG", 2: "FLANCOX 500MG", 3: "MECLIN 25MG"},
     "sem OS":               {},
-    "slot sem etiqueta":    {1: "MIOSAN 5MG", 6: "RETEMIC 5MG"},
+    "slot sem etiqueta":    {1: "MIOSAN 5MG", 6: SEM_ETIQUETA},
     "remedio duplicado":    {1: "MIOSAN 5MG", 5: "MIOSAN 5MG", 2: "LONIUM 40MG"},
-    "tudo sem etiqueta":    {1: "RETEMIC 5MG", 2: "DONAREN 50MG"},
+    "tudo sem etiqueta":    {1: SEM_ETIQUETA, 2: SEM_ETIQUETA_2},
     "todas as etiquetas":   {1: "MIOSAN 5MG", 2: "FLANCOX 500MG", 7: "MECLIN 25MG",
                              8: "LONIUM 40MG"},
     "grafia diferente":     {4: "  flancox   500mg "},
@@ -327,13 +360,18 @@ def test_fantasma_tem_numero_estavel_e_fora_dos_slots(carregar_ponte):
     modulo = carregar_ponte().modulo
     resposta = modulo.ponte.montar_catalogo({3: "MECLIN 25MG"}, modulo.ETIQUETAS)
     por_qr = {m["qr"]: m["dispenser"] for m in resposta["medicamentos"]}
-    assert por_qr == {"MED-001": 1001, "MED-002": 1002, "MED-003": 3, "MED-004": 1004}
+    # Fantasma = 1000 + posição da linha na tabela; o slot real fica com o seu.
+    esperado = {e["qr"]: 1000 + e["posicao"] for e in modulo.ETIQUETAS}
+    esperado["MED-003"] = 3
+    assert por_qr == esperado
+    assert {q: por_qr[q] for q in ("MED-001", "MED-002", "MED-004")} == \
+        {"MED-001": 1001, "MED-002": 1002, "MED-004": 1004}
 
 
 def test_sem_etiqueta_e_duplicado_vao_para_incompletos(carregar_ponte):
     modulo = carregar_ponte().modulo
     resposta = modulo.ponte.montar_catalogo(
-        {1: "MIOSAN 5MG", 5: "MIOSAN 5MG", 2: "LONIUM 40MG", 6: "RETEMIC 5MG"},
+        {1: "MIOSAN 5MG", 5: "MIOSAN 5MG", 2: "LONIUM 40MG", 6: SEM_ETIQUETA},
         modulo.ETIQUETAS)
     incompletos = {i["dispenser"]: i["motivo"] for i in resposta["incompletos"]}
     assert incompletos[6] == modulo.ponte.MOTIVO_SEM_ETIQUETA
@@ -543,8 +581,8 @@ def test_zona_sem_linha_vira_zona_nao_calibrada(carregar_ponte):
 
 
 def test_sem_etiqueta_falha_na_hora_sem_perguntar_a_estacao(carregar_ponte):
-    p = carregar_ponte(linhas_esq={1: _linha("OK", "RETEMIC 5MG", None)})
-    evento = p.ler(1, "RETEMIC 5MG")
+    p = carregar_ponte(linhas_esq={1: _linha("OK", SEM_ETIQUETA, None)})
+    evento = p.ler(1, SEM_ETIQUETA)
     assert (evento["tipo"], evento["motivo"]) == ("leitura_dispenser_falha", "sem_etiqueta_cadastrada")
     assert not [u for u in p.cliente.gets if u.startswith(ESQ)]
     assert p.relogio.t == 100.0
@@ -726,7 +764,7 @@ def test_rota_por_lado_registra_e_rejeita_lado_desconhecido(carregar_ponte):
 def test_o_catalogo_servido_pela_rota_do_lado_e_aceito_pela_estacao(carregar_ponte, Catalogo):
     p = carregar_ponte()
     p.modulo._registrar_na_os("OS-1", 1, "MIOSAN 5MG")
-    p.modulo._registrar_na_os("OS-1", 2, "RETEMIC 5MG")      # sem etiqueta
+    p.modulo._registrar_na_os("OS-1", 2, SEM_ETIQUETA)       # sem etiqueta
     servido = TestClient(p.modulo.app).get("/estacoes/esq/api/visao/catalogo").json()
     assert set(servido) == {"medicamentos"}
     Catalogo.de_itens(servido["medicamentos"])               # levanta se recusar

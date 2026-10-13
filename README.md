@@ -24,6 +24,7 @@ simuladores já têm contrato e transporte prontos do lado Python.
 - [A célula por dentro](#a-célula-por-dentro) — layout, câmeras, Triple Check, fluxo
 - [As 10 ordens padrão](#as-10-ordens-padrão)
 - [Subir a stack](#subir-a-stack)
+- [Rodar tudo integrado, passo a passo](#rodar-tudo-integrado-passo-a-passo) — a célula montada, com placas e câmeras de verdade
 - [Portas seriais na célula montada](#portas-seriais-na-célula-montada) — ⚠️ leia antes de ligar as placas
 - [Operar](#operar) — console, modo apresentação, injeção, reset, pré-voo
 - [Roteiro de demonstração](#roteiro-de-demonstração)
@@ -539,6 +540,294 @@ e [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md).
 | `/console` responde 503 | `CONSOLE_SENHA` vazia | definir no `.env` e reiniciar o central |
 | OS recusada com 429 | fila no teto (`MAX_FILA_OS=5`) | ver `/api/v1/trava` — quase sempre há trava ativa |
 | container órfão depois de renomear serviço | `container_name` mudou | `docker compose down` antes, ou `up -d --remove-orphans` |
+
+---
+
+## Rodar tudo integrado, passo a passo
+
+O [Quickstart](#quickstart) sobe a planta **simulada**: 13 containers, nenhum
+hardware. Esta seção sobe a **célula montada**, com as placas e as câmeras de
+verdade, no mini PC Windows da bancada. São 14 processos: 7 em container e 7 no
+host, porque o Docker Desktop do Windows não repassa porta COM nem webcam para
+container.
+
+| # | Processo | Onde | Porta | Dono de |
+|---|---|---|---|---|
+| 1 | `mysql`, `central-computer`, `vision-adapter`, `vision-simulator`, `erp-simulator`, `dashboard`, `manut_web` | Docker | 3306, 8000, 8102, 8202, —, 8050, 8051 | — |
+| 2 | dispenser-adapter | host | 8100 | COM dos mecanismos + COM das telas TFT |
+| 3 | cnc-adapter | host | 8101 | COM da mesa |
+| 4 | weight-adapter | host | 8103 | COM da balança |
+| 5 | painel de bancada | host | 5000 | COM do display de 7" |
+| 6 | estação de visão da mesa | host | 8212 | webcam da mesa |
+| 7 | estações de visão dos dispensers (esq, dir) | host | 8301, 8302 | webcams das duas fileiras |
+
+O detalhe e o porquê de cada escolha estão em
+[`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md). Aqui fica a ordem de fazer.
+A **parte A** se faz uma vez, na montagem; a **parte B**, toda vez que a célula
+for ligada.
+
+### Parte A — preparação, uma vez por máquina
+
+**A1. Instale no mini PC:**
+
+- Docker Desktop, marcando *Start Docker Desktop when you sign in*;
+- Python 3.11, com *Add python.exe to PATH*;
+- Git;
+- VS Code com PlatformIO, só se for gravar firmware nesta máquina.
+
+**A2. Clone o repositório** num caminho sem espaços (os `.bat` e os venvs
+preferem assim):
+
+```bat
+cd C:\
+git clone <url-do-repo> apsen
+cd C:\apsen
+```
+
+**A3. Grave os firmwares.** Cada placa tem o seu manual, com o passo a passo de
+gravação e o primeiro boot:
+
+| Placa | Manual |
+|---|---|
+| mecanismos dos dispensers + 8 telas TFT (duas placas) | [`dispenser/README.md`](dispenser/README.md) |
+| mesa CNC | [`cnc/README.md`](cnc/README.md), seção "Passo a passo — do zero até a mesa andando" |
+| balança HX711 | [`weight/README.md`](weight/README.md) |
+| display de 7" | [`docs/BANCADA.md`](docs/BANCADA.md) |
+
+**A4. Descubra e FIXE a COM de cada placa.** Ligue as placas uma de cada vez,
+abra o monitor serial a 115200 e leia o ping: `{"cmd":"ping","sub":"cnc"}` é a
+mesa, `"sub":"weight"` a balança, `"sub":"dispenser"` os mecanismos,
+`"sub":"dispenser_tft"` as telas; o display manda `{"cmd":"ping"}` sem `sub`.
+Fixe o número no Gerenciador de Dispositivos (*Portas (COM e LPT)* →
+*Propriedades* → *Configurações de Porta* → *Avançado…* → *Número da Porta
+COM*) e anote na tabela de [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md),
+seção "A tabela de COM por placa". **Feche o monitor serial** depois: no Windows
+a porta é de um processo só.
+
+**A5. Escreva cada COM no `.bat` do seu processo**, na primeira linha editável.
+É o único lugar onde ela se escreve (o `.env` da raiz é do compose e esses
+processos não o leem):
+
+| Arquivo | Linha |
+|---|---|
+| `dispenser-adapter\iniciar_host.bat` | `DISPENSER_SERIAL_URL` e `DISPENSER_TFT_SERIAL_URL` |
+| `cnc-adapter\iniciar_host.bat` | `CNC_SERIAL_URL` |
+| `weight-adapter\iniciar_host.bat` | `WEIGHT_SERIAL_URL` |
+| `painel_operador\iniciar_backend.bat` | `APSEN_DISPLAY_PORTA` |
+
+**A6. Crie os ambientes Python** — um por processo do host, porque cada um tem
+as suas dependências (e os dois OpenCV da visão não convivem no mesmo venv):
+
+```bat
+for %d in (dispenser-adapter cnc-adapter weight-adapter) do (cd C:\apsen\%d && python -m venv .venv && .venv\Scripts\pip install -r requirements.txt)
+
+cd C:\apsen\painel_operador\backend
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+
+cd C:\apsen\vision\visao
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+
+cd C:\apsen\vision\visao_mesa
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt -r integracao_apsen\requirements.txt
+```
+
+O venv da estação da mesa precisa dos **dois** requirements: sem o segundo, o
+servidor dela morre no import. E venv copiado de outra máquina não serve (ele
+aponta para o Python de lá): apague a pasta `.venv` e recrie.
+
+**A7. Guarde os segredos do painel no ambiente do Windows.** Gere cada um com
+`python -c "import secrets; print(secrets.token_hex(32))"`:
+
+```bat
+setx APSEN_SECRET <chave gerada>
+setx APSEN_API_TOKEN <outra chave gerada>
+```
+
+O `setx` só vale para janelas abertas **depois** dele. A liberação da trava pelo
+painel é opcional e precisa de mais duas — `PAINEL_CENTRAL_USER` e
+`PAINEL_CENTRAL_SENHA`, uma conta com role `supervisor` criada no app de
+manutenção (aba Usuários) depois do passo B1.
+
+**A8. Crie o `.env` da raiz** a partir do [modelo](#o-env-da-raiz), com duas
+diferenças para a célula montada:
+
+```bash
+# NÃO coloque COMPOSE_PROFILES=simulado aqui: com ele os adapters e os
+# simuladores sobem em container por cima dos do host, e a célula física fica
+# parada com o dashboard todo verde.
+
+# O central alcança os adapters do HOST por este nome:
+DISPENSER_ADAPTER_URL=http://host.docker.internal:8100
+CNC_ADAPTER_URL=http://host.docker.internal:8101
+WEIGHT_ADAPTER_URL=http://host.docker.internal:8103
+
+# As três câmeras reais (deixe estas linhas de fora até a parte A10 passar):
+VISION_SIM_URL=http://host.docker.internal:8212
+VISAO_MESA_FONTE=estacao
+VISAO_DISPENSER_FONTE=estacao
+VISAO_MESA_POSICOES=<medido na bancada, ex.: 1,2,3,4,5,6,7,8>
+
+# Para usar o console e o pré-voo:
+CONSOLE_SENHA=<uma senha>
+```
+
+**A9. Libere o firewall** para os containers alcançarem o host. Num prompt de
+**Administrador**:
+
+```bat
+netsh advfirewall firewall add rule name="APSEN adapters e estacoes" dir=in action=allow protocol=TCP localport=8100,8101,8103,8212,8301,8302 profile=private
+```
+
+**A10. Calibre e configure a visão.** É trabalho físico, com procedimento
+próprio em [`docs/BANCADA_VISAO.md`](docs/BANCADA_VISAO.md):
+
+1. Crie `vision\visao_mesa\integracao_apsen\.env` com os valores de
+   [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md) (".env da estação da
+   mesa"): `ADAPTER_URL=http://127.0.0.1:8102`, `PORTA=8212`, `HOST=0.0.0.0`,
+   `ACEITAR_INJECAO=0`, `VALIDADE_OS_H=24`, `T_ASSENTAMENTO_S=1.0`.
+2. Calibre a mesa (M1–M5): fundo em modo `"caixa"`, `suavizacao` e
+   `frames_validade` em 0, e meça `VISAO_MESA_POSICOES`.
+3. Rode `vision\iniciar_dispensers.bat esq` uma vez para criar a pasta e
+   feche; idem `dir`. Em cada pasta (`vision\visao_esq`, `vision\visao_dir`):
+   `python src\camera.py` (grava a câmera por nome) e `python src\calibrar.py`
+   (zonas 1–4 na esquerda, **5–8** na direita), e ponha no
+   `config\parametros.json` o `backend.url` do lado —
+   `http://127.0.0.1:8102/estacoes/esq` ou `.../estacoes/dir`.
+4. Confira tudo de uma vez — os dois scripts dizem o que falta, com o que
+   fazer, e saem com erro enquanto faltar algo:
+
+```bat
+vision\visao_mesa\.venv\Scripts\python vision\conferir_mesa.py
+vision\visao\.venv\Scripts\python vision\conferir_dispensers.py esq
+vision\visao\.venv\Scripts\python vision\conferir_dispensers.py dir
+```
+
+Enquanto a visão não estiver calibrada, a célula roda com as câmeras
+SIMULADAS: basta deixar as linhas da visão fora do `.env` (A8). O resto da
+célula não depende delas.
+
+### Parte B — ligar a célula, toda vez
+
+A ordem importa: os processos do host falam com o central, e o central precisa
+estar de pé primeiro. Abra **uma janela por processo** — o log de cada porta
+fica visível, e "fechou a janela" é um sintoma que qualquer um lê.
+
+**B1. Containers.** Com o Docker Desktop aberto:
+
+```bat
+cd C:\apsen
+set COMPOSE_PROFILES=
+docker compose up -d --build
+docker compose ps
+```
+
+O `set COMPOSE_PROFILES=` zera o profile `simulado` mesmo que ele tenha ficado no
+`.env` (é o que o `make up-bancada` faz): sem isso, os adapters e os simuladores
+subiriam em container por cima dos do host. O `--build` só é preciso na
+primeira vez e depois de atualizar o código. Espere
+os 7 serviços em `healthy` (no primeiro boot, ~1 min: o MySQL cria o banco e o
+central semeia o catálogo).
+
+**B2. Os três adapters**, cada um na sua janela:
+
+```bat
+C:\apsen\dispenser-adapter\iniciar_host.bat
+C:\apsen\cnc-adapter\iniciar_host.bat
+C:\apsen\weight-adapter\iniciar_host.bat
+```
+
+Cada um mostra a COM e o transporte ao subir. Confira que acharam a placa:
+`http://localhost:8100/health` (e `8101`, `8103`) — `serial` com
+`"conectado": true`.
+
+**B3. O painel de bancada:**
+
+```bat
+C:\apsen\painel_operador\iniciar_backend.bat
+```
+
+Web em http://localhost:5000; o display de 7" sai de OFFLINE em alguns
+segundos.
+
+**B4. As três estações de visão** (pule se a visão ainda está simulada):
+
+```bat
+C:\apsen\vision\iniciar_mesa.bat
+C:\apsen\vision\iniciar_dispensers.bat esq
+C:\apsen\vision\iniciar_dispensers.bat dir
+```
+
+Cada `.bat` roda o seu conferidor e para em vermelho se algo estiver errado.
+Passando, a estação fica num laço: se cair, ela registra a queda e sobe de novo
+em 5 s.
+
+**B5. Confira que os containers enxergam o host.** Um teste por porta — se der
+timeout, é o firewall (A9):
+
+```bat
+docker compose exec central-computer python -c "import urllib.request;print(urllib.request.urlopen('http://host.docker.internal:8101/ping',timeout=3).read())"
+docker compose exec vision-adapter python -c "import urllib.request;print(urllib.request.urlopen('http://host.docker.internal:8212/ping',timeout=3).read())"
+```
+
+**B6. Pré-voo.** Abra http://localhost:8000/console/prevoo (senha do
+`CONSOLE_SENHA`). **Tudo verde é a condição para a primeira OS.** Cada item
+vermelho ou amarelo diz o que fazer; o bloco **Visão** cobre as três estações,
+a identidade da câmera da mesa e as posições medidas.
+
+### Parte C — a primeira OS
+
+1. Abra o dashboard em http://localhost:8050: ele mostra a bancada nas duas
+   fileiras, a CNC no corredor e as três câmeras.
+2. No console (http://localhost:8000/console), pause o gerador automático se
+   quiser escolher as ordens, e dispare uma das dez ordens padrão.
+3. Acompanhe: carregamento dos slots → conferência de SKU pelas câmeras dos
+   dispensers → tara → para cada slot, mesa → dispensa → foto da mesa →
+   pesagem → Triple Check → HOME. O painel (:5000) e o display espelham a OS.
+4. **Se travar:** a faixa vermelha diz o slot e o motivo. Confira a bancada e
+   libere — pelo console, pelo app de manutenção (http://localhost:8051, login
+   `admin` com o `SEED_ADMIN_SENHA`) ou pelo display, com nome e PIN de
+   supervisor.
+
+Os detalhes de cada tela estão em [Operar](#operar), e um roteiro pronto de
+apresentação em [Roteiro de demonstração](#roteiro-de-demonstração).
+
+### Parte D — desligar
+
+Na ordem inversa: **Ctrl+C** em cada janela do host (estações de visão,
+painel, adapters — nas estações, responda **S** ao "Terminate batch job") e
+depois `docker compose stop`. O banco fica preservado. **Nunca**
+`docker compose down -v` sem querer apagar o banco.
+
+### Subir sozinho no boot
+
+Com tudo funcionando à mão, automatize a parte B pelo Agendador de Tarefas do
+Windows (uma tarefa por `.bat`, gatilho *Ao iniciar a sessão*, na ordem
+acima). Ver [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md), seção "Subir no
+boot".
+
+### Quando uma parte não está pronta
+
+| Situação | O que fazer |
+|---|---|
+| Visão ainda não calibrada | tire do `.env` as linhas `VISION_SIM_URL` e `VISAO_*_FONTE`, recrie o vision-adapter (`docker compose up -d vision-adapter`) e pule B4: as câmeras ficam simuladas |
+| Só a câmera da mesa pronta | deixe `VISAO_DISPENSER_FONTE` fora do `.env` (ou `simulador`); e, sem câmeras de dispenser nenhuma, `VISAO_SKU_HABILITADA=0` pula a conferência de SKU |
+| Nenhuma placa disponível (demonstração em outra máquina) | use a planta simulada: `COMPOSE_PROFILES=simulado` no `.env`, sem as linhas `*_ADAPTER_URL`, e **não** rode os `.bat` dos adapters ([Quickstart](#quickstart)) |
+
+### Problemas da célula integrada
+
+| Sintoma | Causa provável | O que fazer |
+|---|---|---|
+| adapter do host não sobe: porta 810x ocupada | o adapter de **container** está de pé | tire `COMPOSE_PROFILES=simulado` do `.env` e rode `set COMPOSE_PROFILES=` e `docker compose up -d --remove-orphans` |
+| `/health` do adapter com `"conectado": false` | COM errada, monitor serial aberto, ou placa sem energia | confira o ping no monitor serial e **feche-o** antes de subir o adapter |
+| `ACCESS_DENIED` numa COM "livre" | processo duplicado | `tasklist \| findstr python` e feche o que sobrou |
+| central não alcança o adapter (pré-voo vermelho em 810x) | firewall, ou `*_ADAPTER_URL` faltando no `.env` | A9 e A8; teste com o comando de B5 |
+| dashboard verde e a célula física parada | `COMPOSE_PROFILES=simulado` no `.env` do mini PC | tire a linha e suba de novo |
+| display OFFLINE | monitor serial aberto na COM do display, ou `APSEN_DISPLAY_PORTA` errada | feche o monitor; confira o `.bat` do painel |
+| estação de visão não sobe, conferidor vermelho | configuração da estação | faça o que o conferidor diz — ver A10 |
+| pré-voo: "Quem responde pela câmera da mesa" vermelho | `VISION_SIM_URL` e `VISAO_MESA_FONTE` desencontrados no `.env` | corrija e `docker compose up -d vision-adapter` |
 
 ---
 

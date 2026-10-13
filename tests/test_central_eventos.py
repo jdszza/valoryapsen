@@ -807,7 +807,7 @@ def test_falha_de_leitura_nomeia_o_lado_na_descricao(carregar_central):
 
 
 # ── Um evento, no máximo um alarme — e o certo ───────────────────────────────
-# A enxurrada: um alarme por item sem etiqueta (40 de 46 nas ordens padrão), e
+# A enxurrada: um alarme por item sem etiqueta (eram 40 de 46 nas ordens padrão), e
 # dois alarmes para cada divergência da mesa (um daqui, um do orquestrador).
 
 @pytest.mark.parametrize("evento,alarmes", [

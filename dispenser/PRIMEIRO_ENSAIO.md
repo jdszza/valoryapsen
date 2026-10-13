@@ -256,12 +256,16 @@ espera — um prazo muito folgado gasta o relógio do outro lado e a OS aborta
 apontando para o slot certo pelo motivo errado.
 
 Meça também quanto o braço leva de um extremo ao outro **com carga** (o `TEST`
-mostra) e ajuste `DISPENSA_SERVO_MS`. O default é 250 ms.
+mostra) e ajuste `DISPENSA_IDA_MS` / `DISPENSA_VOLTA_MS` (400 e 200 ms; a
+ida é em rampa para empurrar a caixa em vez de arremessá-la). Ida + segura +
+volta + pausa tem de caber em 1 s por unidade — o `DISPENSA_S_POR_UNIDADE` do
+central e o `WP()` da CNC; o `static_assert` do sketch reprova o contrário.
 
 Os dois ficam no topo do `servos_hub.ino`:
 
 ```cpp
-#define DISPENSA_SERVO_MS            250
+#define DISPENSA_IDA_MS             400
+#define DISPENSA_VOLTA_MS           200
 #define DISPENSA_TIMEOUT_UNIDADE_MS 1200
 ```
 

@@ -16,7 +16,7 @@ rem ---- A UNICA linha que voce precisa editar --------------------------------
 rem  A COM fixada da placa da balanca (Gerenciador de Dispositivos ->
 rem  Portas COM -> Propriedades -> Avancado -> Numero da Porta COM).
 rem  Confira contra o ping: a placa certa emite {"cmd":"ping","sub":"weight"}.
-if "%WEIGHT_SERIAL_URL%"=="" set WEIGHT_SERIAL_URL=COM8
+if "%WEIGHT_SERIAL_URL%"=="" set WEIGHT_SERIAL_URL=COM10
 
 rem ---- O resto raramente muda ------------------------------------------------
 rem  `serial` e o firmware; `http` voltaria para o weight-simulator.
