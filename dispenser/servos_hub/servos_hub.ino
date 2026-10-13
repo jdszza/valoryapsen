@@ -272,9 +272,9 @@ const uint8_t SALTO_FINAL_GRAUS[NUM_SERVOS] = {
   60,                          // servo 2  (D3) - fraco na bancada
   DISPENSA_SALTO_FINAL_GRAUS,  // servo 3  (D4)
   DISPENSA_SALTO_FINAL_GRAUS,  // servo 4  (D5)
-  DISPENSA_SALTO_FINAL_GRAUS,  // servo 5  (D6)
+  45,  // servo 5  (D6)
   DISPENSA_SALTO_FINAL_GRAUS,  // servo 6  (D7)
-  DISPENSA_SALTO_FINAL_GRAUS,  // servo 7  (D8)
+  60,  // servo 7  (D8)
 };
 #define DISPENSA_ORCAMENTO_MS      1000   // = DISPENSA_S_POR_UNIDADE do central
 #define DISPENSA_TIMEOUT_UNIDADE_MS 1500

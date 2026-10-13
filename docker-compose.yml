@@ -360,7 +360,9 @@ services:
 
   # ── Weight Adapter ───────────────────────────────────────────────────────────
   weight-adapter:
-    profiles: ["simulado"]
+    # `balanca-simulada` sobe SÓ este par (adapter + simulador) sobre a célula
+    # montada, para quando a balança física está fora — ver o .env.
+    profiles: ["simulado", "balanca-simulada"]
     build: ./weight-adapter
     container_name: apsen-weight-adapter
     logging: *default-logging
@@ -399,7 +401,7 @@ services:
 
   # ── Weight Simulator (HX711) ─────────────────────────────────────────────────
   weight-simulator:
-    profiles: ["simulado"]
+    profiles: ["simulado", "balanca-simulada"]
     build: ./weight-simulator
     container_name: apsen-weight-sim
     logging: *default-logging

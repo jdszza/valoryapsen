@@ -334,9 +334,16 @@ SEMPRE_EM_CONTAINER = {"mysql", "central-computer", "vision-adapter", "vision-si
 README = COMPOSE.parent / "README.md"
 
 
+# A balança pode voltar ao simulador sozinha, sobre a célula montada, quando a
+# física está fora: o profile `balanca-simulada` sobe só o par dela.
+BALANCA_SIMULADA = {"weight-adapter", "weight-simulator"}
+
+
 def test_o_que_a_bancada_substitui_esta_no_profile_simulado(servicos):
-    for nome in sorted(SIMULADO):
+    for nome in sorted(SIMULADO - BALANCA_SIMULADA):
         assert servicos[nome].get("profiles") == ["simulado"], nome
+    for nome in sorted(BALANCA_SIMULADA):
+        assert servicos[nome].get("profiles") == ["simulado", "balanca-simulada"], nome
 
 
 def test_o_que_roda_em_container_na_bancada_nao_tem_profile(servicos):
