@@ -90,10 +90,13 @@
 #define TFT_PIN_RST    22         // reset COMPARTILHADO: pulsado UMA vez no boot
 #define TFT_PIN_BRILHO -1         // backlight direto no 3V3; -1 = sem controle
 #define TFT_SPI_HZ     27000000
-// A ordem do array E a ordem dos slots: CS_PINS[0] e a tela do D1.
+// A ordem do array E a ordem dos slots: TFT_PIN_CS[0] e a tela do D1. Ela
+// segue a SOLDA da bancada, nao a ordem numerica dos GPIOs — conferida tela a
+// tela com `img <slot> <n>`. Ordem errada aqui nao da erro: pinta a caixa de
+// um slot na tela de outro.
 // GPIO12 e pino de strapping (tensao da flash): nada pode puxa-lo para HIGH
 // durante o reset. O setup so o leva a HIGH depois do boot, como o TFT.ino.
-static const uint8_t TFT_PIN_CS[NUM_TELAS] = { 12, 13, 14, 25, 26, 27, 32, 33 };
+static const uint8_t TFT_PIN_CS[NUM_TELAS] = { 33, 5, 25, 13, 12, 32, 27, 14 };
 
 // Sem pino de backlight nao ha brilho a ajustar; a telemetria reporta o que a
 // tela efetivamente tem.

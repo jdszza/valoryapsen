@@ -1,0 +1,124 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# APSEN — configuração local. Copie para `.env` e preencha ANTES do primeiro
+# `docker compose up`. O `.env` está no .gitignore: nenhum segredo real deve
+# voltar para o repositório.
+#
+#   cp .env.example .env
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Assinatura dos tokens JWT ────────────────────────────────────────────────
+# OBRIGATÓRIO. Sem isto o central se recusa a subir (o valor antigo era público
+# neste repositório — quem o tivesse forjava um token role=admin).
+# Gere com:  python -c "import secrets; print(secrets.token_hex(32))"
+SECRET_KEY=ae23094d63abf7534355f86d72a2d0ad08ff061fbc66190d411c711f6867a7e1
+
+# "dev" tolera SECRET_KEY fraca, apenas com aviso no log. Qualquer outro valor
+# (inclusive vazio → prod) trata segredo fraco como erro de configuração.
+APSEN_ENV=prod
+
+# ── MySQL ────────────────────────────────────────────────────────────────────
+# Lidos na PRIMEIRA subida (criação do volume mysql_data). Trocar depois exige
+# `docker compose down -v`, que apaga os dados.
+MYSQL_ROOT_PASS=5t1Pgg7@C1duROcFndnO4X2s
+MYSQL_USER=apsen
+MYSQL_PASS=2xRoFKeZ9qQL_BMzQ7XlvzjX
+MYSQL_DB=apsen_db
+
+# ── Usuários seed do app de manutenção ──────────────────────────────────────
+# Criados só na primeira inicialização do banco. TROQUE AMBAS APÓS O PRIMEIRO
+# LOGIN, pelo próprio app (aba Usuários) — estas ficam em arquivo, em claro.
+SEED_ADMIN_SENHA=aXv35OgLfwV-S_vI
+SEED_MANUT_SENHA=x1nFennRJS3qJrTW
+
+# ── Origens de browser autorizadas a chamar o central ────────────────────────
+# Ajuste para o host real ao publicar fora da máquina local.
+CORS_ORIGINS=http://localhost:8050,http://localhost:8051
+
+# ── Geometria da célula ──────────────────────────────────────────────────────
+# Nº de dispensers, em DUAS FILEIRAS frente a frente (precisa ser par). Uma só
+# variável para todos os serviços: o central deriva dela o mapa de posições e
+# os simuladores, a faixa de slot que aceitam. Opcional — o default é 8.
+NUM_SLOTS=8
+
+# ── Console de operação do central (http://localhost:8000/console) ───────────
+# OPCIONAL, e sem default embutido: vazia ou ausente = console DESABILITADO
+# (toda rota /console* responde 503). É uma senha PRÓPRIA, independente do
+# login do app de manutenção. Troque este valor provisório.
+CONSOLE_SENHA=Apsen@Console#2026!
+# Validade do cookie de sessão do console, em horas (faixa 0.25..24).
+CONSOLE_SESSAO_HORAS=8
+
+# ── Modo de demonstração ─────────────────────────────────────────────────────
+# Dois controles GLOBAIS: valem para o central e para os quatro simuladores de
+# uma vez, sem editar código nem recriar imagem.
+#
+# MODO_APRESENTACAO=1 zera TODA probabilidade de falha aleatória (falha mecânica
+# do dispenser, falha e divergência das três câmeras, falha do sensor HX711 e o
+# ruído da célula de carga). A planta roda determinística: nada de surpresa no
+# meio da explicação. Cada serviço registra no log de boot que está nesse modo.
+MODO_APRESENTACAO=0
+# FATOR_VELOCIDADE multiplica todos os TEMPOS simulados (carga, dispensa, scans,
+# leitura da balança) e divide a velocidade da CNC — 0.5 roda no DOBRO da
+# velocidade, 2.0 na METADE. Faixa 0.1..10. Os timeouts do orquestrador escalam
+# junto (só para cima), senão desacelerar a demo abortaria a OS por timeout.
+FATOR_VELOCIDADE=1.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INTEGRAÇÃO INCREMENTAL DO HARDWARE
+# ═══════════════════════════════════════════════════════════════════════════════
+# Estado atual:  balança SIMULADA (a física não funciona)  ·  dispenser e CNC DESLIGADOS (nem reais, nem
+#                simulados)  ·  visão simulada em container.
+#
+# Passo a passo do ensaio: `weight/PRIMEIRO_ENSAIO.md`.
+
+# ── Quais serviços sobem ─────────────────────────────────────────────────────
+# COMPOSE_PROFILES está AUSENTE de propósito, e a ausência é a configuração:
+# sem ela o compose sobe 7 serviços (mysql, central, vision-adapter,
+# vision-simulator, erp-simulator, dashboard, manut_web) e NÃO sobe os três
+# adapters seriais nem os simuladores de dispenser, CNC e balança.
+#
+# É o que faz a porta 8103 ficar livre para o weight-adapter do host: com
+# `COMPOSE_PROFILES=simulado`, o weight-adapter de container subiria e
+# publicaria a mesma porta, e quem chegasse primeiro ficaria com ela.
+#
+# COMPOSE_PROFILES=simulado
+
+# Balança física fora de serviço: `balanca-simulada` sobe SÓ o weight-adapter e
+# o weight-simulator em container. NÃO rode weight-adapter\iniciar_host.bat
+# junto — os dois disputariam a porta 8103. Para voltar à balança real, comente
+# esta linha, descomente o WEIGHT_ADAPTER_URL abaixo e suba o .bat do host.
+COMPOSE_PROFILES=balanca-simulada
+
+# ── Onde o central procura cada adapter ──────────────────────────────────────
+# `host.docker.internal` é o nome que o Docker Desktop dá à máquina hospedeira.
+# `weight-adapter:8103` é nome DNS da rede `apsen-net` e não resolve fora dela.
+#
+# A balança é a única que já tem firmware: o adapter dela roda no HOST, fora do
+# Docker, porque o Docker Desktop não repassa porta COM para container.
+# Comentado enquanto a balança é simulada: o default do compose
+# (http://weight-adapter:8103) aponta para o adapter de container.
+# WEIGHT_ADAPTER_URL=http://host.docker.internal:8103
+
+# Descomente cada linha no dia em que a placa correspondente entrar. Enquanto
+# comentada, o default do compose vale — e aponta para um container que, sem o
+# profile, não existe: o comando falha na hora em vez de ficar pendurado.
+DISPENSER_ADAPTER_URL=http://host.docker.internal:8100
+CNC_ADAPTER_URL=http://host.docker.internal:8101
+
+# VISION_ADAPTER_URL fica no default: a visão continua em container, por HTTP.
+
+# ── O gerador de OS fica calado durante a integração ─────────────────────────
+# Sem os adapters de dispenser e CNC, TODA OS automática aborta na etapa de
+# carregamento (`erro_envio_carregamento`) — a cada 90 s, enchendo `ordens`, o
+# histórico e o badge de alarmes com falhas que ninguém provocou.
+#
+# 86400 s = uma por dia, na prática nenhuma. O disparo manual pelo console
+# continua funcionando normalmente, que é justamente o que se usa nesta fase.
+# Volte para 90 quando a célula estiver inteira.
+INTERVALO_OS=86400
+
+# ── As variáveis da PLACA não moram aqui ─────────────────────────────────────
+# `WEIGHT_TRANSPORTE` e `WEIGHT_SERIAL_URL` são do processo do HOST, e o
+# processo do host não lê este arquivo — ele recebe o ambiente de quem o
+# inicia. Estão em `weight-adapter/iniciar_host.bat`; é lá que se troca a COM.

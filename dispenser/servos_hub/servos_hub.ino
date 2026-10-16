@@ -233,13 +233,14 @@ static int canalEmOperacao = -1;
 
 // Uma unidade por ciclo de servo, e o ciclo e min -> max -> min.
 //
-// O EMPURRAO E EM RAMPA, nao em salto. `moverCalibrado(max)` direto manda o
-// servo a velocidade maxima dele, e o braco ARREMESSA a caixa em vez de
-// empurra-la — foi o que se viu na bancada. Hoje a ida percorre o curso em
-// passos ao longo de DISPENSA_IDA_MS, segura no max por DISPENSA_SEGURA_MS
-// (a caixa termina de sair), volta em DISPENSA_VOLTA_MS (sem carga, pode ser
-// mais rapida) e espera DISPENSA_PAUSA_MS antes da unidade seguinte, para a
-// pilha assentar e as caixas nao cairem coladas uma na outra.
+// IDA E VOLTA EM SALTO, sem rampa: `moverCalibrado(max)` direto manda o servo
+// a velocidade e forca maximas dele, nos dois sentidos e em todos os slots.
+// (Houve uma rampa para empurrar a caixa em vez de arremessa-la; ela deixava
+// D2/D3/D8 sem forca para terminar o curso com carga, e saiu.) DISPENSA_IDA_MS
+// e o tempo que o braco tem para chegar ao max, segura la por
+// DISPENSA_SEGURA_MS (a caixa termina de sair), DISPENSA_VOLTA_MS para chegar
+// ao min, e DISPENSA_PAUSA_MS antes da unidade seguinte, para a pilha assentar
+// e as caixas nao cairem coladas uma na outra.
 //
 // O CICLO INTEIRO TEM DE CABER EM 1 s. O central nao espera o `dispensado`:
 // ele reserva `quantidade x DISPENSA_S_POR_UNIDADE` (1,0 s) + folga, e a CNC
@@ -256,26 +257,6 @@ static int canalEmOperacao = -1;
 #define DISPENSA_SEGURA_MS          150
 #define DISPENSA_VOLTA_MS           200
 #define DISPENSA_PAUSA_MS           150
-#define DISPENSA_PASSO_RAMPA_MS      20   // 50 atualizacoes/s = periodo do PWM
-#define DISPENSA_SALTO_FINAL_GRAUS   35   // ultimo trecho em salto (ver moverEmRampa)
-
-// Salto final POR SERVO, para os que precisam de mais forca. Quanto maior o
-// salto, menor o trecho em rampa e mais cedo o servo faz forca total; o
-// maximo possivel e o curso inteiro em salto (rampa nenhuma), que e o mesmo
-// movimento de antes da rampa. Software nao passa disso: a forca maxima e a
-// do servo, e D2/D3 ja eram fracos com salto direto — o resto e hardware
-// (servo, alimentacao no conector ou mecanismo; ver dispenser/README.md).
-// D2 (servo 1) tem 80 graus de curso, entao 60 deixa so 20 em rampa.
-const uint8_t SALTO_FINAL_GRAUS[NUM_SERVOS] = {
-  DISPENSA_SALTO_FINAL_GRAUS,  // servo 0  (D1)
-  60,                          // servo 1  (D2) - fraco na bancada
-  60,                          // servo 2  (D3) - fraco na bancada
-  DISPENSA_SALTO_FINAL_GRAUS,  // servo 3  (D4)
-  DISPENSA_SALTO_FINAL_GRAUS,  // servo 4  (D5)
-  45,  // servo 5  (D6)
-  DISPENSA_SALTO_FINAL_GRAUS,  // servo 6  (D7)
-  60,  // servo 7  (D8)
-};
 #define DISPENSA_ORCAMENTO_MS      1000   // = DISPENSA_S_POR_UNIDADE do central
 #define DISPENSA_TIMEOUT_UNIDADE_MS 1500
 static_assert(DISPENSA_IDA_MS + DISPENSA_SEGURA_MS + DISPENSA_VOLTA_MS +
@@ -1031,33 +1012,14 @@ static void emitErroSlot(int slot_1a8, const char* os_id, const char* codigo,
 
 // -- A mecanica: uma unidade por ciclo, confirmada pelo IR --------------------
 
-// Leva o servo de onde ele esta ate `alvo` em `duracao_ms`, sempre dentro da
-// calibracao. Continua lendo IR e serial entre os passos, como qualquer espera
-// do laco de dispensa.
-//
-// A rampa para SALTO_FINAL_GRAUS[canal] antes do alvo, e o resto e um SALTO.
-// Rampa ate o fim nao chega ao fim com carga: o servo de hobby faz forca
-// proporcional ao ERRO, e em passos pequenos o erro e sempre pequeno — o braco
-// para alguns graus antes, segurado pelo atrito da caixa. O `MOVE` do MANUT
-// nunca mostrou isso porque ele e um salto so: erro grande, forca total, e o
-// braco chega embalado. O trecho em rampa e o que tira o arremesso; o salto
-// curto no fim e o que garante o curso calibrado.
-static void moverEmRampa(uint8_t canal_0a7, int alvo, unsigned long duracao_ms) {
-  const int de = angAtual[canal_0a7];
-  const int distancia = abs(alvo - de);
-  const int salto = SALTO_FINAL_GRAUS[canal_0a7];
-  const int passos = (int)(duracao_ms / DISPENSA_PASSO_RAMPA_MS);
-  if (passos <= 1 || de < 0 || distancia <= salto) {
-    moverCalibrado(canal_0a7, alvo);
-    esperarLendoSerial(duracao_ms);
-    return;
-  }
-  const int ate = alvo - (alvo > de ? salto : -salto);
-  for (int i = 1; i <= passos; i++) {
-    moverCalibrado(canal_0a7, de + (int)((long)(ate - de) * i / passos));
-    esperarLendoSerial(DISPENSA_PASSO_RAMPA_MS);
-  }
+// Manda o servo direto ao `alvo` (salto: velocidade e forca maximas, sem
+// rampa), sempre dentro da calibracao, e espera `duracao_ms` para ele chegar
+// lendo IR e serial, como qualquer espera do laco de dispensa. O servo de
+// hobby faz forca proporcional ao ERRO; em salto o erro e o curso inteiro,
+// entao o braco chega ao fim mesmo com carga.
+static void moverEmSalto(uint8_t canal_0a7, int alvo, unsigned long duracao_ms) {
   moverCalibrado(canal_0a7, alvo);
+  esperarLendoSerial(duracao_ms);
 }
 
 static bool soltarUmaUnidade(uint8_t canal_0a7) {
@@ -1067,9 +1029,9 @@ static bool soltarUmaUnidade(uint8_t canal_0a7) {
   // `moverCalibrado`, NUNCA `moverRaw`: fora do MANUT o movimento respeita a
   // calibracao, e e ela que impede o servo de bater no fim de curso no meio de
   // uma OS. O ciclo sempre TERMINA no min, inclusive quando o pulso nao vem.
-  moverEmRampa(canal_0a7, cal[canal_0a7].angMax, DISPENSA_IDA_MS);
+  moverEmSalto(canal_0a7, cal[canal_0a7].angMax, DISPENSA_IDA_MS);
   esperarLendoSerial(DISPENSA_SEGURA_MS);
-  moverEmRampa(canal_0a7, cal[canal_0a7].angMin, DISPENSA_VOLTA_MS);
+  moverEmSalto(canal_0a7, cal[canal_0a7].angMin, DISPENSA_VOLTA_MS);
 
   // Sem IR, o ciclo completo E a unidade (ver CONTAR_PELO_IR). A pausa vem
   // DEPOIS de o braco voltar: e o intervalo entre uma caixa e a seguinte.

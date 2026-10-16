@@ -257,7 +257,7 @@ apontando para o slot certo pelo motivo errado.
 
 Meça também quanto o braço leva de um extremo ao outro **com carga** (o `TEST`
 mostra) e ajuste `DISPENSA_IDA_MS` / `DISPENSA_VOLTA_MS` (400 e 200 ms; a
-ida é em rampa para empurrar a caixa em vez de arremessá-la). Ida + segura +
+ida e a volta são em salto, sem rampa, à força máxima do servo). Ida + segura +
 volta + pausa tem de caber em 1 s por unidade — o `DISPENSA_S_POR_UNIDADE` do
 central e o `WP()` da CNC; o `static_assert` do sketch reprova o contrário.
 

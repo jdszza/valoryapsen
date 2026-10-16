@@ -37,10 +37,25 @@ Falha da placa das telas NUNCA muda o caminho do dispenser: não recusa comando,
 não atrasa ACK, não impede o evento de chegar ao central. Tela errada é
 cosmética; dispensa atrasada não é. E os eventos DELA (`telemetria`, `erro`)
 ficam aqui, em log e no /health — o central não tem endpoint de tela.
+
+E a placa das telas carrega a PORTA NR-12 (`docs/PROTOCOLO_SERIAL.md` §9): a
+ESP da porta fala por UART com ela, e ela repassa pela USB. Para este adapter a
+porta é mais uma ORIGEM de evento (`"origem":"porta"`) e mais três comandos:
+
+  POST /comandos/porta/liberar  → `porta_liberar` (através da placa das telas)
+  POST /comandos/porta/negar    → `porta_negar`
+  POST /comandos/porta/estado   → `porta_estado`
+  eventos com origem "porta"    → POST /api/v1/eventos/porta no central
+
+O adapter traduz TRANSPORTE, não decide nada da porta: o conteúdo atravessa
+cru. O que ele soma é o LINK — a USB das telas, a vigia da placa das telas e a
+idade do último heartbeat viram UM estado, e só a transição sobe.
 """
 import asyncio
+import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -128,6 +143,17 @@ TFT_ACK_TIMEOUT_S    = float(os.getenv("DISPENSER_TFT_ACK_TIMEOUT_S", "2"))
 # chama.
 TRAVA_RESUMO_MAX     = 48
 
+# ── A porta NR-12, atrás da placa das telas (§9) ─────────────────────────────
+#
+# Heartbeat da porta mais velho que isto = link perdido, mesmo com a USB das
+# telas de pé. A placa das telas já vigia em 1,5 s; este é o vigia de CIMA, que
+# cobre a própria placa das telas travada (ela não avisaria nada).
+PORTA_HEARTBEAT_MAX_S = float(os.getenv("PORTA_HEARTBEAT_MAX_S", "2.5"))
+# O heartbeat chega a cada 500 ms e não sobe a cada 500 ms: sobe na MUDANÇA e,
+# sem mudança, no máximo a cada tanto — como sinal de vida. É ele que deixa o
+# central distinguir "porta parada, tudo fechado" de "adapter morto".
+PORTA_ESTADO_REENVIO_S = float(os.getenv("PORTA_ESTADO_REENVIO_S", "5"))
+
 _client: httpx.AsyncClient | None = None
 _link: "serial_link.LinkSerial | None" = None
 _link_tft: "serial_link.LinkSerial | None" = None
@@ -205,7 +231,11 @@ async def lifespan(app: FastAPI):
             ack_timeout_s=TFT_ACK_TIMEOUT_S, ao_receber_evento=_evento_da_placa_tft,
         )
         _link_tft.iniciar()
+        # A vigia da porta NR-12 só existe onde existe porta.
+        vigia_porta = asyncio.create_task(_laco_vigia_porta())
     yield
+    if TFT_TRANSPORTE == "serial":
+        vigia_porta.cancel()
     if _link is not None:
         _link.parar()
     if _link_tft is not None:
@@ -512,7 +542,19 @@ _tft_estado: dict = {"ultima_telemetria": None, "ultimo_erro": None, "erros": 0}
 
 
 def _evento_da_placa_tft(payload: dict) -> None:
-    """Chamado NA THREAD LEITORA da porta das telas. Nunca chega ao central."""
+    """Chamado NA THREAD LEITORA da porta das telas.
+
+    Os eventos DAS TELAS nunca chegam ao central. Os da PORTA NR-12 — que vêm
+    pela mesma USB, marcados com `"origem":"porta"` — chegam todos, pela rota
+    irmã e na ordem em que vieram.
+    """
+    if payload.get("origem") == "porta":
+        loop = _loop
+        if loop is None:
+            logger.warning("[PORTA] evento chegou antes do event loop — descartado.")
+            return
+        asyncio.run_coroutine_threadsafe(_tratar_evento_porta(payload), loop)
+        return
     tipo = payload.get("tipo")
     if tipo == "telemetria":
         _tft_estado["ultima_telemetria"] = payload
@@ -525,6 +567,183 @@ def _evento_da_placa_tft(payload: dict) -> None:
                        payload.get("codigo_erro"), payload.get("descricao"))
     else:
         logger.warning("[TFT] evento desconhecido descartado: %r", tipo)
+
+
+# ── A porta NR-12: o link é UM estado, e só a transição sobe ─────────────────
+
+def _porta_vazia() -> dict:
+    return {
+        # None = ainda não se sabe (boot). Só `True` depois do primeiro `estado`.
+        "link_ok": None,
+        "ultimo_estado": None,
+        "ultimo_estado_em": None,       # monotonic
+        "ultimo_estado_ts": None,       # o `ts` da placa, para o /health
+        "encaminhado_em": None,         # monotonic do último `estado` que subiu
+        "assinatura_encaminhada": None,
+        "tft_conectada": None,
+        "desde": time.monotonic(),
+        "eventos": 0,
+        "perdas": 0,
+    }
+
+
+_porta: dict = _porta_vazia()
+# Serializa o envio ao central: o `porta_link_ok` tem de chegar ANTES do
+# `estado` que o provou, e dois `run_coroutine_threadsafe` seguidos podem se
+# cruzar no `await` do POST. `asyncio.Lock` é FIFO — a ordem de chegada é a de
+# saída. Criado no loop, na primeira vez.
+_porta_lock: "asyncio.Lock | None" = None
+
+
+def _ts_agora() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
+
+def _assinatura(payload: dict) -> str:
+    return json.dumps({k: v for k, v in payload.items() if k != "ts"},
+                      sort_keys=True, ensure_ascii=False, default=str)
+
+
+async def _postar_porta(payload: dict) -> bool:
+    global _porta_lock
+    if _porta_lock is None:
+        _porta_lock = asyncio.Lock()
+    async with _porta_lock:
+        ok = await _post_central(payload, ROTA_EVENTOS_PORTA)
+    if not ok:
+        logger.warning("[PORTA] evento '%s' não chegou ao Central.", payload.get("tipo"))
+    return ok
+
+
+async def _porta_link_perdido(motivo: str) -> None:
+    """Link perdido = porta aberta, para o central. Sobe UMA vez por queda."""
+    if _porta["link_ok"] is False:
+        return
+    _porta["link_ok"] = False
+    _porta["perdas"] += 1
+    _porta["assinatura_encaminhada"] = None   # o próximo `estado` sobe sempre
+    logger.warning("[PORTA] link da porta PERDIDO — %s.", motivo)
+    await _postar_porta({"origem": "porta", "tipo": "porta_link_perdido",
+                         "ts": _ts_agora()})
+
+
+async def _tratar_evento_porta(payload: dict) -> None:
+    """Um evento da porta (ou da vigia da placa das telas), já no event loop.
+
+    O conteúdo sobe CRU. As duas únicas decisões são de transporte: o link e o
+    heartbeat repetido.
+    """
+    _porta["eventos"] += 1
+    tipo = payload.get("tipo")
+
+    if tipo == "porta_link_perdido":
+        await _porta_link_perdido("a placa das telas parou de receber o heartbeat")
+        return
+    if tipo == "porta_link_ok":
+        # A volta só é declarada pelo `estado` que a placa repassa logo depois.
+        logger.info("[PORTA] a placa das telas voltou a ouvir a porta.")
+        return
+
+    if tipo == "estado":
+        agora = time.monotonic()
+        _porta["ultimo_estado"] = payload
+        _porta["ultimo_estado_em"] = agora
+        _porta["ultimo_estado_ts"] = payload.get("ts")
+        if _porta["link_ok"] is not True:
+            _porta["link_ok"] = True
+            logger.info("[PORTA] link da porta OK.")
+            await _postar_porta({"origem": "porta", "tipo": "porta_link_ok",
+                                 "ts": _ts_agora()})
+        assinatura = _assinatura(payload)
+        repetido = assinatura == _porta["assinatura_encaminhada"]
+        recente = (_porta["encaminhado_em"] is not None
+                   and agora - _porta["encaminhado_em"] < PORTA_ESTADO_REENVIO_S)
+        if repetido and recente:
+            return
+        _porta["assinatura_encaminhada"] = assinatura
+        _porta["encaminhado_em"] = agora
+
+    logger.info("[PORTA] %s %s", tipo,
+                {k: v for k, v in payload.items() if k not in ("origem", "tipo", "ts")})
+    await _postar_porta(payload)
+
+
+async def _vigiar_porta_uma_vez() -> None:
+    """Uma rodada da vigia de cima: USB das telas e idade do heartbeat.
+
+    Separada do laço para que a suíte a chame sem esperar relógio.
+    """
+    if TFT_TRANSPORTE != "serial":
+        return
+    conectada = bool(_link_tft is not None and _link_tft.conectado)
+    antes = _porta["tft_conectada"]
+    _porta["tft_conectada"] = conectada
+
+    if not conectada:
+        # A porta deixa de ser vigiada quando a placa das telas some.
+        await _porta_link_perdido("a USB da placa das telas caiu")
+        return
+    if antes is False:
+        # A USB voltou: pede um `estado` na hora em vez de esperar o próximo
+        # heartbeat. O `porta_link_ok` só sobe com o `estado` que chegar.
+        logger.info("[PORTA] USB das telas de volta — pedindo `porta_estado`.")
+        try:
+            await asyncio.to_thread(_link_tft.enviar_comando, "porta_estado", {})
+        except serial_link.ErroLink as exc:
+            logger.warning("[PORTA] porta_estado na reconexão falhou: %s", exc)
+
+    referencia = _porta["ultimo_estado_em"] or _porta["desde"]
+    if _porta["link_ok"] is not False and time.monotonic() - referencia > PORTA_HEARTBEAT_MAX_S:
+        await _porta_link_perdido(
+            f"nenhum `estado` da porta há mais de {PORTA_HEARTBEAT_MAX_S:.1f}s")
+
+
+async def _laco_vigia_porta() -> None:
+    while True:
+        try:
+            await _vigiar_porta_uma_vez()
+        except Exception:  # noqa: BLE001 — a vigia é única e não pode morrer
+            logger.exception("[PORTA] falha na vigia")
+        await asyncio.sleep(0.25)
+
+
+# Os três comandos da porta. O NOME é o `cmd` da linha serial, que a placa das
+# telas reconhece pelo prefixo `porta_` e desce à porta como veio.
+_COMANDOS_PORTA = {
+    "porta_liberar": "/comandos/porta/liberar",
+    "porta_negar":   "/comandos/porta/negar",
+    "porta_estado":  "/comandos/porta/estado",
+}
+
+
+async def _enviar_porta(comando: str, payload: dict) -> dict:
+    """Comando à porta, através da placa das telas. Mesmos 502/503 de sempre.
+
+    Sem as telas por serial não existe porta: o simulador não tem uma, e
+    fingir um ACK aqui faria o central destravar uma porta imaginária.
+    """
+    if TFT_TRANSPORTE != "serial" or _link_tft is None:
+        raise HTTPException(503, "Porta NR-12 indisponível: ela viaja pela placa das "
+                                 "telas, e DISPENSER_TFT_TRANSPORTE não é serial.")
+    try:
+        return await asyncio.to_thread(_link_tft.enviar_comando, comando, payload)
+    except serial_link.AckNegativo as exc:
+        raise HTTPException(502, f"Porta recusou '{comando}': {exc}")
+    except serial_link.ErroLink as exc:
+        raise HTTPException(503, f"Porta indisponível: {exc}")
+
+
+def _estado_porta_health() -> dict:
+    ultimo = _porta["ultimo_estado_em"]
+    return {
+        "link_ok": _porta["link_ok"],
+        "tft_conectada": _porta["tft_conectada"],
+        "ultimo_heartbeat_ts": _porta["ultimo_estado_ts"],
+        "idade_heartbeat_s": None if ultimo is None else round(time.monotonic() - ultimo, 2),
+        "ultimo_estado": _porta["ultimo_estado"],
+        "eventos": _porta["eventos"],
+        "perdas_de_link": _porta["perdas"],
+    }
 
 
 def _resposta(resultado: dict) -> dict:
@@ -570,15 +789,22 @@ def _vale_retentar(status: int) -> bool:
     return status >= 500 or status in (408, 429)
 
 
-async def _post_central(payload: dict) -> bool:
+ROTA_EVENTOS          = "/api/v1/eventos/dispenser"
+ROTA_EVENTOS_PORTA    = "/api/v1/eventos/porta"
+
+
+async def _post_central(payload: dict, rota: str = ROTA_EVENTOS) -> bool:
     """Encaminha evento ao Central, com retry. Nunca lança — devolve False.
 
     False significa "o evento NÃO chegou depois de `_TENTATIVAS_EVENTO`
     tentativas", e quem chama já registra isso no log. Não aborta o fluxo do
     adapter: ele não tem o que fazer com a informação, e derrubar a resposta ao
     simulador não traria o evento de volta.
+
+    `rota` existe para a porta NR-12, que tem rota irmã no central: a mesma
+    política de retry, e não uma segunda implementação dela.
     """
-    url = CENTRAL_URL + "/api/v1/eventos/dispenser"
+    url = CENTRAL_URL + rota
     for tentativa in range(_TENTATIVAS_EVENTO):
         try:
             r = await _client.post(url, json=payload, timeout=TIMEOUT_EVENT)
@@ -638,6 +864,8 @@ async def health():
         corpo["serial_tft"] = estado_tft
         checks["placa-dispenser-tft"] = "ok" if estado_tft.get("conectado") else "desconectada"
     corpo["telas"] = dict(_tft_estado)
+    if TFT_TRANSPORTE == "serial":
+        corpo["porta"] = _estado_porta_health()
 
     ok = all(v == "ok" for v in checks.values())
     corpo["status"] = "ok" if ok else "degradado"
@@ -783,3 +1011,42 @@ async def receber_evento(req: EventoReq):
     """Recebe eventos normalizados do dispenser-simulator e os repassa ao Central."""
     ok = await _encaminhar_evento(req)
     return {"ok": True, "encaminhado": ok}
+
+
+# ── Comandos da porta NR-12 (Central → Adapter → placa das telas → porta) ────
+
+class PortaLiberarReq(BaseModel):
+    janela_ms: int
+
+    @field_validator("janela_ms")
+    @classmethod
+    def _faixa(cls, v: int) -> int:
+        # A placa limita 1..60 s; recusar aqui é 422 com o nome do campo, em
+        # vez de a placa corrigir em silêncio um número que alguém digitou.
+        if not 1000 <= v <= 60000:
+            raise ValueError("janela_ms deve ser 1000-60000")
+        return v
+
+
+class PortaNegarReq(BaseModel):
+    motivo: str
+
+
+@app.post("/comandos/porta/liberar")
+async def cmd_porta_liberar(req: PortaLiberarReq):
+    logger.info("[CMD] PORTA LIBERAR janela=%d ms", req.janela_ms)
+    resultado = await _enviar_porta("porta_liberar", {"janela_ms": req.janela_ms})
+    return {"ok": True, "porta": resultado}
+
+
+@app.post("/comandos/porta/negar")
+async def cmd_porta_negar(req: PortaNegarReq):
+    logger.info("[CMD] PORTA NEGAR motivo=%s", req.motivo)
+    resultado = await _enviar_porta("porta_negar", {"motivo": req.motivo[:60]})
+    return {"ok": True, "porta": resultado}
+
+
+@app.post("/comandos/porta/estado")
+async def cmd_porta_estado():
+    resultado = await _enviar_porta("porta_estado", {})
+    return {"ok": True, "porta": resultado}

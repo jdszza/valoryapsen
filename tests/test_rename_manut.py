@@ -106,7 +106,9 @@ def test_nenhum_arquivo_versionado_menciona_a_sigla_antiga(versionados):
 # exceção de virar porta aberta.
 # `cnc/` pelo mesmo critério: é o firmware da mesa, fala serial com o
 # cnc-adapter e nenhuma API MQTT — o teste seguinte continua cobrindo isso.
-FIRMWARE_PERMITIDO = ("weight/", "dispenser/", "cnc/")
+# `porta/`: a porta NR-12 (RC522 + fins de curso + solenoide), serial pela placa
+# das telas, sem MQTT — e o teste seguinte também a varre.
+FIRMWARE_PERMITIDO = ("weight/", "dispenser/", "cnc/", "porta/")
 
 # Marcas de API, nunca a palavra solta: o `main.cpp` do display cita "MQTT"
 # em dois comentarios que explicam a migracao, e sao justamente os comentarios

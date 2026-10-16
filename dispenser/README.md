@@ -212,9 +212,9 @@ que impede o mesmo comprimido de ser contado duas vezes por tremida do sensor.
 
 | constante | valor | o que é |
 |---|---|---|
-| `DISPENSA_IDA_MS` | 400 ms | empurrão em rampa até o max (em salto, o braço arremessava a caixa); os últimos `DISPENSA_SALTO_FINAL_GRAUS` (30°; 60° em D2 e D3, pela tabela `SALTO_FINAL_GRAUS`) saem em salto, senão o braço com carga para antes do fim |
+| `DISPENSA_IDA_MS` | 400 ms | salto direto ao max, à velocidade e força máximas do servo (sem rampa — a rampa deixava D2/D3/D8 sem força para terminar o curso com carga); é o tempo para o braço chegar |
 | `DISPENSA_SEGURA_MS` | 150 ms | parado no max, a caixa termina de sair |
-| `DISPENSA_VOLTA_MS` | 200 ms | volta em rampa até o min |
+| `DISPENSA_VOLTA_MS` | 200 ms | salto direto de volta ao min, também sem rampa |
 | `DISPENSA_PAUSA_MS` | 150 ms | intervalo antes da unidade seguinte |
 | `DISPENSA_TIMEOUT_UNIDADE_MS` | 1500 ms | prazo do pulso, contado do **início** do ciclo |
 
@@ -327,10 +327,41 @@ telas antes da integração:
 | SCK / MOSI (VSPI) | 18 / 23 |
 | DC (compartilhado) | 4 |
 | RST (compartilhado, pulsado **uma vez** no boot) | 22 |
-| CS de D1..D8 | 12, 13, 14, 25, 26, 27, 32, 33 |
+| CS de D1..D8 | 33, 26, 25, 13, 12, 32, 27, 14 (ordem da solda, conferida com `img <slot> <n>`) |
 
 O RST é pulsado uma vez para as oito e o construtor recebe `-1`: se cada
 `initR` pulsasse o reset, inicializar a tela 2 apagaria a tela 1.
+
+### A placa das telas também carrega a porta NR-12
+
+A ESP da porta (`porta/`) não tem USB no mini PC: ela fala por **UART** com
+esta placa, que repassa as mensagens pela USB que já existe
+([`docs/PROTOCOLO_SERIAL.md`](../docs/PROTOCOLO_SERIAL.md) §9).
+
+| sinal | GPIO desta placa | liga em |
+|---|---|---|
+| RX2 (Serial2) | **16** | TX2 (GPIO17) da ESP da porta |
+| TX2 (Serial2) | **17** | RX2 (GPIO16) da ESP da porta |
+| GND | GND | GND da ESP da porta — **comum** |
+
+São os únicos pinos livres que não colidem com a SPI (18/23, e o 19 que a SPI
+reserva como MISO), com DC, RST nem com os oito CS. **Nada de 5 V entre as
+duas placas**: são duas ESP32 em 3V3, e a ligação é só TX, RX e GND. Cabo curto,
+longe dos fios do solenoide e dos motores.
+
+O que a placa faz com a linha da porta, e nada além disso:
+
+* `evento` e `resp` da porta sobem pela USB **como vieram** (todo evento da
+  porta leva `"origem":"porta"`, que é como o adapter o separa dos das telas);
+* o ping da porta é respondido AQUI, com o relógio e a `sessao` do adapter —
+  repassado, o adapter leria um `sub` alheio e acusaria "cabo trocado";
+* comando `porta_*` do adapter desce **como veio**, e o ACK é o da PORTA; com o
+  link caído, esta placa recusa na hora (`porta_sem_link`);
+* sem `estado` da porta por **1500 ms**, emite UMA vez `porta_link_perdido`;
+  quando o heartbeat volta, `porta_link_ok` e repassa o primeiro `estado`.
+
+A leitura da UART é não bloqueante, no mesmo laço do `serialPoll`: o repasse
+nunca segura o desenho das telas.
 
 **Nome → número da imagem.** O `slot` traz o nome do catálogo do central
 (`"ALOIS 10MG"`); a tela desenha `imgN` de `imagens.h`. A tradução é

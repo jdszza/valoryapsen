@@ -285,6 +285,17 @@ def _cronograma_s(nome: str, default: float, minimo: float, maximo: float) -> fl
     não derruba nada, só faz cada ciclo esperar minutos — mas aí a demonstração
     parece travada e ninguém sabe por quê.
     """
+    return _faixa_s(nome, default, minimo, maximo) * _folga_timeout()
+
+
+def _faixa_s(nome: str, default: float, minimo: float, maximo: float) -> float:
+    """Número do `.env` com faixa, warning e queda no default — SEM a folga.
+
+    É a metade de `_cronograma_s` que não escala com `FATOR_VELOCIDADE`. Existe
+    separada para os prazos que dependem de um número FIXO do outro lado do
+    fio: `PORTA_PARADA_MAX_S` tem de caber no `ESPERA_CENTRAL_MS` gravado na
+    porta, e desacelerar a demo não regrava a placa.
+    """
     bruto = os.getenv(nome, str(default))
     try:
         valor = float(bruto)
@@ -299,7 +310,32 @@ def _cronograma_s(nome: str, default: float, minimo: float, maximo: float) -> fl
             "%s=%r fora da faixa %s..%s — usando %s.", nome, bruto, minimo, maximo, default
         )
         valor = default
-    return valor * _folga_timeout()
+    return valor
+
+
+# ── Portas NR-12 ──────────────────────────────────────────────────────────────
+#
+# Teto de `PORTA_PARADA_MAX_S`: quanto o central espera a CNC e os dispensers
+# confirmarem a parada antes de decidir se a porta abre. Ele tem de caber, com
+# folga para o trajeto, no `ESPERA_CENTRAL_MS` (5 s) GRAVADO na porta — depois
+# disso ela desiste do pedido, e um `porta_liberar` atrasado é recusado. É um
+# limite superior, não um número a manter igual: `tests/test_porta_firmware.py`
+# confere que a espera da placa é maior que este teto.
+PORTA_PARADA_MAX_S_TETO = 4.0
+
+
+def _porta_habilitada() -> bool:
+    """A célula TEM porta NR-12? Default: não.
+
+    Com a porta habilitada o central nasce PARADO ("link perdido") até ouvir o
+    primeiro `estado` dela: uma porta que nunca falou é tratada como porta
+    aberta, que é a regra de link perdido. Sem a porta (a planta simulada, o
+    CI) nada disso existe — e é por isso que o default é desligado: a planta
+    simulada não pode ficar parada à espera de uma placa que ela não tem.
+    """
+    return os.getenv("PORTA_NR12_HABILITADA", "0").strip().lower() in (
+        "1", "true", "yes", "sim", "on",
+    )
 
 
 def _timeout_s(nome: str, default: float) -> float:
@@ -481,6 +517,28 @@ class Settings:
         default_factory=lambda: _cronograma_s("DISPENSA_S_POR_UNIDADE", 1.0, 0.05, 30.0))
     DISPENSA_FOLGA_S:       float = field(
         default_factory=lambda: _cronograma_s("DISPENSA_FOLGA_S", 1.0, 0.05, 30.0))
+
+    # ── Portas NR-12 ──────────────────────────────────────────────────────────
+    # Ver "Portas NR-12: a porta pede, o central para e destrava" no CLAUDE.md.
+    PORTA_NR12_HABILITADA: bool = field(default_factory=_porta_habilitada)
+    # Quanto se espera a CNC e os dispensers confirmarem a parada (ACK do
+    # `parar` e, com dispensa em voo, o `dispensado_parcial`) antes de mandar
+    # `porta_liberar`. Sem a confirmação no prazo, a porta é NEGADA.
+    PORTA_PARADA_MAX_S: float = field(
+        default_factory=lambda: _faixa_s("PORTA_PARADA_MAX_S", 3.0, 0.5,
+                                         PORTA_PARADA_MAX_S_TETO))
+    # A janela do solenoide que vai no `porta_liberar` (a placa limita 1..60 s).
+    PORTA_JANELA_LIBERACAO_MS: int = field(
+        default_factory=lambda: int(_faixa_s("PORTA_JANELA_LIBERACAO_MS", 10000,
+                                             1000, 60000)))
+    # Sem NENHUMA mensagem da porta por este tempo, ela é dada como perdida. O
+    # adapter reenvia o `estado` a cada 5 s mesmo sem mudança justamente para
+    # que este relógio distinga "porta parada" de "adapter morto".
+    PORTA_SILENCIO_MAX_S: float = field(
+        default_factory=lambda: _faixa_s("PORTA_SILENCIO_MAX_S", 15.0, 3.0, 300.0))
+    # O homing da retomada é handshake (espera o `concluido`), e um homing pode
+    # levar o `HOMING_TIMEOUT_MS` de cada eixo.
+    PORTA_TIMEOUT_HOMING_S: float = _timeout_s("PORTA_TIMEOUT_HOMING_S", 90.0)
 
     # ── Modo de demonstração ──────────────────────────────────────────────────
     # O central não sorteia falha; estes dois campos existem para PUBLICAR o

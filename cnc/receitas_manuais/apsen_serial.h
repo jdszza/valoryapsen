@@ -8,11 +8,12 @@
 //  O que muda de uma placa para a outra — quais comandos existem e o que eles
 //  fazem — fica no .ino.
 //
-//  TRES COPIAS, E UM TESTE QUE AS COMPARA
-//  --------------------------------------
+//  QUATRO COPIAS, E UM TESTE QUE AS COMPARA
+//  ---------------------------------------
 //  Este arquivo existe identico em `dispenser/servos_hub/`, em
-//  `dispenser/telas_tft/` e em `cnc/receitas_manuais/`, e
-//  `tests/test_dispenser_firmware.py` reprova se divergirem. Nao e preguica: a
+//  `dispenser/telas_tft/`, em `cnc/receitas_manuais/` e em
+//  `porta/porta_nr12/`, e `tests/test_dispenser_firmware.py` reprova se
+//  divergirem. Nao e preguica: a
 //  Arduino IDE compila a PASTA do sketch, e
 //  um `#include "../apsen_serial.h"` nao sobrevive a copia que o build faz
 //  para o diretorio temporario. As alternativas sao transformar isto numa
@@ -20,12 +21,13 @@
 //  parar de compilar em qualquer maquina que nao a tenha — ou duplicar. E a
 //  mesma avaliacao que `serial_link.py` ja registra para as suas tres copias,
 //  com a mesma conclusao: nesta escala, o teste de igualdade custa menos que a
-//  infraestrutura. Eram duas quando isto foi escrito e a mesa fez a terceira —
-//  se um dia forem cinco, a conta muda.
+//  infraestrutura. Eram duas quando isto foi escrito, a mesa fez a terceira e
+//  a porta NR-12 a quarta — se um dia forem cinco, a conta muda.
 //
 //  O SKETCH QUE INCLUI ESTE HEADER PRECISA FORNECER
 //  ------------------------------------------------
-//    #define APSEN_SUBSISTEMA "<dispenser|dispenser_tft|cnc>"  ANTES do include
+//    #define APSEN_SUBSISTEMA "<dispenser|dispenser_tft|cnc|porta>"  ANTES do include
+//    #define APSEN_SERIAL Serial2   (opcional) a porta da voz de maquina
 //    void logMsg(const char* tag, const char* fmt, ...);
 //    void executarComando(const char* cmd, const char* linha, long cmd_id);
 //    void linhaHumana(char* linha);   // a linha SEM '{'
@@ -39,6 +41,16 @@
 
 #ifndef APSEN_SUBSISTEMA
 #error "defina APSEN_SUBSISTEMA antes de incluir apsen_serial.h"
+#endif
+
+// A porta por onde a voz de maquina entra e sai. `Serial` (a USB) em tres das
+// quatro placas, e o default existe para que elas compilem exatamente como
+// antes. A porta NR-12 e a excecao: a USB dela e da BANCADA (cadastro de tag,
+// diagnostico), e a maquina fala pelo Serial2, com a placa das telas do outro
+// lado do fio. Uma macro, e nao um parametro: e o que deixa este arquivo
+// identico nas quatro copias.
+#ifndef APSEN_SERIAL
+#define APSEN_SERIAL Serial
 #endif
 
 // Comando sem Enter: se ficar este tempo sem chegar caractere, a linha HUMANA
@@ -131,11 +143,13 @@ static void emitir(int escritos, const char* origem) {
   // Mensagem que nao cabe NAO SAI. Ver MAX_LINHA_BYTES.
   if (escritos < 0 || (size_t)escritos >= sizeof(jbuf) ||
       (size_t)escritos > MAX_LINHA_BYTES) {
-    Serial.printf("AVISO: mensagem '%s' (%d bytes) passou do teto da linha e NAO saiu.\n",
-                  origem, escritos);
+    // Pelo log, e nao pela porta de maquina: na porta NR-12 as duas sao fios
+    // diferentes, e o aviso e para o humano.
+    logMsg("AVISO", "mensagem '%s' (%d bytes) passou do teto da linha e NAO saiu.",
+           origem, escritos);
     return;
   }
-  Serial.println(jbuf);
+  APSEN_SERIAL.println(jbuf);
 }
 
 // -- Texto seguro para dentro de um JSON ------------------------------------
@@ -363,14 +377,14 @@ void serialPoll() {
   static uint8_t nivel = 0;
 
   if (nivel >= 2) {
-    while (Serial.available()) Serial.read();
+    while (APSEN_SERIAL.available()) APSEN_SERIAL.read();
     logMsg("ERRO", "serialPoll reentrante em 3 niveis - linha drenada sem despacho");
     return;
   }
   const uint8_t n = nivel++;
 
-  while (Serial.available()) {
-    char c = Serial.read();
+  while (APSEN_SERIAL.available()) {
+    char c = APSEN_SERIAL.read();
     ultimoChar[n] = millis();
 
     if (c == '\r' || c == '\n') {
@@ -417,7 +431,7 @@ void serialPoll() {
 // O buffer de recepcao padrao do ESP32 e de 256 B, e a maior linha do contrato
 // vai a 1024. Dimensiona-lo pelo TETO DA LINHA e o que garante que uma mensagem
 // nunca chegue partida — e meia linha e JSON invalido, que some sem erro.
-// Tem de ser chamado ANTES do Serial.begin().
+// Tem de ser chamado ANTES do begin() da porta de maquina.
 static void apsenSerialInit() {
-  Serial.setRxBufferSize(MAX_LINHA_BYTES);
+  APSEN_SERIAL.setRxBufferSize(MAX_LINHA_BYTES);
 }

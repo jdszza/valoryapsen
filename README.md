@@ -848,6 +848,20 @@ boot".
 | mesa CNC | `cnc` | `CNC_SERIAL_URL` | cnc-adapter | [`cnc/README.md`](cnc/README.md) |
 | balança HX711 | `weight` | `WEIGHT_SERIAL_URL` | weight-adapter | [`weight/README.md`](weight/README.md) |
 | display de 7" | — | `APSEN_DISPLAY_PORTA` | painel_operador | [`docs/BANCADA.md`](docs/BANCADA.md) |
+| ESP da porta NR-12 | `porta` | — (sem USB no mini PC) | dispenser-adapter, **através** da placa das 8 telas | [`porta/README.md`](porta/README.md) |
+
+> **A porta NR-12 não tem porta no mini PC.** A ESP dela (RC522 + dois fins de
+> curso + solenoide) fala por **UART** com a placa das telas TFT dos
+> dispensers, que repassa as mensagens nos dois sentidos pela USB que já
+> existe — ver [`docs/PROTOCOLO_SERIAL.md`](docs/PROTOCOLO_SERIAL.md) §9. O
+> USB da própria ESP da porta serve **só para bancada**: cadastrar tags e
+> diagnosticar pelo Monitor Serial (`R`, `S`, `C`, `L`, `E`). Não há variável
+> de COM para ela, e nenhum processo do host a abre.
+>
+> **Ligação física:** TX2 (GPIO17) da porta → RX (GPIO16) da placa das telas,
+> RX2 (GPIO16) da porta ← TX (GPIO17) da placa das telas, GND comum. **Nada de
+> 5 V entre elas.** Detalhes em [`dispenser/README.md`](dispenser/README.md),
+> "A placa das telas também carrega a porta NR-12".
 
 > **A mesa CNC entra por aqui como as outras.** O firmware
 > (`cnc/receitas_manuais`) fala as duas vozes desde a frente do ciclo por

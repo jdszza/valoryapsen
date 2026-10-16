@@ -5,14 +5,14 @@
     "altura": 720,
     "fps": 30,
     "fourcc": "MJPG",
-    "autofoco": true,
-    "foco": 30,
+    "autofoco": false,
+    "foco": 41,
     "autoexposicao": false,
-    "exposicao": -6,
+    "exposicao": -4,
     "autobalanco_branco": false,
     "temperatura_cor": 4000,
     "ganho": -1,
-    "brilho": -1,
+    "brilho": 156,
     "contraste": -1,
     "espelhar": false,
     "frames_aquecimento": 20
@@ -28,24 +28,24 @@
     "escala_px_por_mm": 2.0,
     "cantos_manuais": [
       [
-        0.026310482621192934,
-        0.183870972527398
+        0.04899193644523621,
+        0.6870967864990234
       ],
       [
-        0.6668346881866455,
-        0.183870972527398
+        0.3012096881866455,
+        0.5403225792778863
       ],
       [
-        0.7575604915618896,
-        0.8758064270019531
+        0.5951612949371338,
+        0.7387096828884548
       ],
       [
-        0.0,
-        0.9887096828884548
+        0.3629032373428345,
+        0.9986111111111111
       ]
     ],
     "metodo": "borda",
-    "limiar": 90,
+    "limiar": 10,
     "limiar_minimo": 20,
     "limiar_maximo": 220,
     "lock": false,
@@ -57,15 +57,15 @@
     "comprimento_mm": 300.0,
     "largura_mm": 200.0,
     "px_por_mm": 2.0,
-    "suavizacao": 0.7,
-    "frames_validade": 60
+    "suavizacao": 0,
+    "frames_validade": 0
   },
   "conteudo": {
     "metodo": "otsu_desloc",
-    "limiar": 184,
+    "limiar": 188,
     "limiar_minimo": 40,
     "limiar_maximo": 220,
-    "lock": true,
+    "lock": false,
     "inverter": false,
     "metodos_auto": [
       "otsu_desloc",

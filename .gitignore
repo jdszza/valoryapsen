@@ -84,6 +84,7 @@ weight/TASK_VALIDAR_BALANCA_2_5.md
 !/vision/conferir_mesa.py
 !/vision/conferir_dispensers.py
 !/vision/iniciar_mesa.bat
+!/vision/PRIMEIRO_ENSAIO_MESA.md
 # Saída de execução das estações: bancos de eventos, logs e a calibração de
 # estoque gerada em campo.
 /vision/visao_mesa/dados/

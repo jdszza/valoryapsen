@@ -11,6 +11,7 @@ com o `vision-adapter`.
 | `visao_esq/`, `visao_dir/` | as pastas de EXECUÇÃO das duas câmeras dos dispensers, criadas por `iniciar_dispensers.bat` como cópia de `visao/` | só `config/` (a calibração de cada câmera) |
 | `iniciar_dispensers.bat` | sobe uma estação dos dispensers (`esq` ou `dir`) | sim |
 | `ensaio_dispensers.py` | ensaio da ponte adapter ↔ estação real dos dispensers, sem câmera | sim |
+| `PRIMEIRO_ENSAIO_MESA.md` | o passo a passo para ligar a câmera da mesa pela primeira vez | sim |
 | `iniciar_visao.bat`, `gerar_arquitetura.py` | vieram no pacote original; ver abaixo | não |
 
 ## Regra nº 1: o código da visão não é editado aqui

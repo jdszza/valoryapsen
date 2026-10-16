@@ -45,6 +45,7 @@ RAIZ_REPO = Path(__file__).resolve().parent.parent
 PASTA_MECANISMOS = RAIZ_REPO / "dispenser" / "servos_hub"
 PASTA_TELAS = RAIZ_REPO / "dispenser" / "telas_tft"
 PASTA_CNC = RAIZ_REPO / "cnc" / "receitas_manuais"
+PASTA_PORTA = RAIZ_REPO / "porta" / "porta_nr12"
 
 # As duas placas do DISPENSER. Quase todo teste daqui é sobre elas — dispensa,
 # índice de canal, pintura de tela —, e a mesa não tem nada disso.
@@ -58,12 +59,14 @@ SKETCHES = {
 # subsistema, definir as três funções e não tocar na linha crua —, não a
 # mecânica dos dispensers. Juntar as duas tabelas faria os testes de dispensa
 # cobrarem `canalDoSlot` de uma placa que move uma mesa.
-SKETCHES_COM_HEADER = {**SKETCHES, "cnc": PASTA_CNC / "receitas_manuais.ino"}
+SKETCHES_COM_HEADER = {**SKETCHES, "cnc": PASTA_CNC / "receitas_manuais.ino",
+                       "porta": PASTA_PORTA / "porta_nr12.ino"}
 
 HEADERS = {
     "dispenser": PASTA_MECANISMOS / "apsen_serial.h",
     "dispenser_tft": PASTA_TELAS / "apsen_serial.h",
     "cnc": PASTA_CNC / "apsen_serial.h",
+    "porta": PASTA_PORTA / "apsen_serial.h",
 }
 
 
@@ -120,7 +123,7 @@ def firmware() -> dict[str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. As três cópias de apsen_serial.h são a MESMA
+# 1. As quatro cópias de apsen_serial.h são a MESMA
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_as_copias_do_header_sao_identicas():
@@ -129,7 +132,7 @@ def test_as_copias_do_header_sao_identicas():
     Divergir aqui é ter uma das placas falando o enquadramento de ontem, e ela
     seria justamente a que ninguém está depurando naquele dia.
 
-    Eram duas; com a mesa, são três. O header registra no próprio cabeçalho que
+    Eram duas; com a mesa, três; com a porta NR-12, quatro. O header registra no próprio cabeçalho que
     a conta muda se um dia forem cinco — o custo deste teste é constante, o de
     manter as cópias em sincronia não.
     """
@@ -321,9 +324,76 @@ def test_limpeza_ok_nao_carrega_os_id(firmware):
 
 def test_a_placa_das_telas_nao_emite_evento_de_resultado(firmware):
     """`slot` e `estado_celula` só PINTAM: o ACK já disse "aceitei", e não há
-    "terminei" a esperar. Um evento novo aqui viraria lixo no adapter."""
+    "terminei" a esperar. Um evento novo aqui viraria lixo no adapter.
+
+    Os dois `porta_link_*` são a exceção registrada: não são resultado de
+    comando nenhum, são a VIGIA do heartbeat da porta NR-12 (§9) — quem perdeu
+    o link não tem como avisar que o perdeu."""
     tipos = set(_blocos_de_evento(firmware["dispenser_tft"]))
-    assert tipos == {"telemetria", "erro"}, tipos
+    assert tipos == {"telemetria", "erro", "porta_link_perdido", "porta_link_ok"}, tipos
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4b. A placa das telas REPASSA a porta NR-12 (§9), sem interpretá-la
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_a_uart_da_porta_nao_colide_com_a_spi_nem_com_os_cs(firmware):
+    """Um pino da UART em cima de um CS faria a tela daquele slot ler o tráfego
+    da porta como comando de desenho — e a porta perderia bytes no meio de um
+    JSON. 16/17 são os livres; 19 é o MISO que a SPI reserva."""
+    texto = sem_comentarios(firmware["dispenser_tft"])
+    rx = int(re.search(r"#define PORTA_UART_RX\s+(\d+)", texto).group(1))
+    tx = int(re.search(r"#define PORTA_UART_TX\s+(\d+)", texto).group(1))
+    cs = {int(n) for n in re.search(r"TFT_PIN_CS\[NUM_TELAS\]\s*=\s*\{([^}]*)\}",
+                                    texto).group(1).split(",")}
+    ocupados = cs | {18, 19, 23,
+                     int(re.search(r"#define TFT_PIN_DC\s+(\d+)", texto).group(1)),
+                     int(re.search(r"#define TFT_PIN_RST\s+(\d+)", texto).group(1))}
+    assert {rx, tx} == {16, 17}
+    assert not ({rx, tx} & ocupados)
+
+
+def test_o_repasse_da_porta_e_nao_bloqueante_e_mora_no_laco(firmware):
+    texto = sem_comentarios(firmware["dispenser_tft"])
+    assert "portaPoll();" in _corpo_da_funcao(texto, "void loop()")
+    poll = _corpo_da_funcao(texto, "static void portaPoll()")
+    assert "PORTA_SERIAL.available()" in poll
+    assert "delay(" not in poll and "readStringUntil" not in poll
+    # A leitura da UART mora SÓ aqui: um segundo leitor partiria as linhas.
+    assert texto.count("PORTA_SERIAL.read()") == 1
+
+
+def test_comando_porta_desce_como_veio_e_o_ack_e_da_porta(firmware):
+    """Esta placa não confirma o que não executa: dois ACKs para o mesmo
+    `cmd_id` seriam o ACK de quem não fez nada. Com o link caído, ela recusa
+    na hora em vez de deixar o adapter queimar o prazo."""
+    texto = sem_comentarios(firmware["dispenser_tft"])
+    despacho = _corpo_da_funcao(texto, "void executarComando")
+    assert 'strncmp(cmd, "porta_", 6)' in despacho
+    repasse = _corpo_da_funcao(texto, "static void repassarComandoPorta(")
+    assert "ackOk" not in repasse
+    assert 'ackErro(cmd_id, "porta_sem_link")' in repasse
+    assert repasse.index("portaLinkPerdido") < repasse.index("PORTA_SERIAL.println")
+
+
+def test_o_ping_da_porta_e_respondido_aqui_e_nao_sobe(firmware):
+    texto = sem_comentarios(firmware["dispenser_tft"])
+    linha = _corpo_da_funcao(texto, "static void linhaDaPorta(")
+    i_ping = linha.index('"\\"cmd\\":\\"ping\\""')
+    i_sobe = linha.index("Serial.println(json)")
+    assert i_ping < i_sobe
+    assert "pongParaPorta(); return;" in linha
+
+
+def test_a_volta_do_link_sai_antes_do_estado_que_a_provou(firmware):
+    """O adapter só declara o link ok depois do primeiro `estado`; a placa
+    emite `porta_link_ok` e então repassa esse `estado`, nessa ordem."""
+    texto = sem_comentarios(firmware["dispenser_tft"])
+    linha = _corpo_da_funcao(texto, "static void linhaDaPorta(")
+    assert linha.index("emitPortaLink(true)") < linha.index("Serial.println(json)")
+    poll = _corpo_da_funcao(texto, "static void portaPoll()")
+    assert "PORTA_VIGIA_MS" in poll and "emitPortaLink(false)" in poll
+    assert "#define PORTA_VIGIA_MS 1500" in texto
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -363,9 +433,8 @@ def test_a_dispensa_usa_mover_calibrado_e_nunca_mover_raw(firmware):
     """Fora do MANUT o movimento respeita a calibração, e é ela que impede o
     servo de bater no fim de curso no meio de uma OS.
 
-    O ciclo move o braço pela rampa (`moverEmRampa`, que empurra a caixa em vez
-    de arremessá-la), e é a rampa que escreve no PWM — então a regra é cobrada
-    nas duas funções."""
+    O ciclo move o braço por `moverEmSalto` (direto ao alvo, sem rampa), e é
+    ela que escreve no PWM — então a regra é cobrada nas duas funções."""
     texto = sem_comentarios(firmware["dispenser"])
 
     def corpo_de(assinatura):
@@ -373,11 +442,20 @@ def test_a_dispensa_usa_mover_calibrado_e_nunca_mover_raw(firmware):
         return corpo[: corpo.index("\n}\n")]
 
     ciclo = corpo_de("static bool soltarUmaUnidade")
-    rampa = corpo_de("static void moverEmRampa")
-    assert "moverEmRampa" in ciclo
-    assert "moverCalibrado" in rampa
+    salto = corpo_de("static void moverEmSalto")
+    assert "moverEmSalto" in ciclo
+    assert "moverCalibrado" in salto
     assert "moverRaw" not in ciclo
-    assert "moverRaw" not in rampa
+    assert "moverRaw" not in salto
+
+
+def test_a_dispensa_nao_tem_rampa(firmware):
+    """Ida e volta saem em salto, à força máxima do servo, em todos os slots:
+    a rampa deixava D2/D3/D8 sem força para terminar o curso com carga."""
+    texto = sem_comentarios(firmware["dispenser"])
+    assert "moverEmRampa" not in texto
+    assert "SALTO_FINAL_GRAUS" not in texto
+    assert "PASSO_RAMPA" not in texto
 
 
 def test_o_pulso_que_nao_vem_interrompe_a_dispensa(firmware):
