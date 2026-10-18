@@ -2301,8 +2301,10 @@ quem consulta por HTTP) contam a mesma história para públicos diferentes.
 até virar "concluida"/"erro". Como `get_ordem_ativa` filtrava
 `status IN ('aguardando','em_andamento') ORDER BY criado_em DESC`, com fila ela
 devolvia a OS enfileirada por ÚLTIMO — o `GET /os/ativa` mostrava a OS errada.
-Hoje `_processar_os` grava "em_andamento" na entrada, e `get_ordem_ativa` procura
-por esse status; o fallback para "aguardando" (a mais ANTIGA, que é a próxima da
+Hoje `_processar_os` grava o status de execução na entrada
+(`aguardando_caixa_vazia`, e `em_andamento` com a caixa conferida vazia), e
+`get_ordem_ativa` procura pelos quatro status de execução
+(`database.STATUS_EM_EXECUCAO`); o fallback para "aguardando" (a mais ANTIGA, que é a próxima da
 fila) existe só para o app de manutenção não piscar entre duas OS.
 
 A contrapartida: **toda saída de `_processar_os` deve fechar em status
@@ -2383,9 +2385,12 @@ silêncio não a apaga.
 **`cmd_homing` do fim da OS** tinha o retorno ignorado. Homing que não sai deixa
 a mesa parada no último dispenser e a OS fecha como `concluida`, sem nada no
 log; quem paga é a OS SEGUINTE, que planeja a serpentina a partir de HOME — e a
-otimalidade dessa rota é a do ciclo FECHADO. Hoje o retorno vira alarme
-`homing_nao_confirmado`, e **não** aborta: a dispensa já terminou e o Triple
-Check já opinou, então abortar marcaria em erro uma OS que entregou tudo certo.
+otimalidade dessa rota é a do ciclo FECHADO. O retorno passou a virar alarme
+(`homing_nao_confirmado`), e depois handshake: hoje o homing do fim espera o
+`concluido`, e sem ele a foto da caixa cheia não é tirada — a OS entra na trava
+com `homing_final_falhou` em vez de abortar, porque a dispensa já terminou e o
+Triple Check já opinou. E a OS seguinte faz o próprio homing no começo, antes
+da foto da caixa vazia.
 
 **O `homing_completo()` da mesa**, nos dois caminhos de trava, emitia
 `concluido` sem conferir nada — violando a regra que o próprio `cmdHoming`
@@ -2413,6 +2418,10 @@ A guarda mora no CENTRAL, e não no firmware, por duas razões. Quem manda no
 FLUXO é o central (README, "Fontes de verdade") — a mesa reporta o que ela fez,
 não o que a OS virou. E a placa em campo precisaria ser regravada; a linha no
 central vale na bancada que já está montada.
+
+**Hoje a guarda é a regra inteira:** o `concluido` não conclui OS nenhuma, com
+ou sem trava. Quem conclui é a chegada da mesa ao centro (ver "A caixa é
+conferida duas vezes no HOME").
 
 ## O cronograma do ciclo é o único relógio, e ele tinha os únicos números crus
 
@@ -3075,9 +3084,12 @@ OS — e nunca refotografa um par (os_id, slot) que já recebeu.
 que falha sem a estação registrar o total também não conta. Nos dois casos a
 foto SEGUINTE vê os slots juntos, e comparar com a quantidade de um slot só
 seria divergência falsa: ela leva a soma (`esperado_camera`) e os
-`slots_cobertos`. No fim da OS, `VISAO_MESA_FINAL=HOME` confere o que sobrou,
-usando o slot de um pendente que nunca foi pedido — se não houver, não há foto
-possível, e fica o alarme.
+`slots_cobertos`. No fim da OS, o que sobrou é coberto pela foto FINAL da caixa
+inteira no HOME — que não herda os pendentes: ela conta a caixa toda sob um
+`os_id` próprio (ver "A caixa é conferida duas vezes no HOME"). O antigo
+`VISAO_MESA_FINAL=HOME`, que fotografava só os pendentes usando o slot de um
+deles, saiu: ele dependia do incremento, e era ali que a dessincronia, o
+déficit e a estação reiniciada voltavam a morder.
 
 **Dessincronia.** Timeout, envio recusado e `timeout_processamento` — que
 continua rodando na estação e pode atualizar o total em silêncio — deixam sem
@@ -3095,12 +3107,14 @@ errado, com o certo marcado OK. O central não espera o `dispensado` por causa
 disso: o relógio não ganha portão novo; a foto seguinte só deixa de ser
 comparada.
 
-A conferência final no HOME **herda** a dessincronia (`_conferir_mesa_no_home`
-recebe `dessincronizada`). Sem isso, timeout na última foto visível seguido de
-slots invisíveis — ou trava liberada seguida só de slots invisíveis — chegava ao
-HOME comparando um incremento que pode incluir o slot cujo total ninguém sabe se
-foi registrado: "a mais" e trava. Ali a divergência vira o alarme
-`conferencia_final_nao_comparavel`, com a contagem e o esperado no texto.
+A conferência final no HOME **não** herda a dessincronia — e é de propósito.
+Quando ela comparava um incremento (o antigo `_conferir_mesa_no_home`, com o
+slot de um pendente), timeout na última foto visível seguido de slots
+invisíveis chegava ao HOME comparando um total que ninguém sabia se fora
+registrado, e precisava de um alarme `conferencia_final_nao_comparavel` para
+não travar no escuro. A foto FINAL de hoje conta a caixa INTEIRA sob um
+`os_id` que a estação nunca viu (ver "A caixa é conferida duas vezes no
+HOME"): não há incremento a dessincronizar.
 
 **A estação pode perder a memória da OS**, e o central não teria como saber. O
 acumulado vive só na memória dela e expira em `VALIDADE_OS_H` (2 h no default)
@@ -3121,3 +3135,325 @@ contar uma a MAIS.
 **`VISAO_SKU_HABILITADA=0`** existe para a bancada sem as câmeras dos
 dispensers: sem a chave, o central mandava o comando a cada slot e retentava
 3× para chegar ao mesmo desfecho de hoje — o slot segue sem conferência.
+
+## Portas NR-12: a porta pede, o central para e autoriza
+
+A célula tem duas portas físicas — **teto** (ES1, abastecer remédio) e
+**frente** (ES2, a caixa sobre a balança) — vigiadas por uma ESP com RC522
+(`porta/porta_nr12/`). **Não há fechadura elétrica:** cada porta é presa por
+um ímã simples, e o fim de curso é o único sensor dela. Quem puxa, abre, a
+qualquer momento — o que o sistema controla não é a abertura, é a AUTORIZAÇÃO
+dela. A ESP da porta não tem USB no mini PC: ela fala
+por UART com a placa das 8 telas TFT, que repassa pela USB que já existia
+(`docs/PROTOCOLO_SERIAL.md` §9). Para o dispenser-adapter a porta é uma ORIGEM
+de evento a mais, e para o central é um estado da célula SEPARADO da trava do
+Triple Check — as duas podem coexistir, e retomar exige as duas resolvidas.
+
+```
+ESP da porta ──UART──> ESP das telas ──USB──> dispenser-adapter ──REST──> central
+```
+
+### Quem decide o quê
+
+| decisão | quem | por quê |
+|---|---|---|
+| a tag vale | a porta (NVS) | o cadastro é físico, na bancada |
+| a abertura é autorizada | o central | só ele sabe se a máquina parou |
+| a máquina para | o central, na hora | porta aberta, pedido de acesso ou link perdido |
+| a máquina retoma | o central, no `rearme` | fechar a porta não religa nada |
+
+**A tag não autoriza sozinha.** A tag gera `pedido_acesso`; o central entra em
+pausa PRIMEIRO, manda `parar` à CNC e aos dispensers em `gather`, e só com os
+dois ACKs (e, se havia dispensa saindo, a contagem dela) manda `porta_liberar`,
+que acende o LED "pode abrir" da placa. Sem confirmação em
+`PORTA_PARADA_MAX_S`, manda `porta_negar` e grava `maquina_nao_confirmou_parada`.
+Autorizar sem a parada confirmada seria dizer "pode abrir" com a mesa andando.
+
+**Sem trava, abrir antes do LED é abrir sem autorização** — e isso é o caso que
+o desenho cobre de propósito, não uma borda. A célula para do mesmo jeito (toda
+`porta_aberta` pausa, autorizada ou não), e a abertura vira o alarme
+`porta_aberta_sem_autorizacao`. A autorização não protege a pessoa — quem
+protege é a parada, que acontece em toda abertura —; ela separa o acesso
+combinado do não combinado, para o histórico e para o alarme.
+
+**Os dois prazos são um teto, não um número duplicado.** A porta espera a
+resposta do central por `ESPERA_CENTRAL_MS` (5 s, gravado na placa) e desiste;
+`PORTA_PARADA_MAX_S` (3 s) tem teto de 4 s em `config.py`, e
+`tests/test_porta_firmware.py` cobra que a espera da placa é maior que o teto
+mais o trajeto. É a regra do `CNC_TETO_TRAJETO_S`: um limite superior continua
+verdadeiro enquanto o outro lado couber embaixo dele. E é por isso que o
+`PORTA_PARADA_MAX_S` NÃO escala com `FATOR_VELOCIDADE` (`_faixa_s` em vez de
+`_cronograma_s`): desacelerar a demo não regrava a placa.
+
+### Parar é parar onde está — o homing é da retomada
+
+A trava do Triple Check já sabia parar a mesa no meio de um movimento, mas ela
+**vai ao HOME** em seguida. Com uma pessoa com a mão na célula, isso é o
+contrário do desejado. Por isso a mesa ganhou o comando `parar` (§4): o MESMO
+passo do `sync_move` que confere a trava confere `parar_pedido`, e a mesa fica
+onde parou, **sem origem** (`ja_fez_homing = false`) — todo `mover` seguinte é
+`sem_homing` até o homing que o central manda na RETOMADA, com a porta fechada
+e rearmada. A regra "rearme → homing → continua" vale na placa, não só no
+central.
+
+O dispenser ganhou `parar` pelo mesmo motivo, com uma diferença: ele **termina
+a unidade atual**. O laço confere o pedido ENTRE uma unidade e a seguinte — o
+braço que já saiu completa o ciclo e o pulso do IR dela é esperado no prazo de
+sempre. Parar o braço no meio deixaria uma caixa presa na boca do dispenser,
+contada por ninguém. Sai `dispensado_parcial` com quantas o IR contou, e o slot
+continua da OS, PRONTO, com o restante como alvo.
+
+### O ciclo reconhece a pausa pela GERAÇÃO
+
+Entrar em pausa é síncrono e chama `cancelar_cronograma()` — a mesma ordem de
+`_ativar_trava`: estado armado primeiro, comando depois, porque cada `await`
+antes de armar é uma janela para mais um `dispensar`. O prazo do ciclo acorda
+cedo, e o ciclo precisa distinguir pausa (refaz o slot depois) de reset (para a
+OS): toda entrada em pausa incrementa `_porta_geracao`, e `_houve_pausa(geração)`
+decide. Não dá para decidir pelo retorno de `_dormir_ou_cancelar`: com prazo
+zero (a suíte) ele pode dizer "cumpriu" com o cancelamento já armado.
+
+O que a retomada preserva é a CONTAGEM, nunca a posição:
+
+* **pausa entre slots** — segue para o próximo slot normalmente;
+* **pausa no trajeto** — o slot se refaz desde o `mover`;
+* **pausa na dispensa, com `dispensado_parcial`** — o `dispensar` da retomada
+  leva `quantidade` = pedida − confirmada, e o Triple Check compara o TOTAL das
+  duas partes (`_desfecho_do_ciclo` recebe a soma);
+* **pausa na dispensa, SEM contagem** — nada se reenvia. O slot cai na trava do
+  Triple Check com `pausa_porta_sem_contagem_parcial`: reenviar tudo seria dose
+  dobrada, seguir como se tivesse caído seria dose curta, e quem decide é o
+  supervisor, com a caixa na frente;
+* **pausa depois da dispensa** — a mesa volta ao slot (`_reposicionar`) antes
+  da foto: a retomada fez homing, e a câmera fotografaria a caixa no HOME.
+
+A dispensa em voo é publicada ANTES do `dispensar` sair (`_dispensa_em_voo`), e
+se a pausa chegar com o comando no fio o central manda um SEGUNDO `parar`: o
+primeiro pode ter chegado à placa antes do `dispensar`, e a placa descarta
+`parar` antigo ao começar uma dispensa.
+
+A tara, a pesagem e o homing de fim de OS também esperam a pausa acabar — a
+porta da frente é a da caixa sobre a balança, e uma mão na caixa entraria no
+zero dela. E nenhuma OS nova começa com a pausa em vigor: o `loop_orquestrador`
+espera SEM teto, porque quem encerra é uma pessoa passando a tag.
+
+### Retomar é sempre por homing, e só com tudo resolvido
+
+`_bloqueio_da_retomada` exige link ok, as duas portas fechadas, a porta em
+FECHADA (não LIBERADA), nenhum rearme pendente e nenhuma trava. A retomada faz
+homing **esperando o `concluido`** (chave `{os_id}:homing`, o único homing que é
+handshake) e só então limpa a pausa. Homing que falha: alarme
+`homing_retomada_falhou`, a OS segue parada e o rearme volta a ser pendente.
+
+O `concluido` desse homing é endereçado à OS que vai retomar. O handler da CNC o
+publicava como OS concluída — a mesma armadilha da trava —, e a guarda era
+`orch.porta_suspende_conclusao()`; hoje o `concluido` não conclui OS nenhuma
+(só a chegada ao centro conclui), e a função ficou como consulta.
+
+Três caminhos chegam à retomada, e cada um tem o porquê:
+
+* **`rearme`** — o caminho normal. Com a trava do Triple Check pendente, o
+  rearme é REGISTRADO e a retomada acontece quando a trava for liberada: as duas
+  resolvidas, em qualquer ordem. Recusar o rearme obrigaria a pessoa a abrir a
+  porta de novo, porque depois de emitir `rearme` a porta já espera um pedido;
+* **`estado` fechado depois de `link_perdido`** — sem porta aberta no meio
+  (`aguardando_rearme` falso no `estado` da própria porta, que é quem lembra se
+  foi aberta), não há o que rearmar. `porta_link_ok` sozinho NÃO retoma: quem
+  prova o link é o `estado` que vem depois;
+* **`liberacao_expirada` que não é `janela_expirou`** — negado pelo central ou a
+  porta desistiu de esperar: o acesso não aconteceu, a porta está travada, e a
+  célula volta ao que fazia. Já `janela_expirou` (liberada, ninguém abriu) exige
+  tag: a máquina parou, e só retoma por decisão.
+
+### Link perdido é porta aberta — vigiado em três lugares
+
+Ninguém que perde o link consegue avisar que o perdeu, então cada salto tem o
+seu vigia: a placa das telas (1,5 s sem heartbeat → `porta_link_perdido`), o
+adapter (USB das telas caída, ou heartbeat mais velho que
+`PORTA_HEARTBEAT_MAX_S`), e o central (`vigiar_porta`, nada da porta em
+`PORTA_SILENCIO_MAX_S` — o adapter reenvia o `estado` a cada 5 s mesmo sem
+mudança justamente para isso). O adapter soma as duas primeiras fontes num
+estado só e sobe só a transição; o central abre UM alarme por queda.
+
+Com `PORTA_NR12_HABILITADA=1`, o central nasce em pausa por link perdido: porta
+que nunca falou é porta aberta. Sem a variável (planta simulada, CI) nada disso
+existe — e é por isso que o default é desligado.
+
+### A faixa tem um dono
+
+"MÁQUINA PARADA — PORTA FRENTE ABERTA", "PORTAS FECHADAS — PASSE A TAG PARA
+RETOMAR", "LINK DA PORTA PERDIDO": a frase sai de `orchestrator.faixa_da_porta`,
+e é a MESMA na web do painel, no display de 7" e nas telas TFT. O painel a lê
+por `GET /api/v1/porta` (o `central_client` continua só de leitura) e a manda ao
+display junto com a trava, em ASCII; as telas TFT a recebem no `estado_celula`
+(`pausa_porta`/`pausa_resumo`), e a mesa NÃO — a mesa recebe `estado_celula`
+como trava, e trava a manda ao HOME. Três frases escritas à mão divergiriam no
+primeiro ajuste, e o operador veria uma tela pedindo a tag e outra dizendo que
+a porta está aberta.
+
+### Histórico e alarmes
+
+`porta_eventos` guarda uma linha por mensagem que MUDA estado — pedido, liberação,
+abertura (com a porta e se foi autorizada), fechamento, rearme, tag negada,
+liberação expirada, link perdido/ok —, com UID, a OS e o slot do momento. O
+heartbeat não vira linha. As tags são genéricas: a linha diz porta, UID e hora,
+não a pessoa.
+
+Alarme é um por evento: `porta_aberta_sem_autorizacao` (fonte `porta_teto` ou
+`porta_frente` — é ela que manda o técnico à porta certa), `porta_link_perdido`
+(na transição), `maquina_nao_confirmou_parada`, e `tentativa_acesso_negada` (3
+tags negadas em 60 s; a contagem recomeça depois do alarme). Pedido de acesso e
+rearme não são alarme: são a operação funcionando.
+
+### Parada só por software — decisão de protótipo
+
+Aceita para o protótipo do desafio. Em produção, uma auditoria NR-12 exige o fim
+de curso cortando fisicamente a energia dos motores (relé de segurança): aqui,
+quem para a máquina é o central, por comando, e um central travado não para
+nada. A porta sem trava é a outra metade da mesma decisão: o ímã segura, mas não
+impede ninguém de abrir — e por isso a parada vale para TODA abertura, não só
+para a autorizada.
+
+**Houve um solenoide no desenho, e ele saiu.** O `porta_liberar` energizava uma
+fechadura; hoje ele só autoriza (o LED). Os nomes do protocolo ficaram —
+`porta_liberar`, `LIBERADA`, `liberada`, `liberacao_expirada` —, porque o que
+eles descrevem continua o mesmo: a janela em que abrir é combinado. O que sumiu
+é o campo `solenoide` do `estado` e o pino de fechadura do sketch, e
+`tests/test_porta_firmware.py` reprova se um pino de fechadura voltar.
+
+## A caixa é conferida duas vezes no HOME, e a mesa só vai ao centro com a visão ok
+
+A OS fecha o ciclo com a câmera da mesa: a caixa de coleta é fotografada
+**vazia** no HOME antes da ordem e **cheia** no HOME depois dela, e só com a
+segunda foto confirmando o central manda `centro` à CNC. A OS só é `concluida`
+com a mesa no centro.
+
+```
+fila → OS sai
+  ├─ CNC: homing (handshake: espera o `concluido`) ─────► HOME
+  ├─ VISÃO: caixa VAZIA?   foto VAZIA-<os_id>, esperado 0
+  │     ├─ 0 caixinhas ........ segue
+  │     ├─ ≥1 caixinha ........ NÃO começa: alarme caixa_nao_vazia, re-foto a
+  │     │                       cada VISAO_CAIXA_VAZIA_REPETIR_S até esvaziarem
+  │     └─ câmera sem resposta  NÃO começa: camera_mesa_indisponivel_inicio, repete
+  ├─ ciclo da OS (slots por relógio, Triple Check por slot — como antes)
+  ├─ CNC: homing (handshake)
+  ├─ VISÃO: caixa CHEIA   foto FINAL-<os_id>, contagem ABSOLUTA × total da OS
+  │     ├─ bate ............... centro
+  │     ├─ a mais ............. trava (conferencia_final_a_mais)
+  │     ├─ a menos ............ balança fechou o total → alarme e segue; senão trava
+  │     └─ sem leitura ........ trava (conferencia_final_sem_camera)
+  └─ CNC: centro → `posicionado {destino:"centro"}` → OS concluída
+```
+
+Os estados que a OS atravessa, no `_estado["os_ativa"]` e em `ordens.status`:
+`aguardando_caixa_vazia` → `em_andamento` → `conferindo_caixa` →
+`indo_ao_centro` → `concluida`. Trava e pausa da porta continuam como sempre —
+não são estados da OS, são estados da célula. `get_ordem_ativa` trata os quatro
+primeiros como "em execução" (`database.STATUS_EM_EXECUCAO`).
+
+### O `os_id` próprio é o que torna a conferência final confiável
+
+A estação da mesa conta por INCREMENTO dentro de um `os_id`
+(`AcumuladoPorOS`): cada foto compara o total da caixa com o total da foto
+anterior da MESMA OS, e uma OS nunca vista começa em zero (o próprio código da
+estação diz: "a suposição é que cada OS começa com a caixa de coleta VAZIA").
+`quantidade_detectada` é o incremento; o total vai em `quantidade_total_caixa`.
+
+As duas fotos do HOME usam `os_id` que a estação nunca viu — `VAZIA-<os_id>` e
+`FINAL-<os_id>` —, então o acumulado anterior é 0 e o "incremento" devolvido é a
+contagem ABSOLUTA da caixa. É isso que livra a conferência final dos buracos da
+auditoria de 07/10: dessincronia, caixinha escondida que reaparece, estação
+reiniciada no meio da OS. A FINAL **não herda** pendentes, déficit nem
+`mesa_dessincronizada` das fotos por slot: ela não compara incremento nenhum. As
+fotos por slot continuam iguais — são o AVISO PRECOCE, que trava no slot onde a
+coisa aconteceu; quem libera o centro é a FINAL.
+
+O que a mudança NÃO resolve sozinha é a física: a contagem absoluta só vale se a
+câmera vê a caixa INTEIRA no HOME. `HOME` entra em `VISAO_MESA_POSICOES` depois
+da medida de bancada (docs/BANCADA_VISAO.md, M4), e o pré-voo avisa enquanto ele
+não estiver lá com a câmera real ligada.
+
+**Repetição é `os_id` NOVO.** A estação nunca refotografa um par
+(`os_id`, `slot_id`) que já recebeu, e uma segunda foto `VAZIA-<os_id>` voltaria
+"captura já em andamento" e nenhum evento. A re-foto da caixa vazia é
+`VAZIA-<os_id>-2`, `-3`… e a FINAL refeita depois de uma pausa da porta é
+`FINAL-<os_id>-2`. Quem traduz o alias de volta à OS real é o orquestrador, que o
+registrou ao pedir a foto (`orch.resolver_alias_visao`); o fallback por texto
+tira o prefixo e um `-<n>` de até três dígitos — nunca mais que isso, porque o
+`os_id` real termina em seis hexadecimais que podem ser todos dígitos.
+
+**O `slot_id` das fotos do HOME é 1, e não "HOME".** A estação (código que este
+repositório não edita) e o vision-simulator aceitam só `1..NUM_SLOTS`. Com um
+`os_id` nunca visto, o par (alias, 1) é novo por construção, e o slot não
+significa nada na estação. Quem diz o que a foto é são o prefixo do `os_id` e o
+campo `etapa` (`caixa_vazia` | `caixa_final`), que o vision-adapter repassa e a
+estação ignora (`extra="allow"`).
+
+### As decisões, e o que o default escolheu
+
+| # | decisão | default | por quê |
+|---|---|---|---|
+| D1 | `centro` vai pelo protocolo, com ACK e evento de chegada | protocolo | caractere cru não tem ACK: o central não saberia se a mesa recebeu, e a OS concluída dependeria de um palpite |
+| D2 | câmera sem resposta no HOME | início: não começa; fim: trava | sem a foto da caixa vazia, a FINAL deixa de ser comparável (o que estava lá antes entra na conta); sem a FINAL, o supervisor confere a olho |
+| D3 | câmera contando A MENOS na FINAL | alarme `conferencia_final_abaixo` se a balança fechou o total da OS; trava se não fechou ou não há leitura | a câmera no HOME deveria ver a caixa inteira, mas até a medida de bancada provar 5/5 a balança é o desempate. Trocar para "trava sempre" é uma linha em `avaliar_caixa_final` |
+| D4 | o que conclui a OS | só a chegada ao centro | o centro é onde a caixa sai da célula; concluir antes faria o painel dizer "pronto" com a mesa no HOME |
+| D5 | injeção de falha nas fotos do HOME | nunca | um gatilho de demonstração consumido pela FINAL travaria a OS no fim, depois de todo o resto ter passado — e a injeção existe para mostrar o Triple Check por slot. O central não consome o gatilho nessas fotos e o vision-adapter descarta o campo se ele chegar |
+
+### Caixa vazia: a OS espera, não aborta
+
+A foto VAZIA vem depois do homing do início e ANTES da reserva de slots: uma
+caixa esquecida é a operação esperando alguém, não falha — abortar obrigaria a
+redisparar a ordem. Status `aguardando_caixa_vazia`, UM alarme por espera
+(`caixa_nao_vazia` ou `camera_mesa_indisponivel_inicio`, fonte `camera_mesa`),
+re-foto a cada `VISAO_CAIXA_VAZIA_REPETIR_S` com alias novo, e o alarme é
+resolvido quando a caixa esvazia. A espera pode ser encerrada pelo console
+(`cancelar` → OS `cancelada`, nada dispensado). `VISAO_CAIXA_VAZIA=0` pula a
+foto para bancada sem câmera, com WARNING por OS.
+
+### Caixa cheia: a contagem absoluta contra o que o ciclo confirmou
+
+O esperado da FINAL é a soma, slot a slot, do que o ciclo CONFIRMOU ter posto na
+caixa: o `quantidade_dispensada` do dispenser (com a parcial da porta somada),
+ou o alvo quando o dispenser não confirmou. Não é o alvo da OS: um slot que saiu
+curto e teve a trava liberada pelo supervisor tem na caixa o que saiu, e a FINAL
+compararia contra uma caixa que ninguém prometeu.
+
+O veredito é a função pura `avaliar_caixa_final(contada, esperada, peso_ok)`.
+`peso_ok` é a balança: True quando TODOS os slots da OS fecharam com `peso_ok`,
+False se algum divergiu, None se algum ficou sem leitura — não há leitura
+absoluta da balança no HOME (a tara é por OS e o evento traz o delta do slot),
+então o total da balança é a conjunção das pesagens por slot.
+
+Homing do fim que não confirma: a FINAL não é tirada (a posição não é confiável
+e a câmera pode nem ver a caixa) e a OS entra na trava com
+`homing_final_falhou`. Liberar a trava DEPOIS de uma conferência final conta
+como conferência ok: o supervisor viu a caixa.
+
+### O centro: a OS só fecha com a mesa lá
+
+`POST /comandos/centro` e espera `posicionado {destino:"centro"}` por
+`TIMEOUT_CNC_CENTRO`. Este é o ÚNICO lugar que conclui uma OS com sucesso. Não
+chegou, `erro` ou `sem_homing`: a OS fica em `indo_ao_centro` com o alarme
+`cnc_nao_chegou_ao_centro`, SEM trava — a contagem já foi validada, e travar
+pediria ao supervisor uma decisão que não é dele. O console ganha "reenviar
+centro", e a OS seguinte só começa depois (ela faz homing de qualquer jeito).
+
+E o `concluido` da mesa **deixou de concluir OS**: ele virou log. Era ele que o
+achado 28 (20/09) mostrou publicando como concluída a OS que estava travada; as
+guardas de trava e de pausa da porta em `_handle_evento_cnc` existiam só para
+tapar esse buraco, e com o centro como único portão de conclusão o buraco some.
+
+### Pausa da porta e reinício do central nessas etapas
+
+Pausa da porta durante a caixa vazia, a conferência final ou a ida ao centro:
+a retomada faz homing, e a etapa se REFAZ com alias novo — a foto que estava no
+fio na hora da pausa é descartada (pode ter fotografado uma mão). A ida ao
+centro interrompida volta ao começo: homing, FINAL, centro.
+
+Reinício do central com OS nessas etapas: a reconciliação da `lifespan` (a de
+"OS órfã") as trata. `conferindo_caixa` e `indo_ao_centro` voltam à fila como
+"homing → FINAL → centro", com o esperado lido de `os_itens.quantidade_real`;
+`aguardando_caixa_vazia` volta à fila como OS nova (nada foi reservado). Só
+`em_andamento` continua fechando em `erro`: ali havia medicamento a caminho.
+

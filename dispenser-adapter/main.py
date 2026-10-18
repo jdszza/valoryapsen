@@ -311,6 +311,21 @@ class ComandoDispensarReq(BaseModel):
     # veio, do mesmo jeito que faz com as duas quantidades da pesagem. Quem
     # decide é o central; quem executa é o simulador, num ramo isolado.
     injetar_falha: Optional[str] = None
+    # Só na RETOMADA depois de um `parar` (porta NR-12): o central pede o que
+    # falta, `quantidade_pedida − quantidade_confirmada`. Ausente, o comando
+    # sai byte a byte como antes.
+    quantidade: Optional[int] = None
+
+    @field_validator("quantidade")
+    @classmethod
+    def _quantidade_na_faixa(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and not 1 <= v <= MAX_UNIDADES:
+            raise ValueError(f"quantidade deve ser 1-{MAX_UNIDADES}")
+        return v
+
+
+class ComandoPararReq(BaseModel):
+    motivo: str = "porta_aberta"
 
 
 class ComandoLimparReq(BaseModel):
@@ -356,6 +371,7 @@ _ROTAS_SIM = {
     "carregar":  "/executar/carregar",
     "dispensar": "/executar/dispensar",
     "limpar":    "/executar/limpar",
+    "parar":     "/executar/parar",
 }
 
 
@@ -523,6 +539,11 @@ def _espelhar_evento_no_slot(payload: dict) -> None:
         _atualizar_slot(slot_id, status="concluido",
                         quantidade_dispensada=payload.get("quantidade_dispensada"),
                         quantidade_alvo=payload.get("quantidade_alvo"),
+                        quantidade_residual=payload.get("quantidade_residual"),
+                        os_id=payload.get("os_id"))
+    elif tipo == "dispensado_parcial":
+        _atualizar_slot(slot_id, status="pausado",
+                        quantidade_dispensada=payload.get("quantidade_confirmada"),
                         quantidade_residual=payload.get("quantidade_residual"),
                         os_id=payload.get("os_id"))
     elif tipo == "limpeza_ok":
@@ -720,7 +741,7 @@ async def _enviar_porta(comando: str, payload: dict) -> dict:
     """Comando à porta, através da placa das telas. Mesmos 502/503 de sempre.
 
     Sem as telas por serial não existe porta: o simulador não tem uma, e
-    fingir um ACK aqui faria o central destravar uma porta imaginária.
+    fingir um ACK aqui faria o central autorizar uma porta imaginária.
     """
     if TFT_TRANSPORTE != "serial" or _link_tft is None:
         raise HTTPException(503, "Porta NR-12 indisponível: ela viaja pela placa das "
@@ -898,12 +919,20 @@ async def cmd_carregar(req: ComandoCarregarReq):
 
 @app.post("/comandos/dispensar")
 async def cmd_dispensar(req: ComandoDispensarReq):
-    logger.info("[CMD] DISPENSAR D%d ← OS %s", req.dispenser_id, req.os_id)
-    resultado = await _enviar(
-        "dispensar",
-        {"dispenser_id": req.dispenser_id, "os_id": req.os_id,
-         "injetar_falha": req.injetar_falha},
-    )
+    logger.info("[CMD] DISPENSAR D%d ← OS %s%s", req.dispenser_id, req.os_id,
+                "" if req.quantidade is None else f" (retomada: {req.quantidade} un.)")
+    if req.quantidade is None:
+        resultado = await _enviar(
+            "dispensar",
+            {"dispenser_id": req.dispenser_id, "os_id": req.os_id,
+             "injetar_falha": req.injetar_falha},
+        )
+    else:
+        resultado = await _enviar(
+            "dispensar",
+            {"dispenser_id": req.dispenser_id, "os_id": req.os_id,
+             "injetar_falha": req.injetar_falha, "quantidade": req.quantidade},
+        )
     _atualizar_slot(req.dispenser_id, status="dispensando", os_id=req.os_id)
     _espelhar_slot(req.dispenser_id)
     return _resposta(resultado)
@@ -921,6 +950,18 @@ async def cmd_limpar(req: ComandoLimparReq):
     return _resposta(resultado)
 
 
+@app.post("/comandos/parar")
+async def cmd_parar(req: ComandoPararReq):
+    """A dispensa em curso termina a unidade atual e para (porta NR-12).
+
+    O ACK diz "aceitei"; quantas caíram chega depois, no `dispensado_parcial`.
+    Sem dispensa em curso, a resposta é a mesma — não há o que parar.
+    """
+    logger.warning("[CMD] PARAR dispensers (%s)", req.motivo)
+    resultado = await _enviar("parar", {"motivo": req.motivo})
+    return _resposta(resultado)
+
+
 class EstadoCelulaReq(BaseModel):
     """O que as 8 telas precisam saber da célula: há trava, e de quem é.
 
@@ -931,6 +972,11 @@ class EstadoCelulaReq(BaseModel):
     trava_slot_id: Optional[int] = None
     os_id: str = ""
     trava_resumo: str = ""
+    # A pausa da porta NR-12, separada da trava: as telas mostram as duas.
+    # Ausentes no aviso de trava sem porta — e a placa trata ausente como "sem
+    # pausa".
+    pausa_porta: Optional[bool] = None
+    pausa_resumo: str = ""
 
 
 @app.post("/comandos/estado-celula")
@@ -946,12 +992,23 @@ async def cmd_estado_celula(req: EstadoCelulaReq):
     resumo = _resumo_trava(req.trava_resumo)
     logger.info("[CMD] ESTADO-CELULA trava=%s slot=%s os=%s '%s'",
                 req.trava_ativa, req.trava_slot_id, req.os_id, resumo)
-    tarefa = _enviar_tft("estado_celula", {
-        "trava_ativa":   req.trava_ativa,
-        "trava_slot_id": req.trava_slot_id,
-        "os_id":         req.os_id,
-        "trava_resumo":  resumo,
-    })
+    if req.pausa_porta is None:
+        # Sem pausa no aviso: o corpo de antes da porta NR-12, byte a byte.
+        tarefa = _enviar_tft("estado_celula", {
+            "trava_ativa":   req.trava_ativa,
+            "trava_slot_id": req.trava_slot_id,
+            "os_id":         req.os_id,
+            "trava_resumo":  resumo,
+        })
+    else:
+        tarefa = _enviar_tft("estado_celula", {
+            "trava_ativa":   req.trava_ativa,
+            "trava_slot_id": req.trava_slot_id,
+            "os_id":         req.os_id,
+            "trava_resumo":  resumo,
+            "pausa_porta":   req.pausa_porta,
+            "pausa_resumo":  _resumo_trava(req.pausa_resumo),
+        })
     if tarefa is None:
         return {"ok": True, "telas": "desligadas"}
     entregue = await tarefa

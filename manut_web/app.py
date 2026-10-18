@@ -71,6 +71,10 @@ def _cor_status_os(status: str) -> str:
     return {
         "aguardando":   "secondary",
         "em_andamento": "warning",
+        # As etapas da caixa no HOME: em execução, como `em_andamento`.
+        "aguardando_caixa_vazia": "warning",
+        "conferindo_caixa":       "warning",
+        "indo_ao_centro":         "warning",
         "concluida":    "success",
         "erro":         "danger",
         "cancelada":    "dark",

@@ -234,6 +234,18 @@ _avisou_url_antiga: set[str] = set()
 # OS cujas leituras a estação já emitiu (LRU). Se ela tem leitura aqui mas a
 # estação não a conhece mais (`/status`), a estação perdeu o acumulado.
 _MAX_OS_MEMORIA = 50
+
+# As fotos do HOME (CLAUDE.md, "A caixa é conferida duas vezes no HOME") usam um
+# `os_id` próprio, que a estação nunca viu: `VAZIA-<os_id>` e `FINAL-<os_id>`
+# (com `-<n>` nas repetições). Para o adapter elas são OS SEPARADAS — é o que o
+# registro por `os_id` já faz sozinho —, com uma regra a mais: nunca recebem
+# injeção de falha (decisão D5). O central não manda o campo nessas fotos; se
+# ele chegar mesmo assim, é descartado aqui com aviso.
+PREFIXOS_FOTO_HOME = ("VAZIA-", "FINAL-")
+
+
+def _foto_do_home(os_id) -> bool:
+    return str(os_id or "").startswith(PREFIXOS_FOTO_HOME)
 _mesa_registrou: "OrderedDict[str, bool]" = OrderedDict()
 _ressincronizar: set[tuple[str, int]] = set()
 # Injeção feita pelo ADAPTER sobre o evento verdadeiro (ver `capturar_mesa`).
@@ -393,6 +405,9 @@ class CapturarMesaReq(BaseModel):
     # esta foto confere e a quantidade só do slot. Repassados como vieram.
     slots_cobertos: Optional[list[int]] = None
     quantidade_slot: Optional[int] = None
+    # Fotos do HOME: "caixa_vazia" | "caixa_final" (ausente nas fotos por
+    # slot). Informativo para a estação, que aceita campo extra e o ignora.
+    etapa: Optional[str] = None
     # Campo de DEMONSTRAÇÃO, ausente no caminho normal (ver
     # `central-computer/injecao.py`). Com o simulador, repassado como veio. Com
     # a estação REAL, ele NÃO segue: a estação injetaria sem medir e sem
@@ -888,6 +903,11 @@ async def capturar_mesa(req: CapturarMesaReq):
                                  f"{_identidade_mesa['recebido']!r} — corrija o .env "
                                  f"e recrie o vision-adapter.")
     injetar = req.injetar_falha
+    if injetar and _foto_do_home(req.os_id):
+        logger.warning("[INJECAO] injetar_falha=%r numa foto do HOME (%s) — "
+                       "descartado: as fotos da caixa nunca recebem injeção.",
+                       injetar, req.os_id)
+        injetar = None
     if VISAO_MESA_FONTE == "estacao":
         await _conferir_memoria_da_estacao(req.os_id, req.slot_id)
         if injetar:
@@ -907,6 +927,7 @@ async def capturar_mesa(req: CapturarMesaReq):
             "posicao_y":         req.posicao_y,
             "slots_cobertos":    req.slots_cobertos,
             "quantidade_slot":   req.quantidade_slot,
+            "etapa":             req.etapa,
             "injetar_falha":     injetar,
         },
     )
@@ -1038,6 +1059,8 @@ async def receber_evento(req: EventoVisionReq):
             _ressincronizar.discard(chave)
             payload["ressincronizar"] = True
         injecao = _injecao_mesa.pop(chave, None)
+        if injecao and _foto_do_home(os_id):
+            injecao = None
         if injecao:
             payload = _injetar_no_evento_mesa(payload, injecao)
             tipo = payload.get("tipo", tipo)

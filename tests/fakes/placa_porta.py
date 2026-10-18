@@ -49,7 +49,6 @@ class PlacaPorta:
         self.estado_atual = "FECHADA" if (teto_fechada and frente_fechada) \
             else "ABERTA_SEM_AUTORIZACAO"
         self.aguardando_rearme = False
-        self.solenoide = False
         self.janela_ms = JANELA_LIBERACAO_MS
         # O heartbeat: `False` encena cabo solto ou placa travada.
         self.viva = True
@@ -69,7 +68,6 @@ class PlacaPorta:
             frente="fechada" if self.frente_fechada else "aberta",
             estado=self.estado_atual,
             aguardando_rearme=self.aguardando_rearme,
-            solenoide=self.solenoide,
         )
 
     def boot(self) -> dict:
@@ -84,8 +82,11 @@ class PlacaPorta:
     def _mudar(self, novo: str) -> None:
         assert novo in ESTADOS, novo
         self.estado_atual = novo
-        if novo != "LIBERADA":
-            self.solenoide = False      # garantirSolenoide()
+
+    @property
+    def led_pode_abrir(self) -> bool:
+        """O LED "pode abrir" segue o estado: aceso só em LIBERADA."""
+        return self.estado_atual == "LIBERADA"
 
     # ── O que a bancada faz ─────────────────────────────────────────────────
 
@@ -178,7 +179,6 @@ class PlacaPorta:
             janela = campos.get("janela_ms") or JANELA_LIBERACAO_MS
             self.janela_ms = max(JANELA_MIN_MS, min(JANELA_MAX_MS, int(janela)))
             self._mudar("LIBERADA")
-            self.solenoide = True
             return ok, [self._evento("liberada", janela_ms=self.janela_ms), self.estado()]
 
         # porta_negar

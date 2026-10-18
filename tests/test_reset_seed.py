@@ -603,8 +603,10 @@ def test_limpeza_de_historico_nao_toca_em_catalogo_nem_usuarios():
     else:
         raise AssertionError("_TABELAS_HISTORICO não encontrado")
 
-    assert tabelas == {"visao_leituras", "leituras_sensores", "cnc_eventos",
-                       "alarmes", "dispensas", "os_itens", "ordens"}
+    # `porta_eventos` é histórico como os outros: quem abriu a porta em qual
+    # OS de ontem — repetir a demonstração não precisa dele.
+    assert tabelas == {"porta_eventos", "visao_leituras", "leituras_sensores",
+                       "cnc_eventos", "alarmes", "dispensas", "os_itens", "ordens"}
     assert not tabelas & {"medicamentos", "usuarios", "log_manutencao",
                           "dispenser_estado"}
 

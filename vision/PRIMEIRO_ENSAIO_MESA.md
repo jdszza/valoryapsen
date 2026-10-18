@@ -404,8 +404,8 @@ Nesta ordem, com a planta inteira:
    5 capturas com `os_id` diferentes (`MAPA-<slot>-a`...`-e`), direto na
    estação como em 2.5. Entra no mapa só a posição com **5 de 5 `ok`**. Grave
    no `.env` da raiz `VISAO_MESA_POSICOES=<os slots aprovados>` — e, se o HOME
-   passou, `VISAO_MESA_FINAL=HOME`, que confere no fim da OS o que ficou
-   pendente nas posições cegas. Recrie o `central-computer`.
+   passou, acrescente `HOME` à mesma lista: é a premissa da conferência da
+   caixa vazia e cheia no HOME (`VISAO_CAIXA_VAZIA`). Recrie o `central-computer`.
 3. **Uma OS pelo console** com a balança ligada, e confira no relatório da OS
    que cada slot visível tem uma leitura da mesa.
 

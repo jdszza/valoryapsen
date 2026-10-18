@@ -330,6 +330,23 @@ _DDL_TABELAS = [
         INDEX idx_alarm_ts        (ts)
     ) ENGINE=InnoDB""",
 
+    # Histórico da porta NR-12: uma linha por mensagem que MUDA estado (pedido,
+    # liberação, abertura, fechamento, rearme, tag negada, link). Tags são
+    # genéricas: a linha registra porta, UID e horário — não a pessoa. `os_id`
+    # e `slot_id` são os do momento, para saber o que a porta interrompeu.
+    """CREATE TABLE IF NOT EXISTS porta_eventos (
+        id         INT AUTO_INCREMENT PRIMARY KEY,
+        tipo       VARCHAR(30)  NOT NULL,
+        porta      VARCHAR(10)  NULL,
+        autorizada TINYINT(1)   NULL,
+        uid        VARCHAR(32)  NULL,
+        detalhe    VARCHAR(120) NULL,
+        os_id      VARCHAR(60)  NULL,
+        slot_id    TINYINT      NULL,
+        ts         DATETIME(3)  NOT NULL,
+        INDEX idx_porta_ts (ts)
+    ) ENGINE=InnoDB""",
+
     """CREATE TABLE IF NOT EXISTS log_manutencao (
         id         INT AUTO_INCREMENT PRIMARY KEY,
         tipo       VARCHAR(50)  NOT NULL,
@@ -385,6 +402,7 @@ _DDL_TABELAS = [
         qtd_esperada  INT          NULL,
         qtd_detectada INT          NULL,
         motivo        VARCHAR(255) NULL,
+        etapa         VARCHAR(20)  NOT NULL DEFAULT 'slot',
         criado_em     DATETIME(3)  NOT NULL,
         INDEX idx_vl_os     (os_id),
         INDEX idx_vl_camera (camera),
@@ -413,6 +431,11 @@ _COLUNAS_EVOLUTIVAS: dict[str, dict[str, str]] = {
     "medicamentos": {
         "categoria_desc":  "VARCHAR(200) NOT NULL DEFAULT '' AFTER categoria",
         "peso_unitario_g": "DECIMAL(8,2) NULL AFTER dimensao",
+    },
+    # caixa_vazia | caixa_final | slot — as fotos do HOME gravam na OS REAL
+    # (sem o prefixo VAZIA-/FINAL-), e é esta coluna que as separa das de slot.
+    "visao_leituras": {
+        "etapa": "VARCHAR(20) NOT NULL DEFAULT 'slot' AFTER motivo",
     },
 }
 
@@ -766,6 +789,14 @@ def atualizar_item_os(os_id: str, dispenser_id: int, quantidade_real: int, statu
             )
 
 
+# Os status de uma OS que o orquestrador TIROU da fila e ainda não fechou. A
+# OS atravessa os quatro em ordem (CLAUDE.md, "A caixa é conferida duas vezes
+# no HOME"); para quem pergunta "qual OS está rodando", os quatro são a mesma
+# resposta.
+STATUS_EM_EXECUCAO = ("aguardando_caixa_vazia", "em_andamento",
+                      "conferindo_caixa", "indo_ao_centro")
+
+
 def get_ordem_ativa() -> dict | None:
     """A OS em execução — e, se não houver nenhuma, a próxima da fila.
 
@@ -781,8 +812,9 @@ def get_ordem_ativa() -> dict | None:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM ordens WHERE status='em_andamento' "
-                "ORDER BY criado_em ASC LIMIT 1"
+                "SELECT * FROM ordens WHERE status IN (%s,%s,%s,%s) "
+                "ORDER BY criado_em ASC LIMIT 1",
+                STATUS_EM_EXECUCAO,
             )
             ordem = _row(cur.fetchone())
             if ordem is None:
@@ -949,18 +981,18 @@ def salvar_leitura_visao(
     sku_esperado: str | None = None, sku_lido: str | None = None,
     match_sku: bool | None = None, confianca: float | None = None,
     qtd_esperada: int | None = None, qtd_detectada: int | None = None,
-    motivo: str | None = None,
+    motivo: str | None = None, etapa: str = "slot",
 ) -> int:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO visao_leituras "
                 "(os_id, camera, slot_id, tipo, sku_esperado, sku_lido, match_sku, "
-                " confianca, qtd_esperada, qtd_detectada, motivo, criado_em) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                " confianca, qtd_esperada, qtd_detectada, motivo, etapa, criado_em) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (os_id, camera, slot_id, tipo, sku_esperado, sku_lido,
                  1 if match_sku else (0 if match_sku is False else None),
-                 confianca, qtd_esperada, qtd_detectada, motivo, _ts()),
+                 confianca, qtd_esperada, qtd_detectada, motivo, etapa, _ts()),
             )
             return cur.lastrowid
 
@@ -987,6 +1019,27 @@ def salvar_alarme(fonte: str, tipo: str, descricao: str) -> int:
             cur.execute("INSERT INTO alarmes (fonte, tipo, descricao, ts) VALUES (%s,%s,%s,%s)",
                         (fonte, tipo, descricao, _ts()))
             return cur.lastrowid
+
+
+# ── Porta NR-12 ────────────────────────────────────────────────────────────────
+
+def salvar_porta_evento(tipo: str, porta=None, autorizada=None, uid=None,
+                        detalhe=None, os_id=None, slot_id=None):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO porta_eventos (tipo, porta, autorizada, uid, detalhe, os_id, "
+                "slot_id, ts) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (tipo, porta, None if autorizada is None else int(bool(autorizada)),
+                 uid, (detalhe or None) and str(detalhe)[:120], os_id, slot_id, _ts()),
+            )
+
+
+def get_porta_eventos(limite: int = 100) -> list:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM porta_eventos ORDER BY ts DESC LIMIT %s", (limite,))
+            return _rows(cur.fetchall())
 
 
 def resolver_alarme(alarme_id: int):
@@ -1164,12 +1217,13 @@ def diagnosticar(num_slots: int) -> dict:
 # interrupção no meio deixe o banco sem ÓRFÃO — item sem ordem é invisível,
 # ordem sem item aparece na tela como OS vazia.
 _TABELAS_HISTORICO = (
-    "visao_leituras", "leituras_sensores", "cnc_eventos",
+    "porta_eventos", "visao_leituras", "leituras_sensores", "cnc_eventos",
     "alarmes", "dispensas", "os_itens", "ordens",
 )
 # SQL literal por tabela, pelo mesmo motivo de `_SQL_EXPURGO`: nome de tabela
 # interpolado escaparia da varredura do `test_schema.py`.
 _SQL_LIMPAR_HISTORICO = {
+    "porta_eventos":     "DELETE FROM porta_eventos",
     "visao_leituras":    "DELETE FROM visao_leituras",
     "leituras_sensores": "DELETE FROM leituras_sensores",
     "cnc_eventos":       "DELETE FROM cnc_eventos",
@@ -1261,6 +1315,52 @@ def fechar_os_orfas(motivo_status: str = "erro") -> list:
                     (motivo_status, "em_andamento"),
                 )
             return orfas
+
+
+def os_para_retomar_no_boot() -> dict:
+    """As OS que um central morto deixou NAS ETAPAS DA CAIXA, para retomar.
+
+    Diferente de `fechar_os_orfas`, que fecha em erro o que estava no meio do
+    ciclo: aqui não há medicamento a caminho, e a OS dá para continuar.
+
+    - `conferindo_caixa` / `indo_ao_centro`: a dispensa terminou. A OS volta
+      para "homing → FINAL → centro", com o esperado da caixa lido de
+      `os_itens.quantidade_real` (o que o handler gravou a cada `dispensado`).
+    - `aguardando_caixa_vazia`: nada foi reservado nem carregado. A OS volta
+      para a fila como nova — status `aguardando` e o payload original.
+
+    Devolve `{"final": [(os_id, esperado)], "refila": [payload]}` e já grava os
+    status de volta; quem chama enfileira.
+    """
+    retomar: dict = {"final": [], "refila": []}
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT os_id FROM ordens WHERE status IN (%s,%s)",
+                ("conferindo_caixa", "indo_ao_centro"),
+            )
+            for linha in cur.fetchall() or []:
+                cur.execute(
+                    "SELECT SUM(quantidade_real) AS total "
+                    "FROM os_itens WHERE os_id=%s", (linha["os_id"],))
+                total = (cur.fetchone() or {}).get("total") or 0
+                retomar["final"].append((linha["os_id"], int(total)))
+            cur.execute(
+                "SELECT os_id, payload_json FROM ordens WHERE status=%s "
+                "ORDER BY criado_em ASC", ("aguardando_caixa_vazia",))
+            for linha in cur.fetchall() or []:
+                try:
+                    payload = json.loads(linha["payload_json"] or "{}")
+                except ValueError:
+                    payload = {}
+                payload["os_id"] = linha["os_id"]
+                retomar["refila"].append(payload)
+            if retomar["refila"]:
+                cur.execute(
+                    "UPDATE ordens SET status=%s WHERE status=%s",
+                    ("aguardando", "aguardando_caixa_vazia"),
+                )
+    return retomar
 
 
 def semear_historico_demo(dados: dict) -> dict:

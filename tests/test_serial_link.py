@@ -1290,3 +1290,63 @@ def test_cmd_id_repetido_nao_move_a_mesa_duas_vezes(adapter_serial):
     movimentos = [e for e in adapter.placa.executados if e["cmd"] == "mover"]
     assert len(movimentos) == 1, (
         f"a mesa executou {len(movimentos)} movimentos para um cmd_id só")
+
+
+# ── `centro`: o fim da OS, pela mesma porta ──────────────────────────────────
+
+def test_centro_tem_ack_e_chega_com_posicionado_destino_centro(adapter_serial):
+    """`centro` → ACK → `posicionado {destino: "centro", dispenser_alvo: 0}`,
+    repassado CRU ao central. Nenhum `concluido`: a mesa no centro não está no
+    HOME, e quem fecha a OS é o central."""
+    adapter = adapter_serial("cnc")
+
+    adapter.chamar(adapter.modulo.cmd_centro(adapter.modulo.ComandoCentroReq(os_id="OS-7")))
+
+    assert _ate(lambda: any(e.get("destino") == "centro"
+                            for e in adapter.eventos_no_central))
+    (chegada,) = [e for e in adapter.eventos_no_central if e.get("destino") == "centro"]
+    assert chegada["tipo"] == "posicionado"
+    assert chegada["os_id"] == "OS-7"
+    assert chegada["dispenser_alvo"] == 0
+    assert "concluido" not in [e["tipo"] for e in adapter.eventos_no_central]
+
+
+def test_centro_com_o_mesmo_cmd_id_move_uma_vez_so(adapter_serial):
+    """O "reenviar centro" do console pode cruzar com um ACK perdido: o mesmo
+    `cmd_id` responde ACK de novo e NÃO move."""
+    adapter = adapter_serial("cnc")
+    adapter.link.enviar_comando("centro", {"os_id": "OS-7"})
+    cmd_id = adapter.placa.executados[-1]["cmd_id"]
+
+    adapter.link._escrever({"cmd": "centro", "cmd_id": cmd_id, "os_id": "OS-7"})
+    adapter.link._escrever({"cmd": "centro", "cmd_id": cmd_id, "os_id": "OS-7"})
+    time.sleep(0.3)
+
+    assert adapter.placa.no_centro == 1
+    assert len([e for e in adapter.placa.executados if e["cmd"] == "centro"]) == 1
+
+
+def test_centro_sem_homing_e_erro_sem_homing(adapter_serial):
+    """Centro sem referência é um ponto que não existe: a placa recusa, e o
+    `erro` sobe com `dispenser_alvo: 0` — é por ele que o central sabe que é a
+    ida ao centro que falhou, e não um slot."""
+    adapter = adapter_serial("cnc")
+    adapter.placa.sem_origem = True
+
+    adapter.chamar(adapter.modulo.cmd_centro(adapter.modulo.ComandoCentroReq(os_id="OS-7")))
+
+    assert _ate(lambda: any(e["tipo"] == "erro" for e in adapter.eventos_no_central))
+    (erro,) = [e for e in adapter.eventos_no_central if e["tipo"] == "erro"]
+    assert erro["codigo_erro"] == "sem_homing"
+    assert erro["dispenser_alvo"] == 0
+    assert adapter.placa.no_centro == 0
+
+
+def test_centro_com_erro_injetado_nao_chega(adapter_serial):
+    adapter = adapter_serial("cnc")
+    adapter.placa.centro_erro = "limit_disparado"
+
+    adapter.chamar(adapter.modulo.cmd_centro(adapter.modulo.ComandoCentroReq(os_id="OS-7")))
+
+    assert _ate(lambda: any(e["tipo"] == "erro" for e in adapter.eventos_no_central))
+    assert not [e for e in adapter.eventos_no_central if e.get("destino") == "centro"]

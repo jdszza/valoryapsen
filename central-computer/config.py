@@ -132,6 +132,10 @@ def _num_slots() -> int:
     return valor
 
 
+def _tokens_posicoes() -> list[str]:
+    return [p.strip() for p in os.getenv("VISAO_MESA_POSICOES", "").split(",") if p.strip()]
+
+
 def _visao_mesa_posicoes() -> frozenset:
     """Slots em que a câmera da mesa vê a caixa de coleta INTEIRA.
 
@@ -141,6 +145,10 @@ def _visao_mesa_posicoes() -> frozenset:
     valor sai de medida de bancada (docs/BANCADA_VISAO.md, M4); o default é
     todas, que é o comportamento de antes.
 
+    O token `HOME` pode vir na mesma lista (a medida de bancada diz que a
+    câmera vê a caixa inteira no HOME) e é lido à parte, por
+    `_visao_mesa_home`: este conjunto continua sendo só de SLOTS.
+
     Inválido (não inteiro, fora de 1..NUM_SLOTS, repetido, vazio) cai no
     default com ERROR: um mapa errado faria a câmera conferir no lugar errado,
     e isso não pode passar com um warning que ninguém lê.
@@ -148,28 +156,92 @@ def _visao_mesa_posicoes() -> frozenset:
     num_slots = _num_slots()
     todas = frozenset(range(1, num_slots + 1))
     bruto = os.getenv("VISAO_MESA_POSICOES", "")
-    if not bruto.strip():
+    tokens = [t for t in _tokens_posicoes() if t.upper() != "HOME"]
+    if not tokens:
         return todas
     try:
-        valores = [int(p) for p in bruto.split(",") if p.strip()]
+        valores = [int(p) for p in tokens]
     except ValueError:
         valores = []
     if (not valores or len(set(valores)) != len(valores)
             or any(not 1 <= v <= num_slots for v in valores)):
         _cfg_logger.error(
-            "VISAO_MESA_POSICOES=%r inválido (inteiros 1..%d, sem repetir) — "
+            "VISAO_MESA_POSICOES=%r inválido (inteiros 1..%d e/ou HOME, sem repetir) — "
             "usando todas as posições.", bruto, num_slots)
         return todas
     return frozenset(valores)
 
 
-def _visao_mesa_final() -> str:
-    """"" (desligado) ou "HOME": conferir no HOME o que nenhuma parada conferiu."""
+def _visao_mesa_home() -> bool:
+    """`HOME` está em VISAO_MESA_POSICOES — a câmera vê a caixa inteira no HOME.
+
+    É a premissa das duas conferências da caixa (vazia antes da OS, cheia
+    depois): a contagem delas é ABSOLUTA, e só vale se nada da caixa sai do
+    quadro. O pré-voo avisa enquanto a medida não estiver registrada aqui.
+    """
+    return any(t.upper() == "HOME" for t in _tokens_posicoes())
+
+
+def _avisar_visao_mesa_final_obsoleta() -> str:
+    """`VISAO_MESA_FINAL` deixou de existir; o valor só vira aviso.
+
+    A conferência no HOME do que nenhuma parada conferiu foi substituída pela
+    foto FINAL da caixa inteira, que acontece em TODA OS (CLAUDE.md, "A caixa é
+    conferida duas vezes no HOME"). Uma variável que ficasse no `.env` sem
+    efeito seria uma alavanca girada à espera de um resultado.
+    """
     bruto = os.getenv("VISAO_MESA_FINAL", "")
-    valor = bruto.strip().upper()
-    if valor not in ("", "HOME"):
-        _cfg_logger.error("VISAO_MESA_FINAL=%r inválido (vazio ou HOME) — desligado.", bruto)
-        return ""
+    if bruto.strip():
+        _cfg_logger.warning(
+            "VISAO_MESA_FINAL=%r não tem mais efeito: a caixa é conferida inteira "
+            "no HOME ao fim de toda OS (VISAO_CAIXA_VAZIA). Remova a linha do .env.",
+            bruto)
+    return ""
+
+
+_SIM = ("1", "true", "yes", "sim", "on")
+_NAO = ("0", "false", "no", "nao", "não", "off")
+
+
+def _visao_caixa_vazia() -> bool:
+    """Conferir a caixa de coleta no HOME (vazia antes, cheia depois)? Default: sim.
+
+    0 é para a bancada SEM a câmera da mesa: as duas fotos do HOME são puladas
+    com WARNING por OS. As duas juntas, e não só a da caixa vazia: sem a foto
+    do começo, a contagem absoluta do fim inclui o que já estava na caixa e
+    deixa de ser comparável.
+
+    Valor que não é nem sim nem não cai no default (ligado) com ERROR —
+    desligar uma conferência por um erro de digitação é o lado errado de errar.
+    """
+    bruto = os.getenv("VISAO_CAIXA_VAZIA", "1")
+    valor = bruto.strip().lower()
+    if valor in _SIM:
+        return True
+    if valor in _NAO:
+        return False
+    _cfg_logger.error("VISAO_CAIXA_VAZIA=%r inválido (1 ou 0) — usando 1 (ligado).", bruto)
+    return True
+
+
+def _numero_com_virgula(nome: str, default: float, minimo: float, maximo: float) -> float:
+    """Número do `.env` que aceita `2,5` (como se digita em pt-BR) e cai no
+    default com ERROR quando é inválido ou sai da faixa.
+
+    ERROR e não warning: estes são prazos de espera de hardware no fim e no
+    começo da OS, e um valor descartado em silêncio é uma espera que ninguém
+    sabe de onde veio.
+    """
+    bruto = os.getenv(nome, str(default))
+    try:
+        valor = float(str(bruto).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        _cfg_logger.error("%s=%r não é número — usando %s.", nome, bruto, default)
+        return default
+    if not minimo <= valor <= maximo:
+        _cfg_logger.error("%s=%r fora da faixa %s..%s — usando %s.",
+                          nome, bruto, minimo, maximo, default)
+        return default
     return valor
 
 
@@ -519,7 +591,7 @@ class Settings:
         default_factory=lambda: _cronograma_s("DISPENSA_FOLGA_S", 1.0, 0.05, 30.0))
 
     # ── Portas NR-12 ──────────────────────────────────────────────────────────
-    # Ver "Portas NR-12: a porta pede, o central para e destrava" no CLAUDE.md.
+    # Ver "Portas NR-12: a porta pede, o central para e autoriza" no CLAUDE.md.
     PORTA_NR12_HABILITADA: bool = field(default_factory=_porta_habilitada)
     # Quanto se espera a CNC e os dispensers confirmarem a parada (ACK do
     # `parar` e, com dispensa em voo, o `dispensado_parcial`) antes de mandar
@@ -527,7 +599,8 @@ class Settings:
     PORTA_PARADA_MAX_S: float = field(
         default_factory=lambda: _faixa_s("PORTA_PARADA_MAX_S", 3.0, 0.5,
                                          PORTA_PARADA_MAX_S_TETO))
-    # A janela do solenoide que vai no `porta_liberar` (a placa limita 1..60 s).
+    # A janela da autorização que vai no `porta_liberar` (a placa limita 1..60 s):
+    # quanto tempo o LED "pode abrir" fica aceso esperando alguém abrir.
     PORTA_JANELA_LIBERACAO_MS: int = field(
         default_factory=lambda: int(_faixa_s("PORTA_JANELA_LIBERACAO_MS", 10000,
                                              1000, 60000)))
@@ -562,8 +635,27 @@ class Settings:
     # inteira — o pré-voo avisa).
     VISAO_MESA_POSICOES_DEFINIDA: bool = field(
         default_factory=lambda: bool(os.getenv("VISAO_MESA_POSICOES", "").strip()))
-    # "HOME": no fim da OS, com a mesa no HOME, confere o que ficou pendente.
-    VISAO_MESA_FINAL: str = field(default_factory=_visao_mesa_final)
+    # `HOME` na mesma lista: a câmera vê a caixa inteira no HOME (premissa das
+    # duas conferências da caixa). Ver `_visao_mesa_home`.
+    VISAO_MESA_HOME: bool = field(default_factory=_visao_mesa_home)
+    # Obsoleta: só avisa se ainda estiver no `.env`.
+    _VISAO_MESA_FINAL_OBSOLETA: str = field(
+        default_factory=_avisar_visao_mesa_final_obsoleta, repr=False)
+
+    # ── A caixa de coleta conferida no HOME ───────────────────────────────────
+    # CLAUDE.md, "A caixa é conferida duas vezes no HOME". 0 pula as duas fotos.
+    VISAO_CAIXA_VAZIA: bool = field(default_factory=_visao_caixa_vazia)
+    # Intervalo entre as re-fotos enquanto a caixa não esvazia (ou a câmera não
+    # responde) antes de a OS começar. NÃO escala com FATOR_VELOCIDADE: é o
+    # ritmo em que se volta a olhar para uma pessoa esvaziando a caixa.
+    VISAO_CAIXA_VAZIA_REPETIR_S: float = field(
+        default_factory=lambda: _numero_com_virgula("VISAO_CAIXA_VAZIA_REPETIR_S",
+                                                    10.0, 1.0, 600.0))
+    # Quanto se espera o `posicionado {destino: "centro"}` da mesa. É teto de
+    # espera por hardware, como os TIMEOUT_*, e escala só para cima com o fator.
+    TIMEOUT_CNC_CENTRO: float = field(
+        default_factory=lambda: _numero_com_virgula("TIMEOUT_CNC_CENTRO", 30.0, 1.0, 600.0)
+        * _folga_timeout())
 
     # ── Backpressure da fila de OS ────────────────────────────────────────────
     MAX_FILA_OS: int = _max_fila_os()

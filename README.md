@@ -851,7 +851,8 @@ boot".
 | ESP da porta NR-12 | `porta` | — (sem USB no mini PC) | dispenser-adapter, **através** da placa das 8 telas | [`porta/README.md`](porta/README.md) |
 
 > **A porta NR-12 não tem porta no mini PC.** A ESP dela (RC522 + dois fins de
-> curso + solenoide) fala por **UART** com a placa das telas TFT dos
+> curso; cada porta é presa por um ímã simples, sem fechadura elétrica) fala
+> por **UART** com a placa das telas TFT dos
 > dispensers, que repassa as mensagens nos dois sentidos pela USB que já
 > existe — ver [`docs/PROTOCOLO_SERIAL.md`](docs/PROTOCOLO_SERIAL.md) §9. O
 > USB da própria ESP da porta serve **só para bancada**: cadastrar tags e
@@ -1411,8 +1412,10 @@ não existe.
 | `CONSOLE_SENHA` / `CONSOLE_SESSAO_HORAS` | vazia (desabilita) / `8` h | central |
 | `TRIPLE_CHECK_MIN_DIVERGENCIAS` | `1` (1–3) | central |
 | `VISAO_SKU_HABILITADA` | `1` — `0` não manda o comando de SKU; os slots seguem sem conferência de produto | central |
-| `VISAO_MESA_POSICOES` | `1,2,3,4,5,6,7,8` — slots em que a câmera da mesa vê a caixa inteira; fora deles não há foto e o slot é conferido junto com o próximo visível | central |
-| `VISAO_MESA_FINAL` | vazio — `HOME` confere no HOME, no fim da OS, o que ficou sem foto | central |
+| `VISAO_MESA_POSICOES` | `1,2,3,4,5,6,7,8` — slots em que a câmera da mesa vê a caixa inteira; fora deles não há foto e o slot é conferido junto com o próximo visível. `HOME` na lista registra que ela vê a caixa inteira no HOME (premissa da conferência da caixa) | central |
+| `VISAO_CAIXA_VAZIA` | `1` — confere a caixa de coleta no HOME: vazia antes da OS, cheia (contagem absoluta) depois; `0` pula as duas fotos | central |
+| `VISAO_CAIXA_VAZIA_REPETIR_S` | `10` s entre as re-fotos enquanto a caixa não esvazia (vírgula aceita) | central |
+| `TIMEOUT_CNC_CENTRO` | `30` s esperando a mesa chegar ao centro; a OS só conclui com ela lá | central |
 | `VISION_SIM_URL` | `http://vision-simulator:8202` — na célula, a estação da mesa: `http://host.docker.internal:8212` | vision-adapter |
 | `VISAO_MESA_FONTE` / `VISAO_DISPENSER_FONTE` | `simulador` — `estacao` = câmera real (descarta a telemetria simulada dela; nos dispensers, liga a ponte com as estações) | vision-adapter |
 | `VISAO_DISP_ESQ_URL` / `_DIR_URL` | `http://host.docker.internal:8301` / `:8302` | vision-adapter |
@@ -1420,6 +1423,13 @@ não existe.
 | `VISAO_DISP_ASSENTAMENTO_S` / `VISAO_DISP_PRAZO_S` | `2` s de folga depois do catálogo novo valer / `20` s de teto para emitir a leitura | vision-adapter |
 | `VISAO_ETIQUETAS_ARQ` | `/app/etiquetas.json` — nome do central → QR/ArUco impressos | vision-adapter |
 | `MAX_FILA_OS` | `5` OS esperando | central |
+| `PORTA_NR12_HABILITADA` | `0` — `1` diz que a célula TEM porta NR-12: o central nasce parado até ouvir o primeiro `estado` dela | central |
+| `PORTA_PARADA_MAX_S` | `3` (faixa 0,5–4) — quanto se espera a CNC e os dispensers confirmarem a parada antes de autorizar a abertura | central |
+| `PORTA_JANELA_LIBERACAO_MS` | `10000` — janela da autorização no `porta_liberar` (LED "pode abrir" aceso) | central |
+| `PORTA_SILENCIO_MAX_S` | `15` — nada da porta por esse tempo = link perdido (a célula para) | central |
+| `PORTA_TIMEOUT_HOMING_S` | `90` — teto do homing da retomada | central |
+| `PORTA_HEARTBEAT_MAX_S` | `2.5` — heartbeat da porta mais velho que isso = link perdido | dispenser-adapter |
+| `PORTA_ESTADO_REENVIO_S` | `5` — o `estado` sem mudança sobe ao central no máximo nesse intervalo, como sinal de vida | dispenser-adapter |
 | `TIMEOUT_CARREGAMENTO` / `_POSICIONAMENTO` / `_DISPENSA` | `180` / `120` / `120` s | central |
 | `TIMEOUT_VISAO_DISPENSER` / `_VISAO_MESA` / `_PESO` | `30` / `30` / `15` s | central |
 | `BROADCAST_MIN_INTERVALO_MS` | `500` ms entre broadcasts periódicos | central |

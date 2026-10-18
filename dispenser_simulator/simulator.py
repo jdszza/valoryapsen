@@ -200,6 +200,12 @@ class DispensarReq(BaseModel):
     # em toda dispensa normal. O ramo que o consome é isolado e marcado; nada
     # da lógica de dispensa muda por causa dele.
     injetar_falha: Optional[str] = None
+    # Só na retomada depois de um `parar` (porta NR-12): o que falta.
+    quantidade: Optional[int] = None
+
+
+class PararReq(BaseModel):
+    motivo: str = "porta_aberta"
 
 
 class LimparReq(BaseModel):
@@ -319,11 +325,20 @@ def _do_carregar(slot_id: int, medicamento: str, sku: str, categoria: str,
     })
 
 
-def _do_dispensar(slot_id: int, os_id: str, injetar_falha: Optional[str] = None):
+# Pedido de parada da dispensa em curso (porta NR-12), por slot. O laço o
+# confere ENTRE unidades, como o firmware: a unidade que já saiu termina.
+_parar: dict[int, threading.Event] = {d: threading.Event() for d in range(1, NUM_SLOTS + 1)}
+
+
+def _do_dispensar(slot_id: int, os_id: str, injetar_falha: Optional[str] = None,
+                  quantidade_pedida: Optional[int] = None):
     """Executa fase de dispensa em background thread. CNC já está posicionada."""
+    _parar[slot_id].clear()
     with _lock:
         med       = _estoque[slot_id]["medicamento"] or ""
         quantidade = _estado[slot_id]["qtd_alvo"]
+    if quantidade_pedida is not None and 1 <= quantidade_pedida < quantidade:
+        quantidade = quantidade_pedida
 
     # ── Injeção de falha (DEMONSTRAÇÃO) ───────────────────────────────────────
     # Decidida ANTES do laço e fora dele, para não se misturar com o sorteio de
@@ -355,6 +370,10 @@ def _do_dispensar(slot_id: int, os_id: str, injetar_falha: Optional[str] = None)
 
     dispensado = 0
     for i in range(1, quantidade + 1):
+        if _parar[slot_id].is_set():
+            _parar[slot_id].clear()
+            _parcial(slot_id, os_id, med, dispensado, quantidade)
+            return
         time.sleep(T_DISPENSA_UNID)
         # A unidade injetada cai nas ÚLTIMAS, para que o resto da dispensa
         # transcorra normal na tela antes do déficit aparecer.
@@ -408,6 +427,27 @@ def _do_dispensar(slot_id: int, os_id: str, injetar_falha: Optional[str] = None)
         # armado no console naquele minuto.
         "falha_injetada":         unidades_a_perder > 0,
         "ts":                     _ts(),
+    })
+
+
+def _parcial(slot_id: int, os_id: str, med: str, confirmada: int, pedida: int) -> None:
+    """A dispensa parou a pedido: o slot continua da OS, PRONTO, com o resto."""
+    with _lock:
+        residual = max(0, _estoque[slot_id]["quantidade"] - confirmada)
+        _estoque[slot_id]["quantidade"] = residual
+        _estado[slot_id].update({"status": "pronto", "qtd_alvo": pedida - confirmada,
+                                 "qtd_dispensada": confirmada})
+    logger.warning("[DISP-%d] PARADO a pedido: %d/%d × '%s'", slot_id, confirmada,
+                   pedida, med)
+    _evento({
+        "tipo":                  "dispensado_parcial",
+        "dispenser_id":          slot_id,
+        "os_id":                 os_id,
+        "medicamento":           med,
+        "quantidade_confirmada": confirmada,
+        "quantidade_pedida":     pedida,
+        "quantidade_residual":   residual,
+        "ts":                    _ts(),
     })
 
 
@@ -517,12 +557,26 @@ def executar_dispensar(req: DispensarReq):
 
     threading.Thread(
         target=_do_dispensar,
-        args=(slot_id, req.os_id, req.injetar_falha),
+        args=(slot_id, req.os_id, req.injetar_falha, req.quantidade),
         daemon=True,
         name=f"dispensar-{slot_id}",
     ).start()
 
     return {"ok": True, "dispenser_id": slot_id, "msg": "Dispensa iniciada"}
+
+
+@app.post("/executar/parar")
+def executar_parar(req: PararReq):
+    """Para a dispensa em curso, se houver: termina a unidade atual e para."""
+    parados = []
+    for slot_id in range(1, NUM_SLOTS + 1):
+        with _lock:
+            dispensando = _estado[slot_id]["status"] == "dispensando"
+        if dispensando:
+            _parar[slot_id].set()
+            parados.append(slot_id)
+    logger.warning("[PARAR] %s — dispensas em curso: %s", req.motivo, parados or "nenhuma")
+    return {"ok": True, "parados": parados}
 
 
 @app.post("/executar/limpar")

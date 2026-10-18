@@ -122,26 +122,26 @@ def test_o_vocabulario_de_estado_e_o_do_documento():
 # 2. A máquina de estados (o modelo que o firmware implementa)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_a_tag_nao_destrava_nada_sozinha():
+def test_a_tag_nao_autoriza_nada_sozinha():
     porta = PlacaPorta()
     (pedido, estado) = porta.passar_tag("04A1B2C3")
     assert pedido["tipo"] == "pedido_acesso"
-    assert estado["estado"] == "AGUARDANDO_CENTRAL" and not porta.solenoide
+    assert estado["estado"] == "AGUARDANDO_CENTRAL" and not porta.led_pode_abrir
 
 
 def test_liberar_sem_pedido_e_recusado():
     porta = PlacaPorta()
     ack, eventos = porta.executar({"cmd": "porta_liberar", "cmd_id": 1, "janela_ms": 5000})
-    assert ack["resp"] == "erro" and not eventos and not porta.solenoide
+    assert ack["resp"] == "erro" and not eventos and not porta.led_pode_abrir
 
 
-def test_abrir_desliga_o_solenoide_e_fechar_exige_rearme():
+def test_abrir_apaga_o_pode_abrir_e_fechar_exige_rearme():
     porta = PlacaPorta()
     porta.passar_tag("04A1B2C3")
     porta.executar({"cmd": "porta_liberar", "cmd_id": 1, "janela_ms": 5000})
-    assert porta.solenoide
+    assert porta.led_pode_abrir
     aberta = porta.abrir("teto")[0]
-    assert aberta["autorizada"] is True and not porta.solenoide
+    assert aberta["autorizada"] is True and not porta.led_pode_abrir
     segunda = porta.abrir("frente")[0]
     assert segunda == {**segunda, "porta": "frente", "autorizada": True}
     porta.fechar("teto")

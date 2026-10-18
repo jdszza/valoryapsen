@@ -1921,7 +1921,16 @@ def central_sync_worker():
 #
 # O dashboard web lê daqui, e não do central: a rota da tela não pode pagar a
 # rede a cada carregamento, e o espelho já roda a cada CENTRAL_SYNC_S.
-TRAVA_CHAVES = ("ativa", "os_id", "slot_id", "motivo")
+# `porta_faixa` é a faixa da porta NR-12 ("MÁQUINA PARADA — PORTA FRENTE
+# ABERTA"), lida do central junto com a trava. Está nas chaves para que a
+# mudança dela também vire push ao display.
+#
+# `caixa_faixa` é a da caixa de coleta no HOME ("ESVAZIE A CAIXA DE COLETA (2
+# caixinhas)", "CONFERINDO A CAIXA…", "CAIXA CONFERIDA — LEVANDO AO CENTRO"),
+# lida do central no mesmo ciclo. O display de 7" tem UMA linha de mensagem da
+# máquina: ele a recebe dentro de `porta_faixa` quando não há pausa da porta
+# (`_faixa_para_display`) — a porta parada pesa mais que a caixa.
+TRAVA_CHAVES = ("ativa", "os_id", "slot_id", "motivo", "porta_faixa", "caixa_faixa")
 _trava_espelho = {"atual": None, "anterior": None, "fonte_ok": False, "lida_em": 0.0}
 _trava_lock = threading.Lock()
 
@@ -1936,7 +1945,8 @@ TRAVA_CACHE_S = 2.0
 # O que o display recebe quando o backend nunca conseguiu ler a trava. "Sem
 # trava" é o estado de boot da célula; o display não tem o que fazer com
 # "desconhecido", e o push da primeira leitura de verdade corrige em segundos.
-TRAVA_DESCONHECIDA = {"ativa": False, "os_id": "", "slot_id": None, "motivo": ""}
+TRAVA_DESCONHECIDA = {"ativa": False, "os_id": "", "slot_id": None, "motivo": "",
+                      "porta_faixa": "", "caixa_faixa": ""}
 
 
 def _trava_normalizada(bruto) -> dict | None:
@@ -1949,7 +1959,20 @@ def _trava_normalizada(bruto) -> dict | None:
         "os_id":   str(bruto.get("os_id") or ""),
         "slot_id": slot if isinstance(slot, int) and not isinstance(slot, bool) else None,
         "motivo":  str(bruto.get("motivo") or ""),
+        "porta_faixa": str(bruto.get("porta_faixa") or ""),
+        "caixa_faixa": str(bruto.get("caixa_faixa") or ""),
     }
+
+
+def _faixa_para_display(estado: dict) -> dict:
+    """A faixa da porta em ASCII para o display de 7": a fonte dele não tem o
+    travessão nem os acentos, e um glifo que falta vira quadrado na tela."""
+    import unicodedata
+    faixa = estado.get("porta_faixa") or estado.get("caixa_faixa") or ""
+    ascii_ = unicodedata.normalize("NFKD", faixa.replace("—", "-").replace("…", "...")
+                                   ).encode("ascii", "ignore").decode()
+    saida = {k: v for k, v in estado.items() if k != "caixa_faixa"}
+    return {**saida, "porta_faixa": ascii_}
 
 
 def sincronizar_trava_central(avisar_display: bool = False) -> tuple:
@@ -1966,7 +1989,14 @@ def sincronizar_trava_central(avisar_display: bool = False) -> tuple:
     e linha serial se perde num reset do ESP32: por isso o display também
     PERGUNTA (`get_trava`), como já faz com as ordens espelhadas.
     """
-    estado = _trava_normalizada(central_client.trava_estado())
+    bruto = central_client.trava_estado()
+    if isinstance(bruto, dict):
+        # A porta NR-12 vem na mesma leitura: uma faixa só, a do central.
+        porta = central_client.porta_estado() or {}
+        caixa = central_client.caixa_estado() or {}
+        bruto = {**bruto, "porta_faixa": porta.get("faixa") or "",
+                 "caixa_faixa": caixa.get("faixa") or ""}
+    estado = _trava_normalizada(bruto)
     with _trava_lock:
         _trava_espelho["lida_em"] = time.time()
         if estado is None:
@@ -1979,7 +2009,7 @@ def sincronizar_trava_central(avisar_display: bool = False) -> tuple:
             _trava_espelho["atual"] = estado
         _trava_espelho["fonte_ok"] = True
     if mudou and avisar_display:
-        push_to_display({"push": "trava", **estado})
+        push_to_display({"push": "trava", **_faixa_para_display(estado)})
     return dict(estado), mudou
 
 
@@ -1992,7 +2022,7 @@ def _trava_para_display() -> dict:
         sincronizar_trava_central()
     with _trava_lock:
         atual = _trava_espelho["atual"]
-    return dict(atual) if atual is not None else dict(TRAVA_DESCONHECIDA)
+    return _faixa_para_display(dict(atual) if atual is not None else dict(TRAVA_DESCONHECIDA))
 
 
 def trava_atual() -> dict | None:

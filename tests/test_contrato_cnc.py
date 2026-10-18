@@ -163,3 +163,44 @@ def test_coordenada_de_chamador_antigo_e_aceita_e_nao_repassada(carregar_adapter
     assert enviados[0][0] == "mover"
     assert "posicao_x" not in enviados[0][1]
     assert "posicao_y" not in enviados[0][1]
+
+
+# ── `centro`: o simulador fala o mesmo contrato da placa ─────────────────────
+
+def test_o_simulador_vai_ao_centro_com_posicionado_destino_centro(carregar_simulador,
+                                                                  monkeypatch):
+    """O transporte default é `http`: sem `/executar/centro` no simulador, a OS
+    da demonstração nunca fecharia (o central só conclui com a mesa no centro)."""
+    sim = carregar_simulador("cnc", env={"VEL_MM_S": "100000"})
+    monkeypatch.setattr(sim.modulo.time, "sleep", lambda _s: None)
+
+    sim.modulo._mover_para(0, *sim.modulo.CENTRO, "OS-7", 0, 0, "centro")
+
+    (chegada,) = sim.eventos_do_tipo("posicionado")
+    assert chegada["destino"] == "centro"
+    assert chegada["dispenser_alvo"] == 0
+    assert not sim.eventos_do_tipo("concluido")
+
+
+def test_o_simulador_recusa_centro_sem_origem(carregar_simulador):
+    from fastapi import HTTPException
+
+    sim = carregar_simulador("cnc")
+    sim.modulo._sem_origem = True
+    try:
+        sim.modulo.executar_centro(sim.modulo.CentroReq(os_id="OS-7"))
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        raise AssertionError("centro sem origem foi aceito")
+    (erro,) = sim.eventos_do_tipo("erro")
+    assert erro["codigo_erro"] == "sem_homing"
+    assert erro["dispenser_alvo"] == 0
+
+
+def test_o_posicionado_do_mover_no_simulador_leva_destino_dispenser(carregar_simulador,
+                                                                    monkeypatch):
+    sim = carregar_simulador("cnc", env={"VEL_MM_S": "100000"})
+    monkeypatch.setattr(sim.modulo.time, "sleep", lambda _s: None)
+    sim.modulo._mover_para(3, *sim.modulo.BANCADA[3], "OS-7", 1, 2)
+    assert sim.eventos_do_tipo("posicionado")[-1]["destino"] == "dispenser"

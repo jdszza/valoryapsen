@@ -327,8 +327,12 @@ def test_divergencia_de_mesa_injetada_trava(carregar_orquestrador):
     asyncio.run(orq.modulo._processar_os(_payload_os("OS-8")))
 
     assert liberacoes == [True]
-    (mesa,) = orq.adapter.comandos("/comandos/capturar/mesa")
+    fotos = orq.adapter.comandos("/comandos/capturar/mesa")
+    (mesa,) = [f for f in fotos if not f.get("etapa")]
     assert mesa["injetar_falha"] == "divergencia_mesa"
+    # D5: as fotos da caixa no HOME (vazia e cheia) nunca levam a injeção.
+    assert [f["etapa"] for f in fotos if f.get("etapa")] == ["caixa_vazia", "caixa_final"]
+    assert not [f for f in fotos if f.get("etapa") and "injetar_falha" in f]
 
 
 def test_a_os_seguinte_volta_ao_normal(carregar_orquestrador):

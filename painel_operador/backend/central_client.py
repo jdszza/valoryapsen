@@ -61,6 +61,13 @@ INTEGRACAO_ATIVA = _flag("PAINEL_CENTRAL", "1")
 STATUS_CENTRAL_PARA_PAINEL = {
     "aguardando":   "Pendente",
     "em_andamento": "Em Processo",
+    # As etapas da caixa de coleta no HOME (CLAUDE.md, "A caixa é conferida
+    # duas vezes no HOME"): a OS saiu da fila e não terminou. Sem estas linhas
+    # elas cairiam em STATUS_DESCONHECIDO ("Erro"), e o painel diria que a OS
+    # que espera a caixa esvaziar morreu.
+    "aguardando_caixa_vazia": "Em Processo",
+    "conferindo_caixa":       "Em Processo",
+    "indo_ao_centro":         "Em Processo",
     "concluida":    "Concluido",
     "erro":         "Erro",
     "cancelada":    "Cancelado",
@@ -132,6 +139,28 @@ def dispensers_estado() -> list:
     """Uma linha por slot físico da célula: quem manda no estoque é quem o mede."""
     dados = _get("/dispensers/estado")
     return dados if isinstance(dados, list) else []
+
+
+def porta_estado() -> dict | None:
+    """A porta NR-12 e a pausa da célula (`GET /api/v1/porta`, sem autenticação).
+
+    O que o painel usa é a `faixa` — a frase que o central monta, a MESMA nas
+    três telas (web, display de 7", telas TFT). `None` = central sem responder,
+    ou central de uma versão sem porta.
+    """
+    dados = _get("/api/v1/porta")
+    return dados if isinstance(dados, dict) else None
+
+
+def caixa_estado() -> dict | None:
+    """A caixa de coleta no HOME (`GET /api/v1/caixa`, sem autenticação).
+
+    `faixa` é a frase do central ("ESVAZIE A CAIXA DE COLETA (2 caixinhas)",
+    "CONFERINDO A CAIXA…", "CAIXA CONFERIDA — LEVANDO AO CENTRO"). `None` =
+    central sem responder, ou de uma versão sem a conferência da caixa.
+    """
+    dados = _get("/api/v1/caixa")
+    return dados if isinstance(dados, dict) else None
 
 
 def trava_estado() -> dict | None:

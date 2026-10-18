@@ -1086,14 +1086,44 @@ def test_concluido_da_mesa_nao_fecha_os_travada(carregar_central, monkeypatch):
         "está ativa e o supervisor ainda não liberou")
 
 
-def test_concluido_da_mesa_fecha_a_os_sem_trava(carregar_central):
-    """Controle: o caminho normal de fim de ciclo continua fechando a OS."""
+def test_concluido_da_mesa_nao_fecha_a_os_nem_sem_trava(carregar_central):
+    """O `concluido` é FIM DE HOMING, não fim de OS — com ou sem trava.
+
+    Quem conclui é a chegada da mesa ao CENTRO, depois da conferência da caixa
+    no HOME (CLAUDE.md, "A caixa é conferida duas vezes no HOME"). O homing do
+    início e o do fim da OS emitem `concluido` com a OS no meio do caminho.
+    """
     central = carregar_central()
     _com_os_ativa(central)
 
     _evento_cnc(central, "concluido")
 
-    assert central.modulo._estado["os_ativa"]["status"] == "concluida"
+    assert central.modulo._estado["os_ativa"]["status"] == "em_andamento"
+
+
+def test_chegada_ao_centro_acorda_a_chave_do_centro(carregar_central, monkeypatch):
+    central = carregar_central()
+    acordadas = []
+    monkeypatch.setattr(central.modulo.orch, "notificar_evento",
+                        lambda chave, dados: acordadas.append((chave, dados["tipo"])))
+
+    asyncio.run(central.modulo._handle_evento_cnc({
+        "tipo": "posicionado", "os_id": "OS-42", "dispenser_alvo": 0,
+        "destino": "centro", "posicao_x": 1.0, "posicao_y": 2.0}))
+    asyncio.run(central.modulo._handle_evento_cnc({
+        "tipo": "erro", "os_id": "OS-42", "dispenser_alvo": 0,
+        "codigo_erro": "sem_homing", "descricao": "x"}))
+    asyncio.run(central.modulo._handle_evento_cnc({
+        "tipo": "erro", "os_id": "OS-42", "dispenser_alvo": 0,
+        "codigo_erro": "homing_falhou", "descricao": "x"}))
+
+    assert ("OS-42:centro", "posicionado") in acordadas
+    assert ("OS-42:centro", "erro") in acordadas
+    # O `homing_falhou` (também com dispenser 0) é do homing, não do centro.
+    assert ("OS-42:homing", "erro") in acordadas
+    assert [c for c in acordadas if c == ("OS-42:centro", "erro")] == [("OS-42:centro", "erro")]
+    # A chegada ao centro não acorda a espera de um slot.
+    assert ("OS-42:posicionado:0", "posicionado") not in acordadas
 
 
 def test_o_evento_de_homing_da_trava_continua_virando_linha(carregar_central,

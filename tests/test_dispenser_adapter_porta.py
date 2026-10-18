@@ -117,7 +117,7 @@ def test_janela_fora_da_faixa_e_422_na_borda(com_porta):
 
 
 def test_sem_telas_por_serial_nao_existe_porta(carregar_adapter):
-    """O simulador não tem porta: fingir um ACK faria o central destravar uma
+    """O simulador não tem porta: fingir um ACK faria o central autorizar uma
     porta imaginária."""
     from fastapi import HTTPException
     modulo = carregar_adapter("dispenser")

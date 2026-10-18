@@ -222,7 +222,7 @@ def test_captura_da_mesa_vai_sempre_para_vision_sim_url(adapter, mesa):
         "url": modulo.VISION_SIM_URL + "/executar/capturar/mesa",
         "json": {"slot_id": 2, "os_id": "OS-1", "quantidade_esperada": 3,
                  "posicao_x": 10.0, "posicao_y": -150.0, "slots_cobertos": None,
-                 "quantidade_slot": None, "injetar_falha": None},
+                 "quantidade_slot": None, "etapa": None, "injetar_falha": None},
     }]
 
 
@@ -488,3 +488,60 @@ def test_injecao_na_mesa_simulada_continua_indo_ao_simulador(adapter):
     upstream = _com_upstream(modulo, _Upstream("apsen-vision-simulator"))
     asyncio.run(modulo.capturar_mesa(_req_mesa(modulo, injetar_falha="divergencia_mesa")))
     assert upstream.chamadas[0]["json"]["injetar_falha"] == "divergencia_mesa"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# As fotos do HOME: `VAZIA-<os_id>` e `FINAL-<os_id>`
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# O `os_id` próprio é o que faz a estação devolver a contagem ABSOLUTA da caixa
+# (o acumulado de uma OS nunca vista é 0). O adapter não pode reescrevê-lo em
+# nenhum dos dois sentidos, e as fotos do HOME nunca recebem injeção (D5).
+
+@pytest.mark.parametrize("alias", ["VAZIA-OS-1", "VAZIA-OS-1-3", "FINAL-OS-1",
+                                   "FINAL-OS-1-2"])
+@pytest.mark.parametrize("mesa", ["estacao", "simulador"])
+def test_o_os_id_da_foto_do_home_atravessa_intocado(adapter, alias, mesa):
+    modulo = adapter(mesa=mesa)
+    upstream = _com_upstream(modulo, _Upstream(
+        "apsen-vision-station" if mesa == "estacao" else "apsen-vision-simulator"))
+
+    asyncio.run(modulo.capturar_mesa(_req_mesa(modulo, slot=1, os_id=alias,
+                                               etapa="caixa_final")))
+    corpo = upstream.chamadas[0]["json"]
+    assert corpo["os_id"] == alias
+    assert corpo["etapa"] == "caixa_final"
+
+    _receber(modulo, _leitura_mesa("leitura_mesa_ok", 1, os_id=alias))
+    assert _encaminhados(upstream)[-1]["os_id"] == alias
+
+
+@pytest.mark.parametrize("mesa", ["estacao", "simulador"])
+def test_foto_do_home_nunca_recebe_injecao(adapter, mesa):
+    modulo = adapter(mesa=mesa)
+    upstream = _com_upstream(modulo, _Upstream(
+        "apsen-vision-station" if mesa == "estacao" else "apsen-vision-simulator"))
+
+    asyncio.run(modulo.capturar_mesa(_req_mesa(modulo, slot=1, os_id="FINAL-OS-1",
+                                               injetar_falha="divergencia_mesa")))
+    assert upstream.chamadas[0]["json"]["injetar_falha"] is None
+    assert ("FINAL-OS-1", 1) not in modulo._injecao_mesa
+
+    _receber(modulo, _leitura_mesa("leitura_mesa_ok", 1, os_id="FINAL-OS-1",
+                                   esperado=3, detectado=3))
+    evento = _encaminhados(upstream)[-1]
+    assert evento["tipo"] == "leitura_mesa_ok"
+    assert not evento.get("falha_injetada")
+
+
+def test_a_foto_do_home_e_uma_os_separada_para_a_memoria(adapter):
+    """A FINAL de uma OS cuja estação esqueceu o acumulado NÃO é ressincronizar:
+    ela nunca compara incremento — o acumulado dela começa em zero."""
+    modulo = adapter(mesa="estacao")
+    upstream = _com_upstream(modulo, _Upstream(acumulado={}))
+    _receber(modulo, _leitura_mesa("leitura_mesa_ok", 1))      # OS-1 registrou
+
+    asyncio.run(modulo.capturar_mesa(_req_mesa(modulo, slot=1, os_id="FINAL-OS-1")))
+    _receber(modulo, _leitura_mesa("leitura_mesa_ok", 1, os_id="FINAL-OS-1"))
+
+    assert "ressincronizar" not in _encaminhados(upstream)[-1]

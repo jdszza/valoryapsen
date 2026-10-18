@@ -394,7 +394,8 @@ def _normalizar_nome(nome) -> str:
 
 
 def itens_visao(saude: dict | None, posicoes_definidas: bool,
-                templates: list[dict]) -> list[dict]:
+                templates: list[dict], *, caixa_vazia: bool = False,
+                home_visivel: bool = True) -> list[dict]:
     """Os itens da visão, a partir de UMA sonda: o `/health` do vision-adapter.
 
     O adapter já fala com as três estações; sondá-las daqui seria repetir o
@@ -463,6 +464,18 @@ def itens_visao(saude: dict | None, posicoes_definidas: bool,
                 "as paradas, inclusive onde a caixa não aparece inteira",
                 "Meça as posições (docs/BANCADA_VISAO.md, M4) e defina "
                 "VISAO_MESA_POSICOES no .env."))
+        if caixa_vazia and not home_visivel:
+            # A conferência da caixa no HOME conta a caixa INTEIRA (contagem
+            # absoluta): sem a câmera vendo a caixa toda lá, toda OS chega ao
+            # fim com uma caixinha "a menos" — alarme, ou trava se a balança não
+            # fechar.
+            itens.append(_item(
+                "visao_mesa_home", "Visão", "Câmera da mesa no HOME", ALERTA,
+                "VISAO_CAIXA_VAZIA=1 com a câmera real, e HOME não está em "
+                "VISAO_MESA_POSICOES: ninguém registrou que a câmera vê a caixa "
+                "inteira no HOME, e é lá que a caixa é conferida vazia e cheia",
+                "Meça se a câmera vê a caixa inteira no HOME (docs/BANCADA_VISAO.md) "
+                "e inclua HOME em VISAO_MESA_POSICOES."))
 
     itens.append(item_cobertura_etiquetas(
         (saude.get("etiquetas") or {}).get("nomes") or [], templates))
@@ -493,6 +506,52 @@ def item_cobertura_etiquetas(etiquetados: list[str], templates: list[dict]) -> d
 
 
 # ── Resumo ────────────────────────────────────────────────────────────────────
+
+# ── Portas NR-12 ──────────────────────────────────────────────────────────────
+
+def item_portas(porta: dict, pausa: dict | None, habilitada: bool,
+                adapter_ok: bool | None, idade_s: float | None,
+                silencio_max_s: float) -> dict:
+    """UM item, sempre — e o vermelho diz o que fazer.
+
+    UM, e não um por condição: com o dispenser-adapter fora, "link perdido",
+    "heartbeat velho" e "portas desconhecidas" seriam três diagnósticos da
+    mesma causa — a regra do banco fora (`itens_banco(None)`), aplicada à
+    porta. A ordem dos testes abaixo é a da CAUSA: o adapter, depois o link,
+    depois o heartbeat, depois as portas, depois o rearme.
+    """
+    def _i(estado, detalhe, acao=""):
+        return _item("portas_nr12", "Célula", "Portas NR-12", estado, detalhe, acao)
+
+    if not habilitada and porta.get("link_ok") is None:
+        return _i(INFO, "sem porta NR-12 nesta célula (PORTA_NR12_HABILITADA=0)")
+    if adapter_ok is False:
+        return _i(FALHA, "o dispenser-adapter não responde — a porta viaja por ele",
+                  "Suba o dispenser-adapter (dispenser-adapter\\iniciar_host.bat). "
+                  "Sem ele a célula fica parada: link perdido é porta aberta.")
+    if porta.get("link_ok") is not True:
+        return _i(FALHA, "link da porta perdido — a célula está parada",
+                  "Confira a USB da placa das telas e o fio UART porta↔telas "
+                  "(TX↔RX cruzados, GND comum).")
+    if idade_s is None or idade_s > silencio_max_s:
+        return _i(FALHA, "nenhuma mensagem da porta há mais de "
+                         f"{silencio_max_s:.0f}s",
+                  "Confira o processo do dispenser-adapter e o /health dele "
+                  "(bloco `porta`).")
+    abertas = [p for p in ("teto", "frente") if porta.get(p) != "fechada"]
+    if abertas:
+        nomes = " e ".join(abertas)
+        artigo = "as portas" if len(abertas) == 2 else "a porta"
+        return _i(FALHA, f"{artigo} {nomes} {'estão' if len(abertas) == 2 else 'está'} aberta(s)",
+                  f"Feche {artigo} {nomes} e passe a tag para rearmar.")
+    if pausa and pausa.get("aguardando_rearme"):
+        return _i(ALERTA, "portas fechadas, rearme pendente — a célula não anda",
+                  "Passe a tag na porta para rearmar.")
+    if pausa:
+        return _i(ALERTA, f"célula parada pela porta ({pausa.get('motivo')})",
+                  "Aguarde a retomada ou passe a tag; veja a faixa no painel.")
+    return _i(OK, f"link ok, heartbeat há {idade_s:.0f}s, teto e frente fechadas")
+
 
 def resumo(itens: list[dict]) -> dict:
     """Contagem por estado + o veredito que a página mostra em cima.

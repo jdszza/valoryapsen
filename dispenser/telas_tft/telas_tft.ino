@@ -32,6 +32,18 @@
  *    imagem e `catalogo_imagens.h`, ao lado das imagens — o protocolo e o
  *    adapter nao mudaram para isso.
  *
+ *  A PORTA NR-12 PASSA POR AQUI (docs/PROTOCOLO_SERIAL.md §9)
+ *    A ESP da porta nao tem USB no mini PC: ela fala por UART (Serial2 desta
+ *    placa, RX=GPIO16, TX=GPIO17) e esta placa REPASSA, sem interpretar:
+ *      linha da porta com `evento`/`resp` -> sobe pela USB como veio;
+ *      ping da porta -> esta placa responde o pong (nao sobe);
+ *      comando do adapter `porta_*` -> desce pela UART como veio, e o ACK e
+ *        da PORTA (esta placa nao confirma o que nao executa).
+ *    E VIGIA o heartbeat dela: sem `estado` por mais de 1500 ms, emite UMA
+ *    vez `porta_link_perdido`; quando volta, `porta_link_ok` e repassa o
+ *    primeiro `estado`. A leitura da UART e nao bloqueante, no mesmo laco do
+ *    serialPoll: o repasse nunca segura o desenho das telas.
+ *
  *  DUAS VOZES NA MESMA PORTA, E O SEPARADOR E O '{'
  *    Igual a placa dos mecanismos e a balanca: linha COM '{' e mensagem,
  *    linha SEM '{' e log. A voz do humano aqui so tem dois comandos de
@@ -106,6 +118,20 @@ static const uint8_t TFT_PIN_CS[NUM_TELAS] = { 33, 5, 25, 13, 12, 32, 27, 14 };
 #define BRILHO_PCT_PADRAO 100
 #endif
 
+// ---------------------------------------------------------------------
+// A UART DA PORTA NR-12
+// ---------------------------------------------------------------------
+// Serial2 em 16/17: os unicos pinos livres que nao colidem com a SPI das
+// telas (18/23, e o 19 que a SPI reserva como MISO), com o DC (4), o RST (22)
+// nem com os oito CS. Ligacao: TX da porta (17) -> RX desta (16), RX da porta
+// (16) <- TX desta (17), GND comum, nada de 5 V entre as duas placas.
+#define PORTA_UART_RX 16
+#define PORTA_UART_TX 17
+// Tres heartbeats de 500 ms. Link perdido e tratado pelo central como PORTA
+// ABERTA: a celula para.
+#define PORTA_VIGIA_MS 1500
+#define PORTA_SERIAL Serial2
+
 // Periodo do `telemetria`. O mesmo 15 s dos outros subsistemas; o adapter
 // descarta a repeticao identica (comparacao ignorando `ts`), entao com as oito
 // telas de pe ele manda uma e cala.
@@ -160,11 +186,27 @@ static int  travaSlot  = -1;
 static char travaResumo[TRAVA_RESUMO_MAX + 1] = "";
 static char travaOsId[MAX_OS_ID_LEN] = "";
 
+// A pausa da porta NR-12 (§9), separada da trava: as duas podem coexistir. Com
+// a pausa, toda tela mostra a faixa do central no topo — "PORTA FRENTE
+// ABERTA", "PASSE A TAG" —, menos a tela do slot travado, que continua sendo a
+// tela da trava. O campo ausente no `estado_celula` vale "sem pausa".
+static bool pausaAtiva = false;
+static char pausaResumo[TRAVA_RESUMO_MAX + 1] = "";
+
 static uint8_t       brilhoPct = BRILHO_PCT_PADRAO;
 static unsigned long ultimaTelemetriaMs = 0;
 
 // Erros de pintura desde o boot — vao no log, e cada um vira um evento `erro`.
 static uint32_t errosDePintura = 0;
+
+// A porta NR-12: buffer da linha da UART e a vigia do heartbeat. O relogio da
+// vigia nasce no boot, entao uma porta que nunca falou vira `link_perdido`
+// em 1,5 s — o central trata porta muda como porta aberta.
+static char          portaBuf[MAX_LINHA_BYTES + 1];
+static size_t        portaLen = 0;
+static bool          portaDescartando = false;
+static unsigned long portaUltimoEstadoMs = 0;
+static bool          portaLinkPerdido = false;
 
 enum Enfase { ENF_NORMAL, ENF_REALCE, ENF_ESMAECIDO, ENF_ALERTA };
 
@@ -392,6 +434,103 @@ static void emitErroTela(int slot_1a8, const char* codigo, const char* descricao
     slot_1a8, codigo, descricao, ts), "erro");
 }
 
+// Os dois eventos de vigia da porta. Sao DESTA placa (quem perdeu o link nao
+// tem como avisar que o perdeu), mas falam da porta: levam `origem: porta`, e
+// o adapter os encaminha ao central junto com os da porta.
+static void emitPortaLink(bool ok) {
+  char ts[24]; tsAgora(ts, sizeof ts);
+  if (ok)
+    emitir(snprintf(jbuf, sizeof jbuf,
+      "{\"evento\":{\"origem\":\"porta\",\"tipo\":\"porta_link_ok\",\"ts\":\"%s\"}}",
+      ts), "porta_link_ok");
+  else
+    emitir(snprintf(jbuf, sizeof jbuf,
+      "{\"evento\":{\"origem\":\"porta\",\"tipo\":\"porta_link_perdido\",\"ts\":\"%s\"}}",
+      ts), "porta_link_perdido");
+}
+
+// =====================================================================
+// O REPASSE DA PORTA NR-12 (§9) — nada alem do prefixo e lido aqui
+// =====================================================================
+
+// O pong da porta e DESTA placa: ela ja tem o relogio e a `sessao` do adapter
+// (do pong que recebe dele). Repassar o ping faria o `serial_link` do adapter
+// ler um `sub` alheio na porta das telas e acusar "cabo trocado".
+static void pongParaPorta() {
+  char buf[96];
+  const unsigned long epoch = epochBase ? epochBase + (millis() - epochMillis) / 1000UL : 0;
+  snprintf(buf, sizeof buf, "{\"resp\":\"pong\",\"epoch\":%lu,\"sessao\":%lu}",
+           epoch, sessaoAdapter);
+  PORTA_SERIAL.println(buf);
+}
+
+static void linhaDaPorta(char* linha) {
+  char* json = strchr(linha, '{');
+  if (!json) {
+    if (linha[0]) logMsg("PORTA", "log da porta: %.80s", linha);
+    return;
+  }
+  if (strstr(json, "\"cmd\":\"ping\"")) { pongParaPorta(); return; }
+
+  // A vigia so olha o TIPO: `estado` e o heartbeat. A volta do link sai ANTES
+  // do `estado` que a provou — o adapter so declara o link ok depois dele.
+  // Literal partido em dois de proposito: e uma BUSCA, nao um evento que esta
+  // placa emita, e o teste que lista os eventos dela le os literais inteiros.
+  if (strstr(json, "\"tipo\":" "\"estado\"")) {
+    portaUltimoEstadoMs = millis();
+    if (portaLinkPerdido) {
+      portaLinkPerdido = false;
+      logMsg("PORTA", "heartbeat da porta voltou");
+      emitPortaLink(true);
+    }
+  }
+  if (strstr(json, "\"evento\"") || strstr(json, "\"resp\"")) {
+    Serial.println(json);   // conteudo intocado: quem interpreta e o central
+  } else {
+    logMsg("PORTA", "linha da porta sem evento/resp, descartada: %.80s", json);
+  }
+}
+
+// Nao bloqueante: le o que ja chegou e volta. Mesma regra de linha do header —
+// acima do teto e descartada INTEIRA, nunca partida em duas.
+static void portaPoll() {
+  while (PORTA_SERIAL.available()) {
+    char c = (char)PORTA_SERIAL.read();
+    if (c == '\r' || c == '\n') {
+      if (portaDescartando) {
+        logMsg("ERRO", "linha da porta acima de %u bytes DESCARTADA", (unsigned)MAX_LINHA_BYTES);
+        portaDescartando = false;
+      } else if (portaLen > 0) {
+        portaBuf[portaLen] = '\0';
+        linhaDaPorta(portaBuf);
+      }
+      portaLen = 0;
+      continue;
+    }
+    if (portaDescartando) continue;
+    if (portaLen < MAX_LINHA_BYTES) portaBuf[portaLen++] = c;
+    else portaDescartando = true;
+  }
+
+  if (!portaLinkPerdido && millis() - portaUltimoEstadoMs > PORTA_VIGIA_MS) {
+    portaLinkPerdido = true;
+    logMsg("PORTA", "sem heartbeat da porta ha %d ms - link PERDIDO", PORTA_VIGIA_MS);
+    emitPortaLink(false);
+  }
+}
+
+// Comando `porta_*` do adapter: desce como veio, com `cmd_id` e `sessao`, e o
+// ACK e da PORTA. Com o link caido, recusa NA HORA — esperar o `ack_timeout`
+// do adapter para descobrir o que esta placa ja sabe so gastaria o relogio do
+// central.
+static void repassarComandoPorta(const char* linha, long cmd_id) {
+  if (portaLinkPerdido) {
+    ackErro(cmd_id, "porta_sem_link");
+    return;
+  }
+  PORTA_SERIAL.println(strchr(linha, '{'));
+}
+
 // =====================================================================
 // PINTURA — a tabela de §6, e nada alem dela
 // =====================================================================
@@ -480,6 +619,13 @@ static bool pintarTravaNesteSlot(uint8_t canal) {
   return ok;
 }
 
+static bool pintarPausa(uint8_t canal, const TelaSlot& t) {
+  // O conteudo continua la, esmaecido: a celula parou, o slot nao foi zerado.
+  bool ok = pintarConteudo(canal, t, true);
+  ok &= telaFaixa(canal, true, pausaResumo[0] ? pausaResumo : "MAQUINA PARADA", ENF_ALERTA);
+  return ok;
+}
+
 static bool pintarTravaEmOutroSlot(uint8_t canal, const TelaSlot& t) {
   char linha[TEXTO_COLUNAS + 8];
   // O conteudo continua la, so nao e o assunto: apaga-lo faria o operador
@@ -496,7 +642,10 @@ static bool pintarTravaEmOutroSlot(uint8_t canal, const TelaSlot& t) {
 static void assinaturaDe(uint8_t canal, char* dest, size_t n) {
   const TelaSlot& t = telas[canal];
   const int slot = slotDoCanal(canal);
-  if (travaAtiva && travaSlot == slot) {
+  if (pausaAtiva && !(travaAtiva && travaSlot == slot)) {
+    // A pausa entra na assinatura: a faixa muda de texto sem o slot mudar.
+    snprintf(dest, n, "P|%s|%d|%s", pausaResumo, t.imagem, t.medicamento);
+  } else if (travaAtiva && travaSlot == slot) {
     snprintf(dest, n, "T|%s", travaResumo);
   } else if (t.imagem >= 0) {
     // Com caixa na tela, os numeros nao aparecem: mudar so a quantidade nao
@@ -516,9 +665,10 @@ static void pintarSlot(uint8_t canal) {
   if (strcmp(assinatura, t.desenhado) == 0) return;
 
   bool ok;
-  if (!travaAtiva)                            ok = pintarConteudo(canal, t, false);
-  else if (travaSlot == slotDoCanal(canal))   ok = pintarTravaNesteSlot(canal);
-  else                                        ok = pintarTravaEmOutroSlot(canal, t);
+  if (travaAtiva && travaSlot == slotDoCanal(canal)) ok = pintarTravaNesteSlot(canal);
+  else if (pausaAtiva)                               ok = pintarPausa(canal, t);
+  else if (!travaAtiva)                              ok = pintarConteudo(canal, t, false);
+  else                                               ok = pintarTravaEmOutroSlot(canal, t);
   ok &= telaMostrar(canal);
 
   t.ok = ok;
@@ -613,8 +763,15 @@ static void cmdEstadoCelula(const char* linha, long cmd_id) {
 
   if (!jsonTexto(linha, "os_id",        os_id,  sizeof os_id))  os_id[0] = '\0';
   if (!jsonTexto(linha, "trava_resumo", resumo, sizeof resumo)) resumo[0] = '\0';
+  bool pausa = false;
+  char resumoPausa[TRAVA_RESUMO_MAX + 1];
+  if (!jsonBool(linha, "pausa_porta", &pausa)) pausa = false;   // ausente = sem pausa
+  if (!jsonTexto(linha, "pausa_resumo", resumoPausa, sizeof resumoPausa)) resumoPausa[0] = '\0';
 
   ackOk(cmd_id, false);
+
+  pausaAtiva = pausa;
+  copiarCampo(pausaResumo, sizeof pausaResumo, pausa ? resumoPausa : "");
 
   travaAtiva = ativa;
   travaSlot  = temSlot ? (int)fslot : -1;
@@ -635,6 +792,8 @@ static void cmdEstadoCelula(const char* linha, long cmd_id) {
 void executarComando(const char* cmd, const char* linha, long cmd_id) {
   if      (strcmp(cmd, "slot")          == 0) cmdSlot(linha, cmd_id);
   else if (strcmp(cmd, "estado_celula") == 0) cmdEstadoCelula(linha, cmd_id);
+  // Prefixo, e so ele: o comando e da porta NR-12, e esta placa nao o le.
+  else if (strncmp(cmd, "porta_", 6) == 0)    repassarComandoPorta(linha, cmd_id);
   else {
     // Comando fora do contrato recusa com ACK NEGATIVO, nunca em silencio: o
     // adapter o transforma em 502 e quem pediu sabe na hora, em vez de esperar
@@ -685,6 +844,10 @@ void linhaHumana(char* linha) {
 void setup() {
   apsenSerialInit();     // buffer de recepcao do tamanho do teto da linha
   Serial.begin(115200);
+  // A UART da porta, com o mesmo teto de linha — antes do begin, como a USB.
+  PORTA_SERIAL.setRxBufferSize(MAX_LINHA_BYTES);
+  PORTA_SERIAL.begin(115200, SERIAL_8N1, PORTA_UART_RX, PORTA_UART_TX);
+  portaUltimoEstadoMs = millis();
   delay(1000);           // tempo para o Serial Monitor conectar
   Serial.println();
   Serial.println(F("=== ESP32 INICIOU - Telas TFT dos dispensers ==="));
@@ -726,6 +889,7 @@ void setup() {
 void loop() {
   serialPoll();
   pingPoll();
+  portaPoll();   // nao bloqueante: o repasse nunca segura o desenho
 
   if (millis() - ultimaTelemetriaMs >= TELEMETRIA_INTERVALO_MS) {
     ultimaTelemetriaMs = millis();

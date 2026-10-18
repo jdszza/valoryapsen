@@ -221,13 +221,36 @@ def test_push_sai_na_transicao_e_nao_na_repeticao(painel):
     painel.modulo.sincronizar_trava_central(avisar_display=True)
     painel.modulo.sincronizar_trava_central(avisar_display=True)
     assert enviados == [{"push": "trava", "ativa": True, "os_id": TRAVA["os_id"],
-                         "slot_id": 3, "motivo": TRAVA["motivo"]}]
+                         "slot_id": 3, "motivo": TRAVA["motivo"], "porta_faixa": ""}]
 
     painel.central.trava = SEM_TRAVA
     painel.modulo.sincronizar_trava_central(avisar_display=True)
     assert enviados[-1] == {"push": "trava", "ativa": False, "os_id": "",
-                            "slot_id": None, "motivo": ""}
+                            "slot_id": None, "motivo": "", "porta_faixa": ""}
     assert len(enviados) == 2
+
+
+def test_a_faixa_da_porta_nr12_vai_junto_e_chega_em_ascii(painel):
+    """A frase é a do central — a MESMA nas três telas. O display recebe sem
+    acento nem travessão (a fonte dele não os tem), e a mudança da faixa
+    sozinha já é transição: sai push."""
+    enviados = _pushes(painel)
+    painel.modulo.sincronizar_trava_central(avisar_display=True)
+    painel.central.porta = {"faixa": "MÁQUINA PARADA — PORTA FRENTE ABERTA"}
+    painel.modulo.sincronizar_trava_central(avisar_display=True)
+    assert len(enviados) == 2
+    assert enviados[-1]["porta_faixa"] == "MAQUINA PARADA - PORTA FRENTE ABERTA"
+    resposta = painel.modulo._trava_para_display()
+    assert resposta["porta_faixa"].isascii()
+    # A web mostra a frase original, com acento.
+    assert painel.modulo.trava_atual()["porta_faixa"] == "MÁQUINA PARADA — PORTA FRENTE ABERTA"
+
+
+def test_o_painel_continua_so_lendo_a_porta(painel):
+    """A faixa vem por GET: `central_client` segue sem escrita nenhuma."""
+    import inspect
+    fonte = inspect.getsource(painel.modulo.central_client.porta_estado)
+    assert '_get("/api/v1/porta")' in fonte
 
 
 def test_push_nao_sai_com_central_fora_do_ar(painel):

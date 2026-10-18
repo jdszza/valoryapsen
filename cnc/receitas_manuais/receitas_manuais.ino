@@ -116,7 +116,8 @@
 // dele. Um código novo inventado na hora não dá erro em lugar nenhum — vira uma
 // linha que ninguém sabe ler.
 //
-// Os cinco primeiros são recusas de `mover`. `homing_falhou` é de `homing`, e
+// Os cinco primeiros são recusas de `mover` (e quatro deles também de `centro`,
+// que segue as regras do `mover`). `homing_falhou` é de `homing`, e
 // está aqui embaixo com a separação escrita: uma lista "fechada" que cresce em
 // silêncio é pior que uma lista aberta, porque ninguém desconfia dela.
 #define ERRO_DISPENSER_INVALIDO "dispenser_invalido"  // fora de 1..NUM_DISPENSERS
@@ -309,6 +310,15 @@ volatile bool trava_ativa = false;
 volatile bool trava_interrompeu_mover = false;
 char trava_os_id[MAX_OS_ID_LEN] = "";
 int  trava_dispenser = 0;
+
+// ── Parada da porta NR-12 ────────────────────────────────────────────────────
+// `parar` chega quando uma porta da celula abre (docs/PROTOCOLO_SERIAL.md §4 e
+// §9). E o MESMO caminho de parada no meio do movimento que a trava usa — a
+// flag e conferida no mesmo passo do `sync_move` —, mas SEM voltar ao HOME: o
+// homing e o central que manda, na RETOMADA, com a porta fechada e rearmada.
+// Mover a mesa ate o HOME com alguem com a mao dentro da celula seria o
+// contrario do que a porta existe para garantir.
+volatile bool parar_pedido = false;
 
 Preferences prefs;
 
@@ -511,8 +521,9 @@ bool sync_move(long delta_A, long delta_B, bool respeitar_limits) {
     // valer NO MEIO de um movimento, que é justamente quando ele importa: a
     // mesa está a caminho de um slot cuja dispensa o supervisor acabou de
     // reprovar.
-    if (trava_ativa) {
-      Serial.println("  ⚠ TRAVA do Triple Check — movimento interrompido.");
+    if (trava_ativa || parar_pedido) {
+      Serial.println(parar_pedido ? "  ⚠ PARAR (porta NR-12) — movimento interrompido."
+                                  : "  ⚠ TRAVA do Triple Check — movimento interrompido.");
       movimento_em_curso = false;
       return false;
     }
@@ -564,6 +575,13 @@ bool mover_para(float x, float y) {
 }
 bool mover_x(float d) { return mover_para(pos_x_mm() + d, pos_y_mm()); }
 bool mover_y(float d) { return mover_para(pos_x_mm(), pos_y_mm() + d); }
+
+// O ÚNICO caminho até o centro operacional. O `C` do terminal humano e o
+// comando de máquina `centro` passam os dois por aqui, e é de propósito: dois
+// centros — um para a bancada, outro para o central — concordariam só até o
+// primeiro `NOVOCENTRO`, e a caixa de coleta passaria a sair da célula num
+// lugar que ninguém mediu.
+bool ir_ao_centro() { return mover_para(CENTRO_X_MM, CENTRO_Y_MM); }
 
 // ═════════════════════════════════════════════════════════════════════════════
 // HOMING
@@ -1117,7 +1135,7 @@ void processar_comando(String cmd) {
     return;
   }
   if (cmd == "C" || cmd == "CENTRO") {
-    mover_para(CENTRO_X_MM, CENTRO_Y_MM); imprimir_status(); return;
+    ir_ao_centro(); imprimir_status(); return;
   }
 
   // NOVOCENTRO x y   → define centro operacional em coordenadas absolutas
@@ -1322,8 +1340,13 @@ void processar_comando(String cmd) {
 // chegada real para depois da hora agendada — ou seja, comprimido caindo com a
 // mesa ainda em trânsito. A trajetória ao vivo custaria uma dispensa no chão.
 
+// `destino` é "dispenser" na chegada de um `mover` e "centro" na do `centro`
+// (com `dispenser_alvo` 0, que não existe). O `posicionado` tem UMA forma só:
+// o central roteia pela chave, e um evento com dois formatos é um campo que
+// some sem erro do lado que não o esperava.
 static void emitPosicionado(const char* os_id, int dispenser_alvo,
-                            int ciclo_atual, int total_ciclos) {
+                            int ciclo_atual, int total_ciclos,
+                            const char* destino) {
   char ts[24]; tsAgora(ts, sizeof ts);
   char sx[16]; fmtF(sx, sizeof sx, pos_x_mm(), 2);
   char sy[16]; fmtF(sy, sizeof sy, pos_y_mm(), 2);
@@ -1332,9 +1355,10 @@ static void emitPosicionado(const char* os_id, int dispenser_alvo,
   // central passaria a registrar uma posição que ninguém verificou.
   emitir(snprintf(jbuf, sizeof jbuf,
     "{\"evento\":{\"tipo\":\"posicionado\",\"os_id\":\"%s\",\"dispenser_alvo\":%d,"
-    "\"posicao_x\":%s,\"posicao_y\":%s,\"ciclo_atual\":%d,\"total_ciclos\":%d,"
-    "\"ts\":\"%s\"}}",
-    os_id, dispenser_alvo, sx, sy, ciclo_atual, total_ciclos, ts), "posicionado");
+    "\"destino\":\"%s\",\"posicao_x\":%s,\"posicao_y\":%s,\"ciclo_atual\":%d,"
+    "\"total_ciclos\":%d,\"ts\":\"%s\"}}",
+    os_id, dispenser_alvo, destino, sx, sy, ciclo_atual, total_ciclos, ts),
+    "posicionado");
 }
 
 static void emitConcluido(const char* os_id) {
@@ -1466,6 +1490,18 @@ static void cmdMover(const char* linha, long cmd_id) {
   trava_dispenser = alvo;
 
   if (!mover_para(p->x, p->y)) {
+    if (parar_pedido) {
+      // Parada da porta: a mesa fica ONDE PAROU, e a posicao deixa de ser
+      // confiavel (parar em velocidade perde passo). Sem `ja_fez_homing`, todo
+      // `mover` e recusado com `sem_homing` ate o homing da retomada — e a
+      // regra "rearme -> homing -> continua" valendo NA PLACA, nao so no
+      // central. Nenhum evento: quem parou a mesa foi o central, e ele sabe.
+      parar_pedido = false;
+      ja_fez_homing = false;
+      logMsg("APSEN", "mover D%d interrompido por parar em (%.2f, %.2f) - sem homing ate a retomada",
+             alvo, pos_x_mm(), pos_y_mm());
+      return;
+    }
     if (trava_ativa) {
       // Interrompido pela trava, não por falha mecânica. O evento vai com
       // `travado`, e é ele que diz a quem esperava a chegada que ela não vem.
@@ -1496,7 +1532,91 @@ static void cmdMover(const char* linha, long cmd_id) {
     return;
   }
 
-  emitPosicionado(os_id, alvo, ciclo, total);
+  emitPosicionado(os_id, alvo, ciclo, total, "dispenser");
+}
+
+// O fim da OS: a caixa de coleta, já conferida no HOME pelo central, vai ao
+// centro operacional. As regras são as do `mover`, campo a campo — a única
+// diferença é o destino (`ir_ao_centro`, a mesma função do `C` humano).
+//
+// NÃO emite `concluido`. `concluido` é o fim de um homing, e a mesa no centro
+// não está no HOME; quem decide que a OS acabou é o central, ao receber este
+// `posicionado` (CLAUDE.md, "A caixa é conferida duas vezes no HOME").
+//
+// O `cmd_id` repetido nem chega aqui: o header responde ACK de novo sem
+// executar — um reenvio do console ("reenviar centro") não vira dois
+// movimentos.
+static void cmdCentro(const char* linha, long cmd_id) {
+  char os_id[MAX_OS_ID_LEN];
+  if (!jsonTexto(linha, "os_id", os_id, sizeof os_id)) {
+    ackErro(cmd_id, "campos ausentes em centro");
+    logMsg("APSEN", "centro sem os_id - recusado");
+    return;
+  }
+  if (movimento_em_curso) {
+    ackErro(cmd_id, "placa ocupada: mesa em movimento");
+    logMsg("APSEN", "centro recusado: mesa ja em movimento");
+    return;
+  }
+  if (trava_ativa) {
+    recusarMover(cmd_id, os_id, 0, ERRO_TRAVADO,
+                 "trava do Triple Check ativa: aguardando liberacao");
+    return;
+  }
+  if (!ja_fez_homing) {
+    // Centro sem referência é um ponto que não existe: a mesa iria para onde
+    // o tracker ACHA que o centro fica, deslocada pelo que o eixo perdeu.
+    recusarMover(cmd_id, os_id, 0, ERRO_SEM_HOMING,
+                 "origem nunca estabelecida: mande homing antes do centro");
+    return;
+  }
+  if (!posicao_dentro_envelope(CENTRO_X_MM, CENTRO_Y_MM)) {
+    recusarMover(cmd_id, os_id, 0, ERRO_FORA_DO_ENVELOPE,
+                 "centro operacional gravado fora do envelope da mesa");
+    return;
+  }
+  if (qualquer_limit_disparado_rapido()) {
+    recusarMover(cmd_id, os_id, 0, ERRO_LIMIT_DISPARADO,
+                 "fim de curso ja acionado antes do movimento");
+    return;
+  }
+
+  ackOk(cmd_id, false);
+  logMsg("APSEN", "centro (%.2f, %.2f) OS %s", CENTRO_X_MM, CENTRO_Y_MM, os_id);
+  strncpy(trava_os_id, os_id, sizeof trava_os_id - 1);
+  trava_os_id[sizeof trava_os_id - 1] = '\0';
+  trava_dispenser = 0;
+
+  if (!ir_ao_centro()) {
+    if (parar_pedido) {
+      // Porta NR-12: fica onde parou e perde a origem, como no `mover`. Nenhum
+      // evento — quem parou foi o central, e é ele que refaz a etapa inteira
+      // (homing, conferência, centro) na retomada.
+      parar_pedido = false;
+      ja_fez_homing = false;
+      logMsg("APSEN", "centro interrompido por parar em (%.2f, %.2f) - sem homing ate a retomada",
+             pos_x_mm(), pos_y_mm());
+      return;
+    }
+    if (trava_ativa) {
+      trava_interrompeu_mover = false;
+      emitErroCnc(os_id, 0, ERRO_TRAVADO,
+                  "ida ao centro interrompida pela trava do Triple Check");
+      if (!homing_completo()) {
+        emitErroCnc(os_id, 0, ERRO_HOMING_FALHOU,
+                    "um dos eixos nao achou o fim de curso no prazo");
+        return;
+      }
+      emitConcluido(os_id);
+      return;
+    }
+    emitErroCnc(os_id, 0, ERRO_LIMIT_DISPARADO,
+                "fim de curso disparou durante a ida ao centro");
+    logMsg("APSEN", "centro abortado por limit em (%.2f, %.2f)", pos_x_mm(), pos_y_mm());
+    return;
+  }
+
+  emitPosicionado(os_id, 0, 0, 0, "centro");
 }
 
 static void cmdEstadoCelula(const char* linha, long cmd_id) {
@@ -1564,6 +1684,21 @@ static void cmdEstadoCelula(const char* linha, long cmd_id) {
 }
 
 
+// `parar` NAO move nada: so marca o pedido, que o laco de `sync_move` confere a
+// cada passo. ACK sempre, e antes de qualquer outra coisa — ele chega quase
+// sempre NO MEIO de um `mover`, pelo serialPoll de dentro do movimento, e o
+// central so autoriza a porta depois deste ACK. Com a mesa parada, e so o ACK.
+static void cmdParar(long cmd_id) {
+  ackOk(cmd_id, false);
+  if (!movimento_em_curso) {
+    logMsg("APSEN", "parar: mesa ja parada");
+    return;
+  }
+  parar_pedido = true;
+  logMsg("APSEN", "parar: interrompendo o movimento (porta NR-12)");
+}
+
+
 static void cmdHoming(const char* linha, long cmd_id) {
   char os_id[MAX_OS_ID_LEN];
   if (!jsonTexto(linha, "os_id", os_id, sizeof os_id)) {
@@ -1609,6 +1744,8 @@ void executarComando(const char* cmd, const char* linha, long cmd_id) {
   if      (strcmp(cmd, "mover")  == 0) cmdMover(linha, cmd_id);
   else if (strcmp(cmd, "homing") == 0) cmdHoming(linha, cmd_id);
   else if (strcmp(cmd, "estado_celula") == 0) cmdEstadoCelula(linha, cmd_id);
+  else if (strcmp(cmd, "parar")  == 0) cmdParar(cmd_id);
+  else if (strcmp(cmd, "centro") == 0) cmdCentro(linha, cmd_id);
   else {
     ackErro(cmd_id, "comando_desconhecido");
     logMsg("APSEN", "comando de maquina fora do contrato: '%s'", cmd);

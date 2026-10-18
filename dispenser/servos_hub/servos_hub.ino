@@ -231,6 +231,15 @@ static Slot slots[NUM_SERVOS];
 // `limpar` sao registro em RAM, sem mecanismo, e terminam no mesmo instante.
 static int canalEmOperacao = -1;
 
+// Pedido de PARADA da dispensa em curso (porta NR-12 aberta, ver
+// docs/PROTOCOLO_SERIAL.md §3 e §9). `volatile` porque e escrito de dentro do
+// `serialPoll()` que roda NO MEIO do laco de dispensa, e lido pela condicao
+// desse mesmo laco. O laco o confere ENTRE uma unidade e a seguinte: a unidade
+// que ja saiu termina o ciclo do servo e espera o pulso do IR dela, no prazo de
+// sempre - parar o braco no meio deixaria uma caixa presa na boca do
+// dispenser, contada por ninguem.
+static volatile bool pararPedido = false;
+
 // Uma unidade por ciclo de servo, e o ciclo e min -> max -> min.
 //
 // IDA E VOLTA EM SALTO, sem rampa: `moverCalibrado(max)` direto manda o servo
@@ -952,6 +961,21 @@ static void emitDispensado(int slot_1a8, const char* os_id, const char* medicame
     residual, injetada ? "true" : "false", ts), "dispensado");
 }
 
+// A dispensa foi PARADA a pedido (porta aberta) depois de `confirmada`
+// unidades. Nao e falha: o slot continua da OS, com o restante a dispensar, e
+// o central reenvia `dispensar` com `quantidade` = pedida - confirmada na
+// retomada. Sem esta contagem o central nao tem como retomar o slot sem
+// adivinhar - e adivinhar aqui e dose dobrada ou dose curta no leito.
+static void emitDispensadoParcial(int slot_1a8, const char* os_id, const char* medicamento,
+                                  int confirmada, int pedida, int residual) {
+  char ts[24]; tsAgora(ts, sizeof ts);
+  emitir(snprintf(jbuf, sizeof jbuf,
+    "{\"evento\":{\"tipo\":\"dispensado_parcial\",\"dispenser_id\":%d,\"os_id\":\"%s\","
+    "\"medicamento\":\"%s\",\"quantidade_confirmada\":%d,\"quantidade_pedida\":%d,"
+    "\"quantidade_residual\":%d,\"ts\":\"%s\"}}",
+    slot_1a8, os_id, medicamento, confirmada, pedida, residual, ts), "dispensado_parcial");
+}
+
 static void emitLimpezaOk(int slot_1a8, const char* medicamento_limpo,
                           const char* solicitado_por) {
   // `limpeza_ok` NAO carrega `os_id`, e isso e contrato, nao esquecimento:
@@ -1174,7 +1198,11 @@ static void cmdDispensar(const char* linha, long cmd_id) {
     return;
   }
 
-  const int alvo = sl.qtd_alvo;
+  // `quantidade` (opcional) e a RETOMADA depois de uma parada: o central pede
+  // so o que falta. Nunca mais que o alvo que o slot ainda guarda.
+  int alvo = sl.qtd_alvo;
+  float fqtd = 0;
+  if (jsonNumero(linha, "quantidade", &fqtd) && fqtd >= 1 && (int)fqtd < alvo) alvo = (int)fqtd;
 
   // Injecao de falha: ramo ISOLADO, ANTES de qualquer outra decisao, e por
   // isso ela funciona com o modo apresentacao ligado — o modo desliga o acaso,
@@ -1195,6 +1223,7 @@ static void cmdDispensar(const char* linha, long cmd_id) {
   }
 
   canalEmOperacao   = (int)canal;
+  pararPedido       = false;   // um `parar` antigo nao vale para esta dispensa
   sl.estado         = SLOT_DISPENSANDO;
   sl.qtd_dispensada = 0;
   emitStatusSlot(canal);
@@ -1202,7 +1231,14 @@ static void cmdDispensar(const char* linha, long cmd_id) {
 
   int  contadas = 0;
   bool interrompeu = false;
+  bool parada = false;
   for (int i = 1; i <= a_soltar; i++) {
+    if (pararPedido) {
+      // Entre unidades, e so aqui: a anterior ja terminou o ciclo e o pulso.
+      logMsg("APSEN", "D%d PARADA a pedido depois de %d de %d", slot, contadas, alvo);
+      parada = true;
+      break;
+    }
     if (!soltarUmaUnidade(canal)) {
       // Pulso que nao vem no prazo INTERROMPE: nao tenta o mesmo comprimido de
       // novo (dose dobrada se ele tiver caido sem o sensor ver) e nao segue
@@ -1243,6 +1279,18 @@ static void cmdDispensar(const char* linha, long cmd_id) {
     sl.medicamento[0] = '\0';
     sl.sku[0]         = '\0';
     sl.categoria[0]   = '\0';
+  }
+
+  if (parada) {
+    // NAO e estado terminal: o slot continua da OS, PRONTO para a retomada,
+    // com o alvo que falta. O `os_id` fica - e ele que diz de quem e o resto.
+    sl.qtd_alvo = alvo - contadas;
+    sl.estado   = SLOT_PRONTO;
+    canalEmOperacao = -1;
+    pararPedido = false;
+    emitStatusSlot(canal);
+    emitDispensadoParcial(slot, os_id, med_evento, contadas, alvo, residual);
+    return;
   }
 
   // Estado terminal limpo: a dispensa acabou e o slot nao pertence mais a OS.
@@ -1308,6 +1356,22 @@ static void cmdLimpar(const char* linha, long cmd_id) {
        slot, anterior[0] ? anterior : "vazio", por);
   emitStatusSlot(canal);
   emitLimpezaOk(slot, anterior, por);
+}
+
+// `parar` NAO move nada e NAO bloqueia: so marca o pedido. Quem para e o laco
+// de dispensa, entre uma unidade e a seguinte. Chega quase sempre NO MEIO de um
+// `dispensar` (pelo serialPoll de dentro do laco), e e por isso que ele e
+// aceito com slot em operacao, ao contrario dos outros tres. Sem dispensa em
+// curso, e so o ACK: nao ha o que parar, e a resposta continua sendo "parado".
+static void cmdParar(long cmd_id) {
+  ackOk(cmd_id, false);
+  if (canalEmOperacao < 0) {
+    logMsg("APSEN", "parar: nenhuma dispensa em curso");
+    return;
+  }
+  pararPedido = true;
+  logMsg("APSEN", "parar: D%d termina a unidade atual e para",
+         slotDoCanal((uint8_t)canalEmOperacao));
 }
 
 // -- Periodicos: `telemetria` e `status` -------------------------------------
@@ -1380,6 +1444,7 @@ void executarComando(const char* cmd, const char* linha, long cmd_id) {
   if      (strcmp(cmd, "carregar")  == 0) cmdCarregar(linha, cmd_id);
   else if (strcmp(cmd, "dispensar") == 0) cmdDispensar(linha, cmd_id);
   else if (strcmp(cmd, "limpar")    == 0) cmdLimpar(linha, cmd_id);
+  else if (strcmp(cmd, "parar")     == 0) cmdParar(cmd_id);
   else {
     // Comando fora do contrato recusa com ACK NEGATIVO, nunca em silencio: o
     // adapter o transforma em 502 e quem pediu sabe na hora, em vez de esperar

@@ -1,16 +1,22 @@
 /*
  * =====================================================================
  *  PORTA NR-12 (prototipo academico) - ESP32 + RC522 + 2 fins de curso
- *  + solenoide - `sub: "porta"`
+ *  - `sub: "porta"`
  * =====================================================================
  *  Duas portas fisicas: ES1 = TETO (abastecer remedio), ES2 = FRENTE (a
  *  caixa sobre a balanca). A celula so esta FECHADA com as DUAS fechadas.
  *
- *  QUEM ABRE E O CENTRAL. Esta placa valida a TAG (lista local na NVS),
- *  mas NAO aciona o solenoide sozinha: ela pede acesso (`pedido_acesso`), o
- *  central PARA a celula inteira e so entao manda `porta_liberar`. Sem
- *  resposta do central em ESPERA_CENTRAL_MS, a porta nao abre. O contrato e
- *  `docs/PROTOCOLO_SERIAL.md` §9.
+ *  SEM FECHADURA ELETRICA. Cada porta e presa por um IMA simples e o fim de
+ *  curso diz se ela esta fechada: quem puxa abre, a qualquer momento. O que
+ *  esta placa controla nao e a abertura, e a AUTORIZACAO dela.
+ *
+ *  QUEM AUTORIZA E O CENTRAL. Esta placa valida a TAG (lista local na NVS),
+ *  mas nao se autoriza sozinha: ela pede acesso (`pedido_acesso`), o central
+ *  PARA a celula inteira e so entao manda `porta_liberar`, que acende o LED de
+ *  "pode abrir". Aberta com o LED aceso, a abertura e AUTORIZADA; aberta antes
+ *  (ou sem tag), e SEM autorizacao — alarme, e a celula para do mesmo jeito.
+ *  Sem resposta do central em ESPERA_CENTRAL_MS, o LED nao acende. O contrato
+ *  e `docs/PROTOCOLO_SERIAL.md` §9.
  *
  *  DUAS PORTAS SERIAIS, DOIS DONOS
  *    Serial2 (UART dedicada, GPIO16/17) - a voz de MAQUINA, com a placa das 8
@@ -35,14 +41,13 @@
  *                    o sinal para baixo)
  *      Fechado = alavanca pressionada = LOW
  *      Fio rompido = HIGH = lido como "aberto" (falha segura)
- *    Solenoide -> GPIO26 (saida para o driver MOSFET logic-level ou rele;
- *      diodo flyback no solenoide e fonte PROPRIA com GND comum. Nunca
- *      alimentar o solenoide pelo 3V3/5V da ESP.) Energizado = DESTRAVA.
+ *    Fechadura: NENHUMA. Cada porta e presa por um ima simples; o fim de
+ *      curso e o unico sensor dela.
  *    UART com a placa das telas (Serial2, 115200 8N1)
  *      TX2 (GPIO17) -> RX da placa das telas
  *      RX2 (GPIO16) <- TX da placa das telas
  *      GND comum. Nada de 5 V entre as duas placas.
- *    LED de status (opcional) -> D25
+ *    LED "pode abrir" -> D25 (aceso enquanto a abertura esta AUTORIZADA)
  *
  *  COMANDOS DE BANCADA (Monitor Serial da USB, 115200)
  *    R -> entra no modo REGISTRO (aproxime a tag a cadastrar)
@@ -58,7 +63,7 @@
  *  Compilar:
  *    arduino-cli compile --fqbn esp32:esp32:esp32 porta/porta_nr12
  *
- *  PARADA SO POR SOFTWARE (decisao de prototipo). Em producao, uma auditoria
+ *  PARADA SO POR SOFTWARE (decisao de prototipo), e porta SEM trava. Em producao, uma auditoria
  *  NR-12 exige o fim de curso cortando fisicamente a energia dos motores (rele
  *  de seguranca). Ver porta/README.md.
  * =====================================================================
@@ -89,23 +94,24 @@
 // ES2 = FRENTE. Constante UNICA de proposito: se a gravacao pela USB falhar,
 // mude para 33 (D2 e pino de boot) e tire o resistor de 10k.
 #define PIN_ENDSTOP2 2
+// "Pode abrir": aceso SO em LIBERADA. Sem fechadura eletrica, e ele que diz a
+// quem passou a tag que a maquina ja parou.
 #define PIN_LED_OK   25
-#define PIN_SOLENOIDE 26  // energizado = destrava
 #define PIN_UART_RX  16   // RX2 <- TX da placa das telas
 #define PIN_UART_TX  17   // TX2 -> RX da placa das telas
 
 // ---------------------------------------------------------------------
 // TEMPOS
 // ---------------------------------------------------------------------
-// Janela padrao do solenoide, se o `porta_liberar` nao trouxer `janela_ms`.
+// Janela padrao da autorizacao, se o `porta_liberar` nao trouxer `janela_ms`.
 const unsigned long JANELA_LIBERACAO_MS = 10000;
 // O que se aceita de `janela_ms`: o central e quem decide, mas um numero
-// absurdo vindo do fio nao pode deixar a porta destravada por uma hora.
+// absurdo vindo do fio nao pode deixar a abertura autorizada por uma hora.
 const unsigned long JANELA_MIN_MS = 1000;
 const unsigned long JANELA_MAX_MS = 60000;
 // Quanto se espera a resposta do central a um `pedido_acesso`. TEM DE SER
 // MAIOR que `PORTA_PARADA_MAX_S` do central (teto de 4 s) mais o trajeto: o
-// central so libera depois de a maquina confirmar a parada, e uma espera
+// central so autoriza depois de a maquina confirmar a parada, e uma espera
 // menor faria a porta desistir de um pedido que o central ia aceitar. E um
 // LIMITE SUPERIOR, como o `CNC_TETO_TRAJETO_S`, e nao um numero a manter igual.
 const unsigned long ESPERA_CENTRAL_MS = 5000;
@@ -128,14 +134,13 @@ int nTags = 0;
 
 // ---------- estados da porta ----------
 // AGUARDANDO_CENTRAL e o estado novo: a tag e valida, o pedido saiu, e a
-// porta continua TRAVADA ate o central dizer que a maquina parou.
+// abertura NAO esta autorizada ate o central dizer que a maquina parou.
 enum Estado { FECHADA, AGUARDANDO_CENTRAL, LIBERADA, ABERTA_AUTORIZADA, ABERTA_SEM_AUTORIZACAO };
 Estado estado = FECHADA;
 bool aguardandoRearme = false;
 unsigned long tPedido = 0;      // quando o pedido_acesso saiu
-unsigned long tLiberacao = 0;   // quando o solenoide energizou
+unsigned long tLiberacao = 0;   // quando a abertura foi autorizada
 unsigned long janelaMs = JANELA_LIBERACAO_MS;
-bool solenoideLigado = false;
 unsigned long ultimoHeartbeatMs = 0;
 
 // ---------- estados do modo registro ----------
@@ -274,21 +279,14 @@ void listarTags() {
 }
 
 // ---------------------------------------------------------------------
-// SOLENOIDE
+// LED "PODE ABRIR"
 // ---------------------------------------------------------------------
-// Uma funcao so escreve no pino. Energizado SO em LIBERADA: o laco confere
-// isso a cada volta (ver `garantirSolenoide`), e e essa a defesa contra um
-// caminho novo que esqueca de desligar.
-void solenoide(bool ligar) {
-  digitalWrite(PIN_SOLENOIDE, ligar ? HIGH : LOW);
-  digitalWrite(PIN_LED_OK, ligar ? HIGH : LOW);
-  if (ligar != solenoideLigado)
-    logMsg("PORTA", "solenoide %s", ligar ? "ENERGIZADO (destravada)" : "desligado (travada)");
-  solenoideLigado = ligar;
-}
-
-void garantirSolenoide() {
-  if (estado != LIBERADA && solenoideLigado) solenoide(false);
+// Nao ha fechadura: o LED e o unico sinal de que a abertura esta autorizada.
+// Ele segue o ESTADO, e nao um flag a parte — aceso so em LIBERADA, conferido
+// a cada volta do laco. Um caminho novo que esquecesse de apaga-lo diria a
+// alguem para abrir com a maquina andando.
+void atualizarLed() {
+  digitalWrite(PIN_LED_OK, estado == LIBERADA ? HIGH : LOW);
 }
 
 // =====================================================================
@@ -316,9 +314,9 @@ static void emitEstado() {
   emitir(snprintf(jbuf, sizeof jbuf,
     "{\"evento\":{\"origem\":\"porta\",\"tipo\":\"estado\",\"teto\":\"%s\","
     "\"frente\":\"%s\",\"estado\":\"%s\",\"aguardando_rearme\":%s,"
-    "\"solenoide\":%s,\"ts\":\"%s\"}}",
+    "\"ts\":\"%s\"}}",
     nomePorta(es1Fechado), nomePorta(es2Fechado), nomeEstado(estado),
-    aguardandoRearme ? "true" : "false", solenoideLigado ? "true" : "false", ts),
+    aguardandoRearme ? "true" : "false", ts),
     "estado");
   ultimoHeartbeatMs = millis();
 }
@@ -378,7 +376,7 @@ static void mudarEstado(Estado novo) {
   if (novo != estado)
     logMsg("PORTA", "%s -> %s", nomeEstado(estado), nomeEstado(novo));
   estado = novo;
-  garantirSolenoide();
+  atualizarLed();
   emitEstado();
 }
 
@@ -387,9 +385,9 @@ static void mudarEstado(Estado novo) {
 // =====================================================================
 
 static void cmdPortaLiberar(const char* linha, long cmd_id) {
-  // So existe liberacao para um pedido PENDENTE. Liberar uma porta que nao
-  // pediu nada seria destrava-la por um comando atrasado - um `porta_liberar`
-  // que chegou depois de esta placa ter desistido do pedido, por exemplo.
+  // So existe liberacao para um pedido PENDENTE. Autorizar uma porta que nao
+  // pediu nada seria acender o "pode abrir" por um comando atrasado - um
+  // `porta_liberar` que chegou depois de esta placa ter desistido do pedido.
   if (estado != AGUARDANDO_CENTRAL) {
     ackErro(cmd_id, "sem_pedido_pendente");
     logMsg("PORTA", "porta_liberar recusado: estado %s", nomeEstado(estado));
@@ -404,11 +402,9 @@ static void cmdPortaLiberar(const char* linha, long cmd_id) {
   ackOk(cmd_id, false);
   janelaMs   = janela;
   tLiberacao = millis();
-  estado     = LIBERADA;       // ANTES do solenoide: `garantirSolenoide` so o
-  solenoide(true);             // deixa ligado em LIBERADA
   logMsg("PORTA", "LIBERADA pelo central por %lu ms - pode abrir.", janela);
   emitLiberada(janela);
-  mudarEstado(LIBERADA);
+  mudarEstado(LIBERADA);       // acende o LED "pode abrir"
 }
 
 static void cmdPortaNegar(const char* linha, long cmd_id) {
@@ -558,7 +554,7 @@ static void tratarAberturas(bool tetoAntes, bool frenteAntes) {
 
   if (autorizada) {
     logMsg("PORTA", "ALERTA: MAQUINA PAUSADA - PORTA ABERTA.");
-    mudarEstado(ABERTA_AUTORIZADA);     // desliga o solenoide na hora
+    mudarEstado(ABERTA_AUTORIZADA);     // apaga o LED: a autorizacao foi usada
   } else {
     logMsg("PORTA", "PORTA ABERTA SEM AUTORIZACAO! Parada de emergencia.");
     mudarEstado(ABERTA_SEM_AUTORIZACAO);
@@ -600,7 +596,7 @@ static void tratarPrazos(bool fechada) {
   if (estado == AGUARDANDO_CENTRAL && millis() - tPedido > ESPERA_CENTRAL_MS) {
     // Sem resposta do central, a porta NAO abre. Volta a FECHADA sem rearme:
     // o acesso nao aconteceu.
-    logMsg("PORTA", "Central nao respondeu em %lu ms - pedido descartado, porta travada.",
+    logMsg("PORTA", "Central nao respondeu em %lu ms - pedido descartado, abertura NAO autorizada.",
            ESPERA_CENTRAL_MS);
     mudarEstado(FECHADA);
     emitLiberacaoExpirada("central_nao_respondeu");
@@ -625,10 +621,8 @@ static void tratarPrazos(bool fechada) {
 
 // =====================================================================
 void setup() {
-  // O solenoide e a PRIMEIRA coisa: desligado antes de qualquer outra linha.
-  // Um boot (queda de energia, reset) nunca pode deixar a porta destravada.
-  pinMode(PIN_SOLENOIDE, OUTPUT);
-  digitalWrite(PIN_SOLENOIDE, LOW);
+  // O LED "pode abrir" nasce APAGADO, antes de qualquer outra linha: um boot
+  // (queda de energia, reset) nunca pode dizer a alguem que pode abrir.
   pinMode(PIN_LED_OK, OUTPUT);
   digitalWrite(PIN_LED_OK, LOW);
 
@@ -684,7 +678,7 @@ void loop() {
   if (uid.length()) tratarTag(uid);
 
   tratarPrazos(fechada);
-  garantirSolenoide();
+  atualizarLed();
 
   if (millis() - ultimoHeartbeatMs >= HEARTBEAT_MS) emitEstado();
   delay(2);

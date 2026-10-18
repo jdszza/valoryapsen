@@ -95,6 +95,14 @@ struct Trava
 
 static Trava trava = {false, "", -1, ""};
 
+// A faixa da porta NR-12, como o central a monta ("MAQUINA PARADA - PORTA
+// FRENTE ABERTA", "PORTAS FECHADAS - PASSE A TAG PARA RETOMAR", "LINK DA PORTA
+// PERDIDO"). Chega junto com a trava (push `trava` e get_trava), ja em ASCII.
+// Vazia = sem pausa. Dimensionada pela origem: a frase mais longa do central
+// tem 48 caracteres.
+#define MAX_PORTA_FAIXA_LEN 72
+static char porta_faixa[MAX_PORTA_FAIXA_LEN] = "";
+
 struct Dispenser
 {
     char nome[32];
@@ -1510,7 +1518,16 @@ void update_dashboard_ui()
         }
     }
 
-    if (trava.ativa)
+    if (porta_faixa[0])
+    {
+        // A porta NR-12 manda no status da maquina ainda antes da trava: com a
+        // porta aberta (ou o link perdido) a celula esta PARADA, e o que o
+        // operador precisa fazer esta escrito na faixa.
+        lv_label_set_text(dash_machine_icon, LV_SYMBOL_WARNING " MAQUINA PARADA - PORTA");
+        lv_obj_set_style_text_color(dash_machine_icon, lv_color_hex(0xDC2626), 0);
+        lv_label_set_text(dash_machine_msg, porta_faixa);
+    }
+    else if (trava.ativa)
     {
         // A trava manda no status da maquina: a celula esta parada esperando
         // um supervisor, e e isso que o operador precisa ler primeiro.
@@ -3432,6 +3449,11 @@ static void aplicar_trava(JsonObject doc)
     // couber termina em "...", visivel na tela — nunca cortado em silencio.
     if (!copy_trunc(trava.motivo, sizeof(trava.motivo), doc["motivo"] | ""))
         Serial.printf("Trava: motivo maior que %d bytes, truncado com ...\n", MAX_MOTIVO_LEN);
+    char faixa_antes[MAX_PORTA_FAIXA_LEN];
+    copy_trunc(faixa_antes, sizeof(faixa_antes), porta_faixa);
+    copy_trunc(porta_faixa, sizeof(porta_faixa), doc["porta_faixa"] | "");
+    if (strcmp(faixa_antes, porta_faixa) != 0)
+        Serial.printf("Porta NR-12: %s\n", porta_faixa[0] ? porta_faixa : "(sem pausa)");
 
     if (ui_trava_badge)
     {

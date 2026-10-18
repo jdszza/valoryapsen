@@ -14,7 +14,7 @@ Uma porta por firmware, uma linha JSON por mensagem:
 | `dispenser-adapter` | as 8 telas TFT              | uma (a SEGUNDA porta do mesmo adapter) | `dispenser_tft` | [`dispenser/telas_tft/`](../dispenser/README.md) |
 | `cnc-adapter`       | a mesa CNC                  | uma   | `cnc`              | — |
 | `weight-adapter`    | a balança HX711             | uma   | `weight`           | [`weight/balanca2_3/`](../weight/README.md) |
-| `dispenser-adapter` | a porta NR-12 (RC522 + fins de curso + solenoide) | **nenhuma** — viaja DENTRO da porta das telas, por UART entre as duas ESPs | `porta` | [`porta/porta_nr12/`](../porta/README.md) |
+| `dispenser-adapter` | a porta NR-12 (RC522 + fins de curso; porta presa por ímã) | **nenhuma** — viaja DENTRO da porta das telas, por UART entre as duas ESPs | `porta` | [`porta/porta_nr12/`](../porta/README.md) |
 
 Três dos quatro firmwares estão escritos. A balança foi a primeira
 (`weight/balanca2_3/`, manual em `weight/README.md`) e as duas placas do
@@ -163,8 +163,9 @@ aqui é o contrato; o que está lá é a placa.
 | `cmd` | campos | efeito |
 |---|---|---|
 | `carregar` | `dispenser_id`, `medicamento`, `sku`, `categoria`, `quantidade`, `os_id` | carrega o slot |
-| `dispensar` | `dispenser_id`, `os_id`, `injetar_falha` (opcional) | dispensa a carga do slot |
+| `dispensar` | `dispenser_id`, `os_id`, `injetar_falha` (opcional), `quantidade` (opcional) | dispensa a carga do slot — `quantidade` só na RETOMADA depois de um `parar` |
 | `limpar` | `dispenser_id`, `solicitado_por` | esvazia o slot |
+| `parar` | `motivo` (opcional) | a dispensa em curso termina a unidade atual e para (porta NR-12, §9) |
 
 ### Eventos (placa → adapter, dentro de `{"evento":{...}}`)
 
@@ -173,6 +174,7 @@ aqui é o contrato; o que está lá é a placa.
 | `carregado` | `dispenser_id`, `os_id`, `medicamento`, `sku`, `categoria`, `quantidade_total`, `quantidade_residual`, `via_residual`, `ts` |
 | `dispensado` | `dispenser_id`, `os_id`, `medicamento`, `quantidade_dispensada`, `quantidade_alvo`, `falha_mecanica`, `motivo_falha`, `quantidade_residual`, `falha_injetada`, `ts` |
 | `limpeza_ok` | `dispenser_id`, `medicamento_limpo`, `solicitado_por`, `ts` |
+| `dispensado_parcial` | `dispenser_id`, `os_id`, `medicamento`, `quantidade_confirmada`, `quantidade_pedida`, `quantidade_residual`, `ts` |
 | `erro` | `dispenser_id`, `os_id`, `codigo_erro`, `descricao`, `ts` |
 | `telemetria` | `dispenser_id`, `componente`, `tipo_leitura`, `valor_c`, `unidade`, `ts` |
 | `status` | `dispenser_id`, `status`, `os_id`, `medicamento`, `quantidade`, ... `ts` |
@@ -184,6 +186,29 @@ não têm `os_id`").
 
 `erro` com `codigo_erro: "limpeza_em_operacao"` é a recusa de limpar um slot que
 está carregando ou dispensando.
+
+### `parar` — termina a unidade, para, e diz quantas caíram
+
+É o comando da porta NR-12 aberta (§9): o central para a célula inteira, e o
+dispenser que estiver no meio de uma dispensa **termina a unidade atual e
+para** — o braço completa o ciclo e o pulso do IR daquela unidade é esperado no
+prazo de sempre. Parar o braço no meio deixaria uma caixa presa na boca do
+dispenser, contada por ninguém.
+
+* com dispensa em curso: ACK na hora, e depois `dispensado_parcial` com
+  `quantidade_confirmada` (o que o IR contou) e `quantidade_pedida`. O slot
+  **continua da OS**, PRONTO, com o restante como alvo;
+* sem dispensa em curso: **só o ACK** — não há o que parar;
+* `cmd_id` repetido: ACK de novo, sem executar, como todo comando.
+
+`parar` é aceito COM slot em operação, ao contrário dos outros três: ele quase
+sempre chega no meio de um `dispensar`, pelo `serialPoll` de dentro do laço. Se
+a última unidade já tinha saído quando ele chegou, a dispensa termina normal e o
+que sai é o `dispensado` de sempre.
+
+Na retomada, o central manda `dispensar` com `quantidade` = pedida − confirmada.
+`dispensado_parcial` **não é falha**: não vira alarme, e o Triple Check do slot
+compara o TOTAL das duas partes.
 
 ---
 
@@ -208,6 +233,46 @@ máximo, para **cancelar**. Ver "Por que o relógio e não a confirmação", aba
 | `mover` | `dispenser_alvo`, `os_id`, `receita`, `ciclo_atual`, `total_ciclos` | move a mesa até o slot |
 | `homing` | `os_id`, `posicao_x` (opcional), `posicao_y` (opcional) | volta ao HOME |
 | `estado_celula` | `trava_ativa`, `trava_slot_id` (opcional), `os_id` (opcional), `trava_resumo` (opcional) | trava do Triple Check |
+| `parar` | `motivo` (opcional) | para o movimento em curso ONDE ESTÁ, sem homing (porta NR-12, §9) |
+| `centro` | `os_id` | leva a mesa ao centro operacional — fim de OS, depois da conferência final da caixa |
+
+**`centro` é a voz de máquina do `C` humano, e a posição é uma só.** O terminal
+de bancada já tinha `C` (e `CENTRO`), que vai ao centro operacional gravado na
+NVS (`CENTRO_X_MM`/`CENTRO_Y_MM`, ajustado por `NOVOCENTRO`). O comando de
+máquina chama a MESMA função de movimento (`ir_ao_centro()`): dois centros — um
+para o humano, outro para o central — concordariam só até o primeiro
+`NOVOCENTRO`. O nome no JSON é `centro`, e não a letra, pela regra de todo o
+vocabulário de máquina (`mover`, `homing`, `parar`): a letra é do humano, e as
+duas vozes se separam pelo `{`, não pelo nome.
+
+Ele segue as regras do `mover`, campo a campo:
+
+* **ACK idempotente** — `cmd_id` repetido responde ACK de novo e NÃO move
+  (§2): o central pode reenviar `centro` pelo console ("reenviar centro"), e um
+  reenvio por ACK perdido não pode virar dois movimentos;
+* **recusa antes do ACK** — `travado` com a trava ativa, `sem_homing` sem
+  homing bem-sucedido nesta energização (centro sem referência é um ponto que
+  não existe), `fora_do_envelope` se o centro gravado caiu fora dos limites,
+  `limit_disparado` com fim de curso já acionado. ACK negativo E evento `erro`,
+  sempre os dois. Mesa já andando: só ACK negativo, como o `mover`;
+* **`parar` vale no meio** — o mesmo passo do `sync_move` confere a flag: a mesa
+  fica onde parou, sem origem, e nenhum evento sai;
+* **chegada é `posicionado` com `destino: "centro"`** e `dispenser_alvo: 0` (não
+  existe dispenser 0); falha depois do ACK é `erro` com `dispenser_alvo: 0` e o
+  `codigo_erro` do vocabulário fechado abaixo;
+* **NÃO emite `concluido`.** `concluido` é o fim de um homing, e a mesa no centro
+  não está no HOME. Quem decide que a OS acabou é o central, ao receber a
+  chegada ao centro (CLAUDE.md, "A caixa é conferida duas vezes no HOME").
+
+**`parar` é o caminho de parada da trava SEM o retorno ao HOME.** A flag é
+conferida no mesmo passo do `sync_move` que confere a trava, e o ACK sai na
+hora — é ele que o central espera para autorizar a porta. Interrompido, o
+`mover` não emite evento (quem parou foi o central) e a placa **perde a
+origem**: `ja_fez_homing` vai a `false`, e todo `mover` seguinte é recusado com
+`sem_homing` até o homing que o central manda na RETOMADA, com a porta fechada
+e rearmada. Mover a mesa até o HOME com alguém com a mão na célula seria o
+contrário do que a porta existe para garantir. Com a mesa parada, `parar` é só o
+ACK.
 
 **A coordenada NÃO vem no comando — o endereço é o dispenser.** O roteiro é
 medido na bancada e gravado na placa, waypoint a waypoint, indexado pelo
@@ -228,13 +293,19 @@ para o log da placa, e **não** é usada para achar a posição.
 
 | `tipo` | campos principais |
 |---|---|
-| `posicionado` | `os_id`, `dispenser_alvo`, `posicao_x`, `posicao_y`, `ciclo_atual`, `total_ciclos`, `ts` |
+| `posicionado` | `os_id`, `dispenser_alvo`, `destino`, `posicao_x`, `posicao_y`, `ciclo_atual`, `total_ciclos`, `ts` |
 | `concluido` | `os_id`, `posicao_x`, `posicao_y`, `ts` |
 | `erro` | `os_id`, `dispenser_alvo`, `codigo_erro`, `descricao`, `ts` |
 | `telemetria` | `componente`, `tipo_leitura`, `valor`, `unidade`, `ts` |
 
 Os três primeiros são transição, e os três viram linha em `cnc_eventos` no
 central (CLAUDE.md, "Só transição vira linha").
+
+`destino` diz para ONDE a mesa foi: `"dispenser"` na chegada de um `mover`,
+`"centro"` na do `centro`. Ele existe nos dois para o `posicionado` ter UMA forma
+só — o central roteia pela chave, e um evento com dois formatos é um campo que
+some sem erro do lado que não o esperava. `dispenser_alvo: 0` acompanha o
+`centro` (no `posicionado` e no `erro`) porque não existe dispenser 0.
 
 **`estado_celula` PRODUZ evento na mesa**, e é a diferença dela para a placa das
 telas, onde o mesmo comando só pinta. A tabela acima não dizia isso, e o
@@ -293,10 +364,10 @@ ler.
 | `codigo_erro` | comando | quando |
 |---|---|---|
 | `dispenser_invalido` | `mover` | `dispenser_alvo` fora de 1..`NUM_SLOTS` |
-| `fora_do_envelope` | `mover` | o waypoint calibrado caiu fora dos limites da mesa |
-| `sem_homing` | `mover` | origem nunca estabelecida — mande `homing` antes |
-| `limit_disparado` | `mover` | fim de curso acionado, antes ou durante o movimento |
-| `travado` | `mover` | trava do Triple Check ativa |
+| `fora_do_envelope` | `mover`, `centro` | o waypoint calibrado (ou o centro gravado) caiu fora dos limites da mesa |
+| `sem_homing` | `mover`, `centro` | origem nunca estabelecida — mande `homing` antes |
+| `limit_disparado` | `mover`, `centro` | fim de curso acionado, antes ou durante o movimento |
+| `travado` | `mover`, `centro` | trava do Triple Check ativa |
 | `homing_falhou` | `homing` | um dos eixos não achou o fim de curso no prazo |
 | `receita_desconhecida` | `mover` | **só o `cnc_simulator`** — a receita não está entre as gravadas |
 
@@ -518,7 +589,7 @@ de texto, nunca uma caixa aproximada.
 | `cmd` | campos | efeito |
 |---|---|---|
 | `slot` | `dispenser_id`, `medicamento`, `sku`, `categoria`, `quantidade_alvo`, `quantidade_dispensada`, `quantidade_residual`, `status`, `os_id` | redesenha a tela do slot |
-| `estado_celula` | `trava_ativa`, `trava_slot_id`, `os_id`, `trava_resumo` | há trava na célula, e de que slot é |
+| `estado_celula` | `trava_ativa`, `trava_slot_id`, `os_id`, `trava_resumo`, `pausa_porta` (opcional), `pausa_resumo` (opcional) | há trava na célula, e de que slot é; e se a porta NR-12 parou a célula (§9) |
 
 **`slot` sai na transição, e só nela:** ao aceitar `carregar`/`dispensar`/
 `limpar` (estado que o adapter acabou de comandar) e ao receber `carregado`,
@@ -552,6 +623,14 @@ adapter loga e segue. Tela errada é cosmética; dispensa atrasada não é.
 | `trava_ativa=false`, sem imagem | texto: D{n} · status · nome (ou **VAZIO**) · dispensada/alvo |
 | `trava_ativa=true` e `trava_slot_id` == meu id | fundo vermelho + **AGUARDE SUPERVISOR** + `trava_resumo` |
 | `trava_ativa=true` e outro slot | a mesma tela, com a faixa **PARADO — D{n}** no topo |
+| `pausa_porta=true` (e não é a trava DESTE slot) | o conteúdo esmaecido, com a faixa vermelha `pausa_resumo` no topo |
+
+`pausa_resumo` é a faixa do central (`MAQUINA PARADA - PORTA FRENTE ABERTA`,
+`PORTAS FECHADAS - PASSE A TAG PARA RETOMAR`, `LINK DA PORTA PERDIDO`), em
+ASCII e no mesmo teto de 48 do `trava_resumo`. Os dois campos da pausa só vêm
+quando há pausa, ou no aviso da retomada (`pausa_porta: false`); ausentes, a
+placa trata como "sem pausa" — e o aviso de trava sem porta sai byte a byte
+como antes.
 
 ### Eventos (placa → adapter, dentro de `{"evento":{...}}`)
 
@@ -638,7 +717,7 @@ tudo verde para sempre, inclusive com o protocolo quebrado.
 ## 9. `porta` — a porta NR-12
 
 **Duas portas físicas da célula, uma ESP, e nenhuma porta USB no mini PC.** A
-ESP da porta (RC522 + dois fins de curso + solenoide) fala por **UART
+ESP da porta (RC522 + dois fins de curso) fala por **UART
 dedicada** (Serial2, 115200) com a placa das 8 telas TFT, e a placa das telas
 repassa as mensagens nos dois sentidos pela USB que ela já tem com o
 `dispenser-adapter`. O USB da própria ESP da porta é só de bancada — cadastro de
@@ -652,6 +731,13 @@ ESP da porta ──UART (Serial2)──> ESP das telas ──USB──> dispense
 As duas portas são **ES1 = `teto`** (abastecer remédio) e **ES2 = `frente`** (a
 caixa sobre a balança). A célula só está FECHADA com as duas fechadas.
 
+**Não há fechadura elétrica.** Cada porta é presa por um ímã simples, e o fim de
+curso é o único sensor dela: quem puxa, abre — a qualquer momento. O que o
+protocolo controla não é a abertura, é a AUTORIZAÇÃO dela. `porta_liberar`
+acende o LED "pode abrir" da placa; aberta com ele aceso, a abertura é
+autorizada; aberta antes (ou sem tag), é sem autorização — alarme, e a célula
+para do mesmo jeito.
+
 **Firmware:** `porta/porta_nr12/porta_nr12.ino`, com a 4ª cópia de
 `apsen_serial.h` — a mesma voz de máquina das outras placas, só que sobre o
 Serial2. Manual em [`porta/README.md`](../porta/README.md).
@@ -661,12 +747,12 @@ Serial2. Manual em [`porta/README.md`](../porta/README.md).
 | decisão | quem decide | por quê |
 |---|---|---|
 | a TAG é válida | a porta (lista local na NVS) | o cadastro é físico, feito na bancada pelo USB da própria porta |
-| a porta ABRE (solenoide) | o central | só ele sabe se a máquina parou; a porta só destrava depois de a CNC e os dispensers confirmarem a parada |
+| a abertura é AUTORIZADA (LED "pode abrir") | o central | só ele sabe se a máquina parou; o LED só acende depois de a CNC e os dispensers confirmarem a parada |
 | a máquina PARA | o central, na hora | qualquer porta aberta, pedido de acesso ou link perdido |
 | a máquina RETOMA | o central, no `rearme` | fechar a porta não religa nada: a tag é o comando deliberado |
 
-**Sem resposta do central, a porta não abre.** Ela pede (`pedido_acesso`), o
-central para tudo e só então manda `porta_liberar`. A porta espera essa resposta
+**Sem resposta do central, a abertura não é autorizada.** A porta pede
+(`pedido_acesso`), o central para tudo e só então manda `porta_liberar`. A porta espera essa resposta
 por `ESPERA_CENTRAL_MS` (5 s) e, sem ela, volta a FECHADA. O número **tem de ser
 maior** que `PORTA_PARADA_MAX_S` do central (teto 4 s) mais o trajeto: é um
 limite superior, como o `CNC_TETO_TRAJETO_S` — não um fato duplicado.
@@ -698,20 +784,20 @@ a placa das telas.
 
 | `cmd` | campos | efeito |
 |---|---|---|
-| `porta_liberar` | `janela_ms` | energiza o solenoide pela janela (só em AGUARDANDO_CENTRAL) |
+| `porta_liberar` | `janela_ms` | autoriza a abertura pela janela e acende o LED "pode abrir" (só em AGUARDANDO_CENTRAL) |
 | `porta_negar` | `motivo` | o central recusou o acesso; a porta volta a FECHADA, sem rearme pendente |
 | `porta_estado` | — | pede um `estado` imediato (usado na reconexão) |
 
 ACK idempotente como em todo o resto: `cmd_id` repetido é respondido sem
 executar. `porta_liberar` fora de AGUARDANDO_CENTRAL é **ACK negativo**
-(`sem_pedido_pendente`): liberar uma porta que não pediu nada seria destravá-la
-por um comando atrasado.
+(`sem_pedido_pendente`): autorizar uma porta que não pediu nada seria acender o
+"pode abrir" por um comando atrasado.
 
 ### Eventos (placa → adapter, dentro de `{"evento":{...}}`)
 
 | `tipo` | campos principais |
 |---|---|
-| `estado` | `origem`, `teto`, `frente`, `estado`, `aguardando_rearme`, `solenoide`, `ts` |
+| `estado` | `origem`, `teto`, `frente`, `estado`, `aguardando_rearme`, `ts` |
 | `pedido_acesso` | `origem`, `uid`, `ts` |
 | `tag_negada` | `origem`, `uid`, `ts` |
 | `liberada` | `origem`, `janela_ms`, `ts` |

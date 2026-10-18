@@ -189,3 +189,39 @@ def test_endpoint_de_captura_devolve_a_camera_escolhida(visao):
     resposta = visao.modulo.executar_capturar_dispenser(req)
 
     assert resposta["camera"] == "dispenser_dir"
+
+
+# ── As fotos do HOME não sorteiam ─────────────────────────────────────────────
+
+@pytest.mark.parametrize("os_id,esperado", [("VAZIA-OS-1", 0), ("VAZIA-OS-1-2", 0),
+                                            ("FINAL-OS-1", 17), ("OS-1", 0)])
+def test_foto_do_home_devolve_o_esperado_sem_sorteio(carregar_simulador, os_id, esperado):
+    """Caixa vazia (esperado 0) e caixa cheia (`FINAL-`) não podem falhar por
+    sorteio: elas decidem se a OS começa e se a mesa vai ao centro. Mesmo com
+    falha e divergência certas no sorteio, o resultado é a contagem esperada."""
+    sim = carregar_simulador("vision", env={
+        "PROB_FALHA_LEITURA_MESA": "1", "PROB_DIVERGENCIA_MESA": "1",
+        "T_SCAN_MESA": "0", "MODO_APRESENTACAO": "0"})
+
+    sim.modulo._do_capturar_mesa(1, os_id, esperado, 0.0, 0.0)
+
+    (evento,) = sim.eventos
+    assert evento["tipo"] == "leitura_mesa_ok"
+    assert evento["quantidade_detectada"] == esperado
+    assert evento["os_id"] == os_id
+
+
+def test_foto_por_slot_continua_sorteando(carregar_simulador):
+    """Controle: a mesma configuração numa foto de slot falha — o caminho do
+    sorteio não sumiu."""
+    sim = carregar_simulador("vision", env={
+        "PROB_FALHA_LEITURA_MESA": "1", "T_SCAN_MESA": "0", "MODO_APRESENTACAO": "0"})
+    sim.modulo._do_capturar_mesa(2, "OS-1", 5, 0.0, 0.0)
+    assert sim.eventos[0]["tipo"] == "leitura_mesa_falha"
+
+
+def test_injecao_explicita_na_final_ainda_vale(carregar_simulador):
+    sim = carregar_simulador("vision", env={"T_SCAN_MESA": "0"})
+    sim.modulo._do_capturar_mesa(1, "FINAL-OS-1", 5, 0.0, 0.0,
+                                 injetar_falha="divergencia_mesa")
+    assert sim.eventos[0]["quantidade_detectada"] == 6

@@ -152,7 +152,7 @@ def main() -> int:
     adapter_url = f"http://127.0.0.1:{porta_adapter}"
 
     # ── O orquestrador de verdade ─────────────────────────────────────────────
-    os.environ.update({"VISAO_MESA_POSICOES": POSICOES_VISIVEIS, "VISAO_MESA_FINAL": "",
+    os.environ.update({"VISAO_MESA_POSICOES": POSICOES_VISIVEIS,
                        "VISION_ADAPTER_URL": adapter_url, "APSEN_ENV": "dev"})
     spec = importlib.util.spec_from_file_location("ensaio_orchestrator", CENTRAL / "orchestrator.py")
     orq = importlib.util.module_from_spec(spec)
@@ -243,7 +243,13 @@ def main() -> int:
             print(f"  D{f['slot_id']}: quantidade_esperada={f['quantidade_esperada']} "
                   f"slots_cobertos={f['slots_cobertos']} quantidade_slot={f['quantidade_slot']}")
         print("Eventos que a estação devolveu (pelo vision-adapter):")
-        da_mesa = {e["slot_id"]: e for e in eventos if e["tipo"].startswith("leitura_mesa_")}
+        # As fotos do HOME (VAZIA-/FINAL-) vêm com slot 1 e `os_id` próprio: o
+        # mapa por slot é só o das fotos da OS.
+        da_mesa = {e["slot_id"]: e for e in eventos
+                   if e["tipo"].startswith("leitura_mesa_") and e.get("os_id") == OS_ID}
+        do_home = {e["os_id"].split("-", 1)[0]: e for e in eventos
+                   if e["tipo"].startswith("leitura_mesa_")
+                   and str(e.get("os_id", "")).startswith(("VAZIA-", "FINAL-"))}
         for slot, e in sorted(da_mesa.items()):
             print(f"  D{slot}: {e['tipo']:<26} detectada={e['quantidade_detectada']} "
                   f"de {e['quantidade_esperada']} (total na caixa "
@@ -259,6 +265,8 @@ def main() -> int:
             print(f"  {'OK   ' if cond else 'FALHA'}  {texto}")
             return cond
 
+        fotos_home = [f for f in fotos if f.get("etapa")]
+        fotos = [f for f in fotos if not f.get("etapa")]
         por_slot = {f["slot_id"]: f for f in fotos}
         resultado = all([
             conferir([f["slot_id"] for f in fotos] == [1, 3, 4], "fotos só de D1, D3 e D4 (D2 sem comando)"),
@@ -271,6 +279,12 @@ def main() -> int:
                      and da_mesa[4]["quantidade_detectada"] < da_mesa[4]["quantidade_esperada"],
                      "D4 divergência a menos"),
             conferir("contagem_camera_abaixo" in alarmes, "alarme contagem_camera_abaixo"),
+            conferir([f["etapa"] for f in fotos_home] == ["caixa_vazia", "caixa_final"],
+                     "uma foto da caixa vazia e uma da caixa cheia no HOME"),
+            conferir(do_home.get("VAZIA", {}).get("quantidade_detectada") == 0,
+                     "caixa vazia contou 0"),
+            conferir(do_home.get("FINAL", {}).get("quantidade_total_anterior") == 0,
+                     "FINAL contou a caixa inteira (acumulado anterior 0)"),
             conferir(not travas, "nenhuma trava"),
             conferir(status[-1:] == ["concluida"], "OS concluída"),
         ])

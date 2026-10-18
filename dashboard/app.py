@@ -112,6 +112,9 @@ STATUS_COR = {
     "dispensando":              "primary",
     "aguardando":               "secondary",
     "em_andamento":             "primary",
+    "aguardando_caixa_vazia":   "warning",
+    "conferindo_caixa":         "info",
+    "indo_ao_centro":           "info",
     "em_operacao":              "primary",
     "atribuicao_recebida":      "info",
 }

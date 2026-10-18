@@ -167,13 +167,24 @@ services:
       # 0 desliga a conferência de SKU pela câmera dos dispensers: os slots
       # seguem sem conferência de produto, sem mandar comando nem retentar.
       VISAO_SKU_HABILITADA: ${VISAO_SKU_HABILITADA:-1}
+      # A célula tem porta NR-12? 1 = o central nasce PARADO até ouvir o
+      # primeiro `estado` da porta (porta muda é porta aberta). 0 na planta
+      # simulada: ela não tem porta.
+      PORTA_NR12_HABILITADA: ${PORTA_NR12_HABILITADA:-0}
+      PORTA_PARADA_MAX_S: ${PORTA_PARADA_MAX_S:-3}
       # Slots em que a câmera da mesa vê a caixa INTEIRA (medido na bancada).
       # Fora deles não há foto: o slot é conferido junto com o próximo visível.
       # Vazio = todas — e o pré-voo avisa quando a câmera da mesa é a real e o
       # mapa ainda não foi medido (por isso o default é vazio, e não "1,...,8").
       VISAO_MESA_POSICOES: ${VISAO_MESA_POSICOES:-}
-      # Vazio = desligado; HOME = confere no HOME o que ficou sem conferência.
-      VISAO_MESA_FINAL: ${VISAO_MESA_FINAL:-}
+      # A caixa de coleta conferida no HOME: vazia antes da OS, cheia depois
+      # (CLAUDE.md, "A caixa é conferida duas vezes no HOME"). 0 pula as duas
+      # fotos (bancada sem câmera da mesa). Inclua HOME em VISAO_MESA_POSICOES
+      # depois de medir que a câmera vê a caixa inteira lá.
+      VISAO_CAIXA_VAZIA: ${VISAO_CAIXA_VAZIA:-1}
+      VISAO_CAIXA_VAZIA_REPETIR_S: ${VISAO_CAIXA_VAZIA_REPETIR_S:-10}
+      # Espera pela chegada da mesa ao centro (fim da OS).
+      TIMEOUT_CNC_CENTRO: ${TIMEOUT_CNC_CENTRO:-30}
       # Teto de OS ESPERANDO na fila (a em execução já saiu dela). Atingido o
       # teto, POST /api/v1/ordens responde 429 sem persistir. Faixa 1..1000.
       MAX_FILA_OS: 5

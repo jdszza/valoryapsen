@@ -265,6 +265,9 @@ CAMPOS_ESPERADOS = {
         "dispensado": ("dispenser_id", "os_id", "medicamento", "quantidade_dispensada",
                        "quantidade_alvo", "falha_mecanica", "motivo_falha",
                        "quantidade_residual", "falha_injetada", "ts"),
+        "dispensado_parcial": ("dispenser_id", "os_id", "medicamento",
+                               "quantidade_confirmada", "quantidade_pedida",
+                               "quantidade_residual", "ts"),
         "limpeza_ok": ("dispenser_id", "medicamento_limpo", "solicitado_por", "ts"),
         "erro": ("dispenser_id", "os_id", "codigo_erro", "descricao", "ts"),
         "telemetria": ("dispenser_id", "componente", "tipo_leitura", "valor_c",
@@ -278,7 +281,7 @@ CAMPOS_ESPERADOS = {
     },
 }
 
-PISO_EVENTOS = {"dispenser": 6, "dispenser_tft": 2}
+PISO_EVENTOS = {"dispenser": 7, "dispenser_tft": 2}
 
 
 def _blocos_de_evento(texto: str) -> dict[str, str]:
@@ -408,7 +411,7 @@ def _comandos_tratados(texto: str) -> set[str]:
 
 
 @pytest.mark.parametrize("sub, esperados", [
-    ("dispenser", {"carregar", "dispensar", "limpar"}),
+    ("dispenser", {"carregar", "dispensar", "limpar", "parar"}),
     ("dispenser_tft", {"slot", "estado_celula"}),
 ])
 def test_cada_placa_trata_exatamente_os_comandos_do_contrato(firmware, sub, esperados):
@@ -891,9 +894,65 @@ def test_a_mesa_nao_ganhou_comando_de_bancada_por_json(firmware):
     A lista é fechada nos dois sentidos de propósito: um comando a mais aqui é
     uma porta nova, e um a menos é uma porta que o adapter promete e a placa não
     atende. `estado_celula` entrou com a trava do Triple Check — ele não muda
-    calibração nenhuma, ele PARA a mesa.
+    calibração nenhuma, ele PARA a mesa. `parar` entrou com a porta NR-12, e
+    pelo mesmo motivo: ele para, sem homing. `centro` entrou com a
+    conferência da caixa no HOME: ele MOVE para o centro já gravado — e não o
+    grava, que é o que o `NOVOCENTRO` humano faz.
     """
-    assert _comandos_tratados(firmware[CNC]) == {"mover", "homing", "estado_celula"}
+    assert _comandos_tratados(firmware[CNC]) == {"mover", "homing", "estado_celula",
+                                                 "parar", "centro"}
+
+
+def test_o_centro_de_maquina_e_o_mesmo_do_terminal(firmware):
+    """Um centro só: o `C` humano e o `centro` do protocolo passam pela mesma
+    função, e ela lê o centro gravado (NVS), sem constante nova."""
+    texto = _cnc(firmware)
+    assert "bool ir_ao_centro()" in texto
+    funcao = _corpo_da_funcao(texto, "bool ir_ao_centro()")
+    assert "CENTRO_X_MM" in funcao and "CENTRO_Y_MM" in funcao
+    humano = texto[texto.index('cmd == "C" || cmd == "CENTRO"'):]
+    assert "ir_ao_centro()" in humano[: humano.index("return;")]
+    maquina = _corpo_da_funcao(texto, "static void cmdCentro(")
+    assert "ir_ao_centro()" in maquina
+    assert "POS_CENTRO" not in texto, "segunda constante de centro"
+
+
+def test_o_centro_recusa_antes_do_ack_e_nao_emite_concluido_na_chegada(firmware):
+    """Sem homing, a posição de centro não vale nada: recusa ANTES do ACK. A
+    chegada é `posicionado` com destino centro — `concluido` é fim de homing, e
+    a OS quem fecha é o central."""
+    texto = _cnc(firmware)
+    centro = _corpo_da_funcao(texto, "static void cmdCentro(")
+    i_ack = centro.index("ackOk(cmd_id, false)")
+    assert centro.index("ERRO_SEM_HOMING") < i_ack
+    assert centro.index("ERRO_TRAVADO") < i_ack
+    assert centro.index("movimento_em_curso") < i_ack
+    depois = centro[i_ack:]
+    assert 'emitPosicionado(os_id, 0, 0, 0, "centro")' in depois
+    # O único `emitConcluido` é o do homing da trava que interrompeu a ida —
+    # depois do `homing_completo()` dela, nunca na chegada.
+    assert depois.count("emitConcluido") == 1
+    assert depois.index("homing_completo()") < depois.index("emitConcluido")
+    assert depois.index("emitConcluido") < depois.index('"centro")')
+    assert "parar_pedido" in depois and "ja_fez_homing = false" in depois
+
+
+def test_parar_da_mesa_para_no_lugar_e_perde_a_origem(firmware):
+    """O caminho da trava, SEM o retorno ao HOME: a flag mora no mesmo passo do
+    `sync_move`, e o `mover` interrompido zera `ja_fez_homing` — o próximo
+    `mover` é `sem_homing` até o homing da retomada. Nenhum evento sai: quem
+    parou a mesa foi o central."""
+    texto = _cnc(firmware)
+    sync = _corpo_da_funcao(texto, "bool sync_move(")
+    assert "trava_ativa || parar_pedido" in sync
+    mover = _corpo_da_funcao(texto, "static void cmdMover(")
+    ramo = mover[mover.index("if (parar_pedido) {"):]
+    ramo = ramo[: ramo.index("return;")]
+    assert "ja_fez_homing = false" in ramo
+    assert "homing_completo" not in ramo and "emit" not in ramo
+    parar = _corpo_da_funcao(texto, "static void cmdParar(")
+    assert parar.index("ackOk(cmd_id, false)") < parar.index("parar_pedido = true")
+    assert "homing_completo" not in parar
 
 
 def test_a_mesa_le_a_serial_durante_o_movimento(firmware):
@@ -923,3 +982,55 @@ def test_a_mesa_le_a_serial_durante_o_movimento(firmware):
     # E uma só: um segundo poll por passo dobraria o custo por pulso sem ler
     # nada a mais, porque o primeiro já drenou o que havia.
     assert sync.count("serialPoll();") == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. `parar` — termina a unidade, para, e diz quantas caíram (porta NR-12)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_parar_e_conferido_entre_unidades_e_nunca_no_meio_de_uma(firmware):
+    """O braço que já saiu completa o ciclo e espera o pulso do IR dela: a
+    checagem mora no TOPO do laço, antes de `soltarUmaUnidade`, e não dentro
+    dele — parar no meio deixaria uma caixa presa, contada por ninguém."""
+    texto = sem_comentarios(firmware["dispenser"])
+    laco = texto[texto.index("  for (int i = 1; i <= a_soltar; i++) {"):]
+    laco = laco[: laco.index("\n  }\n")]
+    assert laco.index("pararPedido") < laco.index("soltarUmaUnidade(canal)")
+    assert "pararPedido" not in _corpo_da_funcao(texto, "static bool soltarUmaUnidade")
+
+
+def test_parar_so_marca_o_pedido_e_responde_ack_sempre(firmware):
+    texto = sem_comentarios(firmware["dispenser"])
+    parar = _corpo_da_funcao(texto, "static void cmdParar(")
+    assert parar.index("ackOk(cmd_id, false)") < parar.index("pararPedido = true")
+    assert "canalEmOperacao < 0" in parar        # sem dispensa: só o ACK
+    for proibido in ("moverCalibrado", "soltarUmaUnidade", "delay("):
+        assert proibido not in parar
+
+
+def test_parada_mantem_o_slot_da_os_com_o_restante(firmware):
+    """Não é estado terminal: o central reenvia `dispensar` só com o que falta,
+    e o slot precisa continuar PRONTO, com o `os_id` e o alvo restante."""
+    texto = sem_comentarios(firmware["dispenser"])
+    corpo = _corpo_da_funcao(texto, "static void cmdDispensar")
+    ramo = corpo[corpo.index("if (parada) {"):]
+    ramo = ramo[: ramo.index("return;")]
+    assert "sl.qtd_alvo = alvo - contadas" in ramo
+    assert "SLOT_PRONTO" in ramo
+    assert "os_id[0] = '\\0'" not in ramo
+    assert "emitDispensadoParcial(slot, os_id, med_evento, contadas, alvo, residual)" in ramo
+    # E a parada vem ANTES de o slot ser devolvido ao pool.
+    assert corpo.index("if (parada) {") < corpo.index("sl.os_id[0] = '\\0'")
+
+
+def test_um_parar_antigo_nao_vale_para_a_dispensa_seguinte(firmware):
+    texto = sem_comentarios(firmware["dispenser"])
+    corpo = _corpo_da_funcao(texto, "static void cmdDispensar")
+    assert corpo.index("pararPedido       = false") < corpo.index("for (int i = 1;")
+
+
+def test_a_retomada_nunca_pede_mais_que_o_alvo(firmware):
+    texto = sem_comentarios(firmware["dispenser"])
+    corpo = _corpo_da_funcao(texto, "static void cmdDispensar")
+    assert '"quantidade", &fqtd' in corpo
+    assert "(int)fqtd < alvo" in corpo

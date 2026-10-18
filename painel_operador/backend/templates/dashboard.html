@@ -15,6 +15,27 @@
 </div>
 
 <!-- Trava do Triple Check: a célula está parada esperando um supervisor -->
+{% if trava and trava.porta_faixa %}
+<div class="alert alert-danger d-flex align-items-center gap-3 mb-4 rounded-3" role="alert" id="porta-banner">
+    <i class="bi bi-door-open fs-3"></i>
+    <div class="flex-grow-1">
+        <div class="fw-bold fs-5">{{ trava.porta_faixa }}</div>
+        <div class="small">Porta NR-12. A célula só retoma com as duas portas fechadas e a tag de rearme.</div>
+        {% if not trava.fonte_ok %}
+        <div class="small text-muted">Último estado conhecido — o central não respondeu à última leitura.</div>
+        {% endif %}
+    </div>
+</div>
+{% endif %}
+{% if trava and trava.caixa_faixa %}
+<div class="alert alert-warning d-flex align-items-center gap-3 mb-4 rounded-3" role="alert" id="caixa-banner">
+    <i class="bi bi-box-seam fs-3"></i>
+    <div class="flex-grow-1">
+        <div class="fw-bold fs-5">{{ trava.caixa_faixa }}</div>
+        <div class="small">Caixa de coleta no HOME: conferida vazia antes da ordem e cheia depois; a mesa só vai ao centro com a contagem confirmada.</div>
+    </div>
+</div>
+{% endif %}
 {% if trava and trava.ativa %}
 <div class="alert alert-danger d-flex align-items-start gap-3 mb-4 rounded-3" role="alert" id="trava-banner">
     <i class="bi bi-lock-fill fs-4 mt-1 flex-shrink-0"></i>

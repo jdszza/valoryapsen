@@ -85,6 +85,7 @@ completo está em [`../docs/PROTOCOLO_SERIAL.md`](../docs/PROTOCOLO_SERIAL.md)
 |---|---|---|
 | `carregado` | fim do `carregar` | `dispenser_id`, `os_id`, `medicamento`, `sku`, `categoria`, `quantidade_total`, `quantidade_residual`, `via_residual` |
 | `dispensado` | fim do `dispensar` | `dispenser_id`, `os_id`, `medicamento`, `quantidade_dispensada`, `quantidade_alvo`, `falha_mecanica`, `motivo_falha`, `quantidade_residual`, `falha_injetada` |
+| `dispensado_parcial` | `parar` no meio de um `dispensar` (porta NR-12 aberta) | `dispenser_id`, `os_id`, `medicamento`, `quantidade_confirmada`, `quantidade_pedida`, `quantidade_residual` |
 | `limpeza_ok` | fim do `limpar` | `dispenser_id`, `medicamento_limpo`, `solicitado_por` |
 | `erro` | qualquer falha que não seja o `dispensado` com `falha_mecanica` | `dispenser_id`, `os_id`, `codigo_erro`, `descricao` |
 | `status` | transição de estado do slot, e periódico | `dispenser_id`, `medicamento`, `sku`, `categoria`, `quantidade`, `status`, `os_id`, `qtd_alvo`, `qtd_dispensada` |
@@ -155,7 +156,17 @@ Para os mecanismos (`sub: "dispenser"`):
  "sku":"APSEN-DIP-500","categoria":"analgesico","quantidade":10,"os_id":"..."}
 {"cmd":"dispensar","cmd_id":8,"dispenser_id":3,"os_id":"..."}
 {"cmd":"limpar","cmd_id":9,"dispenser_id":3,"solicitado_por":"tecnico"}
+{"cmd":"parar","cmd_id":10,"motivo":"porta_aberta"}
+{"cmd":"dispensar","cmd_id":11,"dispenser_id":3,"os_id":"...","quantidade":7}
 ```
+
+**`parar` termina a unidade atual e para** (porta NR-12 aberta). O laço confere
+o pedido ENTRE uma unidade e a seguinte: o braço que já saiu completa o ciclo e
+o pulso do IR dela é esperado no prazo de sempre. Sai `dispensado_parcial` com
+quantas o IR contou, e o slot continua da OS, PRONTO, com o restante como alvo.
+Sem dispensa em curso, `parar` é só o ACK. Na retomada o central manda
+`dispensar` com `quantidade` = o que falta — o comando aceita `quantidade`
+menor que o alvo do slot, nunca maior.
 
 Para as telas (`sub: "dispenser_tft"`):
 
@@ -347,7 +358,7 @@ esta placa, que repassa as mensagens pela USB que já existe
 São os únicos pinos livres que não colidem com a SPI (18/23, e o 19 que a SPI
 reserva como MISO), com DC, RST nem com os oito CS. **Nada de 5 V entre as
 duas placas**: são duas ESP32 em 3V3, e a ligação é só TX, RX e GND. Cabo curto,
-longe dos fios do solenoide e dos motores.
+longe dos fios dos motores.
 
 O que a placa faz com a linha da porta, e nada além disso:
 

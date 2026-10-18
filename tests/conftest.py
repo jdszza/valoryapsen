@@ -439,6 +439,8 @@ class CentralFake:
         }
         self.fora_do_ar = False
         self.caminhos: list[str] = []
+        # `GET /api/v1/porta`: a faixa da porta NR-12. Vazia = sem pausa.
+        self.porta: dict = {"faixa": ""}
 
     def get(self, caminho: str, params: dict | None = None):
         self.caminhos.append(caminho)
@@ -450,6 +452,8 @@ class CentralFake:
             return self.dispensers
         if caminho == "/api/v1/trava":
             return self.trava
+        if caminho == "/api/v1/porta":
+            return self.porta
         if caminho == "/estado":
             return {"ok": True}
         if caminho == "/os/ativa":
@@ -904,12 +908,60 @@ class AdapterFake:
         # que não vem — que é o que o re-scan da trava tratava como "corrigido".
         self.scans_mudos = 0
 
+        # ── A porta NR-12 (`orchestrator.evento_porta`) ──────────────────────
+        # `segurar_dispensas` = N: os N próximos `dispensar` NÃO emitem
+        # `dispensado` — a dispensa fica "saindo", e é um `parar` que a encerra,
+        # com `dispensado_parcial` de `parcial_confirmado` unidades (None = o
+        # dispenser para MUDO, sem contagem).
+        self.segurar_dispensas = 0
+        self.parcial_confirmado: int | None = 0
+        self._dispensa_segurada: dict | None = None
+        # `parar` aceito (ACK) nas duas placas. False encena a máquina que NÃO
+        # confirma a parada — a porta tem de ser negada.
+        self.confirma_parada = True
+        # O homing da retomada é handshake: `concluido` por `{os_id}:homing`.
+        self.homing_falha = False
+        # Ganchos por sufixo de rota, chamados (await) depois de o comando ser
+        # gravado e respondido: é por eles que um teste põe um evento da porta
+        # no MEIO do ciclo — "a porta abriu enquanto D1 dispensava".
+        self.ao_comando: dict = {}
+
+        # ── A caixa de coleta no HOME (fotos VAZIA-/FINAL-) e o centro ───────
+        # `caixa_vazia`: o que as próximas fotos da caixa VAZIA contam, uma por
+        # item (None = a câmera não responde; "falha" = leitura_mesa_falha).
+        # Lista vazia = a caixa está vazia (0). `final_delta` soma à contagem
+        # da caixa CHEIA (+1 = uma a mais), `final_resposta` = None a cala.
+        self.caixa_vazia: list = []
+        self.final_delta = 0
+        self.final_resposta = True
+        # `centro_falhas` = N: as N próximas idas ao centro voltam `erro`
+        # (`centro_mudo` = nem chegada, nem erro).
+        self.centro_falhas = 0
+        self.centro_mudo = False
+        self.recusar_fotos_home = False
+
     async def post(self, url: str, payload: dict, timeout: float = 10.0) -> bool:
         self.chamadas.append({"url": url, "payload": payload})
-        if not self.aceita or any(url.endswith(r) for r in self.recusar_rotas):
+        # As fotos da caixa no HOME (`etapa`) não caem no `recusar_rotas` da
+        # captura da mesa: o teste que recusa a câmera POR SLOT não quer, junto,
+        # uma caixa "sem resposta" que impede a OS de começar — e a espera da
+        # caixa vazia é sem teto. Recusá-las é `recusar_fotos_home`.
+        foto_home = bool(payload.get("etapa"))
+        if foto_home and self.recusar_fotos_home:
+            return False
+        if not self.aceita or (not foto_home
+                               and any(url.endswith(r) for r in self.recusar_rotas)):
+            return False
+        if url.endswith("/comandos/parar") and not self.confirma_parada:
             return False
         self._responder(url, payload)
+        for sufixo, gancho in list(self.ao_comando.items()):
+            if url.endswith(sufixo):
+                await gancho(payload)
         return True
+
+    def para_cnc(self, url: str) -> bool:
+        return url.startswith(self.modulo.settings.CNC_ADAPTER_URL)
 
     def _responder(self, url: str, payload: dict) -> None:
         os_id = payload.get("os_id")
@@ -994,6 +1046,24 @@ class AdapterFake:
                     self._evento(f"{os_id}:posicionado:{slot}",
                                  tipo="posicionado", **medida)
 
+        elif url.endswith("/comandos/parar"):
+            # Só o dos DISPENSERS encerra a dispensa segurada; o da mesa é ACK.
+            if self.para_cnc(url) or self._dispensa_segurada is None:
+                return
+            segurada, self._dispensa_segurada = self._dispensa_segurada, None
+            if self.parcial_confirmado is None:
+                return                         # parou mudo: sem contagem
+            self._evento(f"{segurada['os_id']}:dispensado:{segurada['slot']}",
+                         tipo="dispensado_parcial", dispenser_id=segurada["slot"],
+                         quantidade_confirmada=self.parcial_confirmado,
+                         quantidade_pedida=segurada["alvo"])
+
+        elif url.endswith("/comandos/homing"):
+            if self.homing_falha:
+                self._evento(f"{os_id}:homing", tipo="erro", codigo_erro="homing_falhou")
+            else:
+                self._evento(f"{os_id}:homing", tipo="concluido")
+
         elif url.endswith("/comandos/dispensar"):
             slot = payload["dispenser_id"]
             # O `posicionado` atrasado chega AGORA, com o dispensar já a
@@ -1004,12 +1074,51 @@ class AdapterFake:
                 self._evento(chave, tipo="posicionado", **medida)
             if not self.responder_dispenser:
                 return
-            qtd = (self._carga.get(slot, 0) if self.quantidade_dispensada is None
+            alvo = payload.get("quantidade") or self._carga.get(slot, 0)
+            if self.segurar_dispensas > 0:
+                self.segurar_dispensas -= 1
+                self._dispensa_segurada = {"os_id": os_id, "slot": slot, "alvo": alvo}
+                return
+            qtd = (alvo if self.quantidade_dispensada is None
                    else self.quantidade_dispensada)
             if payload.get("injetar_falha") == "falha_mecanica_dispenser":
                 qtd = max(0, qtd - 1)       # uma a menos, como o simulador
             self._evento(f"{os_id}:dispensado:{slot}", tipo="dispensado",
                          dispenser_id=slot, quantidade_dispensada=qtd)
+
+        elif url.endswith("/comandos/capturar/mesa") and payload.get("etapa"):
+            # Foto da caixa inteira no HOME, sob o alias VAZIA-/FINAL-: a
+            # contagem é ABSOLUTA (o acumulado de um `os_id` novo é zero).
+            slot = payload["slot_id"]
+            esperada = payload["quantidade_esperada"]
+            chave = f"{os_id}:visao_mesa:{slot}"
+            if payload["etapa"] == "caixa_vazia":
+                contagem = self.caixa_vazia.pop(0) if self.caixa_vazia else 0
+            else:
+                contagem = (esperada + self.final_delta) if self.final_resposta else None
+            if contagem is None:
+                return
+            if contagem == "falha":
+                self._evento(chave, tipo="leitura_mesa_falha", motivo="camera_desalinhada",
+                             quantidade_esperada=esperada, quantidade_detectada=0)
+                return
+            self._evento(chave,
+                         tipo="leitura_mesa_ok" if contagem == esperada
+                         else "leitura_mesa_divergencia",
+                         quantidade_esperada=esperada, quantidade_detectada=contagem,
+                         confianca=0.97)
+
+        elif url.endswith("/comandos/centro"):
+            if self.centro_mudo:
+                return
+            if self.centro_falhas > 0:
+                self.centro_falhas -= 1
+                self._evento(f"{os_id}:centro", tipo="erro", dispenser_alvo=0,
+                             codigo_erro="limit_disparado",
+                             descricao="fim de curso disparou durante a ida ao centro")
+                return
+            self._evento(f"{os_id}:centro", tipo="posicionado", destino="centro",
+                         dispenser_alvo=0, posicao_x=171.0, posicao_y=9.0)
 
         elif url.endswith("/comandos/capturar/mesa"):
             slot = payload["slot_id"]
@@ -1027,7 +1136,8 @@ class AdapterFake:
         elif url.endswith("/comandos/pesar"):
             self._evento(f"{os_id}:peso:{payload['slot_id']}", **self._pesagem(payload))
 
-        # `/comandos/homing` não tem evento aguardado — nada a devolver.
+        # `/comandos/porta/*` não têm evento: a porta responde pela UART, e
+        # quem encena a porta é o teste (`orchestrator.evento_porta`).
 
     @staticmethod
     def _pesagem(payload: dict) -> dict:

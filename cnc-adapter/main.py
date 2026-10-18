@@ -5,6 +5,7 @@ Bridge bidirecional entre o Computador Central e a mesa CNC.
 Fluxo entrada (← Central):
   POST /comandos/mover    → `mover`  na mesa CNC
   POST /comandos/homing   → `homing` na mesa CNC
+  POST /comandos/centro   → `centro` na mesa CNC (fim da OS, depois da conferência da caixa)
 
 Fluxo saída (← mesa CNC):
   POST /eventos           → normaliza e encaminha para central-computer POST /api/v1/eventos/cnc
@@ -248,6 +249,8 @@ _ROTAS_SIM = {
     "mover":         "/executar/mover",
     "homing":        "/executar/homing",
     "estado_celula": "/executar/estado-celula",
+    "parar":         "/executar/parar",
+    "centro":        "/executar/centro",
 }
 
 # Teto do resumo que vai para a placa, igual ao do dispenser-adapter. O motivo
@@ -432,6 +435,39 @@ async def cmd_estado_celula(req: EstadoCelulaReq):
             "trava_resumo":  resumo,
         },
     )
+    return _resposta(resultado)
+
+
+class ComandoPararReq(BaseModel):
+    motivo: str = "porta_aberta"
+
+
+@app.post("/comandos/parar")
+async def cmd_parar(req: ComandoPararReq):
+    """A mesa para ONDE ESTÁ (porta NR-12) — sem ir ao HOME.
+
+    É o caminho de parada da trava sem o homing: o homing é da RETOMADA, com
+    a porta fechada. O ACK é o que o central espera para autorizar a porta.
+    """
+    logger.warning("[CMD] PARAR mesa (%s)", req.motivo)
+    resultado = await _enviar("parar", {"motivo": req.motivo})
+    return _resposta(resultado)
+
+
+class ComandoCentroReq(BaseModel):
+    os_id: str
+
+
+@app.post("/comandos/centro")
+async def cmd_centro(req: ComandoCentroReq):
+    """A caixa conferida vai ao centro operacional — o fim da OS.
+
+    Mesmo tratamento de ACK e de erro do `mover`: recusa da placa (sem homing,
+    trava) é 502 na hora, e a chegada sobe como `posicionado` com
+    `destino: "centro"`. O centro é o gravado NA PLACA; nada de coordenada aqui.
+    """
+    logger.info("[CMD] CENTRO ← OS %s", req.os_id)
+    resultado = await _enviar("centro", {"os_id": req.os_id})
     return _resposta(resultado)
 
 

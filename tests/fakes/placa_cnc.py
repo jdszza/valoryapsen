@@ -31,6 +31,10 @@ _PASSO_MM = 88.0
 _Y_MM     = 131.0
 HOME_X_MM = -73.0
 HOME_Y_MM = 6.0
+# O centro operacional DESTA placa (o firmware o guarda na NVS). Número próprio,
+# pelo mesmo motivo dos waypoints.
+CENTRO_X_MM = 171.0
+CENTRO_Y_MM = 9.0
 
 
 def _waypoints(num_slots: int = 8) -> dict[int, tuple[float, float]]:
@@ -65,7 +69,15 @@ class PlacaCNC(PlacaFalsa):
         "mover":         ("dispenser_alvo", "os_id"),
         "homing":        ("os_id",),
         "estado_celula": ("trava_ativa",),
+        # A parada da porta NR-12: sem campo obrigatório (`motivo` é log).
+        "parar":         (),
+        # O fim da OS: a caixa conferida vai ao centro gravado na placa.
+        "centro":        ("os_id",),
     }
+
+    # A mesa perdeu a origem numa parada da porta: `mover` vira `sem_homing`
+    # até o próximo homing, como no firmware.
+    sem_origem = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -95,6 +107,11 @@ class PlacaCNC(PlacaFalsa):
         # mesa parada, e é justamente essa indistinguibilidade que o modelo por
         # relógio trata como normal em vez de como falha.
         self.mover_mudo = False
+        # `codigo_erro` que o próximo `centro` emite no lugar da chegada (None =
+        # chega). E quantas vezes a mesa CHEGOU ao centro — é contra este número
+        # que se prova que um `cmd_id` repetido não move duas vezes.
+        self.centro_erro: str | None = None
+        self.no_centro = 0
 
     def _erro(self, campos: dict, codigo: str, descricao: str) -> dict:
         return {
@@ -114,8 +131,11 @@ class PlacaCNC(PlacaFalsa):
         e o firmware a viola​va nos dois caminhos de trava.
         """
         if self.homing_falha:
+            # Como o firmware: sem o fim de curso, a origem não existe.
+            self.sem_origem = True
             return [self._erro({"os_id": os_id}, "homing_falhou",
                                "um dos eixos nao achou o fim de curso no prazo")]
+        self.sem_origem = False
         self.pos_x = HOME_X_MM
         self.pos_y = HOME_Y_MM
         return [{
@@ -170,6 +190,9 @@ class PlacaCNC(PlacaFalsa):
             # Fora da faixa, a mesa não se move: o waypoint não existe. A placa
             # de verdade recusa no ACK; aqui o que importa é não INVENTAR uma
             # posição para um slot que a bancada não tem.
+            if self.sem_origem:
+                return [self._erro(campos, "sem_homing",
+                                   "origem perdida na parada: mande homing antes")]
             if alvo not in WAYPOINTS:
                 return [self._erro(campos, "dispenser_invalido",
                                    f"dispenser {alvo} sem waypoint gravado")]
@@ -182,6 +205,7 @@ class PlacaCNC(PlacaFalsa):
                 "tipo": "posicionado",
                 "os_id": campos["os_id"],
                 "dispenser_alvo": alvo,
+                "destino": "dispenser",
                 # A MEDIDA, não o alvo. É o único número desta linha que o
                 # comando não trouxe — e é o que o central registra.
                 "posicao_x": self.pos_x,
@@ -193,6 +217,47 @@ class PlacaCNC(PlacaFalsa):
 
         if cmd == "homing":
             return self._homing(campos["os_id"])
+
+        if cmd == "centro":
+            # As regras do `mover`, com o destino gravado na placa. A placa de
+            # verdade recusa no ACK; aqui, como no `mover`, o que importa é o
+            # evento — e que um centro sem origem NÃO invente posição.
+            os_id = campos["os_id"]
+            alvo = {"os_id": os_id, "dispenser_alvo": 0}
+            if self.trava_ativa:
+                return [self._erro(alvo, "travado",
+                                   "trava do Triple Check ativa: aguardando liberacao")]
+            if self.sem_origem:
+                return [self._erro(alvo, "sem_homing",
+                                   "origem nunca estabelecida: mande homing antes do centro")]
+            if self.centro_erro:
+                # Encenação: o fim de curso disparou no caminho.
+                return [self._erro(alvo, self.centro_erro,
+                                   "fim de curso disparou durante a ida ao centro")]
+            if self.mover_mudo:
+                return []
+            self.pos_x, self.pos_y = CENTRO_X_MM, CENTRO_Y_MM
+            self.no_centro += 1
+            return [{
+                "tipo": "posicionado",
+                "os_id": os_id,
+                "dispenser_alvo": 0,
+                "destino": "centro",
+                "posicao_x": self.pos_x,
+                "posicao_y": self.pos_y,
+                "ciclo_atual": 0,
+                "total_ciclos": 0,
+                "ts": agora(),
+            }]
+
+        if cmd == "parar":
+            # Como o firmware: com movimento em curso, a mesa para ONDE ESTÁ e
+            # perde a origem (todo `mover` seguinte seria `sem_homing`); parada,
+            # é só o ACK. Nenhum evento — quem parou foi o central.
+            if self.movimento_em_curso:
+                self.movimento_em_curso = False
+                self.sem_origem = True
+            return []
 
         return []
 

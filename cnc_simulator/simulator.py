@@ -6,6 +6,7 @@ Toda lógica de negócio (rota, sequenciamento, OS) foi movida para o central-co
 Endpoints (servidor HTTP):
   POST /executar/mover    ← adapter comanda mover para dispenser X
   POST /executar/homing   ← adapter comanda retorno à HOME
+  POST /executar/centro   ← adapter comanda a ida ao centro (fim da OS)
   GET  /status            ← estado atual da CNC
 
 Eventos (cliente HTTP via requests.post → adapter):
@@ -170,6 +171,14 @@ HOME: tuple[float, float] = (
     float(os.getenv("HOME_Y", "0")),
 )
 
+# O centro operacional DESTA mesa — o firmware o guarda na NVS (`NOVOCENTRO`).
+# É para onde a caixa conferida vai no fim da OS (`/executar/centro`). Número
+# próprio, como a bancada: o central não dita onde fica o centro.
+CENTRO: tuple[float, float] = (
+    float(os.getenv("CENTRO_X", str(_BANCADA_X0_MM + 1.5 * _BANCADA_PASSO_MM))),
+    float(os.getenv("CENTRO_Y", "0")),
+)
+
 COMPONENTES_TEMP = [
     ("motor_eixo_x", 28, 38),
     ("motor_eixo_y", 27, 36),
@@ -237,6 +246,11 @@ _movimento_lock = threading.Lock()  # protege check-and-set atômico de _em_movi
 # ler, e a diferença só apareceria com a placa montada.
 _travada = False
 
+# Parada da porta NR-12 (`/executar/parar`): o movimento em curso para onde
+# está, como no firmware, e a mesa fica sem origem até o próximo homing.
+_parar_pedido = threading.Event()
+_sem_origem = False
+
 _cnc_state = {
     "status":         "idle",
     "os_id":          None,
@@ -281,8 +295,12 @@ class EstadoCelulaReq(BaseModel):
 # ── Lógica de movimento ────────────────────────────────────────────────────────
 
 def _mover_para(disp_id: int, alvo_x: float, alvo_y: float,
-                os_id: str, ciclo: int, total: int):
-    """Interpola posição até o destino, publicando cada passo."""
+                os_id: str, ciclo: int, total: int, destino: str = "dispenser"):
+    """Interpola posição até o destino, publicando cada passo.
+
+    `destino` vai no `posicionado` ("dispenser" | "centro"), como no firmware:
+    o central roteia a chegada ao centro por ele.
+    """
     with _lock:
         orig_x = _cnc_state["pos_x"]
         orig_y = _cnc_state["pos_y"]
@@ -303,6 +321,7 @@ def _mover_para(disp_id: int, alvo_x: float, alvo_y: float,
             "tipo":           "posicionado",
             "os_id":          os_id,
             "dispenser_alvo": disp_id,
+            "destino":        destino,
             "posicao_x":      round(alvo_x, 2),
             "posicao_y":      round(alvo_y, 2),
             "ciclo_atual":    ciclo,
@@ -318,6 +337,15 @@ def _mover_para(disp_id: int, alvo_x: float, alvo_y: float,
                 orig_x, orig_y, alvo_x, alvo_y, distancia, duracao, passos)
 
     for i in range(1, passos + 1):
+        if _parar_pedido.is_set():
+            global _sem_origem
+            _parar_pedido.clear()
+            _sem_origem = True
+            with _lock:
+                _cnc_state["status"] = "parado"
+            logger.warning("[CNC] PARADA (porta NR-12) no passo %d/%d — sem origem "
+                           "até o próximo homing.", i, passos)
+            return
         t     = i / passos
         cur_x = orig_x + (alvo_x - orig_x) * t
         cur_y = orig_y + (alvo_y - orig_y) * t
@@ -353,6 +381,7 @@ def _mover_para(disp_id: int, alvo_x: float, alvo_y: float,
         "tipo":           "posicionado",
         "os_id":          os_id,
         "dispenser_alvo": disp_id,
+        "destino":        destino,
         "posicao_x":      round(alvo_x, 2),
         "posicao_y":      round(alvo_y, 2),
         "ciclo_atual":    ciclo,
@@ -367,6 +396,8 @@ def _homing(os_id: str, destino: tuple[float, float] = HOME):
     `destino` vem do comando (o central é quem sabe onde fica o HOME); o
     default cobre o chamador que não o informa.
     """
+    global _sem_origem
+    _sem_origem = False      # o homing restabelece a origem (porta NR-12)
     with _lock:
         orig_x = _cnc_state["pos_x"]
         orig_y = _cnc_state["pos_y"]
@@ -426,9 +457,9 @@ def _homing(os_id: str, destino: tuple[float, float] = HOME):
 
 
 def _thread_mover(disp_id: int, alvo_x: float, alvo_y: float,
-                  os_id: str, ciclo: int, total: int):
+                  os_id: str, ciclo: int, total: int, destino: str = "dispenser"):
     try:
-        _mover_para(disp_id, alvo_x, alvo_y, os_id, ciclo, total)
+        _mover_para(disp_id, alvo_x, alvo_y, os_id, ciclo, total, destino)
     except Exception as exc:
         logger.error("[CNC] Erro em movimento: %s", exc, exc_info=True)
         with _lock:
@@ -529,6 +560,13 @@ def executar_mover(req: MoverReq):
                  f"receita '{req.receita}' nao esta gravada nesta placa")
         raise HTTPException(400, f"receita_desconhecida: {req.receita}")
 
+    if _sem_origem:
+        # Parada da porta no meio de um movimento: como no firmware, nada de
+        # `mover` até o homing da retomada.
+        _recusar(req.os_id, req.dispenser_alvo, "sem_homing",
+                 "origem perdida na parada: mande homing antes")
+        raise HTTPException(409, "sem_homing: parada da porta exige homing")
+
     if not 1 <= req.dispenser_alvo <= NUM_SLOTS:
         _recusar(req.os_id, req.dispenser_alvo, "dispenser_invalido",
                  f"dispenser_alvo {req.dispenser_alvo} fora da faixa 1-{NUM_SLOTS}")
@@ -556,6 +594,53 @@ def executar_mover(req: MoverReq):
         "msg": f"Movendo para D{req.dispenser_alvo} (receita {receita})",
         "destino": {"x": alvo_x, "y": alvo_y},
     }
+
+
+class CentroReq(BaseModel):
+    os_id: str
+
+
+@app.post("/executar/centro")
+def executar_centro(req: CentroReq):
+    """Leva a caixa conferida ao centro — as regras do `mover`, como no firmware.
+
+    Recusa com o MESMO `codigo_erro` da placa (trava, origem perdida) e chega
+    com `posicionado {destino: "centro", dispenser_alvo: 0}`. Não emite
+    `concluido`: quem fecha a OS é o central, ao receber esta chegada.
+    """
+    if _travada:
+        _recusar(req.os_id, 0, "travado",
+                 "trava do Triple Check ativa: aguardando liberacao")
+        raise HTTPException(409, "travado: trava do Triple Check ativa")
+    if _sem_origem:
+        _recusar(req.os_id, 0, "sem_homing",
+                 "origem perdida na parada: mande homing antes do centro")
+        raise HTTPException(409, "sem_homing: parada da porta exige homing")
+    with _movimento_lock:
+        if _em_movimento.is_set():
+            raise HTTPException(409, "CNC em movimento — aguarde posicionamento atual")
+        _em_movimento.set()
+    threading.Thread(
+        target=_thread_mover,
+        args=(0, CENTRO[0], CENTRO[1], req.os_id, 0, 0, "centro"),
+        daemon=True,
+        name="cnc-centro",
+    ).start()
+    return {"ok": True, "msg": "Indo ao centro", "destino": {"x": CENTRO[0], "y": CENTRO[1]}}
+
+
+class PararReq(BaseModel):
+    motivo: str = "porta_aberta"
+
+
+@app.post("/executar/parar")
+def executar_parar(req: PararReq):
+    """Para o movimento em curso ONDE ESTÁ, sem homing (porta NR-12)."""
+    if _em_movimento.is_set():
+        _parar_pedido.set()
+        logger.warning("[CNC] PARAR (%s): interrompendo o movimento.", req.motivo)
+        return {"ok": True, "msg": "parando"}
+    return {"ok": True, "msg": "mesa ja parada"}
 
 
 @app.post("/executar/homing")

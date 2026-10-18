@@ -508,13 +508,28 @@ def _status_gravados(orq) -> list:
     return [c["args"] for c in orq.banco.chamadas_de("atualizar_status_ordem")]
 
 
+def _sucesso(os_id: str) -> list:
+    """A sequência de status de uma OS que chegou ao fim (CLAUDE.md, "A caixa é
+    conferida duas vezes no HOME"): caixa vazia, ciclo, caixa cheia, centro."""
+    return [(os_id, s) for s in ("aguardando_caixa_vazia", "em_andamento",
+                                 "conferindo_caixa", "indo_ao_centro", "concluida")]
+
+
+def _abortada_no_ciclo(os_id: str) -> list:
+    """A OS que passou da caixa vazia e abortou no meio do ciclo."""
+    return [(os_id, "aguardando_caixa_vazia"), (os_id, "em_andamento"), (os_id, "erro")]
+
+
 def test_inicio_do_processamento_grava_em_andamento(carregar_orquestrador):
-    """É o que distingue a OS em execução das que ainda esperam na fila."""
+    """É o que distingue a OS em execução das que ainda esperam na fila. O
+    primeiro status já é de execução (`aguardando_caixa_vazia`), e
+    `em_andamento` vem com a caixa conferida vazia."""
     orq = carregar_orquestrador()
 
     asyncio.run(orq.modulo._processar_os(_payload_os("OS-7")))
 
-    assert _status_gravados(orq)[0] == ("OS-7", "em_andamento")
+    assert _status_gravados(orq)[:2] == [("OS-7", "aguardando_caixa_vazia"),
+                                         ("OS-7", "em_andamento")]
 
 
 def test_os_completa_termina_em_concluida(carregar_orquestrador):
@@ -524,7 +539,7 @@ def test_os_completa_termina_em_concluida(carregar_orquestrador):
         _payload_os("OS-7", _item("Dipirona"), _item("Paracetamol"))
     ))
 
-    assert _status_gravados(orq) == [("OS-7", "em_andamento"), ("OS-7", "concluida")]
+    assert _status_gravados(orq) == _sucesso("OS-7")
     assert orq.adapter.comandos("/comandos/homing")   # a OS chegou mesmo ao fim
     assert orq.estado["os_ativa"] is None
 
@@ -533,11 +548,13 @@ def test_abort_no_meio_da_os_termina_em_erro(carregar_orquestrador, monkeypatch)
     """Adapter fora do ar no carregamento: a OS fecha em erro, não em aberto."""
     orq = carregar_orquestrador()
     monkeypatch.setattr(orq.modulo.settings, "TIMEOUT_CARREGAMENTO", 0.01)
-    orq.adapter.aceita = False
+    # Só o dispenser fora: com o adapter da CNC fora, a OS nem começaria (o
+    # homing do início é handshake) — esse caso tem teste próprio.
+    orq.adapter.recusar_rotas.add("/comandos/carregar")
 
     asyncio.run(orq.modulo._processar_os(_payload_os("OS-8")))
 
-    assert _status_gravados(orq) == [("OS-8", "em_andamento"), ("OS-8", "erro")]
+    assert _status_gravados(orq) == _abortada_no_ciclo("OS-8")
     assert orq.estado["os_ativa"] is None
 
 
@@ -554,7 +571,7 @@ def test_os_rejeitada_por_falta_de_slot_termina_em_erro(carregar_orquestrador):
         _payload_os("OS-9", *[_item(f"Med{i}") for i in range(NUM_SLOTS + 1)])
     ))
 
-    assert _status_gravados(orq) == [("OS-9", "em_andamento"), ("OS-9", "erro")]
+    assert _status_gravados(orq) == _abortada_no_ciclo("OS-9")
     assert [c["args"][1] for c in orq.banco.chamadas_de("salvar_alarme")] == ["sem_slot"]
     assert orq.adapter.comandos("/comandos/limpar") == []
     assert orq.estado["os_ativa"] is None
@@ -723,7 +740,7 @@ def test_falha_no_peso_unitario_nao_derruba_a_os(carregar_orquestrador, monkeypa
         _payload_os("OS-9", _item("Dipirona"), _item("Paracetamol"))
     ))
 
-    assert _status_gravados(orq) == [("OS-9", "em_andamento"), ("OS-9", "concluida")]
+    assert _status_gravados(orq) == _sucesso("OS-9")
     pesagens = orq.adapter.comandos("/comandos/pesar")
     assert len(pesagens) == 2
     assert all(p["peso_unitario_g"] == orq.modulo.PESO_UNITARIO_PADRAO_G
@@ -953,11 +970,11 @@ def test_envio_de_carregamento_recusado_aborta_sem_esperar_o_timeout(
     """
     orq = carregar_orquestrador()
     assert orq.modulo.settings.TIMEOUT_CARREGAMENTO >= 60   # o valor real, não um encurtado
-    orq.adapter.aceita = False
+    orq.adapter.recusar_rotas.add("/comandos/carregar")
 
     asyncio.run(orq.modulo._processar_os(_payload_os("OS-11", _item("Dipirona"))))
 
-    assert _status_gravados(orq) == [("OS-11", "em_andamento"), ("OS-11", "erro")]
+    assert _status_gravados(orq) == _abortada_no_ciclo("OS-11")
     assert [c["args"][1] for c in orq.banco.chamadas_de("salvar_alarme")][0] == \
         "erro_envio_carregamento"
     # Nenhum evento da OS morta sobrou para confundir a próxima.
@@ -993,7 +1010,7 @@ def test_scan_recusado_nao_aborta_a_os_mas_tambem_nao_espera(carregar_orquestrad
 
     asyncio.run(orq.modulo._processar_os(_payload_os("OS-12", _item("Dipirona"))))
 
-    assert _status_gravados(orq) == [("OS-12", "em_andamento"), ("OS-12", "concluida")]
+    assert _status_gravados(orq) == _sucesso("OS-12")
     assert not [c for c in aguardadas if "visao_dispenser" in c], (
         "esperou um scan que o vision-adapter recusou enviar"
     )
@@ -1238,8 +1255,7 @@ def test_a_os_seguinte_comeca_com_a_bancada_limpa(os_que_explode, monkeypatch):
     assert entre["eventos"] == {}, "eventos da OS morta sobreviveram ao except"
     assert entre["slot_os_id"] is None
     assert entre["slot_status"] == "idle"
-    assert _status_gravados(orq) == [("OS-DEPOIS", "em_andamento"),
-                                     ("OS-DEPOIS", "concluida")]
+    assert _status_gravados(orq) == _sucesso("OS-DEPOIS")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1664,7 +1680,8 @@ def test_camera_da_mesa_recebe_a_posicao_MEDIDA(carregar_orquestrador):
 
     asyncio.run(orq.modulo._processar_os(_payload_os("OS-MED")))
 
-    capturas = orq.adapter.comandos("/comandos/capturar/mesa")
+    capturas = [c for c in orq.adapter.comandos("/comandos/capturar/mesa")
+                if not c.get("etapa")]     # as fotos POR SLOT; a do HOME é outra
     assert capturas, "nenhuma captura de mesa foi pedida"
     for captura in capturas:
         slot = captura["slot_id"]
@@ -1686,7 +1703,8 @@ def test_sem_posicao_no_evento_cai_no_modelo_E_avisa(carregar_orquestrador, capl
     with caplog.at_level(logging.WARNING):
         asyncio.run(orq.modulo._processar_os(_payload_os("OS-SEM-POS")))
 
-    capturas = orq.adapter.comandos("/comandos/capturar/mesa")
+    capturas = [c for c in orq.adapter.comandos("/comandos/capturar/mesa")
+                if not c.get("etapa")]     # as fotos POR SLOT; a do HOME é outra
     assert capturas
     for captura in capturas:
         slot = captura["slot_id"]
@@ -1839,8 +1857,7 @@ def test_ciclo_sem_nenhum_evento_nao_aborta_a_os(carregar_orquestrador, monkeypa
 
     asyncio.run(orq.modulo._processar_os(_payload_os("OS-CRON-1")))
 
-    assert _status_gravados(orq) == [("OS-CRON-1", "em_andamento"),
-                                     ("OS-CRON-1", "concluida")]
+    assert _status_gravados(orq) == _sucesso("OS-CRON-1")
 
 
 def test_sem_confirmacao_vira_fonte_indisponivel_e_nao_divergencia(carregar_orquestrador):
@@ -1903,7 +1920,7 @@ def test_posicionado_atrasado_nao_se_perde(carregar_orquestrador, monkeypatch):
 
     async def _post(url, payload, timeout=10.0):
         ok = await post_anterior(url, payload, timeout)
-        if url.endswith("/comandos/capturar/mesa"):
+        if url.endswith("/comandos/capturar/mesa") and not payload.get("etapa"):
             entregues.append((payload.get("posicao_x"), payload.get("posicao_y")))
         return ok
 
@@ -2169,7 +2186,7 @@ def test_a_trava_do_triple_check_avisa_a_mesa_e_a_libera_depois(carregar_orquest
     avisos: list[bool] = []
     liberacoes: list[bool] = []
 
-    async def _avisar(trava_ativa, slot_id, os_id, resumo):
+    async def _avisar(trava_ativa, slot_id, os_id, resumo, so_telas=False):
         avisos.append(bool(trava_ativa))
         return True
 
@@ -2276,32 +2293,44 @@ def _alarmes(orq) -> list:
     return [c["args"] for c in orq.banco.chamadas_de("salvar_alarme")]
 
 
-def test_homing_de_fim_de_os_recusado_abre_alarme(carregar_orquestrador):
-    """A rota é serpentina, e a serpentina parte de HOME.
-
-    O homing do passo 5 tinha o retorno ignorado: comando recusado deixava a
-    mesa parada no último dispenser e a OS fechava como `concluida`, sem nada
-    no log. Quem paga é a OS SEGUINTE — ela planeja o ciclo fechado a partir do
-    HOME, e a otimalidade da serpentina é a do ciclo fechado.
-    """
+def test_homing_do_inicio_recusado_nao_comeca_a_os(carregar_orquestrador):
+    """A rota é serpentina e parte de HOME, e a foto da caixa vazia só vale com
+    a mesa lá: o homing do INÍCIO é handshake. Recusado, a OS não começa — nada
+    foi reservado, então o abort não tem o que limpar."""
     orq = carregar_orquestrador()
     orq.adapter.recusar_rotas = {"/comandos/homing"}
 
     asyncio.run(orq.modulo._processar_os(_payload_os("OS-H1")))
 
     tipos = [tipo for _, tipo, _ in _alarmes(orq)]
-    assert "homing_nao_confirmado" in tipos
+    assert "homing_inicial_falhou" in tipos
+    assert _status_gravados(orq) == [("OS-H1", "aguardando_caixa_vazia"), ("OS-H1", "erro")]
+    assert not orq.adapter.comandos("/comandos/carregar")
 
 
-def test_homing_recusado_nao_aborta_a_os(carregar_orquestrador):
-    """A dispensa já terminou e o Triple Check já opinou: abortar aqui marcaria
-    em erro uma OS que entregou tudo certo. O alarme é o desfecho proporcional."""
+def test_homing_do_fim_que_falha_trava_e_nao_aborta(carregar_orquestrador):
+    """A dispensa já terminou: abortar marcaria em erro uma OS que entregou
+    tudo. O homing do FIM que não confirma vira trava (a caixa não pôde ser
+    fotografada), e a OS segue depois da liberação."""
+    from test_injecao import _liberar_trava_automaticamente
+
     orq = carregar_orquestrador()
-    orq.adapter.recusar_rotas = {"/comandos/homing"}
+    homings = {"n": 0}
+    real = orq.adapter._responder
+
+    def _responder(url, payload):
+        if url.endswith("/comandos/homing"):
+            homings["n"] += 1
+            orq.adapter.homing_falha = homings["n"] == 2
+        real(url, payload)
+    orq.adapter._responder = _responder
+    liberacoes = _liberar_trava_automaticamente(orq)
 
     asyncio.run(orq.modulo._processar_os(_payload_os("OS-H2")))
 
-    assert _status_gravados(orq) == [("OS-H2", "em_andamento"), ("OS-H2", "concluida")]
+    assert liberacoes == [True]
+    assert "homing_final_falhou" in [tipo for _, tipo, _ in _alarmes(orq)]
+    assert _status_gravados(orq) == _sucesso("OS-H2")
 
 
 def test_homing_aceito_nao_abre_alarme(carregar_orquestrador):
@@ -2648,7 +2677,9 @@ def _roteiro_mesa(orq, monkeypatch, roteiro: dict):
     original = orq.adapter._responder
 
     def responder(url, payload):
-        if not url.endswith("/comandos/capturar/mesa"):
+        # As fotos da caixa no HOME (VAZIA-/FINAL-, com `etapa`) seguem o
+        # duplo: o roteiro é das fotos POR SLOT.
+        if not url.endswith("/comandos/capturar/mesa") or payload.get("etapa"):
             return original(url, payload)
         slot, esperado = payload["slot_id"], payload["quantidade_esperada"]
         chave = f"{payload['os_id']}:visao_mesa:{slot}"
@@ -2671,8 +2702,10 @@ def _roteiro_mesa(orq, monkeypatch, roteiro: dict):
 
 
 def _fotos(orq) -> list[dict]:
-    """As capturas da mesa — e a regra da estação: nunca o mesmo par duas vezes."""
-    fotos = orq.adapter.comandos("/comandos/capturar/mesa")
+    """As capturas da mesa POR SLOT — e a regra da estação: nunca o mesmo par
+    duas vezes. As fotos da caixa no HOME têm teste próprio (test_caixa_home)."""
+    fotos = [f for f in orq.adapter.comandos("/comandos/capturar/mesa")
+             if not f.get("etapa")]
     pares = [(f["os_id"], f["slot_id"]) for f in fotos]
     assert len(pares) == len(set(pares)), f"par (os_id, slot) repetido: {pares}"
     return fotos
@@ -2789,78 +2822,6 @@ def test_camera_a_menos_sozinha_vira_alarme_e_a_os_segue(carregar_orquestrador,
     assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
 
 
-# ── Conferência final no HOME (VISAO_MESA_FINAL=HOME) ─────────────────────────
-
-def _com_final_home(orq, monkeypatch, posicoes):
-    monkeypatch.setattr(orq.modulo.settings, "VISAO_MESA_FINAL", "HOME")
-    monkeypatch.setattr(orq.modulo.settings, "VISAO_MESA_POSICOES", frozenset(posicoes))
-
-
-def test_final_home_fotografa_o_pendente_livre(carregar_orquestrador, monkeypatch):
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1, 2})
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    fotos = _fotos(orq)
-    assert [f["slot_id"] for f in fotos] == [1, 2, 3]
-    final = fotos[-1]
-    assert (final["quantidade_esperada"], final["slots_cobertos"]) == (5, [3])
-    assert (final["posicao_x"], final["posicao_y"]) == orq.modulo.HOME
-    # A foto final sai depois do homing e antes de a OS fechar.
-    urls = [c["url"] for c in orq.adapter.chamadas]
-    assert urls.index(next(u for u in urls if u.endswith("/comandos/homing"))) < \
-        max(i for i, u in enumerate(urls) if u.endswith("/comandos/capturar/mesa"))
-    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
-
-
-def test_final_home_a_menos_vira_alarme(carregar_orquestrador, monkeypatch):
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1, 2})
-    _roteiro_mesa(orq, monkeypatch, {3: ("div", -2)})
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    assert orq.estado["trava"]["ativa"] is False
-    assert "contagem_camera_abaixo" in _tipos_de_alarme(orq)
-
-
-def test_final_home_a_mais_trava(carregar_orquestrador, monkeypatch):
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1, 2})
-    _roteiro_mesa(orq, monkeypatch, {3: ("div", +1)})
-    liberacoes = _liberar_trava_automaticamente(orq)
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    assert liberacoes == [True]
-    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
-
-
-def test_final_home_sem_pendente_livre_nao_fotografa_e_alarma(carregar_orquestrador,
-                                                             monkeypatch):
-    """O D3 falhou: o par (OS, D3) já foi usado, e a estação não o refotografa."""
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1, 2, 3})
-    _roteiro_mesa(orq, monkeypatch, {3: "falha"})
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    assert [f["slot_id"] for f in _fotos(orq)] == [1, 2, 3]
-    assert "conferencia_final_impossivel" in _tipos_de_alarme(orq)
-
-
-def test_final_home_com_homing_falho_nao_fotografa(carregar_orquestrador, monkeypatch):
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1, 2})
-    orq.adapter.recusar_rotas.add("/comandos/homing")
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    assert [f["slot_id"] for f in _fotos(orq)] == [1, 2]
-    assert "conferencia_final_sem_homing" in _tipos_de_alarme(orq)
-
-
 # ── A configuração ────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("valor,esperado", [
@@ -2877,10 +2838,33 @@ def test_visao_mesa_posicoes(carregar_orquestrador, valor, esperado):
     assert set(orq.modulo.settings.VISAO_MESA_POSICOES) == esperado
 
 
-@pytest.mark.parametrize("valor,esperado", [("", ""), ("home", "HOME"), ("FIM", "")])
-def test_visao_mesa_final(carregar_orquestrador, valor, esperado):
-    orq = carregar_orquestrador({"VISAO_MESA_FINAL": valor})
-    assert orq.modulo.settings.VISAO_MESA_FINAL == esperado
+@pytest.mark.parametrize("valor,slots,home", [
+    ("1,2,HOME", {1, 2}, True),
+    ("home", set(range(1, NUM_SLOTS + 1)), True),
+    ("1,2", {1, 2}, False),
+    ("", set(range(1, NUM_SLOTS + 1)), False),
+])
+def test_home_em_visao_mesa_posicoes(carregar_orquestrador, valor, slots, home):
+    """`HOME` na lista diz que a câmera vê a caixa inteira no HOME; o conjunto
+    continua sendo só de SLOTS."""
+    orq = carregar_orquestrador({"VISAO_MESA_POSICOES": valor})
+    assert set(orq.modulo.settings.VISAO_MESA_POSICOES) == slots
+    assert orq.modulo.settings.VISAO_MESA_HOME is home
+
+
+@pytest.mark.parametrize("valor,esperado", [("1", True), ("0", False), ("nao", False),
+                                            ("talvez", True)])
+def test_visao_caixa_vazia(carregar_orquestrador, valor, esperado):
+    orq = carregar_orquestrador({"VISAO_CAIXA_VAZIA": valor})
+    assert orq.modulo.settings.VISAO_CAIXA_VAZIA is esperado
+
+
+@pytest.mark.parametrize("valor,esperado", [("15", 15.0), ("2,5", 2.5), ("0", 10.0),
+                                            ("abc", 10.0)])
+def test_repeticao_da_caixa_vazia_aceita_virgula_e_tem_faixa(carregar_orquestrador,
+                                                             valor, esperado):
+    orq = carregar_orquestrador({"VISAO_CAIXA_VAZIA_REPETIR_S": valor})
+    assert orq.modulo.settings.VISAO_CAIXA_VAZIA_REPETIR_S == esperado
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2942,70 +2926,8 @@ def test_envio_recusado_a_camera_da_mesa_nao_espera_o_evento(carregar_orquestrad
     assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
 
 
-def test_envio_recusado_no_home_tambem_nao_espera(carregar_orquestrador, monkeypatch):
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1, 2})
-    original = orq.modulo.cmd_visao_mesa
-
-    async def cmd_visao_mesa(*args, **kwargs):
-        # Só a foto do HOME é recusada: as do D1 e D2 seguem normais.
-        if kwargs.get("quantidade_slot") == 0:
-            return False
-        return await original(*args, **kwargs)
-    monkeypatch.setattr(orq.modulo, "cmd_visao_mesa", cmd_visao_mesa)
-    esperas = _espiar_esperas(orq, monkeypatch)
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    assert [c for c in esperas if ":visao_mesa:" in c] == ["OS-M:visao_mesa:1",
-                                                            "OS-M:visao_mesa:2"]
-    assert "conferencia_final_sem_leitura" in _tipos_de_alarme(orq)
-
-
-# ── A conferência final herda a dessincronia ──────────────────────────────────
-
-def test_final_home_depois_de_timeout_nao_compara(carregar_orquestrador, monkeypatch):
-    """A última foto visível deu timeout: o incremento do HOME pode incluir o
-    slot cujo total ninguém sabe se a estação registrou."""
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1, 2})
-    _roteiro_mesa(orq, monkeypatch, {2: "mudo", 3: ("div", +4)})
-    motivos = _espiar_trava(orq, monkeypatch)
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    assert motivos == []
-    assert "conferencia_final_nao_comparavel" in _tipos_de_alarme(orq)
-    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
-
-
-def test_final_home_depois_de_trava_liberada_nao_compara(carregar_orquestrador,
-                                                         monkeypatch):
-    """Decisão F: liberada a trava, alguém pode ter mexido na caixa — e só
-    slots invisíveis vieram depois, então nenhuma foto ressincronizou."""
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1})
-    _roteiro_mesa(orq, monkeypatch, {1: ("div", +2), 2: ("div", +1)})
-    liberacoes = _liberar_trava_automaticamente(orq)
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    assert liberacoes == [True]                      # só a do D1
-    assert "conferencia_final_nao_comparavel" in _tipos_de_alarme(orq)
-
-
-def test_final_home_sincronizado_a_mais_continua_travando(carregar_orquestrador,
-                                                         monkeypatch):
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1, 2})
-    _roteiro_mesa(orq, monkeypatch, {3: ("div", +1)})
-    motivos = _espiar_trava(orq, monkeypatch)
-    _liberar_trava_automaticamente(orq)
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    assert len(motivos) == 1 and "1 a mais" in motivos[0]
-    assert "conferencia_final_nao_comparavel" not in _tipos_de_alarme(orq)
+# (A conferência final no HOME deixou de herdar a dessincronia: ela conta a
+# caixa INTEIRA sob um `os_id` próprio — ver tests/test_caixa_home.py.)
 
 
 # ── Foto da mesa sem a confirmação da dispensa ────────────────────────────────
@@ -3113,18 +3035,6 @@ def test_deficit_da_camera_da_mesa(carregar_orquestrador, monkeypatch, roteiro,
         assert _tipos_de_alarme(orq).count("contagem_camera_abaixo") == 1
 
 
-def test_final_home_tolera_o_que_reapareceu(carregar_orquestrador, monkeypatch):
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1, 2})
-    _roteiro_mesa(orq, monkeypatch, {2: ("div", -1), 3: ("div", +1)})
-    motivos = _espiar_trava(orq, monkeypatch)
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    assert motivos == []
-    assert _status_gravados(orq)[-1] == ("OS-M", "concluida")
-
-
 # ── Estação da mesa sem o acumulado da OS ─────────────────────────────────────
 
 def test_divergencia_com_ressincronizar_nao_trava(carregar_orquestrador, monkeypatch):
@@ -3155,18 +3065,6 @@ def test_ressincronizar_zera_o_deficit(carregar_orquestrador, monkeypatch):
     assert len(motivos) == 1 and "D3" in motivos[0]
 
 
-def test_final_home_com_ressincronizar_nao_trava(carregar_orquestrador, monkeypatch):
-    orq = carregar_orquestrador()
-    _com_final_home(orq, monkeypatch, {1, 2})
-    _roteiro_mesa(orq, monkeypatch, {3: ("div", +5, {"ressincronizar": True})})
-    motivos = _espiar_trava(orq, monkeypatch)
-
-    asyncio.run(orq.modulo._processar_os(_os_de_tres()))
-
-    assert motivos == []
-    assert "conferencia_final_nao_comparavel" in _tipos_de_alarme(orq)
-
-
 # ── Toda divergência da mesa termina em UM alarme ou numa trava ──────────────
 # O handler do central deixou de gravar alarme para `leitura_mesa_divergencia`
 # (gravava "contagem incorreta" até quando o orquestrador decidia que não era).
@@ -3186,3 +3084,437 @@ def test_divergencia_da_mesa_sem_trava_grava_exatamente_um_alarme(
 
     assert motivos == []
     assert _tipos_de_alarme(orq) == [alarme]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Portas NR-12: a porta pede, o central para e autoriza
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# O que se mede são CHAMADAS (quem recebeu o quê, em que ordem), nunca tempo de
+# parede: o cronograma está zerado pela fixture, e cronômetro em suíte é flaky.
+# A porta é encenada por `evento_porta` direto — o caminho que o handler HTTP
+# do central percorre —, e o meio do ciclo é alcançado pelos ganchos do
+# `AdapterFake` ("quando D1 receber o `dispensar`, a porta abre").
+
+def _ev(tipo: str, **campos) -> dict:
+    return {"origem": "porta", "tipo": tipo, **campos, "ts": "2026-10-17T10:00:00"}
+
+
+def _estado_porta(teto="fechada", frente="fechada", estado="FECHADA", rearme=False):
+    return _ev("estado", teto=teto, frente=frente, estado=estado,
+               aguardando_rearme=rearme)
+
+
+async def _porta_fechada_e_viva(orq):
+    """A porta falou: link ok, as duas fechadas — a célula pode rodar."""
+    await orq.modulo.evento_porta(_estado_porta())
+
+
+async def _quando(condicao, limite: int = 500):
+    for _ in range(limite):
+        if condicao():
+            return True
+        await asyncio.sleep(0.01)
+    raise AssertionError("a condição não aconteceu")
+
+
+def _rotas(orq) -> list:
+    """As chamadas na ordem, com a placa: `cnc:/parar`, `disp:/porta/liberar`..."""
+    saida = []
+    for c in orq.adapter.chamadas:
+        placa = "cnc" if orq.adapter.para_cnc(c["url"]) else "disp"
+        saida.append(f"{placa}:{c['url'].split('/comandos', 1)[1]}")
+    return saida
+
+
+def _alarmes_porta(orq) -> list:
+    return [c["args"][1] for c in orq.banco.chamadas_de("salvar_alarme")]
+
+
+def test_pedido_de_acesso_para_cnc_e_dispensers_antes_de_liberar(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    orq.adapter.segurar_dispensas = 1
+    orq.adapter.parcial_confirmado = 4
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+
+        async def _pedir(_payload):
+            if len(orq.adapter.comandos("/comandos/dispensar")) == 1:
+                await orq.modulo.evento_porta(_ev("pedido_acesso", uid="04A1B2C3"))
+        orq.adapter.ao_comando["/comandos/dispensar"] = _pedir
+        os_task = asyncio.create_task(orq.modulo._processar_os(_payload_os("OS-P1")))
+        await _quando(lambda: "disp:/porta/liberar" in _rotas(orq))
+        os_task.cancel()
+        await asyncio.gather(os_task, return_exceptions=True)
+        await orq.modulo.aguardar_tarefas_porta()
+
+    asyncio.run(_cenario())
+    rotas = _rotas(orq)
+    i_liberar = rotas.index("disp:/porta/liberar")
+    assert rotas.index("cnc:/parar") < i_liberar
+    assert rotas.index("disp:/parar") < i_liberar
+    assert orq.estado["pausa_porta"]["motivo"] == "pedido_acesso"
+    assert orq.adapter.comandos("/porta/liberar")[0]["janela_ms"] == \
+        orq.modulo.settings.PORTA_JANELA_LIBERACAO_MS
+
+
+def test_parada_nao_confirmada_nega_a_porta_e_grava_alarme(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    orq.adapter.confirma_parada = False
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+        with orq.modulo._lock:
+            orq.estado["os_ativa"] = {"os_id": "OS-P2"}     # máquina ativa
+        await orq.modulo.evento_porta(_ev("pedido_acesso", uid="04A1B2C3"))
+        await orq.modulo.aguardar_tarefas_porta()
+
+    asyncio.run(_cenario())
+    assert not orq.adapter.comandos("/porta/liberar"), "a porta foi autorizada sem a parada"
+    (negar,) = orq.adapter.comandos("/porta/negar")
+    assert negar["motivo"] == "maquina_nao_confirmou_parada"
+    assert _alarmes_porta(orq).count("maquina_nao_confirmou_parada") == 1
+
+
+def test_porta_aberta_no_meio_do_slot_segura_todo_dispensar_ate_o_rearme(
+        carregar_orquestrador):
+    orq = carregar_orquestrador()
+    orq.adapter.segurar_dispensas = 1
+    orq.adapter.parcial_confirmado = 3
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+
+        async def _abrir(_payload):
+            if len(orq.adapter.comandos("/comandos/dispensar")) == 1:
+                await orq.modulo.evento_porta(_ev("porta_aberta", porta="frente",
+                                                  autorizada=False))
+        orq.adapter.ao_comando["/comandos/dispensar"] = _abrir
+        os_task = asyncio.create_task(orq.modulo._processar_os(
+            _payload_os("OS-P3", _item("Dipirona", 5))))
+        await _quando(lambda: orq.modulo._porta_esperas)
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        assert len(orq.adapter.comandos("/comandos/dispensar")) == 1
+        # Fechar a porta NÃO religa nada.
+        await orq.modulo.evento_porta(_ev("porta_fechada"))
+        await orq.modulo.evento_porta(_estado_porta(rearme=True))
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        assert len(orq.adapter.comandos("/comandos/dispensar")) == 1
+        # Só o homing do INÍCIO da OS: o da retomada espera a tag.
+        assert len(orq.adapter.comandos("/comandos/homing")) == 1
+        # A tag de rearme é o comando deliberado.
+        await orq.modulo.evento_porta(_ev("rearme", uid="04A1B2C3"))
+        await orq.modulo.evento_porta(_estado_porta())
+        await asyncio.wait_for(os_task, 5)
+
+    asyncio.run(_cenario())
+    dispensas = orq.adapter.comandos("/comandos/dispensar")
+    assert len(dispensas) == 2
+    assert "quantidade" not in dispensas[0]
+    assert dispensas[1]["quantidade"] == 2, "a retomada tem de pedir SÓ o que falta"
+    rotas = _rotas(orq)
+    ultimo_dispensar = len(rotas) - 1 - rotas[::-1].index("disp:/dispensar")
+    assert rotas.index("cnc:/homing") < ultimo_dispensar, "homing ANTES do restante"
+    # O Triple Check compara o TOTAL do slot: as duas partes.
+    (pesagem,) = orq.adapter.comandos("/comandos/pesar")
+    assert pesagem["quantidade_real"] == 5
+    assert _status_gravados(orq)[-1] == ("OS-P3", "concluida")
+    assert _alarmes_porta(orq).count("porta_aberta_sem_autorizacao") == 1
+    assert "trava_ativada" not in _alarmes_porta(orq)
+
+
+def test_rearme_com_porta_aberta_nao_retoma(carregar_orquestrador):
+    orq = carregar_orquestrador()
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+        await orq.modulo.evento_porta(_ev("porta_aberta", porta="teto", autorizada=False))
+        await orq.modulo.evento_porta(_estado_porta(teto="aberta",
+                                                    estado="ABERTA_SEM_AUTORIZACAO"))
+        await orq.modulo.evento_porta(_ev("rearme", uid="04A1B2C3"))
+        await orq.modulo.aguardar_tarefas_porta()
+
+    asyncio.run(_cenario())
+    assert orq.modulo.get_pausa_porta() is not None
+    assert not orq.adapter.comandos("/comandos/homing")
+    assert orq.adapter.comandos("/porta/estado"), "o rearme recusado pede um `estado`"
+
+
+def test_parcial_ausente_cai_na_trava_do_triple_check(carregar_orquestrador, monkeypatch):
+    orq = carregar_orquestrador()
+    orq.adapter.segurar_dispensas = 1
+    orq.adapter.parcial_confirmado = None          # o dispenser para MUDO
+    monkeypatch.setattr(orq.modulo.settings, "PORTA_PARADA_MAX_S", 0.05)
+    travas: list = []
+
+    def _liberar_quando_travar():
+        if orq.modulo._trava_ativa and not travas:
+            travas.append(orq.modulo._trava_motivo)
+            orq.modulo.liberar_trava("supervisor")
+    monkeypatch.setattr(orq.modulo, "_broadcast_fn", _liberar_quando_travar)
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+
+        async def _abrir(_payload):
+            if len(orq.adapter.comandos("/comandos/dispensar")) == 1:
+                await orq.modulo.evento_porta(_ev("porta_aberta", porta="frente",
+                                                  autorizada=True))
+        orq.adapter.ao_comando["/comandos/dispensar"] = _abrir
+        os_task = asyncio.create_task(orq.modulo._processar_os(_payload_os("OS-P5")))
+        await _quando(lambda: orq.modulo._porta_esperas)
+        await orq.modulo.evento_porta(_ev("porta_fechada"))
+        await orq.modulo.evento_porta(_estado_porta(rearme=True))
+        await orq.modulo.evento_porta(_ev("rearme", uid="04A1B2C3"))
+        await orq.modulo.evento_porta(_estado_porta())
+        await asyncio.wait_for(os_task, 5)
+
+    asyncio.run(_cenario())
+    assert travas and travas[0].startswith("pausa_porta_sem_contagem_parcial")
+    # Sem contagem, NADA se reenvia: um `dispensar` só.
+    assert len(orq.adapter.comandos("/comandos/dispensar")) == 1
+
+
+def test_link_perdido_pausa_e_link_ok_sozinho_nao_retoma(carregar_orquestrador):
+    orq = carregar_orquestrador()
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+        await orq.modulo.evento_porta(_ev("porta_link_perdido"))
+        assert orq.modulo.get_pausa_porta()["motivo"] == "link_perdido"
+        await orq.modulo.evento_porta(_ev("porta_link_ok"))
+        await orq.modulo.aguardar_tarefas_porta()
+        assert orq.modulo.get_pausa_porta() is not None, "link_ok sozinho retomou"
+        # O `estado` fechado, travado e sem rearme pendente é o que retoma.
+        await orq.modulo.evento_porta(_estado_porta())
+        await orq.modulo.aguardar_tarefas_porta()
+
+    asyncio.run(_cenario())
+    assert orq.modulo.get_pausa_porta() is None
+    assert orq.adapter.comandos("/comandos/homing"), "a retomada sempre faz homing"
+    assert _alarmes_porta(orq).count("porta_link_perdido") == 1
+
+
+def test_link_perdido_com_rearme_pendente_exige_a_tag(carregar_orquestrador):
+    orq = carregar_orquestrador()
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+        await orq.modulo.evento_porta(_ev("porta_link_perdido"))
+        # Enquanto o link estava fora, a porta foi aberta e fechada: ela volta
+        # dizendo que espera rearme.
+        await orq.modulo.evento_porta(_estado_porta(rearme=True))
+        await orq.modulo.aguardar_tarefas_porta()
+
+    asyncio.run(_cenario())
+    assert orq.modulo.get_pausa_porta() is not None
+    assert not orq.adapter.comandos("/comandos/homing")
+
+
+def test_pausa_mais_trava_retomar_exige_as_duas(carregar_orquestrador):
+    orq = carregar_orquestrador()
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+        evento_lib = await orq.modulo._ativar_trava("OS-P8", 2, "Triple Check FALHOU",
+                                                    resumo="divergência de peso")
+        await orq.modulo.evento_porta(_ev("porta_aberta", porta="frente", autorizada=True))
+        await orq.modulo.evento_porta(_ev("porta_fechada"))
+        await orq.modulo.evento_porta(_estado_porta(rearme=True))
+        await orq.modulo.evento_porta(_ev("rearme", uid="04A1B2C3"))
+        await orq.modulo.evento_porta(_estado_porta())
+        await orq.modulo.aguardar_tarefas_porta()
+        # Rearme feito, trava pendente: a máquina NÃO retoma.
+        assert orq.modulo.get_pausa_porta() is not None
+        assert not orq.adapter.comandos("/comandos/homing")
+
+        espera = asyncio.create_task(
+            orq.modulo._aguardar_liberacao(evento_lib, asyncio.Event()))
+        orq.modulo.liberar_trava("supervisor")
+        await asyncio.wait_for(espera, 5)
+        await orq.modulo.aguardar_tarefas_porta()
+
+    asyncio.run(_cenario())
+    assert orq.modulo.get_pausa_porta() is None
+    assert orq.adapter.comandos("/comandos/homing")
+
+
+def test_sem_os_a_pausa_so_registra_e_segura_a_fila(carregar_orquestrador):
+    """Sem OS em andamento não há o que parar: a abertura é autorizada direto, e
+    nenhuma OS nova começa enquanto a pausa não acabar."""
+    orq = carregar_orquestrador()
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+        await orq.modulo.evento_porta(_ev("pedido_acesso", uid="04A1B2C3"))
+        await orq.modulo.aguardar_tarefas_porta()
+        assert not orq.adapter.comandos("/comandos/parar")
+        assert orq.adapter.comandos("/porta/liberar")
+
+        loop_task = asyncio.create_task(orq.modulo.loop_orquestrador())
+        await orq.modulo.enfileirar_os(_payload_os("OS-P9"))
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        assert not orq.adapter.comandos("/comandos/carregar"), \
+            "OS começou com a porta em pausa"
+        # Ninguém abriu: a janela expira, rearme, e a fila anda.
+        await orq.modulo.evento_porta(_estado_porta())
+        await orq.modulo.evento_porta(_ev("liberacao_expirada", motivo="janela_expirou"))
+        await orq.modulo.evento_porta(_estado_porta(rearme=True))
+        await orq.modulo.evento_porta(_ev("rearme", uid="04A1B2C3"))
+        await orq.modulo.evento_porta(_estado_porta())
+        await _quando(lambda: orq.adapter.comandos("/comandos/carregar"))
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+    asyncio.run(_cenario())
+
+
+def test_negado_sem_acesso_retoma_sem_tag(carregar_orquestrador):
+    """`central_nao_respondeu`: o acesso NÃO aconteceu — a porta está travada
+    e não há o que rearmar."""
+    orq = carregar_orquestrador()
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+        orq.adapter.recusar_rotas.add("/porta/liberar")
+        await orq.modulo.evento_porta(_ev("pedido_acesso", uid="04A1B2C3"))
+        await orq.modulo.aguardar_tarefas_porta()
+        await orq.modulo.evento_porta(_estado_porta())
+        await orq.modulo.evento_porta(_ev("liberacao_expirada",
+                                          motivo="central_nao_respondeu"))
+        await orq.modulo.aguardar_tarefas_porta()
+
+    asyncio.run(_cenario())
+    assert orq.modulo.get_pausa_porta() is None
+
+
+def test_homing_da_retomada_que_falha_mantem_a_pausa(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    orq.adapter.homing_falha = True
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+        await orq.modulo.evento_porta(_ev("porta_link_perdido"))
+        await orq.modulo.evento_porta(_estado_porta())
+        await orq.modulo.aguardar_tarefas_porta()
+
+    asyncio.run(_cenario())
+    assert orq.modulo.get_pausa_porta() is not None
+    assert "homing_retomada_falhou" in _alarmes_porta(orq)
+
+
+def test_porta_habilitada_nasce_parada(carregar_orquestrador):
+    """Uma porta que nunca falou é porta aberta: link perdido."""
+    orq = carregar_orquestrador(env={"PORTA_NR12_HABILITADA": "1"})
+    assert orq.modulo.get_pausa_porta()["motivo"] == "link_perdido"
+    assert orq.estado["porta"]["faixa"] == "LINK DA PORTA PERDIDO"
+
+
+def test_a_vigia_de_silencio_e_pura(carregar_orquestrador):
+    """Silêncio longo = adapter morto; a porta habilitada que nunca falou também."""
+    f = carregar_orquestrador().modulo.porta_silenciosa
+    assert f(100, 80, False, True, 15, 0) is True
+    assert f(100, 90, False, True, 15, 0) is False
+    assert f(100, 80, False, False, 15, 0) is False        # já perdido
+    assert f(100, None, True, None, 15, 0) is True          # habilitada e muda
+    assert f(100, None, False, None, 15, 0) is False        # sem porta
+
+
+def test_a_faixa_e_a_mesma_frase_nas_tres_telas(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    f = orq.modulo.faixa_da_porta
+    pausa = {"motivo": "porta_aberta_sem_autorizacao", "aguardando_rearme": True}
+    assert f(None, {}) == ""
+    assert f(pausa, {"link_ok": True, "teto": "fechada", "frente": "aberta"}) == \
+        "MÁQUINA PARADA — PORTA FRENTE ABERTA"
+    assert f(pausa, {"link_ok": True, "teto": "fechada", "frente": "fechada"}) == \
+        "PORTAS FECHADAS — PASSE A TAG PARA RETOMAR"
+    assert f({"motivo": "link_perdido"}, {"link_ok": False}) == "LINK DA PORTA PERDIDO"
+    telas = orq.modulo.resumo_da_pausa_para_telas("MÁQUINA PARADA — PORTA FRENTE ABERTA")
+    assert telas.isascii() and len(telas) <= 48
+
+
+def test_roteiro_completo_pedido_liberar_abrir_fechar_rearme_homing_resto(
+        carregar_orquestrador):
+    """O roteiro de bancada inteiro, e a ORDEM dele.
+
+    OS rodando → `pedido_acesso` no meio da dispensa de D1 → `parar` na CNC e
+    nos dispensers → `dispensado_parcial` 3 de 5 → `porta_liberar` → a porta da
+    frente abre (autorizada) → fecha → `rearme` → homing → `mover` de volta a D1
+    → `dispensar` só das 2 que faltam → foto, pesagem do TOTAL → OS concluída
+    com o Triple Check limpo (nenhuma trava, nenhum alarme de porta).
+    """
+    orq = carregar_orquestrador()
+    orq.adapter.segurar_dispensas = 1
+    orq.adapter.parcial_confirmado = 3
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+
+        async def _pedir(_payload):
+            if len(orq.adapter.comandos("/comandos/dispensar")) == 1:
+                await orq.modulo.evento_porta(_ev("pedido_acesso", uid="04A1B2C3"))
+        orq.adapter.ao_comando["/comandos/dispensar"] = _pedir
+
+        async def _a_porta_responde(payload):
+            # A porta faz o que a placa faz ao receber `porta_liberar`.
+            await orq.modulo.evento_porta(_ev("liberada", janela_ms=payload["janela_ms"]))
+            await orq.modulo.evento_porta(_estado_porta(estado="LIBERADA"))
+            await orq.modulo.evento_porta(_ev("porta_aberta", porta="frente", autorizada=True))
+            await orq.modulo.evento_porta(_estado_porta(frente="aberta",
+                                                        estado="ABERTA_AUTORIZADA"))
+        orq.adapter.ao_comando["/porta/liberar"] = _a_porta_responde
+
+        os_task = asyncio.create_task(orq.modulo._processar_os(
+            _payload_os("OS-ROT", _item("Dipirona", 5), _item("Ibuprofeno", 4))))
+        await _quando(lambda: orq.modulo._porta.get("frente") == "aberta")
+        assert orq.estado["porta"]["faixa"] == "MÁQUINA PARADA — PORTA FRENTE ABERTA"
+        # A pessoa fecha a porta: nada religa.
+        await orq.modulo.evento_porta(_ev("porta_fechada"))
+        await orq.modulo.evento_porta(_estado_porta(rearme=True))
+        assert orq.estado["porta"]["faixa"] == "PORTAS FECHADAS — PASSE A TAG PARA RETOMAR"
+        # Só o homing do INÍCIO da OS: o da retomada espera a tag.
+        assert len(orq.adapter.comandos("/comandos/homing")) == 1
+        # A tag de rearme.
+        await orq.modulo.evento_porta(_ev("rearme", uid="04A1B2C3"))
+        await orq.modulo.evento_porta(_estado_porta())
+        await asyncio.wait_for(os_task, 5)
+        await orq.modulo.aguardar_tarefas_porta()
+
+    asyncio.run(_cenario())
+
+    rotas = _rotas(orq)
+    # Só as transições que interessam ao roteiro, na ordem em que aconteceram.
+    marcos = [r for r in rotas if r in ("disp:/dispensar", "cnc:/parar", "disp:/parar",
+                                        "disp:/porta/liberar", "cnc:/homing", "cnc:/mover",
+                                        "disp:/pesar")]
+    # O homing do INÍCIO da OS (antes da foto da caixa vazia) não é do roteiro
+    # da porta: o que interessa é o da RETOMADA.
+    assert marcos[0] == "cnc:/homing"
+    marcos = marcos[1:]
+    i = {nome: marcos.index(nome) for nome in ("cnc:/parar", "disp:/parar",
+                                               "disp:/porta/liberar", "cnc:/homing")}
+    assert marcos[0] == "cnc:/mover" and marcos[1] == "disp:/dispensar"
+    assert max(i["cnc:/parar"], i["disp:/parar"]) < i["disp:/porta/liberar"] < i["cnc:/homing"]
+    depois = marcos[i["cnc:/homing"] + 1:]
+    assert depois[:2] == ["cnc:/mover", "disp:/dispensar"], " | ".join(marcos)
+
+    moveres = orq.adapter.comandos("/comandos/mover")
+    assert moveres[0]["dispenser_alvo"] == moveres[1]["dispenser_alvo"], (
+        "a retomada tem de voltar ao slot interrompido")
+    dispensas = orq.adapter.comandos("/comandos/dispensar")
+    assert dispensas[1]["quantidade"] == 2
+    assert "quantidade" not in dispensas[2], "o slot seguinte é dispensado inteiro"
+
+    pesagens = orq.adapter.comandos("/comandos/pesar")
+    assert pesagens[0]["quantidade_real"] == 5 == pesagens[0]["quantidade_esperada"]
+    assert _status_gravados(orq)[-1] == ("OS-ROT", "concluida")
+    assert not [a for a in _alarmes_porta(orq)
+                if a in ("trava_ativada", "porta_aberta_sem_autorizacao",
+                         "maquina_nao_confirmou_parada")]
+    assert orq.modulo.get_pausa_porta() is None
+    assert orq.estado["porta"]["faixa"] == ""

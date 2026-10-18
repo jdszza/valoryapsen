@@ -13,9 +13,10 @@ que é DESTA placa:
     ficaria com metade dos bytes de um JSON, e as duas metades sumiriam em
     silêncio. E os comandos de bancada (R/S/C/L/E) moram SÓ na USB: um 'R'
     perdido no fio entre as placas não pode pôr a porta em modo registro;
-  * **o solenoide só destrava por ordem do central.** O único lugar que o
-    energiza é o `porta_liberar`, e o boot o desliga antes de qualquer outra
-    linha;
+  * **não há fechadura, e o "pode abrir" é do central.** A porta é presa
+    por ímã: quem puxa, abre. O que a placa controla é a AUTORIZAÇÃO, e o
+    sinal dela é o LED — aceso só em LIBERADA, que só o `porta_liberar` alcança;
+    e nenhum pino de fechadura voltou ao sketch;
   * **o contrato do §9**, campo por campo, contra `docs/PROTOCOLO_SERIAL.md`.
 
 Lê C++ por texto, como os vizinhos: cada extrator tem PISO, porque um extrator
@@ -127,32 +128,38 @@ def test_a_uart_usa_os_pinos_do_contrato(codigo):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. O solenoide
+# 2. Sem fechadura: o LED "pode abrir" é o sinal da autorização
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_o_solenoide_so_destrava_pelo_porta_liberar(codigo):
-    """O central decide se a porta abre. Um segundo lugar que energizasse o
-    solenoide seria uma porta que abre sem a máquina ter parado."""
-    chamadas = [m.start() for m in re.finditer(r"solenoide\(true\)", codigo)]
-    assert len(chamadas) == 1, f"{len(chamadas)} lugares energizam o solenoide"
+def test_nao_ha_fechadura_eletrica_no_sketch(codigo):
+    """A porta é presa por ímã simples, e o fim de curso é o único sensor dela.
+    Um pino de fechadura que voltasse seria uma peça que a bancada não tem."""
+    assert "olenoide" not in codigo and "PIN_TRAVA" not in codigo
+    assert "GPIO26" not in codigo and "#define PIN_LED_OK   25" in codigo
+
+
+def test_so_o_porta_liberar_leva_a_liberada(codigo):
+    """O central decide se a abertura é autorizada. Um segundo caminho até
+    LIBERADA acenderia o "pode abrir" com a máquina andando."""
+    chegadas = re.findall(r"mudarEstado\(LIBERADA\)", codigo)
+    assert len(chegadas) == 1, f"{len(chegadas)} caminhos chegam a LIBERADA"
     liberar = _corpo_da_funcao(codigo, "static void cmdPortaLiberar(")
-    assert "solenoide(true)" in liberar
-    # E só para um pedido pendente: liberar uma porta que não pediu nada seria
-    # destravá-la por um comando atrasado.
-    assert liberar.index("estado != AGUARDANDO_CENTRAL") < liberar.index("solenoide(true)")
+    assert "mudarEstado(LIBERADA)" in liberar
+    # E só para um pedido pendente: autorizar uma porta que não pediu nada
+    # seria acender o "pode abrir" por um comando atrasado.
+    assert liberar.index("estado != AGUARDANDO_CENTRAL") < liberar.index("mudarEstado(LIBERADA)")
 
 
-def test_o_boot_desliga_o_solenoide_antes_de_tudo(codigo):
+def test_o_led_segue_o_estado_e_nasce_apagado(codigo):
+    led = _corpo_da_funcao(codigo, "void atualizarLed()")
+    assert "estado == LIBERADA ? HIGH : LOW" in led
+    assert "atualizarLed();" in _corpo_da_funcao(codigo, "void loop()")
+    assert "atualizarLed();" in _corpo_da_funcao(codigo, "static void mudarEstado(")
     setup = _corpo_da_funcao(codigo, "void setup()")
-    i_sol = setup.index("digitalWrite(PIN_SOLENOIDE, LOW)")
-    assert i_sol < setup.index("Serial.begin"), (
-        "o solenoide tem de nascer desligado antes de qualquer outra coisa")
-
-
-def test_fora_de_liberada_o_laco_desliga_o_solenoide(codigo):
-    garantia = _corpo_da_funcao(codigo, "void garantirSolenoide()")
-    assert "estado != LIBERADA" in garantia and "solenoide(false)" in garantia
-    assert "garantirSolenoide();" in _corpo_da_funcao(codigo, "void loop()")
+    assert setup.index("digitalWrite(PIN_LED_OK, LOW)") < setup.index("Serial.begin"), (
+        "o \"pode abrir\" tem de nascer apagado antes de qualquer outra coisa")
+    # Ninguém mais escreve no pino: o LED é o estado, não um flag a parte.
+    assert codigo.count("digitalWrite(PIN_LED_OK") == 2
 
 
 def test_es2_e_uma_constante_unica_com_o_aviso_do_pino_de_boot(fonte):

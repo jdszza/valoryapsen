@@ -420,6 +420,33 @@ def _do_capturar_mesa(slot_id: int, os_id: str, quantidade_esperada: int,
 
     ts = _ts()
 
+    # ── As fotos do HOME: sem sorteio ────────────────────────────────────────
+    # A caixa VAZIA (esperado 0) e a caixa CHEIA (`FINAL-<os_id>`) decidem se a
+    # OS começa e se a mesa vai ao centro. Antes, nelas o simulador sorteava
+    # como em qualquer slot: a 2% uma falha de leitura e a 3% uma divergência —
+    # e com esperado 0 o ±1/±2 sorteado ainda produzia "divergência" com 0
+    # detectado (payload incoerente). Uma caixa que o simulador inventa cheia
+    # pararia a demonstração no começo de toda OS por nada. Aqui a contagem é a
+    # esperada, salvo injeção EXPLÍCITA — que o central nunca manda (D5).
+    if not inj_divergencia and (quantidade_esperada == 0
+                                or str(os_id or "").startswith("FINAL-")):
+        logger.info("[%s] Foto do HOME slot=%d OS=%s | caixa com %d (sem sorteio)",
+                    cam.rotulo, slot_id, os_id, quantidade_esperada)
+        _evento({
+            "tipo":                "leitura_mesa_ok",
+            "camera":              cam.nome,
+            "slot_id":             slot_id,
+            "os_id":               os_id,
+            "quantidade_esperada": quantidade_esperada,
+            "quantidade_detectada": quantidade_esperada,
+            "delta":               0,
+            "posicao_x_detectada": round(posicao_x, 2),
+            "posicao_y_detectada": round(posicao_y, 2),
+            "confianca":           0.99,
+            "ts":                  ts,
+        })
+        return
+
     # Caso 1: câmera não detecta produto (produto fora da zona, obstrução)
     if not inj_divergencia and random.random() < cam.prob_falha:
         motivo = random.choice([

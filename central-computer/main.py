@@ -83,12 +83,13 @@ from database import (
     get_historico_ordens, get_historico_sensor, get_log_manutencao,
     get_ordem_ativa, get_ordem_por_id, get_total_alarmes_ativos, get_ultimas_leituras,
     get_usuario, get_usuarios,
-    fechar_os_orfas,
+    fechar_os_orfas, os_para_retomar_no_boot,
     init_db, limpar_dispenser_estado, listar_categorias, listar_medicamentos,
     resolver_alarme,
     salvar_alarme, salvar_cnc_evento, salvar_dispensa, salvar_dispenser_estado,
     diagnosticar,
-    salvar_leitura_sensor, salvar_manutencao, salvar_ordem,
+    salvar_leitura_sensor, salvar_manutencao, salvar_ordem, salvar_porta_evento,
+    get_porta_eventos,
     semear_historico_demo,
     toggle_usuario_ativo,
 )
@@ -151,6 +152,17 @@ _estado = {
     "atribuicao_ia": [],
     # Derivado do banco por _contar_alarmes_ativos() — nunca incrementado à mão.
     "alarmes_ativos": 0,
+    # Porta NR-12 (publicação do orquestrador: `orch._publicar_porta`). A
+    # pausa é um estado SEPARADO da trava — as duas podem coexistir.
+    "porta": {"link_ok": None, "teto": None, "frente": None, "estado": None,
+              "aguardando_rearme": False,
+              "habilitada": settings.PORTA_NR12_HABILITADA, "faixa": ""},
+    "pausa_porta": None,
+    # A caixa de coleta conferida no HOME (publicação de
+    # `orch._publicar_caixa`): {os_id, etapa, faixa, contagem?, problema?} ou
+    # None. É o que as telas mostram enquanto a OS espera a caixa esvaziar,
+    # confere a caixa cheia ou leva a caixa ao centro.
+    "caixa": None,
     # Trava de Triple Check (bloqueio de OS até intervenção de supervisor)
     "trava": {
         "ativa":   False,
@@ -498,6 +510,13 @@ def _abriu_alarme(db_tasks: list) -> bool:
 
 # ── Handlers de eventos vindos dos adapters ────────────────────────────────────
 
+# Unidades que já caíram num slot antes de a porta NR-12 parar a dispensa, por
+# (os_id, slot). A retomada pede só o que falta, e o `dispensado` dela conta só
+# essa segunda parte — `atualizar_item_os` faz UPDATE, então gravar a parte
+# sozinha apagaria do item as unidades da primeira.
+_parciais_por_slot: dict[tuple, int] = {}
+
+
 async def _handle_evento_dispenser(payload: dict):
     """
     Processa eventos do dispenser-adapter e notifica o orquestrador.
@@ -606,12 +625,37 @@ async def _handle_evento_dispenser(payload: dict):
             db_tasks.append((salvar_dispenser_estado,
                              (int(disp_id), residual, os_id, med_db, cat_db)))
             if os_id:
+                # Depois de uma parada da porta, este evento é só a SEGUNDA
+                # parte do slot: o item recebe o total das duas.
+                antes = _parciais_por_slot.pop((os_id, int(disp_id)), 0)
                 status_item = "concluido" if qtd_disp >= qtd_alvo else "em_andamento"
-                db_tasks.append((atualizar_item_os, (os_id, disp_id, qtd_disp, status_item)))
+                db_tasks.append((atualizar_item_os,
+                                 (os_id, disp_id, qtd_disp + antes, status_item)))
             if not validado:
                 db_tasks.append((salvar_alarme,
                                  (f"dispenser_{disp_id}", "falha_validacao",
                                   falha or f"Remédio rejeitado D{disp_id}")))
+
+        elif tipo == "dispensado_parcial":
+            # A porta NR-12 parou a dispensa: NÃO é falha, não vira alarme. A
+            # linha da dispensa registra o que caiu (é rastro nominal), e o
+            # item da OS anda com o TOTAL do slot até aqui.
+            caidas   = _inteiro(payload.get("quantidade_confirmada"))
+            pedida   = _inteiro(payload.get("quantidade_pedida"))
+            residual = _inteiro(payload.get("quantidade_residual"), d.get("quantidade") or 0)
+            med      = (d.get("medicamento") or payload.get("medicamento")
+                        or "(desconhecido)")
+            chave_parcial = (os_id, int(disp_id))
+            _parciais_por_slot[chave_parcial] = _parciais_por_slot.get(chave_parcial, 0) + caidas
+            d.update({"status": "pausado", "quantidade_dispensada": caidas,
+                      "quantidade_residual": residual, "quantidade": residual})
+            db_tasks.append((salvar_dispensa,
+                             (os_id, disp_id, med, caidas, pedida, False, "parado_pela_porta")))
+            if os_id:
+                db_tasks.append((atualizar_item_os,
+                                 (os_id, disp_id, _parciais_por_slot[chave_parcial],
+                                  "em_andamento")))
+            _log("disp_parcial", f"D{disp_id}: parado pela porta, {caidas}/{pedida}")
 
         elif tipo == "erro":
             d["status"] = "erro"
@@ -648,7 +692,9 @@ async def _handle_evento_dispenser(payload: dict):
     if os_id:
         if tipo == "carregado":
             orch.notificar_evento(f"{os_id}:carregado:{disp_id}", payload)
-        elif tipo == "dispensado":
+        elif tipo in ("dispensado", "dispensado_parcial"):
+            # A parcial vai para a MESMA chave: é por ela que o ciclo do slot,
+            # interrompido pela porta, fica sabendo quantas caíram.
             orch.notificar_evento(f"{os_id}:dispensado:{disp_id}", payload)
         elif tipo == "erro":
             orch.notificar_evento(f"{os_id}:carregado:{disp_id}", {**payload, "tipo": "erro"})
@@ -709,32 +755,23 @@ async def _handle_evento_cnc(payload: dict):
                 "ciclo_atual":    ciclo,
                 "total_ciclos":   total,
             })
-            # `concluido` NÃO fecha OS travada, e este é o caso NORMAL do
-            # Triple Check, não uma borda: a trava dispara entre dois ciclos,
-            # com a mesa parada. O firmware então faz homing por conta própria
-            # — é onde o supervisor espera encontrar a mesa — e emite
-            # `concluido` endereçado ao `trava_os_id`, que é a OS que acabou de
-            # travar. O dashboard, o `/estado` e o `/ws` passavam a mostrar
-            # CONCLUÍDA a OS que está parada esperando um supervisor: a tela que
-            # a pessoa que vai liberar a trava está olhando.
+            # `concluido` NÃO conclui OS nenhuma — é o fim de um homing, e a
+            # mesa no HOME não é o fim da OS. Antes ele marcava a OS como
+            # concluída, e foi assim que a OS TRAVADA aparecia concluída no
+            # `/estado`, no `/ws` e no dashboard (achado 28, 20/09): a trava
+            # dispara com a mesa parada, o firmware vai ao HOME por conta
+            # própria e emite `concluido` endereçado à OS que travou. As
+            # guardas de trava e de pausa da porta que existiam aqui tapavam
+            # esse buraco caso a caso.
             #
-            # A guarda mora AQUI, e não no firmware, por duas razões. Quem manda
-            # no FLUXO é o central (README, "Fontes de verdade") — a mesa
-            # reporta o que ela fez, não o que a OS virou. E a placa em campo
-            # precisaria ser regravada; esta linha vale na bancada que já está
-            # montada.
-            if (tipo == "concluido" and os_id and _estado["os_ativa"]
-                    and _estado["os_ativa"].get("os_id") == os_id):
-                # `get_trava_estado` lê globais do orquestrador e NÃO pega
-                # `_lock` — pode ser chamada daqui de dentro.
-                if orch.get_trava_estado()["ativa"]:
-                    logger.info(
-                        "[CNC] `concluido` de %s ignorado para o status da OS: "
-                        "a trava do Triple Check está ativa (é o retorno ao HOME).",
-                        os_id,
-                    )
-                else:
-                    _estado["os_ativa"]["status"] = "concluida"
+            # Hoje quem conclui é o orquestrador, e num lugar só: na chegada da
+            # mesa ao CENTRO (`posicionado` com `destino: "centro"`), depois da
+            # conferência da caixa no HOME (CLAUDE.md, "A caixa é conferida
+            # duas vezes no HOME"). O `concluido` vira log — e continua sendo o
+            # handshake do homing, pela chave `{os_id}:homing` lá embaixo.
+            if tipo == "concluido" and os_id:
+                logger.info("[CNC] `concluido` de %s: mesa no HOME (o status da OS "
+                            "não muda — quem conclui é a chegada ao centro).", os_id)
 
             # Só TRANSIÇÃO vira linha. "movendo" chega a cada 0.5s durante todo
             # o movimento — eram centenas de linhas por OS para descrever uma
@@ -761,8 +798,25 @@ async def _handle_evento_cnc(payload: dict):
 
     await _atualizar_alarmes_ativos(forcar=_abriu_alarme(db_tasks))
 
-    # Notifica orquestrador
-    if os_id and disp_alvo is not None:
+    # O homing da retomada da porta é handshake: a retomada espera o
+    # `concluido` (ou o `erro` de homing) por esta chave. Ninguém mais a
+    # registra, então no homing de fim de OS ela é ignorada.
+    if os_id and tipo == "concluido":
+        orch.notificar_evento(f"{os_id}:homing", payload)
+    elif os_id and tipo == "erro" and payload.get("codigo_erro") == "homing_falhou":
+        orch.notificar_evento(f"{os_id}:homing", {**payload, "tipo": "erro"})
+
+    # Notifica orquestrador. A ida ao CENTRO (fim da OS) tem chave própria:
+    # chega como `posicionado` com `destino: "centro"`, e falha como `erro` com
+    # `dispenser_alvo: 0` — não existe dispenser 0, e o `homing_falhou` (que
+    # também vem com 0) é do homing, não do centro.
+    centro = (tipo == "posicionado" and payload.get("destino") == "centro") or (
+        tipo == "erro" and disp_alvo == 0
+        and payload.get("codigo_erro") != "homing_falhou")
+    if os_id and centro:
+        orch.notificar_evento(f"{os_id}:centro",
+                              payload if tipo == "posicionado" else {**payload, "tipo": "erro"})
+    elif os_id and disp_alvo is not None:
         if tipo == "posicionado":
             orch.notificar_evento(f"{os_id}:posicionado:{disp_alvo}", payload)
         elif tipo == "erro":
@@ -779,6 +833,30 @@ async def _handle_evento_cnc(payload: dict):
     else:
         _log(f"cnc_{tipo}", f"CNC {tipo} | D{disp_alvo} | ({pos_x:.1f},{pos_y:.1f})")
     _broadcast_estado(prioritario=tipo not in _TIPOS_ALTA_FREQUENCIA)
+
+
+async def _handle_evento_porta(payload: dict):
+    """Eventos da porta NR-12 (via dispenser-adapter, através da placa das telas).
+
+    QUEM DECIDE é o orquestrador (`orch.evento_porta`): parar, autorizar,
+    retomar. Este handler grava o HISTÓRICO — uma linha por mensagem que muda
+    estado, com UID, porta, a OS e o slot do momento — e mantém o badge de
+    alarmes em dia. O heartbeat (`estado`) não vira linha: são dois por
+    segundo, e o que ele diz já está na tela.
+    """
+    tipo = payload.get("tipo", "?")
+    fatos = await orch.evento_porta(payload)
+    if fatos.get("linha"):
+        detalhe = payload.get("motivo") or payload.get("estado")
+        if tipo == "liberada":
+            detalhe = f"janela {payload.get('janela_ms')} ms"
+        await _db(salvar_porta_evento, tipo, payload.get("porta"),
+                  payload.get("autorizada"), payload.get("uid"), detalhe,
+                  fatos.get("os_id"), fatos.get("slot_id"))
+        _log(f"porta_{tipo}", f"PORTA {tipo}"
+             + (f" ({payload.get('porta')})" if payload.get("porta") else ""), payload)
+    await _atualizar_alarmes_ativos(forcar=bool(fatos.get("alarmes")))
+    _broadcast_estado()
 
 
 # As duas câmeras que cobrem as fileiras de dispensers. A da mesa não entra
@@ -823,6 +901,11 @@ async def _handle_evento_visao(payload: dict):
     slot_id = payload.get("slot_id")
     os_id   = payload.get("os_id")
     db_tasks = []
+    # As fotos do HOME chegam com o `os_id` próprio (`VAZIA-…`/`FINAL-…`): a
+    # linha do histórico vai para a OS REAL, com a `etapa`, e a notificação ao
+    # orquestrador usa o alias — é por ele que a foto foi pedida.
+    os_real, etapa = orch.resolver_alias_visao(os_id)
+    foto_do_home = etapa != "slot"
 
     with _lock:
         # ── Câmeras dos Dispensers (esquerda e direita) ────────────────────
@@ -904,13 +987,21 @@ async def _handle_evento_visao(payload: dict):
 
             # Persiste leitura no histórico (todos os tipos de câmera mesa)
             db_tasks.append((salvar_leitura_visao, (
-                os_id, "mesa", slot_id, tipo,
+                os_real, "mesa", slot_id, tipo,
                 None, None, None, payload.get("confianca"),
                 payload.get("quantidade_esperada"), payload.get("quantidade_detectada"),
-                payload.get("motivo"),
+                payload.get("motivo"), etapa,
             )))
 
-            if tipo == "leitura_mesa_falha":
+            if foto_do_home:
+                # SEM alarme aqui, em nenhum dos três tipos: quem decide o que a
+                # foto da caixa significa é o orquestrador (caixa não vazia,
+                # câmera muda no início, conferência final), e ele grava o
+                # alarme certo — um por caso, nunca em dobro.
+                _log("visao", f"Câmera mesa no HOME ({etapa}) OS {os_real}: "
+                              f"{tipo} — contou {payload.get('quantidade_detectada')} "
+                              f"de {payload.get('quantidade_esperada')}")
+            elif tipo == "leitura_mesa_falha":
                 descricao = (f"Câmera mesa não detectou produto slot {slot_id}: "
                              f"{payload.get('motivo', 'desconhecido')}")
                 db_tasks.append((salvar_alarme,
@@ -1125,6 +1216,38 @@ async def _fechar_os_orfas_no_boot() -> None:
     await _atualizar_alarmes_ativos(forcar=True)
 
 
+async def _retomar_os_da_caixa_no_boot() -> None:
+    """OS que um central morto deixou nas etapas da caixa voltam à fila.
+
+    `conferindo_caixa`/`indo_ao_centro`: a dispensa terminou, a OS volta para
+    "homing → FINAL → centro". `aguardando_caixa_vazia`: nada foi reservado, ela
+    volta como OS nova. Roda ANTES de `loop_orquestrador` existir, como a
+    reconciliação das órfãs. Fila cheia (não deveria, no boot) fecha em erro com
+    alarme, em vez de deixar a linha pendurada num status de execução.
+    """
+    try:
+        retomar = await asyncio.to_thread(os_para_retomar_no_boot) or {}
+    except Exception as exc:
+        logger.warning("[BOOT] Não foi possível retomar OS das etapas da caixa (%s).", exc)
+        return
+    for os_id, esperado in retomar.get("final", []):
+        ok = await orch.enfileirar_os({"os_id": os_id, "retomar_final": True,
+                                       "esperado": esperado})
+        logger.warning("[BOOT] OS %s estava na conferência da caixa/centro: %s.", os_id,
+                       "volta para homing → FINAL → centro" if ok else "fila cheia")
+        if not ok:
+            await _db(atualizar_status_ordem, os_id, "erro")
+            await _db(salvar_alarme, "central", "os_orfa_no_boot",
+                      f"OS {os_id} estava na conferência da caixa num central que "
+                      f"caiu, e a fila não tinha vaga para retomá-la.")
+    for payload in retomar.get("refila", []):
+        ok = await orch.enfileirar_os(payload)
+        logger.warning("[BOOT] OS %s esperava a caixa vazia: %s.", payload.get("os_id"),
+                       "de volta à fila" if ok else "fila cheia")
+        if not ok:
+            await _db(atualizar_status_ordem, payload.get("os_id"), "cancelada")
+
+
 async def _validar_templates_no_boot() -> None:
     problemas, catalogo = await _diagnosticar_templates()
     if problemas:
@@ -1152,6 +1275,9 @@ async def lifespan(app: FastAPI):
 
     # Injeta loop no orquestrador para notificar_evento thread-safe
     orch.inicializar(_estado, _lock, _broadcast_estado, _loop)
+    # As etapas da caixa no HOME (caixa vazia, conferência final, centro)
+    # aparecem no histórico de eventos do central.
+    orch._historico_fn = _log
 
     # Segredo fraco derruba o boot (fora de APSEN_ENV=dev). O valor default é
     # público neste repositório: com ele qualquer um forja um JWT role=admin.
@@ -1164,6 +1290,10 @@ async def lifespan(app: FastAPI):
     # OS ativa" para sempre, no `GET /os/ativa`, no app de manutenção e no
     # espelho do painel de bancada.
     await _fechar_os_orfas_no_boot()
+    # As que estavam nas etapas da CAIXA (antes da reserva ou depois da
+    # dispensa) não fecham em erro: voltam à fila (CLAUDE.md, "A caixa é
+    # conferida duas vezes no HOME").
+    await _retomar_os_da_caixa_no_boot()
 
     # As 10 ordens padrão contra o catálogo REAL, agora que o banco está de pé.
     # Aqui é WARNING, não queda: o central serve a planta inteira e derrubá-lo
@@ -1177,6 +1307,8 @@ async def lifespan(app: FastAPI):
     task_flusher   = asyncio.create_task(_broadcast_flusher())
     task_orch      = asyncio.create_task(orch.loop_orquestrador())
     task_expurgo   = asyncio.create_task(_loop_expurgo())
+    # A vigia de cima da porta NR-12: silêncio dela também para a célula.
+    task_porta     = asyncio.create_task(orch.vigiar_porta())
 
     if settings.MODO_APRESENTACAO:
         logger.warning(
@@ -1192,7 +1324,7 @@ async def lifespan(app: FastAPI):
     logger.info("Computador Central APSEN v3.1 iniciado.")
     yield
 
-    for tarefa in (task_broadcast, task_flusher, task_orch, task_expurgo):
+    for tarefa in (task_broadcast, task_flusher, task_orch, task_expurgo, task_porta):
         tarefa.cancel()
     await orch.encerrar()
     # As conexões do pool sobrevivem a cada operação de propósito; no shutdown
@@ -1599,6 +1731,20 @@ async def evento_dispenser(req: EventoDispenserReq):
 async def evento_cnc(req: EventoCNCReq):
     """Recebe eventos normalizados do cnc-adapter."""
     await _handle_evento_cnc(req.model_dump())
+    return {"ok": True}
+
+
+class EventoPortaReq(BaseModel):
+    tipo: str
+    origem: Optional[str] = None
+
+    model_config = {"extra": "allow"}
+
+
+@app.post("/api/v1/eventos/porta", tags=["Eventos dos Adapters"])
+async def evento_porta(req: EventoPortaReq):
+    """Eventos da porta NR-12 — rota irmã da dos dispensers (§9 do protocolo)."""
+    await _handle_evento_porta(req.model_dump())
     return {"ok": True}
 
 
@@ -2188,6 +2334,42 @@ def manut_resolver_alarme(alarme_id: int, user=Depends(_get_tecnico)):
 
 # ── Triple Check — trava de emergência ────────────────────────────────────────
 
+@app.get("/api/v1/porta", tags=["Porta NR-12"])
+def get_porta():
+    """Estado da porta NR-12 e da pausa da célula, e a FAIXA que o operador vê.
+
+    Sem autenticação, como `/api/v1/trava`: quem lê é o painel de bancada e o
+    dashboard, e a frase é a mesma nas três telas porque sai daqui.
+    """
+    return {
+        "porta": orch.get_estado_porta(),
+        "pausa": orch.get_pausa_porta(),
+        "faixa": orch.faixa_da_porta(),
+        "habilitada": settings.PORTA_NR12_HABILITADA,
+    }
+
+
+@app.get("/api/v1/caixa", tags=["Caixa de coleta"])
+def get_caixa():
+    """A etapa da caixa de coleta no HOME e a FAIXA que o operador vê.
+
+    Sem autenticação, como `/api/v1/porta`: quem lê é o painel de bancada, e a
+    frase sai daqui para ser a mesma no painel, no display e no dashboard.
+    `caixa` None = nenhuma OS está esperando, conferindo ou indo ao centro.
+    """
+    with _lock:
+        caixa = copy.deepcopy(_estado.get("caixa"))
+    return {"caixa": caixa, "faixa": (caixa or {}).get("faixa", "")}
+
+
+@app.get("/api/v1/porta/historico", tags=["Porta NR-12"])
+async def get_porta_historico(limite: int = 100):
+    try:
+        return await asyncio.to_thread(get_porta_eventos, _limite(limite))
+    except Exception as exc:
+        raise HTTPException(503, f"histórico da porta indisponível: {exc}")
+
+
 @app.get("/api/v1/trava", tags=["Triple Check"])
 def get_trava():
     """Retorna estado atual da trava de Triple Check."""
@@ -2647,6 +2829,42 @@ async def console_liberar_trava(request: Request):
     return {"ok": True, "liberado_por": "console"}
 
 
+@app.post("/console/api/cancelar-espera-caixa", include_in_schema=False)
+async def console_cancelar_espera_caixa(request: Request):
+    """Encerra a OS que espera a caixa de coleta esvaziar — `cancelada`.
+
+    Só nessa espera: ela vem antes da reserva de slots, então cancelar não
+    deixa medicamento em lugar nenhum. Depois dela a saída é outra (trava,
+    reset). Rotina, não destrutivo: um clique.
+    """
+    _console_exigir_sessao(request)
+    os_id = orch.cancelar_espera_caixa()
+    if os_id is None:
+        return JSONResponse(status_code=409, content={
+            "erro": "sem_espera",
+            "mensagem": "Nenhuma OS esperando a caixa de coleta esvaziar."})
+    _log("console", f"OS {os_id} cancelada pelo console na espera da caixa vazia")
+    return {"ok": True, "os_id": os_id}
+
+
+@app.post("/console/api/reenviar-centro", include_in_schema=False)
+async def console_reenviar_centro(request: Request):
+    """Manda de novo a mesa ao centro, depois de um `cnc_nao_chegou_ao_centro`.
+
+    A contagem da caixa já foi conferida: é só a ida que se repete. O `cmd_id`
+    novo é do adapter; um reenvio que cruze com um ACK perdido não move duas
+    vezes (a placa ignora id repetido).
+    """
+    _console_exigir_sessao(request)
+    os_id = orch.reenviar_centro()
+    if os_id is None:
+        return JSONResponse(status_code=409, content={
+            "erro": "sem_centro_pendente",
+            "mensagem": "Nenhuma OS esperando para reenviar a mesa ao centro."})
+    _log("console", f"OS {os_id}: mesa reenviada ao centro pelo console")
+    return {"ok": True, "os_id": os_id}
+
+
 # ── Injeção de falha sob demanda ──────────────────────────────────────────────
 #
 # O gatilho mora em `injecao.py` e viaja no comando que o orquestrador já
@@ -2898,8 +3116,16 @@ async def console_prevoo(request: Request):
                                  catalogo is not None)]
         + [prevoo.item_fila(fila["tamanho"], fila["capacidade"])]
         + prevoo.itens_celula(snapshot, orch.HOME)
+        + [prevoo.item_portas(
+            orch.get_estado_porta(), orch.get_pausa_porta(),
+            settings.PORTA_NR12_HABILITADA,
+            next((s["estado"] == prevoo.OK for s in servicos
+                  if s["id"] == "dispenser-adapter"), None),
+            orch.idade_porta_s(), settings.PORTA_SILENCIO_MAX_S)]
         + prevoo.itens_visao(visao, settings.VISAO_MESA_POSICOES_DEFINIDA,
-                             os_templates.listar())
+                             os_templates.listar(),
+                             caixa_vazia=settings.VISAO_CAIXA_VAZIA,
+                             home_visivel=settings.VISAO_MESA_HOME)
         + prevoo.itens_modo(settings.MODO_APRESENTACAO, settings.FATOR_VELOCIDADE,
                             injecao.armada(), len(_ws_manager.active))
     )

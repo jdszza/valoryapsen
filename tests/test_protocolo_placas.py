@@ -220,6 +220,10 @@ EXEMPLOS_DE_COMANDO = {
         "homing": {"os_id": "OS-1", "posicao_x": -120.0, "posicao_y": 0.0},
         "estado_celula": {"trava_ativa": True, "trava_slot_id": 3,
                           "os_id": "OS-1", "trava_resumo": "divergência de peso"},
+        # Depois da trava (que deixou a placa travada), o `centro` sai como
+        # `erro` — e o `posicionado` do `mover` acima continua sendo o exemplo.
+        # Quem cobra a chegada ao centro, campo a campo, é o teste abaixo.
+        "centro": {"os_id": "OS-1"},
     },
     "weight": {
         "tara": {"os_id": "OS-1"},
@@ -248,8 +252,19 @@ EXEMPLOS_DE_COMANDO = {
 
 # Eventos que a placa emite fora do ciclo comando → resultado. As telas SÓ
 # emitem por conta própria: pintar não produz resultado.
+def _parada_no_meio(placa) -> list[dict]:
+    """`dispensado_parcial` só existe no MEIO de uma dispensa: encena a lenta."""
+    placa.eventos_para("carregar", EXEMPLOS_DE_COMANDO["dispenser"]["carregar"])
+    placa.dispensa_lenta = True
+    placa.eventos_para("dispensar", {"dispenser_id": 1, "os_id": "OS-1"})
+    placa.avancar(3)
+    eventos = placa.eventos_para("parar", {"motivo": "porta_aberta"})
+    placa.dispensa_lenta = False
+    return eventos
+
+
 EXTRAS_DA_PLACA = {
-    "dispenser":     lambda p: [p.telemetria(1)],
+    "dispenser":     lambda p: [p.telemetria(1)] + _parada_no_meio(p),
     "cnc":           lambda p: [p.movendo("OS-1", 3, 120.0, -150.0)],
     "weight":        lambda p: [p.telemetria(), p.boot(), p.peso(),
                                 p.erro_balanca("canal 0 saturado")],
@@ -858,3 +873,28 @@ def test_a_placa_falsa_usa_o_vocabulario_do_firmware():
 
     assert emitidos, "a placa falsa não emite `erro` nenhum"
     assert emitidos <= _codigos_do_firmware(), sorted(emitidos - _codigos_do_firmware())
+
+
+def test_o_posicionado_do_centro_tem_a_forma_do_posicionado_do_mover(doc):
+    """UMA forma só para o `posicionado`: o central roteia por `destino`, e um
+    evento com dois formatos é um campo que some do lado que não o esperava."""
+    placa = PlacaCNC(atraso_evento=0.0)
+    (centro,) = placa.eventos_para("centro", {"os_id": "OS-1"})
+    (mover,) = placa.eventos_para("mover", {"dispenser_alvo": 2, "os_id": "OS-1"})
+
+    assert centro["tipo"] == mover["tipo"] == "posicionado"
+    assert set(centro) == set(mover)
+    assert set(centro) - {"tipo"} == set(doc_eventos(doc, "cnc")["posicionado"])
+    assert (centro["destino"], centro["dispenser_alvo"]) == ("centro", 0)
+    assert mover["destino"] == "dispenser"
+
+
+def test_o_centro_sem_origem_nao_inventa_posicao():
+    placa = PlacaCNC(atraso_evento=0.0)
+    placa.homing_falha = True
+    placa.eventos_para("homing", {"os_id": "OS-1"})
+
+    (evento,) = placa.eventos_para("centro", {"os_id": "OS-1"})
+    assert evento["tipo"] == "erro"
+    assert evento["codigo_erro"] == "sem_homing"
+    assert placa.no_centro == 0

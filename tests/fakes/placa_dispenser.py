@@ -23,11 +23,18 @@ class PlacaDispenser(PlacaFalsa):
                       "quantidade", "os_id"),
         "dispensar": ("dispenser_id", "os_id"),
         "limpar":    ("dispenser_id", "solicitado_por"),
+        "parar":     (),
     }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.estoque: dict[int, dict] = {}
+        # `dispensa_lenta=True` encena a dispensa que DEMORA: o `dispensar` é
+        # aceito e nada sai até `avancar(n)` contar unidades e um `parar`
+        # chegar (ou `concluir()` encerrar). É o que deixa um teste parar "3 de
+        # 5" — com o evento instantâneo de sempre não haveria meio para parar.
+        self.dispensa_lenta = False
+        self.em_curso: dict | None = None
 
     def eventos_para(self, cmd: str, campos: dict) -> list[dict]:
         slot = campos.get("dispenser_id")
@@ -51,9 +58,38 @@ class PlacaDispenser(PlacaFalsa):
                 "ts": agora(),
             }]
 
+        if cmd == "parar":
+            # Sem dispensa em curso: só o ACK. Com: termina a unidade e para.
+            if self.em_curso is None:
+                return []
+            curso, self.em_curso = self.em_curso, None
+            self.estoque[curso["slot"]] = {
+                "medicamento": curso["medicamento"], "sku": curso["sku"],
+                "quantidade": curso["alvo"] - curso["caidas"],
+            }
+            return [{
+                "tipo": "dispensado_parcial",
+                "dispenser_id": curso["slot"],
+                "os_id": curso["os_id"],
+                "medicamento": curso["medicamento"],
+                "quantidade_confirmada": curso["caidas"],
+                "quantidade_pedida": curso["alvo"],
+                "quantidade_residual": curso["alvo"] - curso["caidas"],
+                "ts": agora(),
+            }]
+
+        if cmd == "dispensar" and self.dispensa_lenta:
+            carga = self.estoque.get(slot, {"medicamento": None, "sku": None,
+                                            "quantidade": 0})
+            alvo = campos.get("quantidade") or carga["quantidade"]
+            self.em_curso = {"slot": slot, "os_id": campos["os_id"], "alvo": alvo,
+                             "medicamento": carga["medicamento"],
+                             "sku": carga.get("sku"), "caidas": 0}
+            return []
+
         if cmd == "dispensar":
             carga = self.estoque.pop(slot, {"medicamento": None, "quantidade": 0})
-            alvo = carga["quantidade"]
+            alvo = campos.get("quantidade") or carga["quantidade"]
             # `injetar_falha` atravessou o adapter sem interpretação e chega
             # aqui; a placa a trata num ramo isolado, ANTES de qualquer sorteio.
             # Falha mecânica solta UMA unidade a menos — o número sai do
@@ -87,6 +123,12 @@ class PlacaDispenser(PlacaFalsa):
             }]
 
         return []
+
+    def avancar(self, unidades: int) -> None:
+        """Na dispensa lenta, `unidades` caíram e o IR as contou."""
+        assert self.em_curso is not None, "nenhuma dispensa em curso"
+        self.em_curso["caidas"] = min(self.em_curso["alvo"],
+                                      self.em_curso["caidas"] + unidades)
 
     # ── Telemetria periódica ─────────────────────────────────────────────────
 
