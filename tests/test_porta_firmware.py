@@ -7,12 +7,14 @@ própria, o buffer antes do `begin`) já é cobrado em
 `tests/test_dispenser_firmware.py`, que passou a incluir a porta. Aqui fica o
 que é DESTA placa:
 
-  * **duas portas seriais, dois donos.** A voz de máquina é o Serial2, e ela
-    só entra pelo `serialPoll()` do header. Uma leitura caractere a caractere
-    do Serial2 no `.ino` seria um segundo leitor da MESMA linha — cada um
-    ficaria com metade dos bytes de um JSON, e as duas metades sumiriam em
-    silêncio. E os comandos de bancada (R/S/C/L/E) moram SÓ na USB: um 'R'
-    perdido no fio entre as placas não pode pôr a porta em modo registro;
+  * **uma USB, duas vozes.** A porta tem USB própria no mini PC (o dono é o
+    `porta-adapter`), e máquina e bancada dividem essa USB, separadas pelo
+    '{' — a regra do header nas outras placas. Quem lê a USB é o
+    `serialPoll()` do header, e só ele: um segundo leitor no `.ino` ficaria
+    com metade dos bytes de um JSON. Os comandos de bancada (R/S/C/L/E)
+    chegam por `linhaHumana()`, uma letra por linha. Nada de Serial2 nem de
+    `APSEN_SERIAL`: a UART com a placa das telas saiu, e GPIO16/17 ficaram
+    livres;
   * **não há fechadura, e o "pode abrir" é do central.** A porta é presa
     por ímã: quem puxa, abre. O que a placa controla é a AUTORIZAÇÃO, e o
     sinal dela é o LED — aceso só em LIBERADA, que só o `porta_liberar` alcança;
@@ -35,9 +37,10 @@ RAIZ_REPO = Path(__file__).resolve().parent.parent
 SKETCH = RAIZ_REPO / "porta" / "porta_nr12" / "porta_nr12.ino"
 DOC = RAIZ_REPO / "docs" / "PROTOCOLO_SERIAL.md"
 
-# Os dois eventos de vigia são da placa das TELAS, não da porta — o firmware
-# da porta não os emite, e é isso que o teste do contrato tem de saber.
-EVENTOS_DA_PLACA_DAS_TELAS = {"porta_link_perdido", "porta_link_ok"}
+# Os dois eventos de vigia são do `porta-adapter`, não da porta — quem perdeu
+# o link não tem como avisar que o perdeu. O firmware da porta não os emite, e
+# é isso que o teste do contrato tem de saber.
+EVENTOS_DO_ADAPTER = {"porta_link_perdido", "porta_link_ok"}
 
 
 @pytest.fixture(scope="module")
@@ -85,46 +88,70 @@ def doc_eventos() -> dict[str, list[str]]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. Duas portas seriais, dois donos
+# 1. Uma USB, duas vozes
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_a_voz_de_maquina_e_o_serial2(codigo):
-    """O header fala pela macro `APSEN_SERIAL`, e ela tem de vir ANTES do
-    include — depois, o header já teria fixado a USB."""
-    i_define = codigo.index("#define APSEN_SERIAL Serial2")
-    i_include = codigo.index('#include "apsen_serial.h"')
-    assert i_define < i_include
+def test_a_voz_de_maquina_e_a_usb_sem_serial2_nem_macro(fonte, codigo):
+    """A porta fala pela USB, como as outras placas. Um `APSEN_SERIAL`
+    redefinido ou um Serial2 de volta seria a UART com a placa das telas
+    voltando por um merge — e o adapter, na USB, ouviria silêncio."""
+    assert "Serial2" not in fonte, "Serial2 voltou ao sketch da porta"
+    assert "APSEN_SERIAL" not in fonte, "o sketch redefine a porta da voz de máquina"
+    assert "PIN_UART" not in codigo
+    setup = _corpo_da_funcao(codigo, "void setup()")
+    assert "Serial.begin(115200)" in setup
 
 
-def test_o_ino_nao_le_o_serial2_caractere_a_caractere(codigo):
-    """Quem lê o Serial2 é o `serialPoll()` do header, e só ele.
+def test_gpio16_e_17_ficaram_livres(codigo):
+    """Eram a UART com a placa das telas. Nenhum `#define` de pino usa 16/17."""
+    pinos = {int(n) for n in re.findall(r"#define\s+PIN_\w+\s+(\d+)", codigo)}
+    assert len(pinos) >= 8, f"o extrator achou só {sorted(pinos)}"
+    assert not ({16, 17} & pinos), sorted(pinos)
 
-    Um segundo leitor da mesma porta dividiria os bytes de uma linha entre os
-    dois: cada metade vira JSON inválido e some sem erro em lugar nenhum.
+
+def test_o_ino_nao_le_a_usb_por_conta_propria(codigo):
+    """Quem lê a USB é o `serialPoll()` do header, e só ele.
+
+    Com a bancada e a máquina na MESMA USB, o antigo `tratarBancada()` — que
+    lia `Serial` caractere a caractere — viraria um segundo leitor da mesma
+    linha: cada um ficaria com metade dos bytes de um JSON, e as duas metades
+    sumiriam sem erro em lugar nenhum.
     """
-    assert "Serial2.read" not in codigo
-    assert "Serial2.available" not in codigo
-    assert "Serial2.readString" not in codigo
+    for proibido in ("Serial.read", "Serial.available", "Serial.readString",
+                     "tratarBancada"):
+        assert proibido not in codigo, proibido
+    assert "serialPoll();" in _corpo_da_funcao(codigo, "void loop()")
 
 
-def test_os_comandos_de_bancada_moram_so_na_usb(codigo):
-    """R/S/C/L/E leem `Serial` (a USB), e a linha sem '{' do Serial2 só vira
-    log — nunca um comando de bancada."""
-    bancada = _corpo_da_funcao(codigo, "void tratarBancada()")
-    assert "Serial.read()" in bancada
-    assert "Serial2" not in bancada
+def test_os_comandos_de_bancada_chegam_por_linha_humana(codigo):
+    """R/S/C/L/E saem de `linhaHumana()` — a linha SEM '{' que o header já
+    separou na linha crua. Uma letra por linha, em maiúscula ou minúscula,
+    espaços ignorados; mais de uma letra não vira sequência de comandos."""
+    humana = _corpo_da_funcao(codigo, "void linhaHumana(char* linha)")
+    assert "comandoBancada(" in humana
+    assert "maiuscula(" in humana
+    assert "' '" in humana, "a linha humana deixou de ignorar espaço"
+    assert "letras > 1" in humana, "mais de uma letra virou sequência de comandos"
+    bancada = _corpo_da_funcao(codigo, "static void comandoBancada(char c)")
     for letra in "RSCLE":
         assert f"case '{letra}'" in bancada, f"o comando de bancada {letra} sumiu"
+    # Só `linhaHumana` chama o comando de bancada: um segundo caminho seria
+    # uma segunda porta de entrada da voz do humano.
+    assert codigo.count("comandoBancada(") == 2, "definição + a chamada em linhaHumana"
 
-    humana = _corpo_da_funcao(codigo, "void linhaHumana(char* linha)")
-    assert "tratarBancada" not in humana and "case '" not in humana
-    assert "modoReg" not in humana, "linha do Serial2 mexendo no modo registro"
 
-
-def test_a_uart_usa_os_pinos_do_contrato(codigo):
-    assert "#define PIN_UART_RX  16" in codigo
-    assert "#define PIN_UART_TX  17" in codigo
-    assert "Serial2.begin(115200, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX)" in codigo
+def test_nenhum_log_humano_leva_chave(fonte):
+    """Linha com '{' é voz de MÁQUINA do outro lado do fio. Um log que
+    levasse '{' viraria uma tentativa de JSON no adapter — descartada como
+    inválida no melhor caso, e lida como mensagem no pior."""
+    chamadas = re.findall(r"(?:logMsg|Serial\.print(?:ln|f)?)\((.*)", fonte)
+    assert len(chamadas) >= 20, f"o extrator achou só {len(chamadas)} logs"
+    for chamada in chamadas:
+        if chamada.startswith("const char* tag"):
+            continue                      # a definição de logMsg
+        literais = re.findall(r'"((?:\\.|[^"\\])*)"', chamada)
+        for literal in literais:
+            assert "{" not in literal, chamada
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -212,7 +239,7 @@ def _eventos_do_firmware(codigo: str) -> dict[str, str]:
 def test_cada_evento_carrega_os_campos_do_documento(codigo):
     blocos = _eventos_do_firmware(codigo)
     documentados = doc_eventos()
-    da_porta = set(documentados) - EVENTOS_DA_PLACA_DAS_TELAS
+    da_porta = set(documentados) - EVENTOS_DO_ADAPTER
     assert len(blocos) >= 9, f"o extrator achou só {sorted(blocos)}"
     assert set(blocos) == da_porta, {
         "emitido e não documentado": sorted(set(blocos) - da_porta),
@@ -227,7 +254,8 @@ def test_cada_evento_carrega_os_campos_do_documento(codigo):
 
 
 def test_todo_evento_leva_a_origem(codigo):
-    """É o campo que separa, no adapter, o evento da porta do das telas."""
+    """O central filtra por ele. Com a USB própria ele é redundante — a COM já
+    diz de quem é a linha —, e fica: tirá-lo mudaria firmware e rota juntos."""
     # O literal C inteiro, com as aspas escapadas DENTRO dele.
     literais = re.findall(r'"\{\\"evento\\":\{(?:\\.|[^"\\])*"', codigo)
     assert len(literais) >= 7
@@ -236,9 +264,9 @@ def test_todo_evento_leva_a_origem(codigo):
 
 
 def test_a_porta_nao_emite_os_eventos_de_vigia(codigo):
-    """`porta_link_perdido`/`porta_link_ok` são da placa das telas: quem perdeu
+    """`porta_link_perdido`/`porta_link_ok` são do `porta-adapter`: quem perdeu
     o link não tem como avisar que o perdeu."""
-    for tipo in EVENTOS_DA_PLACA_DAS_TELAS:
+    for tipo in EVENTOS_DO_ADAPTER:
         assert tipo not in codigo
 
 

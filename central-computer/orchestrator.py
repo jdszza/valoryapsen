@@ -2257,7 +2257,7 @@ async def _atender_pedido_acesso(uid: str, geracao: int) -> None:
     if _porta_geracao != geracao or _pausa_porta is None:
         return
     if confirmada:
-        ok = await _post(settings.DISPENSER_ADAPTER_URL + "/comandos/porta/liberar",
+        ok = await _post(settings.PORTA_ADAPTER_URL + "/comandos/porta/liberar",
                          {"janela_ms": settings.PORTA_JANELA_LIBERACAO_MS})
         if not ok:
             # A porta desiste sozinha em ESPERA_CENTRAL_MS e volta a FECHADA
@@ -2270,7 +2270,7 @@ async def _atender_pedido_acesso(uid: str, geracao: int) -> None:
         f"Pedido de acesso (tag {uid}) NEGADO: a CNC ou os dispensers não "
         f"confirmaram a parada em {settings.PORTA_PARADA_MAX_S:.1f}s. A porta "
         f"continua travada.")
-    await _post(settings.DISPENSER_ADAPTER_URL + "/comandos/porta/negar",
+    await _post(settings.PORTA_ADAPTER_URL + "/comandos/porta/negar",
                 {"motivo": "maquina_nao_confirmou_parada"})
 
 
@@ -2368,7 +2368,7 @@ def _registrar_tag_negada(agora: float) -> bool:
 
 
 async def evento_porta(payload: dict) -> dict:
-    """Um evento da porta NR-12 (via dispenser-adapter). Decide e devolve o fato.
+    """Um evento da porta NR-12 (via porta-adapter). Decide e devolve o fato.
 
     Rápido: o que demora (parar, liberar, homing) vai para background — o
     handler HTTP é o único caminho de volta do adapter, e segurá-lo faria o
@@ -2479,7 +2479,7 @@ async def evento_porta(payload: dict) -> dict:
             elif bloqueio:
                 logger.warning("[PORTA] rearme recusado: %s. Máquina segue parada.",
                                bloqueio)
-                _agendar_porta(_post(settings.DISPENSER_ADAPTER_URL
+                _agendar_porta(_post(settings.PORTA_ADAPTER_URL
                                      + "/comandos/porta/estado", {}))
             else:
                 _pausa_porta["aguardando_rearme"] = False

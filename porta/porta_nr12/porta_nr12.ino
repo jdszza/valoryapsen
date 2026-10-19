@@ -18,15 +18,18 @@
  *  Sem resposta do central em ESPERA_CENTRAL_MS, o LED nao acende. O contrato
  *  e `docs/PROTOCOLO_SERIAL.md` §9.
  *
- *  DUAS PORTAS SERIAIS, DOIS DONOS
- *    Serial2 (UART dedicada, GPIO16/17) - a voz de MAQUINA, com a placa das 8
- *      telas TFT do outro lado do fio. Ela repassa as linhas pela USB dela ao
- *      dispenser-adapter, sem mexer no conteudo. E por aqui que sai todo
- *      evento do contrato e que chega todo comando do central.
- *    Serial (USB) - SO BANCADA. Os comandos de um caractere R/S/C/L/E
- *      continuam aqui e so aqui, e os textos para humano tambem. Nenhum
- *      caractere vindo do Serial2 vira comando de bancada: um 'R' perdido no
- *      fio entre as placas nao pode por a porta em modo registro.
+ *  UMA USB, DUAS VOZES (a mesma regra das outras placas)
+ *    Esta placa tem USB PROPRIA no mini PC, e o dono dela e o `porta-adapter`
+ *    (HTTP 8104). Na mesma USB andam:
+ *      - a voz de MAQUINA: linha com chave. Todo evento do contrato, todo ACK
+ *        e todo comando do central. Lida SO pelo `serialPoll()` do header;
+ *      - a voz de BANCADA: linha sem chave. Os comandos de um caractere
+ *        R/S/C/L/E chegam por `linhaHumana()`, e os textos para humano saem por
+ *        `logMsg`/`Serial.print` - nenhum deles com chave de abertura, que
+ *        viraria linha de maquina do outro lado.
+ *    O adapter nunca manda linha sem chave. E no Windows a COM abre em UM
+ *    programa por vez: para cadastrar tag pelo Monitor Serial, PARE o
+ *    porta-adapter antes.
  *
  *  LIGACOES (ESP32 NodeMCU / DevKit V1) - as do RC522 e dos fins de curso sao
  *  as VALIDADAS na bancada, sem mudar um pino.
@@ -43,13 +46,11 @@
  *      Fio rompido = HIGH = lido como "aberto" (falha segura)
  *    Fechadura: NENHUMA. Cada porta e presa por um ima simples; o fim de
  *      curso e o unico sensor dela.
- *    UART com a placa das telas (Serial2, 115200 8N1)
- *      TX2 (GPIO17) -> RX da placa das telas
- *      RX2 (GPIO16) <- TX da placa das telas
- *      GND comum. Nada de 5 V entre as duas placas.
+ *    USB -> mini PC (a COM fixada no Windows vai em PORTA_SERIAL_URL)
  *    LED "pode abrir" -> D25 (aceso enquanto a abertura esta AUTORIZADA)
  *
- *  COMANDOS DE BANCADA (Monitor Serial da USB, 115200)
+ *  COMANDOS DE BANCADA (Monitor Serial da USB, 115200, com o porta-adapter
+ *  PARADO). Uma letra por linha; maiuscula ou minuscula, espacos ignorados.
  *    R -> entra no modo REGISTRO (aproxime a tag a cadastrar)
  *    S -> salva a tag lida (dentro do modo registro)
  *    C -> cancela o registro
@@ -76,10 +77,9 @@
 #include <stdarg.h>
 
 // A voz de MAQUINA inteira - enquadramento, relogio, scanner de JSON, ACK e
-// `cmd_id` - vem do header, identico ao das outras tres placas. A unica
-// diferenca e o fio: aqui ela sai pelo Serial2, porque a USB e da bancada.
+// `cmd_id` - vem do header, identico ao das outras tres placas, e pela mesma
+// porta delas: a USB.
 #define APSEN_SUBSISTEMA "porta"
-#define APSEN_SERIAL Serial2
 #include "apsen_serial.h"
 
 // ---------------------------------------------------------------------
@@ -97,8 +97,7 @@
 // "Pode abrir": aceso SO em LIBERADA. Sem fechadura eletrica, e ele que diz a
 // quem passou a tag que a maquina ja parou.
 #define PIN_LED_OK   25
-#define PIN_UART_RX  16   // RX2 <- TX da placa das telas
-#define PIN_UART_TX  17   // TX2 -> RX da placa das telas
+// GPIO16/17 ficaram LIVRES: eram a UART com a placa das telas, que saiu.
 
 // ---------------------------------------------------------------------
 // TEMPOS
@@ -115,8 +114,8 @@ const unsigned long JANELA_MAX_MS = 60000;
 // menor faria a porta desistir de um pedido que o central ia aceitar. E um
 // LIMITE SUPERIOR, como o `CNC_TETO_TRAJETO_S`, e nao um numero a manter igual.
 const unsigned long ESPERA_CENTRAL_MS = 5000;
-// O heartbeat. A placa das telas declara a porta perdida depois de 1500 ms
-// sem ele: tres heartbeats.
+// O heartbeat. O porta-adapter declara o link perdido depois de
+// `PORTA_HEARTBEAT_MAX_S` (2,5 s) sem ele: cinco heartbeats.
 const unsigned long HEARTBEAT_MS = 500;
 const unsigned long DEBOUNCE_MS  = 30;
 const int MAX_TAGS               = 20;
@@ -290,10 +289,11 @@ void atualizarLed() {
 }
 
 // =====================================================================
-// EVENTOS (placa -> adapter, pelo Serial2). `docs/PROTOCOLO_SERIAL.md` §9.
+// EVENTOS (placa -> adapter, pela USB). `docs/PROTOCOLO_SERIAL.md` §9.
 // =====================================================================
-// Todo evento leva "origem":"porta": e o que separa, no adapter, a mensagem
-// da porta das mensagens das proprias telas, que chegam pela mesma USB.
+// Todo evento leva "origem":"porta". Com a USB propria ele e redundante - a
+// COM ja diz de quem e a linha -, e fica: o central filtra por ele, e tira-lo
+// mudaria firmware e rota juntos por ganho nenhum.
 
 static const char* nomeEstado(Estado e) {
   // Vocabulario FECHADO: o central e o painel comparam por igualdade.
@@ -381,7 +381,7 @@ static void mudarEstado(Estado novo) {
 }
 
 // =====================================================================
-// COMANDOS DO CENTRAL (pelo Serial2, atraves da placa das telas)
+// COMANDOS DO CENTRAL (pela USB, atraves do porta-adapter)
 // =====================================================================
 
 static void cmdPortaLiberar(const char* linha, long cmd_id) {
@@ -442,14 +442,8 @@ void executarComando(const char* cmd, const char* linha, long cmd_id) {
   }
 }
 
-// A linha SEM '{' que chega pelo SERIAL2. Ela NAO e comando de bancada - a
-// bancada e a USB. E lixo de linha (ou log da placa das telas), e so vira log.
-void linhaHumana(char* linha) {
-  if (linha[0]) logMsg("UART", "linha sem JSON vinda da placa das telas, ignorada: %.80s", linha);
-}
-
 // =====================================================================
-// A VOZ DO HUMANO - so na USB
+// A VOZ DO HUMANO - a linha SEM chave, na mesma USB
 // =====================================================================
 static inline char maiuscula(char c) { return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
 
@@ -459,60 +453,84 @@ void sairModoRegistro() {
   logMsg("REG", "Saiu do modo registro. Operacao normal.");
 }
 
-void tratarBancada() {
-  // `Serial` e a USB, e SO ela. A porta de maquina (Serial2) e lida pelo
-  // `serialPoll()` do header, e nada dela chega aqui.
-  while (Serial.available()) {
-    char c = maiuscula((char)Serial.read());
-    if (c == '\r' || c == '\n' || c == ' ') continue;
+static void usoBancada() {
+  Serial.println(">> Use: R (registrar) | S (salvar) | C (cancelar) | L (listar) | E (end-stops)");
+}
 
-    switch (c) {
-      case 'R':
-        if (modoReg != REG_DESLIGADO) {
-          Serial.println(">> Ja esta no modo registro. Envie 'C' para cancelar.");
+// Um comando de bancada, ja em maiuscula. So `linhaHumana` chama isto: ler a
+// USB por conta propria seria um segundo leitor da MESMA linha que o
+// `serialPoll()` do header le, e cada um ficaria com metade dos bytes de um
+// JSON - as duas metades sumiriam em silencio.
+static void comandoBancada(char c) {
+  switch (c) {
+    case 'R':
+      if (modoReg != REG_DESLIGADO) {
+        Serial.println(">> Ja esta no modo registro. Envie 'C' para cancelar.");
+      } else {
+        modoReg = REG_AGUARDANDO_TAG;
+        logMsg("REG", "MODO REGISTRO: aproxime a tag do leitor ('C' cancela).");
+      }
+      break;
+
+    case 'S':
+      if (modoReg == REG_AGUARDANDO_CONFIRMACAO) {
+        if (salvarTag(uidPendente)) {
+          logMsg("REG", "Tag %s salva com sucesso.", uidPendente.c_str());
         } else {
-          modoReg = REG_AGUARDANDO_TAG;
-          logMsg("REG", "MODO REGISTRO: aproxime a tag do leitor ('C' cancela).");
+          logMsg("REG", "Memoria cheia: limite de tags atingido (%s nao salva).",
+                 uidPendente.c_str());
         }
-        break;
+        sairModoRegistro();
+      } else {
+        Serial.println(">> 'S' so funciona apos ler uma tag no modo registro.");
+      }
+      break;
 
-      case 'S':
-        if (modoReg == REG_AGUARDANDO_CONFIRMACAO) {
-          if (salvarTag(uidPendente)) {
-            logMsg("REG", "Tag %s salva com sucesso.", uidPendente.c_str());
-          } else {
-            logMsg("REG", "Memoria cheia: limite de tags atingido (%s nao salva).",
-                   uidPendente.c_str());
-          }
-          sairModoRegistro();
-        } else {
-          Serial.println(">> 'S' so funciona apos ler uma tag no modo registro.");
-        }
-        break;
+    case 'C':
+      if (modoReg != REG_DESLIGADO) {
+        logMsg("REG", "Registro cancelado. Nenhuma tag foi salva.");
+        sairModoRegistro();
+      } else {
+        Serial.println(">> Nada para cancelar.");
+      }
+      break;
 
-      case 'C':
-        if (modoReg != REG_DESLIGADO) {
-          logMsg("REG", "Registro cancelado. Nenhuma tag foi salva.");
-          sairModoRegistro();
-        } else {
-          Serial.println(">> Nada para cancelar.");
-        }
-        break;
+    case 'L':
+      listarTags();
+      break;
 
-      case 'L':
-        listarTags();
-        break;
+    case 'E':
+      diagnosticoEndStops();
+      break;
 
-      case 'E':
-        diagnosticoEndStops();
-        break;
-
-      default:
-        Serial.print(">> Comando desconhecido: "); Serial.println(c);
-        Serial.println(">> Use: R (registrar) | S (salvar) | C (cancelar) | L (listar) | E (end-stops)");
-        break;
-    }
+    default:
+      Serial.print(">> Comando desconhecido: "); Serial.println(c);
+      usoBancada();
+      break;
   }
+}
+
+// A linha SEM chave, que o header separa da voz de maquina na linha CRUA (ver
+// `despacharLinha`). Uma letra por linha: espaco, tab, \r e \n nao contam, e a
+// letra vale em maiuscula ou minuscula - "R", "s" e " L " sao os comandos que
+// parecem. Mais de uma letra NAO vira uma sequencia de comandos: um "RS"
+// digitado de uma vez entraria no modo registro e tentaria salvar uma tag que
+// ninguem leu.
+void linhaHumana(char* linha) {
+  char letra = 0;
+  int letras = 0;
+  for (const char* p = linha; *p; p++) {
+    if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') continue;
+    letra = maiuscula(*p);
+    letras++;
+  }
+  if (letras == 0) return;          // linha em branco: nada a fazer
+  if (letras > 1) {
+    Serial.print(">> Uma letra por linha. Recebido: "); Serial.println(linha);
+    usoBancada();
+    return;
+  }
+  comandoBancada(letra);
 }
 
 // Tag lida durante o modo registro: vai para o cadastro e NAO abre nada.
@@ -626,10 +644,9 @@ void setup() {
   pinMode(PIN_LED_OK, OUTPUT);
   digitalWrite(PIN_LED_OK, LOW);
 
-  // Buffer de recepcao do Serial2 do tamanho do teto da linha, ANTES do begin.
+  // Buffer de recepcao da USB do tamanho do teto da linha, ANTES do begin.
   apsenSerialInit();
   Serial.begin(115200);
-  Serial2.begin(115200, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
 
   iniciarEndStops();
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_SS);
@@ -640,11 +657,12 @@ void setup() {
   delay(50);
   Serial.println();
   Serial.println("=== Porta NR-12 | ESP32 + RC522 ===");
-  Serial.println("Bancada (USB): R (registrar) | S (salvar) | C (cancelar) | L (listar) | E (end-stops)");
-  Serial.println("Maquina: Serial2 (GPIO16/17) com a placa das telas TFT.");
+  Serial.println("Bancada (esta USB, com o porta-adapter parado):");
+  usoBancada();
+  Serial.println("Maquina: linhas JSON nesta mesma USB, com o porta-adapter.");
   listarTags();
 
-  // A primeira linha de maquina: o ping. Quem o responde e a placa das telas.
+  // A primeira linha de maquina: o ping. Quem o responde e o porta-adapter.
   emitPing();
   emitBoot();
   if (es1Fechado && es2Fechado) {
@@ -659,9 +677,8 @@ void setup() {
 }
 
 void loop() {
-  serialPoll();     // voz de maquina (Serial2), pelo header
+  serialPoll();     // as duas vozes da USB, pelo header (maquina e bancada)
   pingPoll();
-  tratarBancada();  // voz do humano (USB)
 
   // Os 2 fins de curso sao monitorados SEMPRE, mesmo no modo registro.
   const bool tetoAntes = es1Fechado, frenteAntes = es2Fechado;

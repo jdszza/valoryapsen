@@ -29,6 +29,7 @@ framework) e de `seed_demo.py` (decide × persiste), e é o que permite testar
 import asyncio
 import logging
 from typing import NamedTuple
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +52,15 @@ TIMEOUT_TOTAL_S = 6.0
 class Servico(NamedTuple):
     """Um serviço da stack e como perguntar a ele se está de pé."""
     nome:    str
-    host:    str      # nome DNS na rede `apsen-net`
+    host:    str      # nome DNS na rede `apsen-net` (ou o host, ver `subir`)
     porta:   int
     caminho: str      # `/ping` nos serviços de API; `/` nos dois Dash
     papel:   str
+    # Como subir o serviço quando ele não está de pé. Vazio = é um serviço do
+    # compose, e a ação é `docker compose up -d <nome>`. Preenchido = ele roda
+    # FORA do compose (no host), e mandar subir um container que não existe
+    # seria a ação errada na hora em que a tela é mais necessária.
+    subir:   str = ""
 
 
 # Os treze serviços do compose. O caminho é o MESMO que o healthcheck do compose
@@ -101,6 +107,39 @@ NOME_GERADOR   = "erp-simulator"
 # dentro.
 SONDAVEIS = tuple(s for s in SERVICOS if s.nome != NOME_CENTRAL)
 
+# O porta-adapter NÃO é do compose — não há porta simulada, e ele roda no host,
+# dono da COM da porta NR-12. Por isso fica fora de `SERVICOS` (a tabela que
+# `tests/test_prevoo.py` compara com o `docker-compose.yml`) e só entra nas
+# sondas com `PORTA_NR12_HABILITADA`: numa célula sem porta o serviço não
+# existe, e não pode virar item vermelho.
+NOME_PORTA_ADAPTER = "porta-adapter"
+PORTA_ADAPTER_SUBIR = ("Inicie porta-adapter\\iniciar_host.bat com a COM da porta "
+                       "(PORTA_SERIAL_URL). Sem ele a célula fica parada: link "
+                       "perdido é porta aberta.")
+
+
+def servico_porta_adapter(url: str) -> Servico:
+    """O porta-adapter, sondado no MESMO endereço para onde o central manda os
+    comandos da porta (`PORTA_ADAPTER_URL`).
+
+    Na célula real ele é `host.docker.internal:8104`; sondar o nome DNS do
+    compose responderia uma pergunta que ninguém fez — duas respostas
+    diferentes para "o adapter da porta está de pé?" seriam pior que nenhuma.
+    """
+    partes = urlsplit(url)
+    return Servico(NOME_PORTA_ADAPTER, partes.hostname or NOME_PORTA_ADAPTER,
+                   partes.port or 8104, "/ping",
+                   "Ponte para a porta NR-12 (USB própria, roda no host).",
+                   subir=PORTA_ADAPTER_SUBIR)
+
+
+def sondaveis(porta_habilitada: bool, porta_adapter_url: str) -> tuple[Servico, ...]:
+    """Os serviços a sondar NESTA célula: os do compose e, só com a porta
+    NR-12 habilitada, o porta-adapter."""
+    if not porta_habilitada:
+        return SONDAVEIS
+    return SONDAVEIS + (servico_porta_adapter(porta_adapter_url),)
+
 
 def _item(id_: str, grupo: str, titulo: str, estado: str,
           detalhe: str = "", acao: str = "") -> dict:
@@ -113,7 +152,11 @@ def _item(id_: str, grupo: str, titulo: str, estado: str,
 async def _sondar(cliente, servico: Servico, timeout: float) -> dict:
     """Uma sonda. NUNCA levanta — exceção aqui derrubaria o `gather` inteiro."""
     url = f"http://{servico.host}:{servico.porta}{servico.caminho}"
-    subir = f"docker compose up -d {servico.nome}"
+    no_host = bool(servico.subir)
+    subir = servico.subir or f"Suba o serviço: `docker compose up -d {servico.nome}`"
+    log = (f"a janela do {servico.nome} no host" if no_host
+           else f"`docker compose logs --tail=50 {servico.nome}`")
+    laco = "" if no_host else ", ou o container reinicia em laço"
     try:
         resposta = await cliente.get(url, timeout=timeout)
     except Exception as exc:
@@ -125,23 +168,21 @@ async def _sondar(cliente, servico: Servico, timeout: float) -> dict:
         if "timeout" in type(exc).__name__.lower():
             return _item(servico.nome, "Serviços", servico.nome, FALHA,
                          f"Não respondeu em {timeout:.0f}s ({servico.papel})",
-                         f"O processo está de pé mas travado, ou o container "
-                         f"reinicia em laço. Veja "
-                         f"`docker compose logs --tail=50 {servico.nome}`.")
+                         f"O processo está de pé mas travado{laco}. Veja {log}.")
         return _item(servico.nome, "Serviços", servico.nome, FALHA,
-                     f"{type(exc).__name__}: {exc} ({servico.papel})",
-                     f"Suba o serviço: `{subir}`")
+                     f"{type(exc).__name__}: {exc} ({servico.papel})", subir)
 
     codigo = getattr(resposta, "status_code", 0)
     if codigo >= 300:
         return _item(servico.nome, "Serviços", servico.nome, FALHA,
                      f"HTTP {codigo} em {servico.caminho} ({servico.papel})",
-                     f"Veja `docker compose logs --tail=50 {servico.nome}`.")
+                     f"Veja {log}.")
     return _item(servico.nome, "Serviços", servico.nome, OK,
                  f"porta {servico.porta} respondendo ({servico.papel})")
 
 
-async def sondar_servicos(cliente, timeout: float = TIMEOUT_SONDA_S) -> list[dict]:
+async def sondar_servicos(cliente, timeout: float = TIMEOUT_SONDA_S,
+                          servicos: tuple[Servico, ...] = SONDAVEIS) -> list[dict]:
     """Todas as sondas em paralelo. O tempo total é o da mais lenta.
 
     `return_exceptions=True` é o cinto sobre o suspensório: `_sondar` já não
@@ -150,11 +191,11 @@ async def sondar_servicos(cliente, timeout: float = TIMEOUT_SONDA_S) -> list[dic
     quebrou de um jeito novo.
     """
     resultados = await asyncio.gather(
-        *[_sondar(cliente, s, timeout) for s in SONDAVEIS],
+        *[_sondar(cliente, s, timeout) for s in servicos],
         return_exceptions=True,
     )
     itens: list[dict] = []
-    for servico, resultado in zip(SONDAVEIS, resultados, strict=True):
+    for servico, resultado in zip(servicos, resultados, strict=True):
         if isinstance(resultado, BaseException):
             logger.warning("[PREVOO] sonda de %s falhou: %s", servico.nome, resultado)
             itens.append(_item(servico.nome, "Serviços", servico.nome, FALHA,
@@ -514,7 +555,7 @@ def item_portas(porta: dict, pausa: dict | None, habilitada: bool,
                 silencio_max_s: float) -> dict:
     """UM item, sempre — e o vermelho diz o que fazer.
 
-    UM, e não um por condição: com o dispenser-adapter fora, "link perdido",
+    UM, e não um por condição: com o porta-adapter fora, "link perdido",
     "heartbeat velho" e "portas desconhecidas" seriam três diagnósticos da
     mesma causa — a regra do banco fora (`itens_banco(None)`), aplicada à
     porta. A ordem dos testes abaixo é a da CAUSA: o adapter, depois o link,
@@ -526,17 +567,18 @@ def item_portas(porta: dict, pausa: dict | None, habilitada: bool,
     if not habilitada and porta.get("link_ok") is None:
         return _i(INFO, "sem porta NR-12 nesta célula (PORTA_NR12_HABILITADA=0)")
     if adapter_ok is False:
-        return _i(FALHA, "o dispenser-adapter não responde — a porta viaja por ele",
-                  "Suba o dispenser-adapter (dispenser-adapter\\iniciar_host.bat). "
-                  "Sem ele a célula fica parada: link perdido é porta aberta.")
+        return _i(FALHA, "o porta-adapter não responde — a porta NR-12 fala por ele",
+                  PORTA_ADAPTER_SUBIR)
     if porta.get("link_ok") is not True:
         return _i(FALHA, "link da porta perdido — a célula está parada",
-                  "Confira a USB da placa das telas e o fio UART porta↔telas "
-                  "(TX↔RX cruzados, GND comum).")
+                  "Confira o cabo USB da porta no mini PC e a COM em "
+                  "PORTA_SERIAL_URL; o /health do porta-adapter diz se a placa "
+                  "conectou (bloco `serial`) e há quanto tempo ela falou (bloco "
+                  "`porta`).")
     if idade_s is None or idade_s > silencio_max_s:
         return _i(FALHA, "nenhuma mensagem da porta há mais de "
                          f"{silencio_max_s:.0f}s",
-                  "Confira o processo do dispenser-adapter e o /health dele "
+                  "Confira o processo do porta-adapter e o /health dele "
                   "(bloco `porta`).")
     abertas = [p for p in ("teto", "frente") if porta.get(p) != "fechada"]
     if abertas:

@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
 """Transporte serial dos adapters — uma linha JSON por mensagem, um dono por porta.
 
-ESTE ARQUIVO É UMA CÓPIA IDÊNTICA nos três adapters que falam com firmware:
-`cnc-adapter/`, `dispenser-adapter/` e `weight-adapter/`.
-`tests/test_serial_link.py` compara os três byte a byte e reprova se
+ESTE ARQUIVO É UMA CÓPIA IDÊNTICA nos quatro adapters que falam com firmware:
+`cnc-adapter/`, `dispenser-adapter/`, `weight-adapter/` e `porta-adapter/`.
+`tests/test_serial_link.py` compara os quatro byte a byte e reprova se
 divergirem — a mesma forma de `tests/test_adapters.py` com o `_post_central`.
 
 Por que cópia e não um `shared/`: cada adapter tem o seu próprio contexto de
 build no compose (`build: ./cnc-adapter`), e um diretório compartilhado
-obrigaria os três a virarem `context: .` + `dockerfile:`, arrastando o
-repositório inteiro para dentro das três imagens e passando a exigir um
-`.dockerignore`. O CLAUDE.md já registra essa avaliação para os templates de OS
-— com a diferença de que lá a alternativa era um GET, e aqui não existe GET que
-resolva: este código roda ANTES de haver qualquer rede. Se um dia existirem
-cinco cópias, a conta muda.
+obrigaria os três que têm imagem a virarem `context: .` + `dockerfile:`,
+arrastando o repositório inteiro para dentro das três imagens e passando a
+exigir um `.dockerignore`. O CLAUDE.md já registra essa avaliação para os
+templates de OS — com a diferença de que lá a alternativa era um GET, e aqui
+não existe GET que resolva: este código roda ANTES de haver qualquer rede. A
+porta NR-12 trouxe a quarta cópia (o `porta-adapter` roda só no host, sem
+imagem); se um dia existirem cinco, a conta muda.
 
 O que este módulo NÃO faz, de propósito:
 
@@ -667,9 +668,9 @@ class LinkSerial:
         self._porta_fixa_avisada = False
         del self._buffer[:]
         self._descartando = False
-        # O log tem que dizer QUAL porta este processo tomou: com três adapters
-        # e três cabos, "conectado" sem a porta não diz se o cabo certo entrou
-        # no soquete certo.
+        # O log tem que dizer QUAL porta este processo tomou: com quatro
+        # adapters e cinco cabos, "conectado" sem a porta não diz se o cabo
+        # certo entrou no soquete certo.
         logger.info("[%s] porta tomada: %s @ %d baud (dono único deste processo)",
                     self.subsistema, self._url_aberta, self.baud)
 

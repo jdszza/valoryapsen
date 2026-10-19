@@ -402,3 +402,52 @@ def test_cmd_id_repetido_nao_reexecuta_na_placa_das_telas():
     placa._processar(linha)
     assert len(placa.executados) == 1
     placa.parar()
+
+
+# ── A porta NR-12 não passa mais por esta placa ──────────────────────────────
+
+def test_porta_liberar_na_placa_das_telas_e_ack_negativo(adapter_com_telas):
+    """A porta tem USB e adapter próprios (§9). Um `porta_*` que chegue às
+    telas — um adapter antigo, um operador digitando — é comando fora do
+    contrato, e recusa com ACK NEGATIVO na hora, como qualquer outro: nunca
+    silêncio, nunca um repasse que já não existe."""
+    m = adapter_com_telas(mecanismos_serial=False)
+    with pytest.raises(m.modulo.serial_link.AckNegativo, match="comando desconhecido"):
+        m.modulo._link_tft.enviar_comando("porta_liberar", {"janela_ms": 5000})
+    assert not [e for e in m.placa_tft.executados if e["cmd"].startswith("porta_")]
+
+
+def test_evento_da_porta_pela_placa_das_telas_e_descartado_com_aviso(
+        adapter_com_telas, caplog):
+    """Firmware das telas antigo ainda repassando a porta: o evento NÃO vai ao
+    central (lá ele chega pelo porta-adapter, e dois caminhos para o mesmo
+    evento teriam o link de um desmentindo o do outro). Um warning claro, UMA
+    vez — o heartbeat repassado chega a cada 500 ms."""
+    m = adapter_com_telas(mecanismos_serial=False)
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            m.placa_tft.emitir({"origem": "porta", "tipo": "estado", "teto": "fechada",
+                                "frente": "fechada", "estado": "FECHADA",
+                                "aguardando_rearme": False, "ts": "x"})
+        m.placa_tft.emitir(m.placa_tft.telemetria())
+        assert _ate(lambda: m.modulo._tft_estado["ultima_telemetria"] is not None)
+    avisos = [r for r in caplog.records
+              if "firmware das telas antigo" in r.getMessage() and "regrave" in r.getMessage()]
+    assert len(avisos) == 1, [r.getMessage() for r in caplog.records]
+    assert m.cliente.posts == [], "evento da porta encaminhado pelo dispenser-adapter"
+
+
+def test_o_dispenser_adapter_nao_tem_mais_rota_de_porta(carregar_adapter):
+    """`/comandos/porta/*` mudou de dono: quem a chamar aqui toma 404, e não um
+    503 que pareceria a porta fora do ar."""
+    from fastapi.testclient import TestClient
+    modulo = carregar_adapter("dispenser")
+    rotas = {getattr(r, "path", "") for r in modulo.app.routes}
+    assert not [r for r in rotas if r.startswith("/comandos/porta")], sorted(rotas)
+    cliente = TestClient(modulo.app)          # sem `with`: a lifespan não sobe
+    resposta = cliente.post("/comandos/porta/liberar", json={"janela_ms": 5000})
+    assert resposta.status_code == 404
+    for resto in ("_porta", "_vigiar_porta_uma_vez", "_COMANDOS_PORTA", "_enviar_porta",
+                  "ROTA_EVENTOS_PORTA", "PORTA_HEARTBEAT_MAX_S", "PORTA_ESTADO_REENVIO_S",
+                  "_estado_porta_health"):
+        assert not hasattr(modulo, resto), f"`{resto}` sobrou no dispenser-adapter"

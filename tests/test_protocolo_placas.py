@@ -504,9 +504,9 @@ def test_o_documento_lista_os_quatro_subsistemas_e_so_eles(doc):
     """Quatro portas — dispenser, dispenser_tft, cnc, weight —, e o
     `vision-adapter` continua fora da migração: a ausência é decisão.
 
-    A `porta` NR-12 tem `sub` próprio e NÃO é uma quinta porta: ela viaja
-    dentro da porta das telas (§9), e o ping dela é respondido pela placa das
-    telas, sem chegar a adapter nenhum."""
+    A `porta` NR-12 tem `sub` próprio, USB própria e adapter próprio (o
+    `porta-adapter`, §9) — e fica fora desta lista porque não tem transporte
+    selecionável nem simulador: a comparação dela é `test_protocolo_porta.py`."""
     subs = set(re.findall(r'\{"cmd":"ping","sub":"(\w+)"\}', doc))
     assert subs <= set(ADAPTERS_SERIAIS) | {"<subsistema>", "porta"}
     for subsistema in ADAPTERS_SERIAIS:
@@ -518,9 +518,11 @@ def test_as_duas_portas_do_dispenser_adapter_estao_no_documento(doc):
     """`dispenser` e `dispenser_tft` são DUAS portas físicas do MESMO adapter,
     e é o documento que diz isso a quem for escrever o firmware."""
     tabela = doc.split("## 1.", 1)[0]
-    # Três linhas: as duas portas físicas e a porta NR-12, que viaja DENTRO da
-    # das telas (§9) — mesmo adapter, nenhuma porta a mais no mini PC.
-    assert tabela.count("`dispenser-adapter`") == 3
+    # Duas linhas: as duas portas físicas do dispenser. A porta NR-12 tem a sua
+    # (§9), com o `porta-adapter` — e não carona na placa das telas.
+    linhas = [l for l in tabela.splitlines() if l.startswith("|")]
+    assert sum("`dispenser-adapter`" in l for l in linhas) == 2
+    assert sum(l.startswith("| `porta-adapter`") for l in linhas) == 1
     assert "`dispenser_tft`" in tabela
     assert "duas portas físicas do mesmo adapter" in doc
     assert "48" in _secao(doc, "dispenser_tft")

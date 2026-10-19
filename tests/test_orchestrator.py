@@ -3119,10 +3119,20 @@ async def _quando(condicao, limite: int = 500):
 
 
 def _rotas(orq) -> list:
-    """As chamadas na ordem, com a placa: `cnc:/parar`, `disp:/porta/liberar`..."""
+    """As chamadas na ordem, com o adapter: `cnc:/parar`, `porta:/porta/liberar`...
+
+    `porta:` é o porta-adapter — a porta NR-12 tem adapter e USB próprios. Um
+    comando de porta que voltasse a sair pelo dispenser-adapter apareceria
+    como `disp:/porta/...`, e todo teste que espera `porta:` ficaria vermelho.
+    """
     saida = []
     for c in orq.adapter.chamadas:
-        placa = "cnc" if orq.adapter.para_cnc(c["url"]) else "disp"
+        if orq.adapter.para_cnc(c["url"]):
+            placa = "cnc"
+        elif c["url"].startswith(orq.modulo.settings.PORTA_ADAPTER_URL):
+            placa = "porta"
+        else:
+            placa = "disp"
         saida.append(f"{placa}:{c['url'].split('/comandos', 1)[1]}")
     return saida
 
@@ -3144,14 +3154,14 @@ def test_pedido_de_acesso_para_cnc_e_dispensers_antes_de_liberar(carregar_orques
                 await orq.modulo.evento_porta(_ev("pedido_acesso", uid="04A1B2C3"))
         orq.adapter.ao_comando["/comandos/dispensar"] = _pedir
         os_task = asyncio.create_task(orq.modulo._processar_os(_payload_os("OS-P1")))
-        await _quando(lambda: "disp:/porta/liberar" in _rotas(orq))
+        await _quando(lambda: "porta:/porta/liberar" in _rotas(orq))
         os_task.cancel()
         await asyncio.gather(os_task, return_exceptions=True)
         await orq.modulo.aguardar_tarefas_porta()
 
     asyncio.run(_cenario())
     rotas = _rotas(orq)
-    i_liberar = rotas.index("disp:/porta/liberar")
+    i_liberar = rotas.index("porta:/porta/liberar")
     assert rotas.index("cnc:/parar") < i_liberar
     assert rotas.index("disp:/parar") < i_liberar
     assert orq.estado["pausa_porta"]["motivo"] == "pedido_acesso"
@@ -3241,6 +3251,41 @@ def test_rearme_com_porta_aberta_nao_retoma(carregar_orquestrador):
     assert orq.modulo.get_pausa_porta() is not None
     assert not orq.adapter.comandos("/comandos/homing")
     assert orq.adapter.comandos("/porta/estado"), "o rearme recusado pede um `estado`"
+
+
+def test_os_tres_comandos_da_porta_vao_ao_porta_adapter(carregar_orquestrador):
+    """`porta_liberar`, `porta_negar` e `porta_estado` saem por
+    `PORTA_ADAPTER_URL` — nunca pelo dispenser-adapter, que não tem mais a
+    rota (404) e cujo travamento não pode calar a porta."""
+    orq = carregar_orquestrador()
+    base = orq.modulo.settings.PORTA_ADAPTER_URL
+    assert base != orq.modulo.settings.DISPENSER_ADAPTER_URL
+
+    async def _cenario():
+        await _porta_fechada_e_viva(orq)
+        # liberar: pedido com a máquina parada
+        await orq.modulo.evento_porta(_ev("pedido_acesso", uid="04A1B2C3"))
+        await orq.modulo.aguardar_tarefas_porta()
+        await orq.modulo.evento_porta(_ev("liberacao_expirada",
+                                          motivo="central_nao_respondeu"))
+        await orq.modulo.aguardar_tarefas_porta()
+        # negar: pedido com a máquina ativa que não confirma a parada
+        orq.adapter.confirma_parada = False
+        with orq.modulo._lock:
+            orq.estado["os_ativa"] = {"os_id": "OS-URL"}
+        await orq.modulo.evento_porta(_ev("pedido_acesso", uid="04A1B2C3"))
+        await orq.modulo.aguardar_tarefas_porta()
+        # estado: rearme recusado com a porta aberta
+        await orq.modulo.evento_porta(_ev("porta_aberta", porta="teto", autorizada=False))
+        await orq.modulo.evento_porta(_estado_porta(teto="aberta",
+                                                    estado="ABERTA_SEM_AUTORIZACAO"))
+        await orq.modulo.evento_porta(_ev("rearme", uid="04A1B2C3"))
+        await orq.modulo.aguardar_tarefas_porta()
+
+    asyncio.run(_cenario())
+    da_porta = [c["url"] for c in orq.adapter.chamadas if "/comandos/porta/" in c["url"]]
+    assert {u.rsplit("/", 1)[1] for u in da_porta} == {"liberar", "negar", "estado"}, da_porta
+    assert all(u.startswith(base + "/comandos/porta/") for u in da_porta), da_porta
 
 
 def test_parcial_ausente_cai_na_trava_do_triple_check(carregar_orquestrador, monkeypatch):
@@ -3490,16 +3535,16 @@ def test_roteiro_completo_pedido_liberar_abrir_fechar_rearme_homing_resto(
     rotas = _rotas(orq)
     # Só as transições que interessam ao roteiro, na ordem em que aconteceram.
     marcos = [r for r in rotas if r in ("disp:/dispensar", "cnc:/parar", "disp:/parar",
-                                        "disp:/porta/liberar", "cnc:/homing", "cnc:/mover",
+                                        "porta:/porta/liberar", "cnc:/homing", "cnc:/mover",
                                         "disp:/pesar")]
     # O homing do INÍCIO da OS (antes da foto da caixa vazia) não é do roteiro
     # da porta: o que interessa é o da RETOMADA.
     assert marcos[0] == "cnc:/homing"
     marcos = marcos[1:]
     i = {nome: marcos.index(nome) for nome in ("cnc:/parar", "disp:/parar",
-                                               "disp:/porta/liberar", "cnc:/homing")}
+                                               "porta:/porta/liberar", "cnc:/homing")}
     assert marcos[0] == "cnc:/mover" and marcos[1] == "disp:/dispensar"
-    assert max(i["cnc:/parar"], i["disp:/parar"]) < i["disp:/porta/liberar"] < i["cnc:/homing"]
+    assert max(i["cnc:/parar"], i["disp:/parar"]) < i["porta:/porta/liberar"] < i["cnc:/homing"]
     depois = marcos[i["cnc:/homing"] + 1:]
     assert depois[:2] == ["cnc:/mover", "disp:/dispensar"], " | ".join(marcos)
 

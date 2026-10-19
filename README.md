@@ -122,6 +122,12 @@ Painel     :5000  ─ GET (espelho de mão única) → Central
 | `dashboard` | 8050 | Monitoramento read-only (Dash) |
 | `manut_web` | 8051 | Manutenção e operação, com JWT (Dash) |
 
+O **`porta-adapter`** (:8104, a ponte central ↔ porta NR-12) **não** está nesta
+tabela de propósito: ele não tem serviço no compose. Não existe porta simulada,
+e na célula montada ele roda no host, dono da COM da porta
+(`porta-adapter\iniciar_host.bat`). Sem porta na célula
+(`PORTA_NR12_HABILITADA=0`, o default) ninguém fala com ele.
+
 **Ordem de subida.** Todos os serviços de aplicação têm healthcheck (menos o
 `erp-simulator`, que é worker de laço sem porta) e as dependências usam
 `condition: service_healthy`. O grafo é
@@ -131,7 +137,8 @@ tolera adapter fora do ar.
 
 **Profiles.** Os três adapters seriais e os quatro simuladores ficam atrás do
 profile `simulado` (`COMPOSE_PROFILES=simulado` no `.env`): na célula montada,
-em Windows, eles não sobem em container — ver
+em Windows, eles não sobem em container (o `porta-adapter` nunca sobe: não
+está no compose) — ver
 [Portas seriais na célula montada](#portas-seriais-na-célula-montada).
 
 ### Os adapters têm DOIS transportes
@@ -147,14 +154,16 @@ Cada adapter fala com a ponta de baixo por HTTP (o simulador) **ou** por serial
 | `<SUB>_ACK_TIMEOUT_S` | `2` | prazo do ACK, **não** da conclusão |
 
 `<SUB>` é `DISPENSER`, `CNC` ou `WEIGHT`. O `vision-adapter` não entra: a visão
-continua por HTTP.
+continua por HTTP. O `porta-adapter` (porta NR-12, :8104) também não: ele só
+tem serial, porque não há porta simulada — `PORTA_SERIAL_URL` é obrigatória e
+não existe `PORTA_TRANSPORTE`.
 
 A **perna de cima não muda**: mesmos endpoints `/comandos/*`, mesmos modelos,
 mesmo payload de evento indo ao central sem interpretação. Por isso trocar o
 simulador por firmware não toca em `central-computer/`. Contrato completo em
 [`docs/PROTOCOLO_SERIAL.md`](docs/PROTOCOLO_SERIAL.md); o transporte é o
-`serial_link.py` (cópia idêntica nos três adapters, com teste que cobra a
-igualdade).
+`serial_link.py` (cópia idêntica nos quatro adapters com placa — o
+`porta-adapter` é o quarto —, com teste que cobra a igualdade).
 
 Há uma **segunda porta** no dispenser-adapter: as 8 telas TFT
 (`dispenser_tft`, `DISPENSER_TFT_*`), espelho do que cada slot está fazendo.
@@ -163,8 +172,8 @@ Com o default (`http`) não há tela e o adapter é o de sempre.
 **Onde a porta é aberta depende do sistema operacional do mini PC.** Em Linux
 a porta entra no container pelo `devices:` do compose — o bloco está escrito e
 **comentado** nos três serviços. **A célula montada roda em Windows**, e lá o
-Docker Desktop não repassa COM para container: os três adapters seriais rodam
-**fora do Docker**, no host, abrindo a COM direto com pyserial — a ponte
+Docker Desktop não repassa COM para container: os três adapters seriais — e o
+`porta-adapter`, que nem tem serviço no compose — rodam **fora do Docker**, no host, abrindo a COM direto com pyserial — a ponte
 RFC2217 foi avaliada e preterida. O porquê, e o passo a passo, estão em
 [Portas seriais na célula montada](#portas-seriais-na-célula-montada) e em
 [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md).
@@ -547,7 +556,7 @@ e [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md).
 
 O [Quickstart](#quickstart) sobe a planta **simulada**: 13 containers, nenhum
 hardware. Esta seção sobe a **célula montada**, com as placas e as câmeras de
-verdade, no mini PC Windows da bancada. São 14 processos: 7 em container e 7 no
+verdade, no mini PC Windows da bancada. São 15 processos: 7 em container e 8 no
 host, porque o Docker Desktop do Windows não repassa porta COM nem webcam para
 container.
 
@@ -557,9 +566,10 @@ container.
 | 2 | dispenser-adapter | host | 8100 | COM dos mecanismos + COM das telas TFT |
 | 3 | cnc-adapter | host | 8101 | COM da mesa |
 | 4 | weight-adapter | host | 8103 | COM da balança |
-| 5 | painel de bancada | host | 5000 | COM do display de 7" |
-| 6 | estação de visão da mesa | host | 8212 | webcam da mesa |
-| 7 | estações de visão dos dispensers (esq, dir) | host | 8301, 8302 | webcams das duas fileiras |
+| 5 | porta-adapter | host | 8104 | COM da porta NR-12 (USB própria) |
+| 6 | painel de bancada | host | 5000 | COM do display de 7" |
+| 7 | estação de visão da mesa | host | 8212 | webcam da mesa |
+| 8 | estações de visão dos dispensers (esq, dir) | host | 8301, 8302 | webcams das duas fileiras |
 
 O detalhe e o porquê de cada escolha estão em
 [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md). Aqui fica a ordem de fazer.
@@ -592,12 +602,14 @@ gravação e o primeiro boot:
 | mecanismos dos dispensers + 8 telas TFT (duas placas) | [`dispenser/README.md`](dispenser/README.md) |
 | mesa CNC | [`cnc/README.md`](cnc/README.md), seção "Passo a passo — do zero até a mesa andando" |
 | balança HX711 | [`weight/README.md`](weight/README.md) |
+| porta NR-12 (RC522 + fins de curso) | [`porta/README.md`](porta/README.md) |
 | display de 7" | [`docs/BANCADA.md`](docs/BANCADA.md) |
 
 **A4. Descubra e FIXE a COM de cada placa.** Ligue as placas uma de cada vez,
 abra o monitor serial a 115200 e leia o ping: `{"cmd":"ping","sub":"cnc"}` é a
 mesa, `"sub":"weight"` a balança, `"sub":"dispenser"` os mecanismos,
-`"sub":"dispenser_tft"` as telas; o display manda `{"cmd":"ping"}` sem `sub`.
+`"sub":"dispenser_tft"` as telas, `"sub":"porta"` a porta NR-12; o display manda
+`{"cmd":"ping"}` sem `sub`.
 Fixe o número no Gerenciador de Dispositivos (*Portas (COM e LPT)* →
 *Propriedades* → *Configurações de Porta* → *Avançado…* → *Número da Porta
 COM*) e anote na tabela de [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md),
@@ -613,13 +625,14 @@ processos não o leem):
 | `dispenser-adapter\iniciar_host.bat` | `DISPENSER_SERIAL_URL` e `DISPENSER_TFT_SERIAL_URL` |
 | `cnc-adapter\iniciar_host.bat` | `CNC_SERIAL_URL` |
 | `weight-adapter\iniciar_host.bat` | `WEIGHT_SERIAL_URL` |
+| `porta-adapter\iniciar_host.bat` | `PORTA_SERIAL_URL` (sem default: vazia, o `.bat` avisa e sai) |
 | `painel_operador\iniciar_backend.bat` | `APSEN_DISPLAY_PORTA` |
 
 **A6. Crie os ambientes Python** — um por processo do host, porque cada um tem
 as suas dependências (e os dois OpenCV da visão não convivem no mesmo venv):
 
 ```bat
-for %d in (dispenser-adapter cnc-adapter weight-adapter) do (cd C:\apsen\%d && python -m venv .venv && .venv\Scripts\pip install -r requirements.txt)
+for %d in (dispenser-adapter cnc-adapter weight-adapter porta-adapter) do (cd C:\apsen\%d && python -m venv .venv && .venv\Scripts\pip install -r requirements.txt)
 
 cd C:\apsen\painel_operador\backend
 python -m venv .venv
@@ -663,6 +676,10 @@ diferenças para a célula montada:
 DISPENSER_ADAPTER_URL=http://host.docker.internal:8100
 CNC_ADAPTER_URL=http://host.docker.internal:8101
 WEIGHT_ADAPTER_URL=http://host.docker.internal:8103
+# A porta NR-12: o adapter dela também roda no host, e a célula passa a nascer
+# PARADA até ouvir o primeiro `estado` da porta (porta muda é porta aberta).
+PORTA_ADAPTER_URL=http://host.docker.internal:8104
+PORTA_NR12_HABILITADA=1
 
 # As três câmeras reais (deixe estas linhas de fora até a parte A10 passar):
 VISION_SIM_URL=http://host.docker.internal:8212
@@ -678,7 +695,7 @@ CONSOLE_SENHA=<uma senha>
 **Administrador**:
 
 ```bat
-netsh advfirewall firewall add rule name="APSEN adapters e estacoes" dir=in action=allow protocol=TCP localport=8100,8101,8103,8212,8301,8302 profile=private
+netsh advfirewall firewall add rule name="APSEN adapters e estacoes" dir=in action=allow protocol=TCP localport=8100,8101,8103,8104,8212,8301,8302 profile=private
 ```
 
 **A10. Calibre e configure a visão.** É trabalho físico, com procedimento
@@ -731,17 +748,20 @@ primeira vez e depois de atualizar o código. Espere
 os 7 serviços em `healthy` (no primeiro boot, ~1 min: o MySQL cria o banco e o
 central semeia o catálogo).
 
-**B2. Os três adapters**, cada um na sua janela:
+**B2. Os quatro adapters**, cada um na sua janela:
 
 ```bat
 C:\apsen\dispenser-adapter\iniciar_host.bat
 C:\apsen\cnc-adapter\iniciar_host.bat
 C:\apsen\weight-adapter\iniciar_host.bat
+C:\apsen\porta-adapter\iniciar_host.bat
 ```
 
 Cada um mostra a COM e o transporte ao subir. Confira que acharam a placa:
-`http://localhost:8100/health` (e `8101`, `8103`) — `serial` com
-`"conectado": true`.
+`http://localhost:8100/health` (e `8101`, `8103`, `8104`) — `serial` com
+`"conectado": true`. No da porta, o bloco `porta` tem de mostrar
+`"link_ok": true` com o heartbeat a menos de 1 s: até lá, o central mantém a
+célula parada.
 
 **B3. O painel de bancada:**
 
@@ -826,6 +846,8 @@ boot".
 | central não alcança o adapter (pré-voo vermelho em 810x) | firewall, ou `*_ADAPTER_URL` faltando no `.env` | A9 e A8; teste com o comando de B5 |
 | dashboard verde e a célula física parada | `COMPOSE_PROFILES=simulado` no `.env` do mini PC | tire a linha e suba de novo |
 | display OFFLINE | monitor serial aberto na COM do display, ou `APSEN_DISPLAY_PORTA` errada | feche o monitor; confira o `.bat` do painel |
+| célula parada com "LINK DA PORTA PERDIDO" | porta-adapter parado (ficou parado depois de cadastrar tag?), USB da porta solta, ou `PORTA_SERIAL_URL` errada | suba `porta-adapter\iniciar_host.bat` e confira `http://localhost:8104/health` (bloco `porta`, `"link_ok": true`) |
+| log do dispenser-adapter: "firmware das telas antigo: ainda repassa a porta" | a placa das telas foi gravada antes de a porta ganhar USB própria | regrave `dispenser/telas_tft`; o evento é descartado até lá |
 | estação de visão não sobe, conferidor vermelho | configuração da estação | faça o que o conferidor diz — ver A10 |
 | pré-voo: "Quem responde pela câmera da mesa" vermelho | `VISION_SIM_URL` e `VISAO_MESA_FONTE` desencontrados no `.env` | corrija e `docker compose up -d vision-adapter` |
 
@@ -839,7 +861,8 @@ boot".
 
 > ⚠️ **No mini PC, toda placa tem que ter o número da COM fixado e a variável
 > de porta preenchida. A varredura automática é só para desenvolvimento sem
-> hardware.** Cinco portas, cinco donos, um processo por porta — nenhum varre.
+> hardware.** Seis portas, cada uma com o seu dono — nenhuma é descoberta por
+> varredura, e o `porta-adapter` nem sobe sem a dele.
 
 | Placa | Subsistema | Variável | Processo (no host) | Manual da placa |
 |---|---|---|---|---|
@@ -848,21 +871,21 @@ boot".
 | mesa CNC | `cnc` | `CNC_SERIAL_URL` | cnc-adapter | [`cnc/README.md`](cnc/README.md) |
 | balança HX711 | `weight` | `WEIGHT_SERIAL_URL` | weight-adapter | [`weight/README.md`](weight/README.md) |
 | display de 7" | — | `APSEN_DISPLAY_PORTA` | painel_operador | [`docs/BANCADA.md`](docs/BANCADA.md) |
-| ESP da porta NR-12 | `porta` | — (sem USB no mini PC) | dispenser-adapter, **através** da placa das 8 telas | [`porta/README.md`](porta/README.md) |
+| ESP da porta NR-12 | `porta` | `PORTA_SERIAL_URL` (**obrigatória**) | porta-adapter (:8104) — USB PRÓPRIA no mini PC | [`porta/README.md`](porta/README.md) |
 
-> **A porta NR-12 não tem porta no mini PC.** A ESP dela (RC522 + dois fins de
-> curso; cada porta é presa por um ímã simples, sem fechadura elétrica) fala
-> por **UART** com a placa das telas TFT dos
-> dispensers, que repassa as mensagens nos dois sentidos pela USB que já
-> existe — ver [`docs/PROTOCOLO_SERIAL.md`](docs/PROTOCOLO_SERIAL.md) §9. O
-> USB da própria ESP da porta serve **só para bancada**: cadastrar tags e
-> diagnosticar pelo Monitor Serial (`R`, `S`, `C`, `L`, `E`). Não há variável
-> de COM para ela, e nenhum processo do host a abre.
+> **A porta NR-12 tem USB própria e adapter próprio.** A ESP dela (RC522 + dois
+> fins de curso; cada porta é presa por um ímã simples, sem fechadura elétrica)
+> é uma placa dedicada, como a balança e a CNC: o dono da COM dela é o
+> `porta-adapter` (host, :8104), e ela não passa pela placa das telas — travar
+> ou regravar as telas não cega a vigia da porta. Na mesma USB andam as duas
+> vozes de sempre: JSON (`{`) é a máquina; linha sem `{` é a bancada — os
+> comandos `R`, `S`, `C`, `L`, `E` do Monitor Serial. **Para cadastrar tag,
+> pare o porta-adapter antes**: no Windows a COM abre em um programa por vez
+> (e, com ele parado, a célula para — link perdido é porta aberta). Contrato em
+> [`docs/PROTOCOLO_SERIAL.md`](docs/PROTOCOLO_SERIAL.md) §9.
 >
-> **Ligação física:** TX2 (GPIO17) da porta → RX (GPIO16) da placa das telas,
-> RX2 (GPIO16) da porta ← TX (GPIO17) da placa das telas, GND comum. **Nada de
-> 5 V entre elas.** Detalhes em [`dispenser/README.md`](dispenser/README.md),
-> "A placa das telas também carrega a porta NR-12".
+> **A placa das telas TFT é só telas.** Não há mais fio entre as duas ESPs, e
+> GPIO16/17 das duas ficaram livres.
 
 > **A mesa CNC entra por aqui como as outras.** O firmware
 > (`cnc/receitas_manuais`) fala as duas vozes desde a frente do ciclo por
@@ -873,7 +896,7 @@ boot".
 
 ### Onde escrever o número da COM
 
-**Na primeira linha editável do `.bat` daquele processo.** São quatro `.bat`,
+**Na primeira linha editável do `.bat` daquele processo.** São cinco `.bat`,
 um por processo do host, todos no mesmo molde: abra, troque o número da COM,
 salve, rode.
 
@@ -883,6 +906,7 @@ salve, rode.
 | " | as 8 telas TFT | o **mesmo** arquivo, a linha de baixo | `DISPENSER_TFT_SERIAL_URL` |
 | cnc-adapter | mesa CNC | [`cnc-adapter/iniciar_host.bat`](cnc-adapter/iniciar_host.bat) | `CNC_SERIAL_URL` |
 | weight-adapter | balança HX711 | [`weight-adapter/iniciar_host.bat`](weight-adapter/iniciar_host.bat) | `WEIGHT_SERIAL_URL` |
+| porta-adapter | porta NR-12 | [`porta-adapter/iniciar_host.bat`](porta-adapter/iniciar_host.bat) | `PORTA_SERIAL_URL` |
 | painel de bancada | display de 7" | [`painel_operador/iniciar_backend.bat`](painel_operador/iniciar_backend.bat) | `APSEN_DISPLAY_PORTA` |
 
 Cada arquivo tem no topo o bloco *a única linha que você precisa editar*. Fora
@@ -903,7 +927,7 @@ weight-adapter\iniciar_host.bat
 Duas coisas que o `.bat` **não** é:
 
 * **não é o `.env` da raiz.** O `.env` alimenta o **compose**, e na célula
-  montada esses quatro processos rodam fora do Docker — ninguém lê o `.env`
+  montada esses processos rodam fora do Docker — ninguém lê o `.env`
   deles. Escrever `CNC_SERIAL_URL=COM5` lá, no Windows, não chega a processo
   nenhum e **não dá erro**: o adapter do host sobe varrendo as portas, como se
   a variável estivesse vazia. (No caminho Linux, com o `devices:` do compose
@@ -938,8 +962,8 @@ COM*. O Windows deixa **entradas fantasma** de portas já usadas (aparecem como
 Qual placa é qual: o ping de cada uma carrega o `sub` (`{"cmd":"ping","sub":"cnc"}`);
 o display manda `{"cmd":"ping"}` sem `sub`.
 
-**Só um processo pode abrir a porta — e agora são cinco.** O lembrete que
-[`docs/BANCADA.md`](docs/BANCADA.md) já traz para o display vale para as cinco:
+**Só um processo pode abrir a porta — e agora são seis.** O lembrete que
+[`docs/BANCADA.md`](docs/BANCADA.md) já traz para o display vale para as seis:
 o Serial Monitor do PlatformIO aberto em qualquer uma delas derruba quem deveria
 estar com ela, e o sintoma é só "desconectado" no `/health` do adapter (ou
 `OFFLINE` no display). Feche-o antes de subir os processos.
@@ -1428,8 +1452,11 @@ não existe.
 | `PORTA_JANELA_LIBERACAO_MS` | `10000` — janela da autorização no `porta_liberar` (LED "pode abrir" aceso) | central |
 | `PORTA_SILENCIO_MAX_S` | `15` — nada da porta por esse tempo = link perdido (a célula para) | central |
 | `PORTA_TIMEOUT_HOMING_S` | `90` — teto do homing da retomada | central |
-| `PORTA_HEARTBEAT_MAX_S` | `2.5` — heartbeat da porta mais velho que isso = link perdido | dispenser-adapter |
-| `PORTA_ESTADO_REENVIO_S` | `5` — o `estado` sem mudança sobe ao central no máximo nesse intervalo, como sinal de vida | dispenser-adapter |
+| `PORTA_ADAPTER_URL` | `http://porta-adapter:8104` — na célula real, `http://host.docker.internal:8104` (o adapter roda no host) | central |
+| `PORTA_SERIAL_URL` | **obrigatória** — a COM da porta; vazia, o serviço recusa subir | porta-adapter |
+| `PORTA_SERIAL_BAUD` / `PORTA_ACK_TIMEOUT_S` | `115200` / `2` s | porta-adapter |
+| `PORTA_HEARTBEAT_MAX_S` | `2.5` — heartbeat da porta mais velho que isso = link perdido | porta-adapter |
+| `PORTA_ESTADO_REENVIO_S` | `5` — o `estado` sem mudança sobe ao central no máximo nesse intervalo, como sinal de vida | porta-adapter |
 | `TIMEOUT_CARREGAMENTO` / `_POSICIONAMENTO` / `_DISPENSA` | `180` / `120` / `120` s | central |
 | `TIMEOUT_VISAO_DISPENSER` / `_VISAO_MESA` / `_PESO` | `30` / `30` / `15` s | central |
 | `BROADCAST_MIN_INTERVALO_MS` | `500` ms entre broadcasts periódicos | central |

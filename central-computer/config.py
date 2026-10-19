@@ -520,6 +520,11 @@ class Settings:
     CNC_ADAPTER_URL:       str = os.getenv("CNC_ADAPTER_URL",       "http://cnc-adapter:8101")
     VISION_ADAPTER_URL:    str = os.getenv("VISION_ADAPTER_URL",    "http://vision-adapter:8102")
     WEIGHT_ADAPTER_URL:    str = os.getenv("WEIGHT_ADAPTER_URL",    "http://weight-adapter:8103")
+    # A porta NR-12 tem adapter próprio, dono da COM dela. Ele não tem serviço
+    # no compose (não há porta simulada) e, na célula real, roda no HOST: o
+    # `.env` usa http://host.docker.internal:8104. O default segue o padrão dos
+    # outros, e só é consultado com PORTA_NR12_HABILITADA=1.
+    PORTA_ADAPTER_URL:     str = os.getenv("PORTA_ADAPTER_URL",     "http://porta-adapter:8104")
 
     # ── Timeouts de orquestração (segundos) ───────────────────────────────────
     # Todos escalados por `_folga_timeout()`: com a célula desacelerada para

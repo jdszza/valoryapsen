@@ -27,7 +27,7 @@
 //  O SKETCH QUE INCLUI ESTE HEADER PRECISA FORNECER
 //  ------------------------------------------------
 //    #define APSEN_SUBSISTEMA "<dispenser|dispenser_tft|cnc|porta>"  ANTES do include
-//    #define APSEN_SERIAL Serial2   (opcional) a porta da voz de maquina
+//    #define APSEN_SERIAL <porta>   (opcional) a porta da voz de maquina; default Serial
 //    void logMsg(const char* tag, const char* fmt, ...);
 //    void executarComando(const char* cmd, const char* linha, long cmd_id);
 //    void linhaHumana(char* linha);   // a linha SEM '{'
@@ -43,12 +43,13 @@
 #error "defina APSEN_SUBSISTEMA antes de incluir apsen_serial.h"
 #endif
 
-// A porta por onde a voz de maquina entra e sai. `Serial` (a USB) em tres das
-// quatro placas, e o default existe para que elas compilem exatamente como
-// antes. A porta NR-12 e a excecao: a USB dela e da BANCADA (cadastro de tag,
-// diagnostico), e a maquina fala pelo Serial2, com a placa das telas do outro
-// lado do fio. Uma macro, e nao um parametro: e o que deixa este arquivo
-// identico nas quatro copias.
+// A porta por onde a voz de maquina entra e sai: `Serial` (a USB) nas quatro
+// placas, e a bancada divide a MESMA USB com ela, separadas pelo '{' (ver
+// `despacharLinha`). A porta NR-12 ja falou por uma UART com a placa das telas
+// e hoje tem USB propria, como as outras. A macro ficou como gancho para uma
+// placa que um dia precise de outra porta - redefinida ANTES do include, sem
+// fork deste arquivo. Uma macro, e nao um parametro: e o que deixa este
+// arquivo identico nas quatro copias.
 #ifndef APSEN_SERIAL
 #define APSEN_SERIAL Serial
 #endif
@@ -143,8 +144,8 @@ static void emitir(int escritos, const char* origem) {
   // Mensagem que nao cabe NAO SAI. Ver MAX_LINHA_BYTES.
   if (escritos < 0 || (size_t)escritos >= sizeof(jbuf) ||
       (size_t)escritos > MAX_LINHA_BYTES) {
-    // Pelo log, e nao pela porta de maquina: na porta NR-12 as duas sao fios
-    // diferentes, e o aviso e para o humano.
+    // Pelo log, e nao como mensagem de maquina: o aviso e para o humano, e
+    // sai sem '{' para o outro lado o tratar como log.
     logMsg("AVISO", "mensagem '%s' (%d bytes) passou do teto da linha e NAO saiu.",
            origem, escritos);
     return;

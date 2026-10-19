@@ -117,8 +117,8 @@ SIMULADORES = {
 }
 
 # (nome do adapter, diretório, rota de evento no central). Tabela ÚNICA: ela é
-# usada por `test_adapters.py` (a política de retry dos quatro `_post_central`)
-# e por `test_serial_link.py` (o transporte serial dos três que falam com
+# usada por `test_adapters.py` (a política de retry dos cinco `_post_central`)
+# e por `test_serial_link.py` (o transporte serial dos que falam com
 # firmware). Duas cópias divergiriam no dia em que um adapter mudasse de rota, e
 # a que ficasse para trás passaria verde.
 ADAPTERS = [
@@ -126,12 +126,19 @@ ADAPTERS = [
     ("cnc",       "cnc-adapter",       "/api/v1/eventos/cnc"),
     ("vision",    "vision-adapter",    "/api/v1/eventos/visao"),
     ("weight",    "weight-adapter",    "/api/v1/eventos/peso"),
+    # A porta NR-12 tem adapter próprio, só serial e só no host (sem simulador,
+    # sem serviço no compose). Entra aqui pela política de retry, que é a
+    # mesma dos outros quatro; NÃO entra em `ADAPTERS_SERIAIS`, que é a lista
+    # dos adapters com transporte SELECIONÁVEL (http × serial).
+    ("porta",     "porta-adapter",     "/api/v1/eventos/porta"),
 ]
 
-# Os subsistemas com firmware serial. O `vision-adapter` ficou de fora da
-# migração serial: a visão continua por HTTP. O `dispenser_tft` (as 8 telas
-# TFT) é a SEGUNDA porta do dispenser-adapter — mesmo `main.py`, outro
-# `LinkSerial` —, e por isso não é um quinto adapter em `ADAPTERS`.
+# Os subsistemas com transporte selecionável (http × serial). O
+# `vision-adapter` ficou de fora da migração serial: a visão continua por HTTP.
+# O `dispenser_tft` (as 8 telas TFT) é a SEGUNDA porta do dispenser-adapter —
+# mesmo `main.py`, outro `LinkSerial` —, e por isso não é um adapter a mais em
+# `ADAPTERS`. A `porta` fica de fora pelo motivo oposto: só tem serial, e o
+# que vale para ela está em `test_porta_adapter.py`.
 ADAPTERS_SERIAIS = ["dispenser", "cnc", "weight", "dispenser_tft"]
 
 # Pasta de cada subsistema serial. Uma tabela só, derivada de `ADAPTERS`, para
@@ -317,7 +324,7 @@ def carregar_adapter(monkeypatch):
             monkeypatch.setenv(chave, valor)
 
         monkeypatch.syspath_prepend(str(diretorio))
-        # Os três `serial_link.py` são cópias idênticas, mas todas se chamam
+        # Os quatro `serial_link.py` são cópias idênticas, mas todas se chamam
         # `serial_link`: sem este descarte, o segundo adapter carregado neste
         # teste reusaria o módulo do primeiro e um teste de identidade mediria
         # a coisa errada.
@@ -1136,8 +1143,9 @@ class AdapterFake:
         elif url.endswith("/comandos/pesar"):
             self._evento(f"{os_id}:peso:{payload['slot_id']}", **self._pesagem(payload))
 
-        # `/comandos/porta/*` não têm evento: a porta responde pela UART, e
-        # quem encena a porta é o teste (`orchestrator.evento_porta`).
+        # `/comandos/porta/*` não têm evento: a porta responde pela USB dela,
+        # ao porta-adapter, e quem encena a porta é o teste
+        # (`orchestrator.evento_porta`).
 
     @staticmethod
     def _pesagem(payload: dict) -> dict:

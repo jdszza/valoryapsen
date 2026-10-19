@@ -147,6 +147,10 @@ services:
       CNC_ADAPTER_URL:        ${CNC_ADAPTER_URL:-http://cnc-adapter:8101}
       VISION_ADAPTER_URL:     ${VISION_ADAPTER_URL:-http://vision-adapter:8102}
       WEIGHT_ADAPTER_URL:     ${WEIGHT_ADAPTER_URL:-http://weight-adapter:8103}
+      # O porta-adapter NÃO é serviço deste compose (não há porta simulada; ele
+      # roda no host, dono da COM da porta NR-12). Na célula real o `.env` usa
+      # http://host.docker.internal:8104; o default só segue o padrão dos outros.
+      PORTA_ADAPTER_URL:      ${PORTA_ADAPTER_URL:-http://porta-adapter:8104}
       # Controles globais de demonstração — uma variável para toda a stack.
       # MODO_APRESENTACAO=1 zera TODA probabilidade de falha aleatória dos
       # simuladores; FATOR_VELOCIDADE multiplica os tempos simulados (0.5 = dobro

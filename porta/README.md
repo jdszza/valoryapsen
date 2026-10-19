@@ -5,6 +5,12 @@ contrato é [`docs/PROTOCOLO_SERIAL.md`](../docs/PROTOCOLO_SERIAL.md) §9; o que
 central faz com ele está no CLAUDE.md, seção "Portas NR-12: a porta pede, o
 central para e autoriza".
 
+**A placa tem USB PRÓPRIA no mini PC**, e o dono dela é o
+[`porta-adapter`](../porta-adapter/main.py) (host, HTTP 8104, subido por
+`porta-adapter\iniciar_host.bat` com a COM em `PORTA_SERIAL_URL`). Ela não
+passa pela placa das telas TFT: travar ou regravar as telas não cega a vigia da
+porta, e vice-versa.
+
 **Não há fechadura elétrica.** Cada porta é presa por um **ímã simples**, e o
 fim de curso é o único sensor dela: fechada, a alavanca fica pressionada; aberta,
 o fim de curso solta. Quem puxa, abre — a qualquer momento.
@@ -31,26 +37,32 @@ sketch de teste que já funcionava, sem mudar um pino.
 | RC522 RST | D15 | |
 | ES1 — **teto** (abastecer remédio) | D4 | COM no GND, NO no pino, `INPUT_PULLUP` |
 | ES2 — **frente** (caixa sobre a balança) | D2 | idem + resistor de 10 k entre D2 e 3V3 (o LED da placa puxa o D2 para baixo). **Se a gravação pela USB falhar, mude `PIN_ENDSTOP2` para 33** (D2 é pino de boot) e tire o resistor |
-| UART com a placa das telas — TX2 | GPIO17 | → RX da placa das telas (GPIO16 dela) |
-| UART com a placa das telas — RX2 | GPIO16 | ← TX da placa das telas (GPIO17 dela) |
-| GND | GND | **comum** com a placa das telas. Nada de 5 V entre as duas |
+| USB | — | **no mini PC**: a COM fixada vai em `PORTA_SERIAL_URL`. GPIO16/17 ficaram livres |
 | LED **"pode abrir"** | D25 | aceso só em LIBERADA: a abertura está autorizada. Sem fechadura, é ele o sinal para a pessoa |
 
 Fechado = alavanca pressionada = LOW. **Fio rompido = HIGH = lido como aberto**
 (falha segura). A célula só está fechada com os DOIS fins de curso
 pressionados.
 
-## Duas portas seriais, dois donos
+## Uma USB, duas vozes
 
-* **Serial2 (GPIO16/17)** — a voz de MÁQUINA. É por ela que sai todo evento do
-  §9 e chega todo comando do central, através da placa das telas. Usa o
-  `apsen_serial.h` (a 4ª cópia, idêntica às outras três) com
-  `#define APSEN_SERIAL Serial2`.
-* **Serial (USB)** — SÓ BANCADA. Os comandos de um caractere ficam aqui e só
-  aqui, e os textos para humano também. Nada que chegue pelo Serial2 vira
-  comando de bancada.
+As duas conversas andam na MESMA USB, separadas pelo `{` — a regra do
+`apsen_serial.h` (a 4ª cópia, idêntica às outras três) em todas as placas:
 
-| comando (USB) | efeito |
+* **JSON = máquina.** Linha com `{` é evento do §9, ACK ou comando do central.
+  Quem a lê é o `serialPoll()` do header, e só ele.
+* **Linha sem `{` = bancada.** Os comandos de um caractere abaixo chegam por
+  `linhaHumana()`, **uma letra por linha** (maiúscula ou minúscula, espaços
+  ignorados; `RS` numa linha só NÃO vira dois comandos), e os textos para
+  humano saem sem `{` — um `{` num log viraria linha de máquina do outro lado.
+
+O `porta-adapter` nunca manda linha sem `{`. E os dois não abrem a COM ao mesmo
+tempo: **no Windows a COM abre em um programa por vez.** Para usar os comandos
+de bancada pelo Monitor Serial, **PARE o porta-adapter antes** (feche a janela
+dele) e suba-o de novo depois de fechar o Monitor. Enquanto ele estiver parado,
+o central mantém a célula parada: link perdido é porta aberta.
+
+| comando (Monitor Serial, 115200) | efeito |
 |---|---|
 | `R` | entra no modo REGISTRO — aproxime a tag a cadastrar |
 | `S` | salva a tag lida (dentro do modo registro) |
@@ -104,18 +116,24 @@ relação.
    PRESSIONADA (`E` mostra FECHADO); aberta, tem de soltar. Folga no ímã que
    deixe a alavanca no limiar vira porta "piscando" aberta/fechada — ajuste a
    posição do fim de curso até o `E` ficar estável nas duas posições.
-2. **Ligação com a placa das telas**: TX2 (17) da porta → RX (16) das telas,
-   RX2 (16) da porta → TX (17) das telas, GND comum. Cabo curto e longe dos
-   fios dos motores.
+2. **USB da porta no mini PC**: anote a COM no Gerenciador de Dispositivos
+   (fixe o número em *Propriedades → Configurações de Porta → Avançado…*) e
+   defina `PORTA_SERIAL_URL` no `porta-adapter\iniciar_host.bat`. Ela não pode
+   coincidir com a COM dos mecanismos, das telas, da CNC nem da balança. Não
+   há mais fio entre esta placa e a das telas.
 3. **Identificar as portas**: ES1 (D4) = teto, ES2 (D2) = frente. Teste com
    `E` no Monitor Serial da USB, abrindo uma de cada vez.
 4. **D2 e gravação**: se o upload falhar com o resistor de 10 k no D2, mova o
    ES2 para o GPIO33 e troque `PIN_ENDSTOP2` (sem o resistor).
-5. **Cadastrar as tags** pela USB da ESP da porta (`R`, aproxima, `S`) e
-   conferir com `L`.
+5. **Cadastrar as tags**: **pare o porta-adapter**, abra o Monitor Serial na
+   COM da porta, `R` → aproxime a tag → `S`, confira com `L`, feche o Monitor
+   e suba o adapter de novo. No Windows a COM só abre em um programa por vez.
 6. **LED "pode abrir" visível** de onde a pessoa passa a tag: é o único sinal
    de que a máquina já parou e a abertura está autorizada.
-7. **Teste do "para tudo"** com a mesa andando: abrir a porta da frente no meio
+7. **Teste de link**: com o adapter no ar, `http://localhost:8104/health` mostra
+   `"link_ok": true` e o heartbeat com menos de 1 s. Puxe o cabo USB da porta:
+   o central tem de parar a célula em até ~2,5 s (`PORTA_HEARTBEAT_MAX_S`).
+8. **Teste do "para tudo"** com a mesa andando: abrir a porta da frente no meio
    de um movimento e medir quanto a mesa ainda anda até parar.
 
 ## Parada só por software — decisão de protótipo

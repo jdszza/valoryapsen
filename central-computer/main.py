@@ -22,6 +22,7 @@ Endpoints de entrada (dos adapters e erp-simulator):
   POST /api/v1/eventos/cnc         ← cnc-adapter
   POST /api/v1/eventos/visao       ← vision-adapter
   POST /api/v1/eventos/peso        ← weight-adapter
+  POST /api/v1/eventos/porta       ← porta-adapter (porta NR-12, roda no host)
 
 Endpoints de leitura (dashboard, manut_web):
   GET  /estado, /os/*, /dispensers/estado, /medicamentos, ...
@@ -836,7 +837,7 @@ async def _handle_evento_cnc(payload: dict):
 
 
 async def _handle_evento_porta(payload: dict):
-    """Eventos da porta NR-12 (via dispenser-adapter, através da placa das telas).
+    """Eventos da porta NR-12 (via porta-adapter, pela USB própria da porta).
 
     QUEM DECIDE é o orquestrador (`orch.evento_porta`): parar, autorizar,
     retomar. Este handler grava o HISTÓRICO — uma linha por mensagem que muda
@@ -3080,8 +3081,12 @@ async def console_prevoo(request: Request):
         # antes somaria o tempo dele ao da sonda mais lenta.
         try:
             servicos, banco, visao = await asyncio.wait_for(
-                asyncio.gather(prevoo.sondar_servicos(cliente), _prevoo_banco(),
-                               _prevoo_visao(cliente)),
+                asyncio.gather(
+                    prevoo.sondar_servicos(
+                        cliente,
+                        servicos=prevoo.sondaveis(settings.PORTA_NR12_HABILITADA,
+                                                  settings.PORTA_ADAPTER_URL)),
+                    _prevoo_banco(), _prevoo_visao(cliente)),
                 timeout=prevoo.TIMEOUT_TOTAL_S,
             )
         except asyncio.TimeoutError:
@@ -3120,7 +3125,7 @@ async def console_prevoo(request: Request):
             orch.get_estado_porta(), orch.get_pausa_porta(),
             settings.PORTA_NR12_HABILITADA,
             next((s["estado"] == prevoo.OK for s in servicos
-                  if s["id"] == "dispenser-adapter"), None),
+                  if s["id"] == prevoo.NOME_PORTA_ADAPTER), None),
             orch.idade_porta_s(), settings.PORTA_SILENCIO_MAX_S)]
         + prevoo.itens_visao(visao, settings.VISAO_MESA_POSICOES_DEFINIDA,
                              os_templates.listar(),

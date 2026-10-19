@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
-"""O contrato da porta NR-12 (§9) — documento × placa falsa × repasse.
+"""O contrato da porta NR-12 (§9) — documento × placa falsa × transporte.
 
-A porta é o quinto firmware da célula e o primeiro sem porta própria no mini
-PC: ela viaja DENTRO da porta das telas. Por isso ela não entra em
-`ADAPTERS_SERIAIS` (não há `LinkSerial` dela) e tem este arquivo próprio, com
-as mesmas três cópias de sempre confrontadas:
+A porta é o quinto firmware da célula, com USB PRÓPRIA no mini PC e um adapter
+só dela (o `porta-adapter`). Ela não entra em `ADAPTERS_SERIAIS` — aquela lista
+é a dos adapters com transporte SELECIONÁVEL (http × serial), e a porta só tem
+serial: não há simulador de porta. Por isso tem este arquivo próprio, com as
+mesmas três cópias de sempre confrontadas:
 
   * `docs/PROTOCOLO_SERIAL.md` §9 — o documento;
-  * `tests/fakes/placa_porta.py`  — o modelo da máquina de estados do firmware;
-  * `dispenser-adapter/main.py`   — quem manda o comando (task 5, mais abaixo).
+  * `tests/fakes/placa_porta.py`  — a placa falsa, modelo da máquina de estados
+                                    do firmware;
+  * `porta-adapter/main.py`       — quem manda o comando (seção 4).
 
-E o REPASSE da placa das telas é exercitado de verdade, por `socket://`, com o
-`serial_link` do adapter do outro lado: o comando `porta_*` desce, o ACK que
-volta é o da porta, e o heartbeat que some vira `porta_link_perdido`.
+E o transporte é exercitado de verdade, por `socket://`, com o `serial_link`
+do outro lado do fio: ping/pong, o comando `porta_*` descendo com o ACK da
+porta, e a porta que para de falar.
 """
 from __future__ import annotations
 
@@ -22,13 +24,24 @@ from pathlib import Path
 
 import pytest
 
-from fakes.placa_dispenser_tft import PlacaDispenserTFT
 from fakes.placa_porta import ESTADOS, PlacaPorta
 
 RAIZ_REPO = Path(__file__).resolve().parent.parent
 DOC = RAIZ_REPO / "docs" / "PROTOCOLO_SERIAL.md"
 
-EVENTOS_DA_PLACA_DAS_TELAS = {"porta_link_perdido", "porta_link_ok"}
+# Os dois de vigia são do ADAPTER: quem perdeu o link não tem como avisar.
+EVENTOS_DO_ADAPTER = {"porta_link_perdido", "porta_link_ok"}
+
+
+def _modelo(**kw) -> PlacaPorta:
+    """A máquina de estados, sem fio: a seção 2 testa só a decisão.
+
+    A `PlacaFalsa` abre o socket de escuta no construtor; fechado aqui, sem
+    `iniciar()`, o que a encenação põe "no fio" vai para lugar nenhum.
+    """
+    porta = PlacaPorta(**kw)
+    porta.parar()
+    return porta
 
 
 def _secao() -> str:
@@ -66,7 +79,7 @@ def _todos_os_eventos_da_porta() -> dict[str, dict]:
         for e in eventos:
             exemplos[e["tipo"]] = e
 
-    porta = PlacaPorta()
+    porta = _modelo()
     guardar([porta.boot(), porta.estado()])
     guardar(porta.passar_tag("FFFFFFFF"))                       # tag_negada
     guardar(porta.passar_tag("04A1B2C3"))                       # pedido_acesso
@@ -104,7 +117,7 @@ def test_todo_evento_da_porta_bate_campo_a_campo_com_o_documento():
     repassa cru, e o campo que some vira coluna vazia no histórico."""
     documentado = doc_eventos()
     emitidos = _todos_os_eventos_da_porta()
-    da_porta = set(documentado) - EVENTOS_DA_PLACA_DAS_TELAS
+    da_porta = set(documentado) - EVENTOS_DO_ADAPTER
     assert set(emitidos) == da_porta, {
         "emitido e não documentado": sorted(set(emitidos) - da_porta),
         "documentado e não emitido": sorted(da_porta - set(emitidos)),
@@ -123,20 +136,20 @@ def test_o_vocabulario_de_estado_e_o_do_documento():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_a_tag_nao_autoriza_nada_sozinha():
-    porta = PlacaPorta()
+    porta = _modelo()
     (pedido, estado) = porta.passar_tag("04A1B2C3")
     assert pedido["tipo"] == "pedido_acesso"
     assert estado["estado"] == "AGUARDANDO_CENTRAL" and not porta.led_pode_abrir
 
 
 def test_liberar_sem_pedido_e_recusado():
-    porta = PlacaPorta()
+    porta = _modelo()
     ack, eventos = porta.executar({"cmd": "porta_liberar", "cmd_id": 1, "janela_ms": 5000})
     assert ack["resp"] == "erro" and not eventos and not porta.led_pode_abrir
 
 
 def test_abrir_apaga_o_pode_abrir_e_fechar_exige_rearme():
-    porta = PlacaPorta()
+    porta = _modelo()
     porta.passar_tag("04A1B2C3")
     porta.executar({"cmd": "porta_liberar", "cmd_id": 1, "janela_ms": 5000})
     assert porta.led_pode_abrir
@@ -154,7 +167,7 @@ def test_abrir_apaga_o_pode_abrir_e_fechar_exige_rearme():
 
 
 def test_abrir_sem_liberacao_e_sem_autorizacao_inclusive_com_rearme_pendente():
-    porta = PlacaPorta()
+    porta = _modelo()
     assert porta.abrir("frente")[0]["autorizada"] is False
     porta.fechar("frente")
     assert porta.aguardando_rearme
@@ -162,7 +175,7 @@ def test_abrir_sem_liberacao_e_sem_autorizacao_inclusive_com_rearme_pendente():
 
 
 def test_negar_volta_a_fechada_sem_rearme():
-    porta = PlacaPorta()
+    porta = _modelo()
     porta.passar_tag("04A1B2C3")
     ack, eventos = porta.executar({"cmd": "porta_negar", "cmd_id": 1,
                                    "motivo": "maquina_nao_confirmou_parada"})
@@ -173,7 +186,7 @@ def test_negar_volta_a_fechada_sem_rearme():
 
 
 def test_janela_vencida_entra_em_rearme_e_central_mudo_nao():
-    porta = PlacaPorta()
+    porta = _modelo()
     porta.passar_tag("04A1B2C3")
     assert porta.expirar()[-1]["motivo"] == "central_nao_respondeu"
     assert not porta.aguardando_rearme
@@ -184,10 +197,14 @@ def test_janela_vencida_entra_em_rearme_e_central_mudo_nao():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. O repasse da placa das telas, por socket://, com o serial_link do adapter
+# 3. A porta pela USB dela, por socket://, com o serial_link do outro lado
 # ══════════════════════════════════════════════════════════════════════════════
 
 pytest.importorskip("serial", reason="pyserial (tests/requirements-dev.txt)")
+
+# A cópia de `serial_link.py` que a porta usa. As cinco são idênticas
+# (`tests/test_serial_link.py`), então o que muda é só de qual pasta ela vem.
+PASTA_SERIAL_LINK = "porta-adapter"
 
 
 @pytest.fixture
@@ -197,7 +214,7 @@ def montagem():
     import threading
     import time
 
-    caminho = RAIZ_REPO / "dispenser-adapter" / "serial_link.py"
+    caminho = RAIZ_REPO / PASTA_SERIAL_LINK / "serial_link.py"
     spec = importlib.util.spec_from_file_location("apsen_sl_porta", caminho)
     sl = importlib.util.module_from_spec(spec)
     sys.modules["apsen_sl_porta"] = sl
@@ -210,10 +227,8 @@ def montagem():
         with lock:
             eventos.append(payload)
 
-    porta = PlacaPorta()
-    placa = PlacaDispenserTFT(intervalo_ping=0.2).iniciar()
-    placa.conectar_porta(porta, heartbeat_s=0.05, vigia_s=0.25)
-    link = sl.LinkSerial("dispenser_tft", url=placa.url, ack_timeout_s=1.0,
+    porta = PlacaPorta(intervalo_ping=0.2, heartbeat_s=0.05).iniciar()
+    link = sl.LinkSerial("porta", url=porta.url, ack_timeout_s=1.0,
                          ao_receber_evento=receber, probe_assentar_s=0.0,
                          probe_espera_s=1.0, reconexao_s=0.05)
     link.iniciar()
@@ -224,7 +239,7 @@ def montagem():
     class M:
         pass
     m = M()
-    m.sl, m.porta, m.placa, m.link = sl, porta, placa, link
+    m.sl, m.porta, m.link = sl, porta, link
 
     def tipos():
         with lock:
@@ -241,8 +256,15 @@ def montagem():
     m.ate = ate
     yield m
     link.parar()
-    placa.parar()
+    porta.parar()
     sys.modules.pop("apsen_sl_porta", None)
+
+
+def test_a_porta_pinga_e_o_adapter_responde_pong(montagem):
+    """Quem inicia o ping é a placa, e quem responde é o lado do adapter —
+    não mais a placa das telas."""
+    assert montagem.ate(lambda: montagem.porta.pongs_recebidos > 0)
+    assert montagem.porta.sessao_adapter is not None
 
 
 def test_o_heartbeat_sobe_com_origem_porta(montagem):
@@ -250,19 +272,22 @@ def test_o_heartbeat_sobe_com_origem_porta(montagem):
 
 
 def test_comando_porta_desce_e_o_ack_e_o_da_porta(montagem):
-    montagem.placa.da_porta(montagem.porta.passar_tag("04A1B2C3"))
+    montagem.porta.passar_tag("04A1B2C3")
     assert montagem.ate(lambda: "pedido_acesso" in montagem.tipos())
     resposta = montagem.link.enviar_comando("porta_liberar", {"janela_ms": 4000})
     assert resposta["resp"] == "ok"
     assert montagem.porta.executados[-1]["cmd"] == "porta_liberar"
     assert montagem.ate(lambda: "liberada" in montagem.tipos())
-    # A placa das telas não executou nada: o comando foi da porta.
-    assert not [e for e in montagem.placa.executados if e["cmd"].startswith("porta_")]
 
 
 def test_ack_negativo_da_porta_vira_ack_negativo(montagem):
-    with pytest.raises(montagem.sl.AckNegativo):
+    with pytest.raises(montagem.sl.AckNegativo, match="sem_pedido_pendente"):
         montagem.link.enviar_comando("porta_liberar", {"janela_ms": 4000})
+
+
+def test_comando_fora_do_contrato_e_ack_negativo(montagem):
+    with pytest.raises(montagem.sl.AckNegativo, match="comando desconhecido"):
+        montagem.link.enviar_comando("slot", {"dispenser_id": 1})
 
 
 def test_porta_estado_pede_um_estado_na_hora(montagem):
@@ -270,20 +295,33 @@ def test_porta_estado_pede_um_estado_na_hora(montagem):
     assert montagem.porta.executados[-1]["cmd"] == "porta_estado"
 
 
-def test_heartbeat_que_some_vira_link_perdido_e_volta_com_ok_antes_do_estado(montagem):
+def test_cmd_id_repetido_nao_executa_de_novo(montagem):
+    """A idempotência é da placa, como em todas: reenviar `porta_liberar`
+    acenderia o "pode abrir" duas vezes para um pedido só."""
+    montagem.porta.passar_tag("04A1B2C3")
+    ack, _ = montagem.porta.executar({"cmd": "porta_liberar", "cmd_id": 50,
+                                      "janela_ms": 4000})
+    assert ack["resp"] == "ok"
+    repetido, eventos = montagem.porta.executar({"cmd": "porta_liberar", "cmd_id": 50,
+                                                 "janela_ms": 4000})
+    assert repetido == {"resp": "ok", "cmd_id": 50, "repetido": True} and not eventos
+
+
+def test_porta_que_para_de_falar_some_do_fio_inteira(montagem):
+    """`silenciar` é a placa travada com a USB de pé: sem heartbeat, sem ping
+    e sem ACK. É o caso que só a vigia do heartbeat do adapter pega."""
     assert montagem.ate(lambda: "estado" in montagem.tipos())
     montagem.porta.silenciar()
-    assert montagem.ate(lambda: "porta_link_perdido" in montagem.tipos())
-    # Com o link caído, o comando é recusado NA HORA pela placa das telas.
-    with pytest.raises(montagem.sl.AckNegativo, match="porta_sem_link"):
-        montagem.link.enviar_comando("porta_estado", {})
+    import time
+    time.sleep(0.15)
     antes = len(montagem.tipos())
+    time.sleep(0.4)                       # ~8 heartbeats a 50 ms
+    assert len(montagem.tipos()) == antes, "a porta travada continuou falando"
+    with pytest.raises(montagem.sl.SemAck):
+        montagem.link.enviar_comando("porta_estado", {}, ack_timeout_s=0.3)
+    assert montagem.link.conectado, "silenciar não é cabo solto"
     montagem.porta.falar()
-    assert montagem.ate(lambda: "porta_link_ok" in montagem.tipos()[antes:])
-    depois = montagem.tipos()[antes:]
-    assert depois.index("porta_link_ok") < len(depois) - 1
-    assert depois[depois.index("porta_link_ok") + 1] == "estado"
-    assert montagem.tipos().count("porta_link_perdido") == 1
+    assert montagem.ate(lambda: len(montagem.tipos()) > antes)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -291,7 +329,7 @@ def test_heartbeat_que_some_vira_link_perdido_e_volta_com_ok_antes_do_estado(mon
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _adapter():
-    return ast.parse((RAIZ_REPO / "dispenser-adapter" / "main.py").read_text(encoding="utf-8"))
+    return ast.parse((RAIZ_REPO / "porta-adapter" / "main.py").read_text(encoding="utf-8"))
 
 
 def adapter_comandos_porta() -> set[str]:

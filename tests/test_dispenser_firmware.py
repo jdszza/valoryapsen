@@ -329,74 +329,47 @@ def test_a_placa_das_telas_nao_emite_evento_de_resultado(firmware):
     """`slot` e `estado_celula` só PINTAM: o ACK já disse "aceitei", e não há
     "terminei" a esperar. Um evento novo aqui viraria lixo no adapter.
 
-    Os dois `porta_link_*` são a exceção registrada: não são resultado de
-    comando nenhum, são a VIGIA do heartbeat da porta NR-12 (§9) — quem perdeu
-    o link não tem como avisar que o perdeu."""
+    Os `porta_link_*` que esta placa emitia saíram com o repasse da porta: a
+    vigia do heartbeat é do `porta-adapter` (§9)."""
     tipos = set(_blocos_de_evento(firmware["dispenser_tft"]))
-    assert tipos == {"telemetria", "erro", "porta_link_perdido", "porta_link_ok"}, tipos
+    assert tipos == {"telemetria", "erro"}, tipos
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4b. A placa das telas REPASSA a porta NR-12 (§9), sem interpretá-la
+# 4b. A placa das telas NÃO carrega mais a porta NR-12 (§9)
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# A porta ganhou USB e adapter próprios. Daqui saíram a UART (Serial2 em
+# 16/17), o repasse das linhas nos dois sentidos, o pong que esta placa dava
+# ao ping da porta e a vigia de 1500 ms. Um merge que ressuscitasse metade
+# disso não quebraria nada visível: o display da porta continuaria mudo, e a
+# vigia de cima (o porta-adapter) seria a única a perceber.
 
-def test_a_uart_da_porta_nao_colide_com_a_spi_nem_com_os_cs(firmware):
-    """Um pino da UART em cima de um CS faria a tela daquele slot ler o tráfego
-    da porta como comando de desenho — e a porta perderia bytes no meio de um
-    JSON. 16/17 são os livres; 19 é o MISO que a SPI reserva."""
+def test_a_placa_das_telas_nao_tem_uart_nem_repasse_da_porta(firmware):
     texto = sem_comentarios(firmware["dispenser_tft"])
-    rx = int(re.search(r"#define PORTA_UART_RX\s+(\d+)", texto).group(1))
-    tx = int(re.search(r"#define PORTA_UART_TX\s+(\d+)", texto).group(1))
-    cs = {int(n) for n in re.search(r"TFT_PIN_CS\[NUM_TELAS\]\s*=\s*\{([^}]*)\}",
-                                    texto).group(1).split(",")}
-    ocupados = cs | {18, 19, 23,
-                     int(re.search(r"#define TFT_PIN_DC\s+(\d+)", texto).group(1)),
-                     int(re.search(r"#define TFT_PIN_RST\s+(\d+)", texto).group(1))}
-    assert {rx, tx} == {16, 17}
-    assert not ({rx, tx} & ocupados)
+    for resto in ("Serial2", "PORTA_SERIAL", "PORTA_UART_RX", "PORTA_UART_TX",
+                  "PORTA_VIGIA_MS", "portaPoll", "linhaDaPorta", "pongParaPorta",
+                  "repassarComandoPorta", "emitPortaLink", "portaBuf",
+                  "portaLinkPerdido", "portaUltimoEstadoMs", "portaDescartando"):
+        assert resto not in texto, f"`{resto}` voltou ao firmware das telas"
 
 
-def test_o_repasse_da_porta_e_nao_bloqueante_e_mora_no_laco(firmware):
-    texto = sem_comentarios(firmware["dispenser_tft"])
-    assert "portaPoll();" in _corpo_da_funcao(texto, "void loop()")
-    poll = _corpo_da_funcao(texto, "static void portaPoll()")
-    assert "PORTA_SERIAL.available()" in poll
-    assert "delay(" not in poll and "readStringUntil" not in poll
-    # A leitura da UART mora SÓ aqui: um segundo leitor partiria as linhas.
-    assert texto.count("PORTA_SERIAL.read()") == 1
-
-
-def test_comando_porta_desce_como_veio_e_o_ack_e_da_porta(firmware):
-    """Esta placa não confirma o que não executa: dois ACKs para o mesmo
-    `cmd_id` seriam o ACK de quem não fez nada. Com o link caído, ela recusa
-    na hora em vez de deixar o adapter queimar o prazo."""
+def test_porta_nao_tem_ramo_proprio_no_despacho_das_telas(firmware):
+    """Um `porta_*` cai no ramo de comando desconhecido — ACK negativo, como
+    qualquer outro fora do contrato. Prefixo nenhum é tratado à parte."""
     texto = sem_comentarios(firmware["dispenser_tft"])
     despacho = _corpo_da_funcao(texto, "void executarComando")
-    assert 'strncmp(cmd, "porta_", 6)' in despacho
-    repasse = _corpo_da_funcao(texto, "static void repassarComandoPorta(")
-    assert "ackOk" not in repasse
-    assert 'ackErro(cmd_id, "porta_sem_link")' in repasse
-    assert repasse.index("portaLinkPerdido") < repasse.index("PORTA_SERIAL.println")
+    assert "strncmp" not in despacho and "porta_" not in despacho
+    assert 'ackErro(cmd_id, "comando desconhecido")' in despacho
 
 
-def test_o_ping_da_porta_e_respondido_aqui_e_nao_sobe(firmware):
+def test_a_faixa_da_pausa_continua_nas_telas(firmware):
+    """O que FICA: o central avisando as telas de que a célula parou. Não é a
+    porta passando por esta placa — é o `estado_celula` de sempre."""
     texto = sem_comentarios(firmware["dispenser_tft"])
-    linha = _corpo_da_funcao(texto, "static void linhaDaPorta(")
-    i_ping = linha.index('"\\"cmd\\":\\"ping\\""')
-    i_sobe = linha.index("Serial.println(json)")
-    assert i_ping < i_sobe
-    assert "pongParaPorta(); return;" in linha
-
-
-def test_a_volta_do_link_sai_antes_do_estado_que_a_provou(firmware):
-    """O adapter só declara o link ok depois do primeiro `estado`; a placa
-    emite `porta_link_ok` e então repassa esse `estado`, nessa ordem."""
-    texto = sem_comentarios(firmware["dispenser_tft"])
-    linha = _corpo_da_funcao(texto, "static void linhaDaPorta(")
-    assert linha.index("emitPortaLink(true)") < linha.index("Serial.println(json)")
-    poll = _corpo_da_funcao(texto, "static void portaPoll()")
-    assert "PORTA_VIGIA_MS" in poll and "emitPortaLink(false)" in poll
-    assert "#define PORTA_VIGIA_MS 1500" in texto
+    celula = _corpo_da_funcao(texto, "static void cmdEstadoCelula(")
+    assert '"pausa_porta"' in celula and '"pausa_resumo"' in celula
+    assert "pintarPausa(" in texto
 
 
 # ══════════════════════════════════════════════════════════════════════════════

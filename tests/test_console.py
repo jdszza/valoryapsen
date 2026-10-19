@@ -668,7 +668,7 @@ def test_prevoo_inclui_a_visao_com_uma_sonda_so(logado, monkeypatch):
     com o adapter fora, é UM item vermelho."""
     modulo = logado.modulo
 
-    async def servicos(_cliente, timeout=None):
+    async def servicos(_cliente, timeout=None, servicos=()):
         return []
 
     async def banco():

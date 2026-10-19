@@ -14,7 +14,7 @@ Uma porta por firmware, uma linha JSON por mensagem:
 | `dispenser-adapter` | as 8 telas TFT              | uma (a SEGUNDA porta do mesmo adapter) | `dispenser_tft` | [`dispenser/telas_tft/`](../dispenser/README.md) |
 | `cnc-adapter`       | a mesa CNC                  | uma   | `cnc`              | — |
 | `weight-adapter`    | a balança HX711             | uma   | `weight`           | [`weight/balanca2_3/`](../weight/README.md) |
-| `dispenser-adapter` | a porta NR-12 (RC522 + fins de curso; porta presa por ímã) | **nenhuma** — viaja DENTRO da porta das telas, por UART entre as duas ESPs | `porta` | [`porta/porta_nr12/`](../porta/README.md) |
+| `porta-adapter`     | a porta NR-12 (RC522 + fins de curso; porta presa por ímã) | uma — USB PRÓPRIA no mini PC, independente das telas | `porta` | [`porta/porta_nr12/`](../porta/README.md) |
 
 Três dos quatro firmwares estão escritos. A balança foi a primeira
 (`weight/balanca2_3/`, manual em `weight/README.md`) e as duas placas do
@@ -31,7 +31,9 @@ O `vision-adapter` **não** entra: a visão continua por HTTP. E `dispenser` e
 `dispenser_tft` são **duas portas físicas do mesmo adapter**: acionar os 8
 mecanismos, desenhar 8 telas e manter a serial não cabe num ESP só, e quem já
 vê todo comando que desce e todo evento que sobe do slot é o dispenser-adapter
-— ver a seção 6.
+— ver a seção 6. A porta NR-12 é o caso oposto, e de propósito: placa própria,
+USB própria e adapter próprio (`porta-adapter`, HTTP 8104), para que travar ou
+regravar a placa das telas não cegue a vigia da porta — ver a seção 9.
 
 ---
 
@@ -613,6 +615,14 @@ supervisor decide; a tela do slot responde uma pergunta só: *é este slot?*
 comando, não atrasa ACK, não impede o encaminhamento do evento ao central. O
 adapter loga e segue. Tela errada é cosmética; dispensa atrasada não é.
 
+**Esta placa não carrega mais a porta NR-12.** A porta tem USB e adapter
+próprios (§9): a placa das telas não tem UART com ela, não repassa linha
+nenhuma, não responde o ping dela e não vigia o heartbeat dela. Um `porta_*`
+que chegue aqui é um comando como qualquer outro fora desta tabela — **ACK
+negativo** `comando desconhecido`. O que fica é só a FAIXA da pausa
+(`pausa_porta`/`pausa_resumo` no `estado_celula`): é o central avisando as
+telas de que a célula parou, não a porta passando por esta placa.
+
 ### Tabela de pintura
 
 É o que o firmware das telas implementa, e nada além disso:
@@ -654,10 +664,11 @@ O código **não sabe** em qual sistema operacional está: ele chama
 `rfc2217://h:p` e `loop://` com a mesma API.
 
 * **A célula montada roda num mini PC Windows.** O Docker Desktop não repassa
-  porta COM para container, então os três adapters seriais rodam **fora do
+  porta COM para container, então os adapters seriais rodam **fora do
   Docker**, no host, abrindo a COM direto com pyserial — como o painel de
-  bancada já fazia, pelo mesmo motivo. No compose eles (e os simuladores que
-  substituem) estão atrás do profile `simulado`. **Toda placa tem a COM fixada
+  bancada já fazia, pelo mesmo motivo. No compose os três que têm simulador
+  (e os simuladores que substituem) estão atrás do profile `simulado`; o
+  `porta-adapter` nem entra no compose, porque não há porta simulada. **Toda placa tem a COM fixada
   no Windows e a `<SUB>_SERIAL_URL` preenchida**: a varredura é só para
   desenvolvimento sem hardware, porque cada processo varrendo abre as portas
   dos outros por até 9,5 s cada e derruba o dono de verdade. O passo a passo
@@ -696,10 +707,17 @@ EXATAMENTE o de antes desta feature — é o default justamente para que a suít
 CI e a demonstração em Docker não mudem de resultado (para as telas, `http`
 significa "sem telas").
 
+A porta NR-12 é a exceção da tabela: o `porta-adapter` **só** tem transporte
+serial — não há simulador de porta, e fingir um ACK faria o central autorizar
+uma porta imaginária. Não existe `PORTA_TRANSPORTE`; `PORTA_SERIAL_URL` é
+**obrigatória** (vazia, o serviço recusa subir), e `PORTA_SERIAL_BAUD`/
+`PORTA_ACK_TIMEOUT_S` seguem os defaults acima. Ver a seção 9.
+
 ## 8. Sem placa: as placas falsas
 
-`tests/fakes/placa_dispenser.py`, `placa_dispenser_tft.py`, `placa_cnc.py` e
-`placa_weight.py` falam este contrato inteiro por `socket://`: respondem ping,
+`tests/fakes/placa_dispenser.py`, `placa_dispenser_tft.py`, `placa_cnc.py`,
+`placa_weight.py` e `placa_porta.py` falam este contrato inteiro por
+`socket://`, cada uma na sua porta: respondem ping,
 aceitam comando, devolvem ACK, ignoram `cmd_id` repetido e emitem os eventos
 com atraso configurável (inclusive zero). Elas são o que permite exercitar o transporte sem hardware — e são também
 o documento executável contra o qual o firmware foi escrito. É o mesmo papel
@@ -716,17 +734,36 @@ tudo verde para sempre, inclusive com o protocolo quebrado.
 
 ## 9. `porta` — a porta NR-12
 
-**Duas portas físicas da célula, uma ESP, e nenhuma porta USB no mini PC.** A
-ESP da porta (RC522 + dois fins de curso) fala por **UART
-dedicada** (Serial2, 115200) com a placa das 8 telas TFT, e a placa das telas
-repassa as mensagens nos dois sentidos pela USB que ela já tem com o
-`dispenser-adapter`. O USB da própria ESP da porta é só de bancada — cadastro de
-tags e diagnóstico pelo Monitor Serial —, e nenhum processo do host o abre.
+**Duas portas físicas da célula, uma ESP, e uma USB só dela no mini PC.** A ESP
+da porta (RC522 + dois fins de curso + LED "pode abrir") é uma placa DEDICADA,
+como a balança e a CNC: USB própria, `sub: "porta"`, e um adapter só dela — o
+**`porta-adapter`** (host, HTTP 8104), dono da COM em `PORTA_SERIAL_URL`.
 
 ```
-ESP da porta ──UART (Serial2)──> ESP das telas ──USB──> dispenser-adapter ──REST──> central
-             <──────────────────              <──────                    <──────
+ESP da porta ──USB (COMx)──> porta-adapter :8104 ──REST──> central
+             <──────────────               <──────
 ```
+
+**Ela não passa por placa nenhuma.** Houve um desenho em que a porta falava por
+UART com a placa das 8 telas TFT e as telas repassavam pela USB delas ao
+dispenser-adapter; ele saiu. Com a porta independente, travar ou regravar a
+placa das telas não cega a vigia da porta, e a porta tem o seu `/health` e a
+sua COM. A placa das telas voltou a ser só telas (seção 6).
+
+**Duas vozes na MESMA USB, separadas pelo `{`** — a regra que o
+`apsen_serial.h` aplica em todas as placas:
+
+* linha com `{` é a voz de MÁQUINA: todo evento deste contrato, todo ACK e todo
+  comando do central;
+* linha sem `{` é a voz de BANCADA: os comandos de um caractere `R`/`S`/`C`/`L`/`E`
+  (cadastro de tag e diagnóstico dos fins de curso) que chegam do Monitor
+  Serial, e os logs para humano que a placa imprime. Nenhum log da placa leva
+  `{` — um `{` num log viraria linha de máquina.
+
+O adapter **nunca** envia linha sem `{`: um `R` vindo do PC poria a porta em
+modo registro. E as duas vozes não convivem com dois programas: no Windows a COM
+abre em um processo por vez, então cadastrar tag pelo Monitor Serial exige
+PARAR o `porta-adapter` antes (`porta/README.md`).
 
 As duas portas são **ES1 = `teto`** (abastecer remédio) e **ES2 = `frente`** (a
 caixa sobre a balança). A célula só está FECHADA com as duas fechadas.
@@ -739,14 +776,14 @@ autorizada; aberta antes (ou sem tag), é sem autorização — alarme, e a cél
 para do mesmo jeito.
 
 **Firmware:** `porta/porta_nr12/porta_nr12.ino`, com a 4ª cópia de
-`apsen_serial.h` — a mesma voz de máquina das outras placas, só que sobre o
-Serial2. Manual em [`porta/README.md`](../porta/README.md).
+`apsen_serial.h` — a mesma voz de máquina das outras placas, na mesma USB
+(`Serial`) que a bancada. Manual em [`porta/README.md`](../porta/README.md).
 
 ### Quem decide o quê
 
 | decisão | quem decide | por quê |
 |---|---|---|
-| a TAG é válida | a porta (lista local na NVS) | o cadastro é físico, feito na bancada pelo USB da própria porta |
+| a TAG é válida | a porta (lista local na NVS) | o cadastro é físico, feito na bancada pelo Monitor Serial na USB da porta, com o `porta-adapter` parado |
 | a abertura é AUTORIZADA (LED "pode abrir") | o central | só ele sabe se a máquina parou; o LED só acende depois de a CNC e os dispensers confirmarem a parada |
 | a máquina PARA | o central, na hora | qualquer porta aberta, pedido de acesso ou link perdido |
 | a máquina RETOMA | o central, no `rearme` | fechar a porta não religa nada: a tag é o comando deliberado |
@@ -757,28 +794,29 @@ por `ESPERA_CENTRAL_MS` (5 s) e, sem ela, volta a FECHADA. O número **tem de se
 maior** que `PORTA_PARADA_MAX_S` do central (teto 4 s) mais o trajeto: é um
 limite superior, como o `CNC_TETO_TRAJETO_S` — não um fato duplicado.
 
-### O que a placa das telas faz com essas linhas
+### Ping, pong e sessão — como nas outras placas
 
-Ela **não interpreta** a mensagem da porta. A regra dela cabe em quatro linhas:
+Nada aqui é novo; é a seção 2 aplicada a mais uma placa:
 
-* linha da porta com `evento` ou `resp` → sobe pela USB **como veio**;
-* `{"cmd":"ping","sub":"porta"}` → **não sobe**: a placa das telas responde o
-  `pong` ela mesma, com o `epoch` e a `sessao` do adapter que ela já conhece.
-  Repassado, o `serial_link` do adapter leria um ping de outro `sub` na porta
-  das telas e acusaria "cabo trocado";
-* comando do adapter cujo `cmd` começa com `porta_` → desce pela UART **como
-  veio** (com `cmd_id` e `sessao`), e quem responde o ACK é a PORTA. A placa das
-  telas não o confirma: dois ACKs para o mesmo `cmd_id` seriam o ACK de quem não
-  executou nada;
-* comando `porta_*` com o link da porta caído → a placa das telas responde
-  **ACK negativo na hora** (`porta_sem_link`), em vez de deixar o adapter
-  queimar o `ack_timeout_s` descobrindo o que ela já sabe.
+* **a porta inicia o ping** (`{"cmd":"ping","sub":"porta"}`), no boot e a cada
+  3 s, e quem responde o `pong` — com `epoch` e `sessao` — é o `porta-adapter`.
+  O relógio da porta vem desse `epoch`, e a idempotência do `cmd_id` vem dessa
+  `sessao`, exatamente como na balança e na CNC;
+* **cabo trocado é detectado como nas outras placas.** O `porta-adapter` abre
+  SÓ a COM de `PORTA_SERIAL_URL` (não varre: sem ela, recusa subir) e o
+  `serial_link` confere o `sub` de todo ping que chega. Ping de outro `sub`
+  nessa COM — a balança ligada no lugar da porta, por exemplo — vira UMA linha
+  de ERRO "cabo trocado?" no log do adapter. E a célula não anda: a placa errada
+  não emite o `estado` da porta, então o link nunca é declarado ok, e link
+  perdido é porta aberta;
+* **comando fora deste contrato é ACK negativo** (`comando desconhecido`), nunca
+  silêncio.
 
-Todo evento desta seção leva **`"origem":"porta"`**. É o campo que separa, no
-adapter, o evento da porta do evento das próprias telas (`telemetria`, `erro`),
-que vêm pela mesma USB e ficam no adapter. Os dois de vigia (`porta_link_*`)
-também levam `origem: "porta"` — falam da porta, mesmo que quem os escreva seja
-a placa das telas.
+Todo evento desta seção leva **`"origem":"porta"`**. Hoje ele é redundante — a
+COM já diz de quem é a linha —, e fica assim mesmo: o central já filtra por ele,
+ele não custa nada, e tirá-lo obrigaria a mudar a rota e o firmware juntos por
+ganho nenhum. Os dois de vigia (`porta_link_*`) também o levam: falam da porta,
+embora quem os escreva seja o `porta-adapter`.
 
 ### Comandos (adapter → placa)
 
@@ -827,26 +865,41 @@ transição. `porta_aberta` sai **uma vez por porta**, na transição: se a segu
 abre com a primeira já aberta, sai outra. `porta_fechada` só quando as DUAS
 fecharam.
 
-**`porta_link_perdido` e `porta_link_ok` são da placa das telas, não da
-porta.** Sem `estado` por mais de 1500 ms (três heartbeats), ela emite UMA vez
-`porta_link_perdido`; quando o heartbeat volta, emite `porta_link_ok` e repassa
-o primeiro `estado`. O adapter faz a mesma vigia por cima (a placa das telas
-pode ser ela mesma quem sumiu), e quem decide o que fazer com isso é o central:
-**link perdido é porta aberta**.
+**`porta_link_perdido` e `porta_link_ok` são do `porta-adapter`, não da
+porta.** Quem perdeu o link não tem como avisar que o perdeu, então quem vigia
+é o lado de cá do cabo. O adapter declara o link **perdido** — UMA vez por
+queda — quando:
+
+* a USB da porta caiu (cabo solto, placa reiniciando, COM sumida); ou
+* nenhum `estado` chegou há mais de `PORTA_HEARTBEAT_MAX_S` (**2,5 s**, cinco
+  heartbeats): a USB está de pé e a placa parou de falar.
+
+E declara o link **ok** só com o primeiro `estado` que chegar depois da volta —
+nunca com a USB reaberta sozinha. Ao reabrir a USB, o adapter manda
+`porta_estado` para não esperar o próximo heartbeat; o `porta_link_ok` sobe
+**antes** do `estado` que o provou. Quem decide o que fazer com isso é o
+central: **link perdido é porta aberta**, e a célula para.
+
+**A relação de tempos que continua valendo:** `ESPERA_CENTRAL_MS` da porta
+(5 s, gravado na placa) **>** `PORTA_PARADA_MAX_S_TETO` do central (4 s) mais o
+trajeto. Mudar o transporte não mexeu em nenhum dos dois números.
 
 ### O que o adapter faz com isso
 
-Repassa ao central em `POST /api/v1/eventos/porta` — rota irmã de
-`/api/v1/eventos/dispenser`, com o mesmo `_post_central` e o mesmo retry —
-**sem interpretar** o conteúdo. Duas exceções, e as duas são de TRANSPORTE:
+O `porta-adapter` repassa ao central em `POST /api/v1/eventos/porta` — rota
+irmã de `/api/v1/eventos/dispenser`, com a mesma política de retry do
+`_post_central` dos outros adapters —, **sem interpretar** o conteúdo e na
+ordem em que chegou. Comandos descem por `POST /comandos/porta/liberar`
+(`janela_ms`), `/comandos/porta/negar` (`motivo`) e `/comandos/porta/estado`:
+ACK negativo da porta é 502, porta inalcançável é 503 — os mesmos de todo
+adapter. Duas exceções ao "sem interpretar", e as duas são de TRANSPORTE:
 
 * o heartbeat repetido idêntico (ignorando `ts`) não sobe a cada 500 ms: sobe na
   mudança e, no máximo, a cada `PORTA_ESTADO_REENVIO_S` (5 s) como sinal de
   vida — é ele que deixa o central notar um adapter morto;
-* o link é UM estado só, somado de três fontes (a USB das telas, o
-  `porta_link_*` da placa das telas e a idade do último `estado`), e só a
-  TRANSIÇÃO sobe: `porta_link_perdido` uma vez, `porta_link_ok` só depois do
-  primeiro `estado` que chegar com o link de volta.
+* o link é UM estado só, somado de duas fontes (a USB da porta e a idade do
+  último `estado`), e só a TRANSIÇÃO sobe: `porta_link_perdido` uma vez,
+  `porta_link_ok` só depois do primeiro `estado` que chegar com o link de volta.
 
-Ao reabrir a USB das telas, o adapter manda `porta_estado` — sem ele, a placa só
+Ao reabrir a USB da porta, o adapter manda `porta_estado` — sem ele, a placa só
 falaria no próximo heartbeat, e o `porta_link_ok` esperaria por nada.

@@ -257,6 +257,9 @@ _URLS_DE_ADAPTER = {
     "CNC_ADAPTER_URL":       "http://cnc-adapter:8101",
     "VISION_ADAPTER_URL":    "http://vision-adapter:8102",
     "WEIGHT_ADAPTER_URL":    "http://weight-adapter:8103",
+    # O porta-adapter não é serviço do compose, e roda SEMPRE no host: o `.env`
+    # da célula é o único lugar de onde o endereço certo pode vir.
+    "PORTA_ADAPTER_URL":     "http://porta-adapter:8104",
 }
 
 

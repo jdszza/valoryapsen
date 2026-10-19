@@ -343,36 +343,20 @@ telas antes da integração:
 O RST é pulsado uma vez para as oito e o construtor recebe `-1`: se cada
 `initR` pulsasse o reset, inicializar a tela 2 apagaria a tela 1.
 
-### A placa das telas também carrega a porta NR-12
+### A placa das telas NÃO carrega a porta NR-12
 
-A ESP da porta (`porta/`) não tem USB no mini PC: ela fala por **UART** com
-esta placa, que repassa as mensagens pela USB que já existe
-([`docs/PROTOCOLO_SERIAL.md`](../docs/PROTOCOLO_SERIAL.md) §9).
+A ESP da porta (`porta/`) tem USB própria no mini PC e um adapter só dela, o
+`porta-adapter` ([`docs/PROTOCOLO_SERIAL.md`](../docs/PROTOCOLO_SERIAL.md) §9).
+Esta placa é só telas: não há fio entre as duas ESPs, GPIO16/17 desta placa
+ficaram livres, e um comando da porta que chegue aqui recebe o ACK negativo de
+qualquer comando fora do contrato (`comando desconhecido`). O que ficou da porta
+nas telas é a FAIXA da pausa — `pausa_porta`/`pausa_resumo` no `estado_celula`
+—, que é o central avisando que a célula parou.
 
-| sinal | GPIO desta placa | liga em |
-|---|---|---|
-| RX2 (Serial2) | **16** | TX2 (GPIO17) da ESP da porta |
-| TX2 (Serial2) | **17** | RX2 (GPIO16) da ESP da porta |
-| GND | GND | GND da ESP da porta — **comum** |
-
-São os únicos pinos livres que não colidem com a SPI (18/23, e o 19 que a SPI
-reserva como MISO), com DC, RST nem com os oito CS. **Nada de 5 V entre as
-duas placas**: são duas ESP32 em 3V3, e a ligação é só TX, RX e GND. Cabo curto,
-longe dos fios dos motores.
-
-O que a placa faz com a linha da porta, e nada além disso:
-
-* `evento` e `resp` da porta sobem pela USB **como vieram** (todo evento da
-  porta leva `"origem":"porta"`, que é como o adapter o separa dos das telas);
-* o ping da porta é respondido AQUI, com o relógio e a `sessao` do adapter —
-  repassado, o adapter leria um `sub` alheio e acusaria "cabo trocado";
-* comando `porta_*` do adapter desce **como veio**, e o ACK é o da PORTA; com o
-  link caído, esta placa recusa na hora (`porta_sem_link`);
-* sem `estado` da porta por **1500 ms**, emite UMA vez `porta_link_perdido`;
-  quando o heartbeat volta, `porta_link_ok` e repassa o primeiro `estado`.
-
-A leitura da UART é não bloqueante, no mesmo laço do `serialPoll`: o repasse
-nunca segura o desenho das telas.
+**Firmware antigo gravado** (de quando a porta passava por aqui) ainda repassa
+os eventos da porta pela USB das telas: o dispenser-adapter os descarta e loga
+UMA vez "firmware das telas antigo: ainda repassa a porta — regrave". Regrave
+esta placa.
 
 **Nome → número da imagem.** O `slot` traz o nome do catálogo do central
 (`"ALOIS 10MG"`); a tela desenha `imgN` de `imagens.h`. A tradução é

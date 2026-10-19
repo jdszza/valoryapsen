@@ -1,7 +1,7 @@
 """O caminho de VOLTA dos adapters ao central também retenta.
 
-Os quatro adapters são a ponte bidirecional entre o orquestrador e os
-simuladores. A ida — orquestrador → adapter — sempre teve retry (`_post` do
+Os cinco adapters são a ponte bidirecional entre o orquestrador e os
+simuladores (e, no caso da porta NR-12, a placa — ela não tem simulador). A ida — orquestrador → adapter — sempre teve retry (`_post` do
 `orchestrator.py`, 3 tentativas). A volta não: `_post_central` postava UMA vez
 e, em falha, só logava.
 
@@ -163,8 +163,8 @@ def test_sucesso_de_primeira_posta_uma_vez_na_rota_certa(carregar_adapter,
 
 # ── A política é a MESMA dos dois lados ───────────────────────────────────────
 
-def test_os_quatro_adapters_usam_a_mesma_politica(carregar_adapter):
-    """Quatro cópias do mesmo helper divergem no primeiro ajuste, e a que ficar
+def test_os_adapters_usam_a_mesma_politica(carregar_adapter):
+    """Cinco cópias do mesmo helper divergem no primeiro ajuste, e a que ficar
     para trás é a do adapter que ninguém está depurando naquele dia."""
     valores = {}
     for nome in NOMES:

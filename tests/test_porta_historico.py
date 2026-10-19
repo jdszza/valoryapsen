@@ -8,7 +8,9 @@
     confirmou a parada, e tag negada repetida (3 em 1 min). Pedido de acesso e
     rearme NÃO são alarme;
   * o pré-voo tem UM item "Portas NR-12", com `acao` em todo vermelho/amarelo,
-    e com o adapter fora continua sendo um item — não três.
+    e com o porta-adapter fora continua sendo um item — não três. O
+    porta-adapter só é sondado com a porta habilitada: sem porta na célula, o
+    serviço não existe e não pode virar vermelho.
 
 O que se conta são chamadas a `salvar_porta_evento` e `salvar_alarme`, pelo
 handler HTTP de verdade (`_handle_evento_porta`).
@@ -192,19 +194,23 @@ def test_tudo_certo_e_verde_sem_acao(prevoo):
 
 def test_adapter_fora_e_um_item_so_e_diz_qual_e_a_causa(central):
     """Com o adapter fora, o pré-voo não lista link perdido + heartbeat velho +
-    portas desconhecidas: é UM item, apontando para o adapter."""
+    portas desconhecidas: é UM item, apontando para o porta-adapter — e para o
+    .bat que o sobe com a COM da porta, porque ele não é do compose."""
     prevoo = central.modulo.prevoo
     item = prevoo.item_portas({"link_ok": False}, {"motivo": "link_perdido"},
                               True, False, None, 15)
-    assert item["estado"] == prevoo.FALHA and "dispenser-adapter" in item["acao"]
+    assert item["estado"] == prevoo.FALHA
+    assert "porta-adapter" in item["detalhe"]
+    assert "Inicie porta-adapter\\iniciar_host.bat com a COM da porta" in item["acao"]
+    assert "dispenser-adapter" not in item["acao"] and "UART" not in item["acao"]
 
 
 def test_o_relatorio_do_prevoo_tem_um_item_de_porta(central, monkeypatch):
     m = central.modulo
     monkeypatch.setattr(m, "_console_exigir_sessao", lambda request: None)
 
-    async def _servicos(cliente):
-        return [m.prevoo._item("dispenser-adapter", "Serviços", "dispenser-adapter",
+    async def _servicos(cliente, servicos=()):
+        return [m.prevoo._item("porta-adapter", "Serviços", "porta-adapter",
                                m.prevoo.FALHA, "fora", "suba")]
 
     async def _nada(*a, **k):
@@ -219,3 +225,80 @@ def test_o_relatorio_do_prevoo_tem_um_item_de_porta(central, monkeypatch):
     relatorio = asyncio.run(m.console_prevoo(None))
     portas = [i for i in relatorio["itens"] if i["id"] == "portas_nr12"]
     assert len(portas) == 1
+
+
+class _ClienteSonda:
+    """Responde a toda sonda, menos aos hosts em `caidos` (conexão recusada)."""
+
+    def __init__(self, caidos=()):
+        self.caidos = set(caidos)
+        self.urls: list = []
+
+    async def get(self, url, timeout=None):
+        self.urls.append(url)
+        host = url.split("//", 1)[1].split(":", 1)[0]
+        if host in self.caidos:
+            raise ConnectionError("Connection refused")
+
+        class _R:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {}
+        return _R()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _relatorio(central, monkeypatch, cliente) -> dict:
+    m = central.modulo
+    monkeypatch.setattr(m, "_console_exigir_sessao", lambda request: None)
+
+    async def _nada(*a, **k):
+        return None
+
+    async def _templates():
+        return [], {}
+    monkeypatch.setattr(m, "_prevoo_banco", _nada)
+    monkeypatch.setattr(m, "_prevoo_visao", _nada)
+    monkeypatch.setattr(m, "_diagnosticar_templates", _templates)
+    monkeypatch.setattr(m.httpx, "AsyncClient", lambda *a, **k: cliente)
+    return asyncio.run(m.console_prevoo(None))
+
+
+def test_porta_habilitada_e_porta_adapter_fora_e_um_item_vermelho_com_a_acao(
+        central, monkeypatch):
+    m = central.modulo
+    monkeypatch.setattr(m.settings, "PORTA_NR12_HABILITADA", True)
+    monkeypatch.setattr(m.settings, "PORTA_ADAPTER_URL", "http://host.docker.internal:8104")
+    cliente = _ClienteSonda(caidos={"host.docker.internal"})
+    itens = _relatorio(central, monkeypatch, cliente)["itens"]
+
+    # A sonda bate onde o central manda os comandos — não no nome do compose.
+    assert "http://host.docker.internal:8104/ping" in cliente.urls
+    (portas,) = [i for i in itens if i["id"] == "portas_nr12"]
+    assert portas["estado"] == m.prevoo.FALHA
+    assert "porta-adapter\\iniciar_host.bat com a COM da porta" in portas["acao"]
+    # A sonda do serviço diz o mesmo: ele não é do compose, e "docker compose
+    # up -d porta-adapter" seria a ação errada.
+    (servico,) = [i for i in itens if i["id"] == "porta-adapter"]
+    assert servico["estado"] == m.prevoo.FALHA
+    assert "docker compose" not in servico["acao"]
+    assert "iniciar_host.bat" in servico["acao"]
+
+
+def test_porta_desabilitada_o_porta_adapter_nem_aparece(central, monkeypatch):
+    m = central.modulo
+    monkeypatch.setattr(m.settings, "PORTA_NR12_HABILITADA", False)
+    cliente = _ClienteSonda(caidos={"porta-adapter", "host.docker.internal"})
+    itens = _relatorio(central, monkeypatch, cliente)["itens"]
+
+    assert not [u for u in cliente.urls if ":8104" in u], cliente.urls
+    assert not [i for i in itens if i["id"] == "porta-adapter"]
+    (portas,) = [i for i in itens if i["id"] == "portas_nr12"]
+    assert portas["estado"] == m.prevoo.INFO

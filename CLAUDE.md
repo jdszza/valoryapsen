@@ -651,10 +651,13 @@ WebSocket, e a mesma linha: transição nunca é filtrada, porque atraso ali é
 atraso de decisão do operador — e porque duas dispensas idênticas são dois fatos,
 não um repetido.
 
-### Três cópias de `serial_link.py`, e um teste que as compara
+### Quatro cópias de `serial_link.py`, e um teste que as compara
 
-O arquivo é idêntico nos três adapters, e `tests/test_serial_link.py` reprova se
-divergirem — a mesma forma de `tests/test_adapters.py` com o `_post_central`.
+O arquivo é idêntico nos quatro adapters com placa — os três daqui e o
+`porta-adapter`, que veio com a USB própria da porta NR-12 —, e
+`tests/test_serial_link.py` reprova se divergirem (e se aparecer uma cópia em
+pasta que a comparação não conhece) — a mesma forma de `tests/test_adapters.py`
+com o `_post_central`.
 
 Cópia e não `shared/` porque cada adapter tem o seu próprio contexto de build no
 compose (`build: ./cnc-adapter`): compartilhar obrigaria os três a virarem
@@ -662,8 +665,9 @@ compose (`build: ./cnc-adapter`): compartilhar obrigaria os três a virarem
 três imagens e passaria a exigir `.dockerignore`. É a avaliação que a seção "Os
 templates moram no CENTRAL" já registra — com a diferença de que lá a alternativa
 era um GET, e aqui não existe GET que resolva: este código roda antes de haver
-rede. **Se um dia existirem cinco cópias, a conta muda**; com três, o teste de
-igualdade custa menos que a infraestrutura.
+rede. **Se um dia existirem cinco cópias, a conta muda**; com quatro — e a
+quarta sem imagem nenhuma, porque o `porta-adapter` só roda no host —, o teste
+de igualdade continua custando menos que a infraestrutura.
 
 O corolário de sempre, e ele mordeu aqui: arquivo novo no adapter exige que o
 Dockerfile o copie. O `weight-adapter` fazia `COPY main.py .` e teria subido sem
@@ -3143,15 +3147,56 @@ A célula tem duas portas físicas — **teto** (ES1, abastecer remédio) e
 (`porta/porta_nr12/`). **Não há fechadura elétrica:** cada porta é presa por
 um ímã simples, e o fim de curso é o único sensor dela. Quem puxa, abre, a
 qualquer momento — o que o sistema controla não é a abertura, é a AUTORIZAÇÃO
-dela. A ESP da porta não tem USB no mini PC: ela fala
-por UART com a placa das 8 telas TFT, que repassa pela USB que já existia
-(`docs/PROTOCOLO_SERIAL.md` §9). Para o dispenser-adapter a porta é uma ORIGEM
-de evento a mais, e para o central é um estado da célula SEPARADO da trava do
-Triple Check — as duas podem coexistir, e retomar exige as duas resolvidas.
+dela. A ESP da porta tem **USB própria** no mini PC e um serviço só dela, o
+**`porta-adapter`** (host, HTTP 8104, dono da COM em `PORTA_SERIAL_URL`;
+`docs/PROTOCOLO_SERIAL.md` §9). Para o central a porta é um estado da célula
+SEPARADO da trava do Triple Check — as duas podem coexistir, e retomar exige as
+duas resolvidas.
 
 ```
-ESP da porta ──UART──> ESP das telas ──USB──> dispenser-adapter ──REST──> central
+ESP da porta ──USB (COMx)──> porta-adapter :8104 ──REST──> central
+ESP das telas ──USB──> dispenser-adapter :8100 (só telas)
 ```
+
+### A porta tem USB e adapter próprios, e não passa pelas telas
+
+Ela já passou: a ESP da porta falava por UART com a placa das 8 telas TFT, que
+repassava as linhas pela USB dela ao dispenser-adapter. O desenho saiu porque
+punha uma placa COSMÉTICA no caminho da SEGURANÇA. Travar ou regravar a placa
+das telas — que é a placa que mais muda nesta célula, toda vez que entra uma
+imagem — cegava a vigia da porta, e link perdido é porta aberta: a célula
+inteira parada por causa de uma tela. E o contrário também: um bug no repasse
+derrubava as telas junto com a porta.
+
+Hoje são duas placas, duas USB e dois processos que não dependem um do outro:
+
+* **`porta-adapter` separado, e não uma terceira porta do dispenser-adapter.**
+  Falha de um não derruba o outro, e a porta tem o seu `/health` e a sua COM.
+  A lógica de link, heartbeat e reenvio do `estado` que morava no
+  dispenser-adapter veio para cá sem mudar de comportamento.
+* **Só serial, e sem serviço no compose.** Não há porta simulada: fingir um ACK
+  faria o central autorizar uma porta imaginária. Por isso não existe
+  `PORTA_TRANSPORTE`, e o serviço roda só no host (`porta-adapter\iniciar_host.bat`),
+  como os outros adapters com placa.
+* **COM fixa obrigatória.** `PORTA_SERIAL_URL` vazia recusa subir — a mesma
+  regra dos outros adapters ("A varredura de portas deixou de ser o default"),
+  e o `.bat` sai em vez de chutar uma COM.
+* **Máquina, bancada e logs na mesma USB, separadas pelo `{`.** Os comandos de
+  bancada R/S/C/L/E chegam por `linhaHumana()`, uma letra por linha. O
+  Monitor Serial e o adapter não abrem a COM ao mesmo tempo: cadastrar tag é
+  PARAR o adapter antes — e, com ele parado, a célula para.
+* **`"origem":"porta"` ficou nos eventos.** Com a COM própria ele é redundante;
+  o central já filtrava por ele, e tirá-lo mudaria firmware e rota juntos.
+* **Firmware das telas antigo** ainda repassa a porta: o dispenser-adapter
+  descarta esses eventos com UM warning ("regrave"). Encaminhá-los daria ao
+  central dois caminhos para o mesmo evento, com o link de um desmentindo o do
+  outro.
+
+O contrato do §9 (máquina de estados, eventos, comandos) NÃO mudou — mudaram o
+transporte e quem é dono dele. O central também não mudou de lógica: os três
+comandos `/comandos/porta/*` só trocaram de endereço (`PORTA_ADAPTER_URL`), e o
+pré-voo sonda o porta-adapter só com `PORTA_NR12_HABILITADA` — numa célula sem
+porta o serviço não existe e não pode virar item vermelho.
 
 ### Quem decide o quê
 
@@ -3268,12 +3313,14 @@ Três caminhos chegam à retomada, e cada um tem o porquê:
 ### Link perdido é porta aberta — vigiado em três lugares
 
 Ninguém que perde o link consegue avisar que o perdeu, então cada salto tem o
-seu vigia: a placa das telas (1,5 s sem heartbeat → `porta_link_perdido`), o
-adapter (USB das telas caída, ou heartbeat mais velho que
-`PORTA_HEARTBEAT_MAX_S`), e o central (`vigiar_porta`, nada da porta em
+seu vigia: o `porta-adapter` (USB da porta caída, ou heartbeat mais velho que
+`PORTA_HEARTBEAT_MAX_S`, 2,5 s) e o central (`vigiar_porta`, nada da porta em
 `PORTA_SILENCIO_MAX_S` — o adapter reenvia o `estado` a cada 5 s mesmo sem
-mudança justamente para isso). O adapter soma as duas primeiras fontes num
-estado só e sobe só a transição; o central abre UM alarme por queda.
+mudança justamente para isso). O adapter soma as duas fontes dele num estado
+só e sobe só a transição — `porta_link_ok` só com o primeiro `estado` depois da
+volta, e ele pede `porta_estado` ao reabrir a USB —; o central abre UM alarme
+por queda. Eram três vigias enquanto a porta passava pela placa das telas, que
+tinha a sua (1,5 s); com a USB própria, o salto do meio deixou de existir.
 
 Com `PORTA_NR12_HABILITADA=1`, o central nasce em pausa por link perdido: porta
 que nunca falou é porta aberta. Sem a variável (planta simulada, CI) nada disso

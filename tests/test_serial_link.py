@@ -1165,23 +1165,32 @@ def test_serial_link_nao_conhece_asyncio():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 10. As três cópias de serial_link.py são a MESMA
+# 10. As cópias de serial_link.py são a MESMA
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_as_tres_copias_de_serial_link_sao_identicas():
+# Toda pasta com `serial_link.py`: os adapters de transporte selecionável e o
+# `porta-adapter`, que só tem serial. Eram três; a porta NR-12 trouxe a quarta.
+PASTAS_COM_SERIAL_LINK = sorted({PASTA[n] for n in ADAPTERS_SERIAIS} | {"porta-adapter"})
+
+
+def test_as_copias_de_serial_link_sao_identicas():
     """Cópia e não `shared/`: cada adapter tem o seu contexto de build no
     compose, e compartilhar um diretório arrastaria o repositório inteiro para
-    dentro das três imagens.
+    dentro das imagens.
 
     O preço da escolha é este teste — a mesma forma de
-    `test_adapters.py::test_os_quatro_adapters_usam_a_mesma_politica`. Divergir
+    `test_adapters.py::test_os_adapters_usam_a_mesma_politica`. Divergir
     aqui é ter um adapter com o enquadramento de ontem, e ele seria justamente o
     que ninguém está depurando naquele dia.
     """
     conteudos = {
         pasta: (RAIZ_REPO / pasta / "serial_link.py").read_bytes()
-        for pasta in (PASTA[n] for n in ADAPTERS_SERIAIS)
+        for pasta in PASTAS_COM_SERIAL_LINK
     }
+    assert len(conteudos) == 4, sorted(conteudos)
+    # Nenhuma cópia escondida em outra pasta, fora desta comparação.
+    achadas = sorted(c.parent.name for c in RAIZ_REPO.glob("*/serial_link.py"))
+    assert achadas == PASTAS_COM_SERIAL_LINK, achadas
     assert len(set(conteudos.values())) == 1, {
         pasta: len(dados) for pasta, dados in conteudos.items()
     }
