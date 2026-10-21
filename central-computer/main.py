@@ -65,6 +65,7 @@ from pydantic import BaseModel
 
 import httpx
 
+import chave_visao_tc
 import console
 import injecao
 import necessidades
@@ -137,6 +138,10 @@ _estado = {
     # vivo, e o `/ws` já entrega o snapshot a cada transição — publicar aqui
     # evita um polling só para um booleano.
     "gerador_pausado": False,
+    # O switch "Visão no Triple Check" do console (fonte: `chave_visao_tc`),
+    # republicado pelo orquestrador a cada leitura ignorada e pelo console a
+    # cada mudança — o `/ws` leva o estado ao console sem polling novo.
+    "visao_triple_check": orch.get_visao_tc(),
     # Modo de demonstração em vigor. Publicado no snapshot pelo mesmo motivo da
     # trava e da pausa do gerador: quem opera precisa ver na tela, ao vivo, se o
     # acaso está desligado. Um painel que não diz isso faz a demo sem imprevisto
@@ -933,7 +938,14 @@ async def _handle_evento_visao(payload: dict):
             )))
 
             motivo = payload.get("motivo")
-            if tipo == "leitura_dispenser_falha" and motivo == "sem_etiqueta_cadastrada":
+            if tipo != "leitura_dispenser_ok" and not orch.visao_conta():
+                # Switch "Visão no Triple Check" desligado: quem grava o alarme
+                # desta leitura é o orquestrador (`visao_ignorada`), no veredito
+                # do slot — um alarme por evento, nunca em dobro. A leitura em
+                # si já foi para o histórico acima.
+                _log("visao", f"Câmera {_LADO[cam]} slot {slot_id}: {tipo} "
+                              f"({motivo or '-'}) — visão fora do Triple Check")
+            elif tipo == "leitura_dispenser_falha" and motivo == "sem_etiqueta_cadastrada":
                 # Medicamento sem etiqueta impressa: é COBERTURA, não falha de
                 # hardware. Hoje 40 dos 46 itens das ordens padrão estão assim,
                 # e um alarme por item enchia o badge e a tela de necessidades
@@ -1002,6 +1014,12 @@ async def _handle_evento_visao(payload: dict):
                 _log("visao", f"Câmera mesa no HOME ({etapa}) OS {os_real}: "
                               f"{tipo} — contou {payload.get('quantidade_detectada')} "
                               f"de {payload.get('quantidade_esperada')}")
+            elif tipo == "leitura_mesa_falha" and not orch.visao_conta():
+                # Switch desligado: o orquestrador grava `visao_ignorada` no
+                # veredito do slot (ver o ramo dos dispensers acima).
+                _log("visao", f"Câmera mesa slot {slot_id}: falha "
+                              f"({payload.get('motivo', 'desconhecido')}) — visão fora "
+                              f"do Triple Check")
             elif tipo == "leitura_mesa_falha":
                 descricao = (f"Câmera mesa não detectou produto slot {slot_id}: "
                              f"{payload.get('motivo', 'desconhecido')}")
@@ -1909,6 +1927,14 @@ def os_detalhe(os_id: str):
     ordem = get_ordem_por_id(os_id)
     if not ordem:
         raise HTTPException(404, "OS não encontrada")
+    return _com_marca_visao(ordem)
+
+
+def _com_marca_visao(ordem: dict) -> dict:
+    """`observacao_visao` na OS concluída com leituras da visão ignoradas."""
+    n = _inteiro(ordem.get("visao_ignoradas"))
+    if n and ordem.get("status") == "concluida":
+        return {**ordem, "observacao_visao": orch.marca_visao_fora(ordem.get("os_id"), n)}
     return ordem
 
 
@@ -1962,25 +1988,40 @@ async def relatorio_os(
     return _gerar_csv(os_id, os_data, dispensas_data, visao_data, alarmes_data)
 
 
+# Coluna do relatório com o total de leituras da visão que o switch "Visão no
+# Triple Check" desligado deixou fora do veredito da OS.
+COLUNA_VISAO_IGNORADAS = "Leituras da visão ignoradas"
+
+
+def _slots_visao_ignorada(os_data: dict) -> set:
+    """Slots da OS marcados `visao_ignorada` (os_itens)."""
+    return {i.get("dispenser_id") for i in (os_data.get("itens") or [])
+            if i.get("visao_ignorada")}
+
+
 def _gerar_csv(os_id, os_data, dispensas_data, visao_data, alarmes_data) -> StreamingResponse:
     """Gera CSV com múltiplas seções separadas por linha em branco."""
     buf = io.StringIO()
     writer = csv.writer(buf)
 
     # Cabeçalho OS
+    ignoradas = _slots_visao_ignorada(os_data)
     writer.writerow(["=== ORDEM DE SAÍDA ==="])
-    writer.writerow(["OS ID", "Status", "Categoria", "Descrição", "Criado em", "Atualizado em"])
+    writer.writerow(["OS ID", "Status", "Categoria", "Descrição", "Criado em", "Atualizado em",
+                     COLUNA_VISAO_IGNORADAS])
     writer.writerow([
         os_data.get("os_id", ""), os_data.get("status", ""),
         os_data.get("categoria", ""), os_data.get("descricao", ""),
         str(os_data.get("criado_em", ""))[:19],
         str(os_data.get("atualizado_em", ""))[:19],
+        _inteiro(os_data.get("visao_ignoradas")),
     ])
     writer.writerow([])
 
     # Dispensas
     writer.writerow(["=== DISPENSAS ==="])
-    writer.writerow(["Dispenser", "Medicamento", "Qtd Dispensada", "Qtd Alvo", "Validado", "Horário"])
+    writer.writerow(["Dispenser", "Medicamento", "Qtd Dispensada", "Qtd Alvo", "Validado", "Horário",
+                     "Visão ignorada"])
     for d in (dispensas_data or []):
         writer.writerow([
             f"D{d.get('dispenser_id','')}",
@@ -1989,6 +2030,7 @@ def _gerar_csv(os_id, os_data, dispensas_data, visao_data, alarmes_data) -> Stre
             d.get("quantidade_alvo", ""),
             "SIM" if d.get("validado") else "NÃO",
             str(d.get("ts", ""))[:19],
+            "SIM" if d.get("dispenser_id") in ignoradas else "NÃO",
         ])
     writer.writerow([])
 
@@ -2051,22 +2093,27 @@ async def _gerar_xlsx(os_id, os_data, dispensas_data, visao_data, alarmes_data) 
     # Aba: OS
     ws_os = wb.active
     ws_os.title = "OS"
-    _header_style(ws_os, 1, ["OS ID", "Status", "Categoria", "Descrição", "Criado em", "Atualizado em"])
+    _header_style(ws_os, 1, ["OS ID", "Status", "Categoria", "Descrição", "Criado em", "Atualizado em",
+                             COLUNA_VISAO_IGNORADAS])
     ws_os.append([
         os_data.get("os_id", ""), os_data.get("status", ""),
         os_data.get("categoria", ""), os_data.get("descricao", ""),
         str(os_data.get("criado_em", ""))[:19], str(os_data.get("atualizado_em", ""))[:19],
+        _inteiro(os_data.get("visao_ignoradas")),
     ])
 
     # Aba: Dispensas
+    ignoradas = _slots_visao_ignorada(os_data)
     ws_d = wb.create_sheet("Dispensas")
-    _header_style(ws_d, 1, ["Dispenser", "Medicamento", "Qtd Dispensada", "Qtd Alvo", "Validado", "Horário"])
+    _header_style(ws_d, 1, ["Dispenser", "Medicamento", "Qtd Dispensada", "Qtd Alvo", "Validado", "Horário",
+                            "Visão ignorada"])
     for d in (dispensas_data or []):
         ws_d.append([
             f"D{d.get('dispenser_id','')}", d.get("medicamento", ""),
             d.get("quantidade_dispensada", ""), d.get("quantidade_alvo", ""),
             "SIM" if d.get("validado") else "NÃO",
             str(d.get("ts", ""))[:19],
+            "SIM" if d.get("dispenser_id") in ignoradas else "NÃO",
         ])
 
     # Aba: Visão
@@ -2371,10 +2418,22 @@ async def get_porta_historico(limite: int = 100):
         raise HTTPException(503, f"histórico da porta indisponível: {exc}")
 
 
+# A frase que o painel de bancada e o display de 7" mostram com o switch
+# desligado — uma só, como as faixas da porta e da caixa.
+FAIXA_VISAO_FORA = "VISÃO FORA DO TRIPLE CHECK"
+
+
 @app.get("/api/v1/trava", tags=["Triple Check"])
 def get_trava():
-    """Retorna estado atual da trava de Triple Check."""
-    return orch.get_trava_estado()
+    """Retorna estado atual da trava de Triple Check.
+
+    Leva também o switch "Visão no Triple Check" (`visao_triple_check`) e a
+    faixa dele (`visao_faixa`, vazia com o switch ligado): quem lê a trava — o
+    painel de bancada — é quem precisa avisar que a visão não está travando.
+    """
+    ativo = orch.visao_conta()
+    return {**orch.get_trava_estado(), "visao_triple_check": ativo,
+            "visao_faixa": "" if ativo else FAIXA_VISAO_FORA}
 
 
 @app.post("/api/v1/admin/liberar-trava", tags=["Triple Check"],
@@ -2568,6 +2627,10 @@ class ConsoleDisparoReq(BaseModel):
 
 class ConsoleGeradorReq(BaseModel):
     pausado: bool
+
+
+class ConsoleVisaoTCReq(BaseModel):
+    ativo: bool
 
 
 class ConsoleInjecaoReq(BaseModel):
@@ -2866,6 +2929,40 @@ async def console_reenviar_centro(request: Request):
     return {"ok": True, "os_id": os_id}
 
 
+# ── Switch da visão no Triple Check ──────────────────────────────────────────
+#
+# Rotina de emergência, não ação destrutiva: um clique, sem confirmação, e o
+# histórico registra quem e quando. Não libera trava já ativa — ver
+# `orchestrator`, seção do switch.
+
+def _visao_tc_corpo() -> dict:
+    return orch.get_visao_tc()
+
+
+@app.get("/console/api/visao-triple-check", include_in_schema=False)
+def console_visao_tc(request: Request):
+    _console_exigir_sessao(request)
+    return _visao_tc_corpo()
+
+
+@app.post("/console/api/visao-triple-check", include_in_schema=False)
+def console_visao_tc_definir(request: Request, req: ConsoleVisaoTCReq):
+    """Liga/desliga. Mesmo valor que já está: 200 sem linha de histórico."""
+    _console_exigir_sessao(request)
+    if chave_visao_tc.chave.definir(req.ativo, "console"):
+        with _lock:
+            os_ativa = (_estado.get("os_ativa") or {}).get("os_id")
+        msg = ("visão de volta ao Triple Check (pelo console)" if req.ativo
+               else "visão FORA do Triple Check (pelo console)")
+        _log("console", msg + (f" — OS em andamento: {os_ativa}" if os_ativa else ""))
+        logger.warning("[CONSOLE] %s", msg)
+        # Estado real primeiro (a chave, acima), tela depois — `_publicar_gerador`.
+        with _lock:
+            _estado["visao_triple_check"] = _visao_tc_corpo()
+        _broadcast_estado()
+    return _visao_tc_corpo()
+
+
 # ── Injeção de falha sob demanda ──────────────────────────────────────────────
 #
 # O gatilho mora em `injecao.py` e viaja no comando que o orquestrador já
@@ -3131,6 +3228,7 @@ async def console_prevoo(request: Request):
                              os_templates.listar(),
                              caixa_vazia=settings.VISAO_CAIXA_VAZIA,
                              home_visivel=settings.VISAO_MESA_HOME)
+        + [prevoo.item_visao_triple_check(orch.visao_conta())]
         + prevoo.itens_modo(settings.MODO_APRESENTACAO, settings.FATOR_VELOCIDADE,
                             injecao.armada(), len(_ws_manager.active))
     )

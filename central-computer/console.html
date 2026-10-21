@@ -79,6 +79,35 @@ button{font-family:inherit}
 .trava .titulo{font-size:14px; font-weight:700; letter-spacing:1px; color:#F2A093}
 .trava .detalhe{font-size:12.5px; color:var(--ap-text); font-family:var(--ap-mono)}
 
+/* ── Switch "Visão no Triple Check" ────────────────────────────────────────── */
+/* Sempre visível no topo: numa emergência, quem procura o switch não pode ter
+   de rolar a página. Ligado é verde e discreto; desligado é vermelho e vem com
+   uma faixa fixa logo abaixo da barra, porque a planta está rodando com uma
+   fonte do Triple Check a menos e ninguém pode esquecer disso. */
+.chave{
+  display:inline-flex; align-items:center; gap:8px; padding:4px 10px 4px 6px;
+  border-radius:999px; border:1px solid rgba(62,142,90,.55); background:transparent;
+  color:var(--ap-ok); font:inherit; font-size:11.5px; font-weight:600; letter-spacing:.4px;
+  cursor:pointer;
+}
+.chave .trilho{position:relative; width:30px; height:16px; border-radius:999px;
+               background:var(--ap-ok); transition:background .15s}
+.chave .botao{position:absolute; top:2px; left:16px; width:12px; height:12px;
+              border-radius:50%; background:#fff; transition:left .15s}
+.chave[aria-checked="false"]{color:#F2A093; border-color:var(--ap-err)}
+.chave[aria-checked="false"] .trilho{background:var(--ap-err)}
+.chave[aria-checked="false"] .botao{left:2px}
+.chave:focus-visible{outline:2px solid var(--ap-gold-bright); outline-offset:2px}
+.chave:disabled{opacity:.55; cursor:progress}
+.visao-fora{
+  display:none; flex:1 1 100%; align-items:center; gap:12px; flex-wrap:wrap;
+  padding:8px 12px; border-radius:8px; background:rgba(192,57,43,.22);
+  border:1px solid var(--ap-err);
+}
+.visao-fora.ativa{display:flex}
+.visao-fora .titulo{font-size:13.5px; font-weight:700; letter-spacing:.6px; color:#F2A093}
+.visao-fora .detalhe{font-size:12.5px; color:var(--ap-text)}
+
 /* ── Faixa da caixa de coleta no HOME ─────────────────────────────────────── */
 .caixa{
   display:none; align-items:center; gap:16px; flex-wrap:wrap;
@@ -258,6 +287,13 @@ button{font-family:inherit}
     <span id="injPill" class="pill" hidden>
       <span class="ponto"></span><span id="injTexto"></span></span>
 
+    <button type="button" class="chave" id="chaveVisao" role="switch" aria-checked="true"
+            aria-labelledby="chaveVisaoRotulo" disabled
+            title="Desligado: as câmeras continuam medindo, mas não travam a OS. Balança e dispenser continuam travando.">
+      <span class="trilho"><span class="botao"></span></span>
+      <span id="chaveVisaoRotulo">Visão no Triple Check</span>
+    </button>
+
     <button class="btn" id="btnGerador" disabled>Gerador…</button>
     <a class="btn" href="/console/prevoo"
        title="Confere, item a item, se a stack inteira está de pé.">Pré-voo</a>
@@ -265,6 +301,15 @@ button{font-family:inherit}
       <button class="btn" type="submit">Sair</button>
     </form>
   </div>
+
+  <!-- A visão fora do Triple Check. Mora dentro da barra de topo, que é sticky:
+       fica na tela enquanto o switch estiver desligado. A planta segue rodando,
+       e quem olha a tela tem de saber que uma das três fontes não decide. -->
+  <section class="visao-fora" id="faixaVisao" role="status">
+    <span class="titulo">VISÃO FORA DO TRIPLE CHECK</span>
+    <span class="detalhe">— câmeras não travam a OS; balança e dispenser continuam travando
+      (<span id="visaoIgnoradas">0</span> leituras ignoradas nesta OS)</span>
+  </section>
 </header>
 
 <section class="trava" id="faixaTrava">
@@ -391,6 +436,10 @@ var travaAtiva = false;
    gatilho armado que nunca dispara. */
 var tiposFalha = [];
 var falhaArmada = null;
+/* O switch "Visão no Triple Check". `null` até a primeira leitura: o botão
+   nasce desabilitado e só vale depois que o central disse o estado real. */
+var visaoTC = null;
+var visaoEnviando = false;
 var ws = null, tentativasWs = 0;
 
 var $ = function (id) { return document.getElementById(id); };
@@ -620,6 +669,56 @@ $("btnReenviarCentro").addEventListener("click", async function () {
   await chamar("Reenviar a mesa ao centro", "/console/api/reenviar-centro", {});
 });
 
+/* ── Switch "Visão no Triple Check" (rotina de emergência: um clique) ────── */
+/* Sem modal: o histórico do central registra quem desligou e quando. O estado
+   chega pelo GET na abertura e, depois, pelo /ws que a página já escuta — não
+   há segundo timer. */
+async function carregarVisaoTC() {
+  try {
+    var resp = await fetch("/console/api/visao-triple-check", { credentials: "same-origin" });
+    if (resp.ok) aplicarVisaoTC(await resp.json());
+  } catch (erro) {
+    registrar("Ler o switch da visão", "err", String(erro), null, "—");
+  }
+}
+
+function aplicarVisaoTC(v) {
+  if (!v || visaoEnviando) return;
+  visaoTC = !!v.ativo;
+  var chave = $("chaveVisao");
+  chave.disabled = false;
+  chave.setAttribute("aria-checked", visaoTC ? "true" : "false");
+  texto($("chaveVisaoRotulo"), visaoTC ? "Visão conta no Triple Check"
+                                       : "Visão FORA do Triple Check");
+  $("faixaVisao").className = "visao-fora" + (visaoTC ? "" : " ativa");
+  texto($("visaoIgnoradas"), String(v.ignoradas_na_os_atual || 0));
+}
+
+async function alternarVisaoTC() {
+  if (visaoTC === null || visaoEnviando) return;
+  var anterior = visaoTC;
+  var alvo = !anterior;
+  var chave = $("chaveVisao");
+  visaoEnviando = true;
+  chave.disabled = true;
+  var r = await chamar(alvo ? "Visão de volta ao Triple Check"
+                            : "Visão FORA do Triple Check",
+                       "/console/api/visao-triple-check", { ativo: alvo });
+  visaoEnviando = false;
+  if (r && r.ok && r.corpo) {
+    aplicarVisaoTC(r.corpo);
+    if (!alvo && travaAtiva) {
+      registrar("A trava atual continua", "info",
+                "a trava atual continua; libere pelo botão de sempre");
+    }
+  } else {
+    /* Erro do backend: o switch volta ao que era, e o feed já tem a mensagem. */
+    aplicarVisaoTC({ ativo: anterior });
+  }
+}
+$("chaveVisao").addEventListener("click", alternarVisaoTC);
+/* <button> já responde a Enter e Espaço; o rótulo está dentro dele. */
+
 /* ── Injeção de falha (demonstração) ──────────────────────────────────────── */
 async function carregarInjecao() {
   try {
@@ -806,6 +905,8 @@ function aplicarEstado(st) {
     aplicarGerador(st.gerador_pausado);
   }
 
+  if (st.visao_triple_check) aplicarVisaoTC(st.visao_triple_check);
+
   /* Quem desarma de verdade é o orquestrador, no momento em que injeta a falha
      no comando. A tela descobre por aqui, não por polling — e registra no feed,
      porque "a falha saiu agora" é a informação que dá sentido ao que vai
@@ -904,6 +1005,7 @@ function cartaoSlot(id, d, alvo) {
 
 carregarTemplates();
 carregarInjecao();
+carregarVisaoTC();
 conectar();
 </script>
 </body>

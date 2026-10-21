@@ -3504,3 +3504,68 @@ Reinício do central com OS nessas etapas: a reconciliação da `lifespan` (a de
 `aguardando_caixa_vazia` volta à fila como OS nova (nada foi reservado). Só
 `em_andamento` continua fechando em `erro`: ali havia medicamento a caminho.
 
+
+## Switch da visão no Triple Check: tira SÓ a visão, e só do veredito
+
+O console tem um switch, "Visão no Triple Check", para a emergência em que a
+visão computacional está travando a célula sem motivo (câmera suja, estação
+desalinhada, iluminação). Desligado, **a câmera da mesa por slot, as câmeras
+dos dispensers e as duas fotos do HOME (VAZIA e FINAL)** deixam de decidir:
+o que elas disserem — divergência, falha de leitura, timeout, contagem errada
+na caixa — vira UM alarme `visao_ignorada` por leitura, e a OS segue.
+**Balança e dispenser continuam travando** com o limiar de sempre, e a porta
+NR-12, o homing e o equipamento continuam parando a célula. Um switch só para
+as quatro, e não dois: numa emergência ninguém quer escolher qual câmera.
+
+**A visão continua MEDINDO.** As fotos saem, a estação registra o total, e
+`pendentes_mesa`, `deficit_mesa` e a dessincronia do passo 4 andam como sempre
+— `avaliar_triple_check(visao_conta=False)` faz a mesma conta da câmera, só
+muda para onde o resultado vai. É isso que permite religar no MEIO da OS sem
+trava falsa: a caixinha que se escondeu com o switch desligado reaparece na
+foto seguinte como "a mais", e o déficit a reconcilia. Se a conta parasse de
+andar desligada, a primeira foto depois de religar compararia contra um total
+velho.
+
+**Lido em cada veredito, nunca copiado no começo da OS.** `visao_conta()` é
+chamado no passo 3b (SKU), no re-scan da trava de SKU, no 4e de cada slot, e em
+cada foto VAZIA/FINAL. Desligar no meio vale já no slot seguinte.
+
+**O estado mora em `chave_visao_tc.py`, que é puro** (sem FastAPI, sem banco), e
+nasce em `VISAO_TRIPLE_CHECK_PADRAO` a cada boot. Não é persistido, pela mesma
+razão da pausa do gerador: um "desligado" gravado sobreviveria à emergência que
+o motivou, e o sintoma — OS seguindo com a câmera acusando, alarme atrás de
+alarme — é o que ninguém procura depois. Restart devolve a visão ao Triple
+Check.
+
+**Não libera trava já ativa.** O roteiro de emergência é de três passos:
+desliga o switch → libera a trava pelo botão de sempre (senha do console ou
+supervisor) → a OS segue, e a visão não trava mais. Fazer o switch soltar a
+trava misturaria "tirar uma fonte do veredito" com "aceitar uma divergência já
+registrada", que é decisão de supervisor. O re-scan de SKU depois da liberação
+lê o switch de novo — por isso, desligado, ele não reabre a trava.
+
+**Um alarme por evento, nunca dois.** Com o switch desligado, o handler do
+central (`_handle_evento_visao`) NÃO grava `divergencia_sku`,
+`falha_leitura_dispenser`, `codigo_desconhecido_dispenser` nem
+`falha_deteccao_mesa`: quem grava é o orquestrador, no veredito, como
+`visao_ignorada`. A leitura vai para `visao_leituras` nos dois casos. A troca do
+switch entre o evento e o veredito pode, no limite, dar zero ou dois alarmes
+para aquela leitura — aceito: é uma janela de milissegundos numa ação manual.
+`sem_etiqueta_cadastrada` continua não alarmando nas duas posições (é
+cobertura, não leitura).
+
+**O rastro.** `ordens.visao_ignoradas` conta as leituras deixadas de fora na OS
+(inclusive as do HOME), `os_itens.visao_ignorada` marca o slot, e a OS concluída
+com pelo menos uma ganha a frase "concluída com a visão fora do Triple Check (N
+leituras ignoradas)" no histórico (`_historico`) e no `GET /os/{os_id}`
+(`observacao_visao`). O relatório CSV/XLSX leva as duas colunas. O painel de
+bancada recebe o aviso no `GET /api/v1/trava` que já lia (`visao_faixa`), e o
+display de 7" o vê na mesma linha da faixa da porta — por último na fila: a
+porta e a caixa pedem ação agora, a visão fora dura a emergência inteira. O
+pré-voo mostra um item AMARELO, no grupo "Modo" (o grupo "Visão" é das
+estações, e o pré-voo não deixou de mostrá-las).
+
+**A divergência de SKU não passa por `avaliar_triple_check`**, e continua não
+passando: ela trava no passo 3b, ANTES de dispensar, e não junto das três
+fontes do slot. A regra dela com o switch é `avaliar_sku_dispenser` — pura,
+testada pela mesma tabela.

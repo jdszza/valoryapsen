@@ -27,6 +27,15 @@
     </div>
 </div>
 {% endif %}
+{% if trava and trava.visao_faixa %}
+<div class="alert alert-danger d-flex align-items-center gap-3 mb-4 rounded-3" role="status" id="visao-banner">
+    <i class="bi bi-camera-video-off fs-3"></i>
+    <div class="flex-grow-1">
+        <div class="fw-bold fs-5">{{ trava.visao_faixa }}</div>
+        <div class="small">Desligada no console do central: as câmeras continuam medindo, mas não travam a OS. Balança e dispenser continuam travando.</div>
+    </div>
+</div>
+{% endif %}
 {% if trava and trava.caixa_faixa %}
 <div class="alert alert-warning d-flex align-items-center gap-3 mb-4 rounded-3" role="alert" id="caixa-banner">
     <i class="bi bi-box-seam fs-3"></i>

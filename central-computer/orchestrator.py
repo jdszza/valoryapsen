@@ -32,6 +32,7 @@ from typing import NamedTuple, Optional
 
 import httpx
 
+import chave_visao_tc
 import injecao
 import os_templates
 from config import settings
@@ -42,6 +43,7 @@ from database import (
     get_peso_medicamento,
     limpar_dispenser_estado,
     limpar_historico,
+    registrar_visao_ignorada,
     resolver_alarme,
     salvar_alarme,
     salvar_porta_evento,
@@ -183,6 +185,7 @@ def inicializar(estado: dict, lock, broadcast_fn, loop: asyncio.AbstractEventLoo
     if settings.PORTA_NR12_HABILITADA:
         _entrar_em_pausa("link_perdido")
     _publicar_porta()
+    _publicar_visao_tc()
 
 
 async def encerrar():
@@ -232,6 +235,115 @@ def liberar_trava(liberado_por: str) -> bool:
     if _pausa_porta is not None and not _pausa_porta.get("aguardando_rearme"):
         _agendar_porta(_tentar_retomar("trava_liberada"))
     return True
+
+
+# ── Switch da visão no Triple Check ─────────────────────────────────────────────
+#
+# Desligado pelo console, a visão (câmera da mesa por slot, câmeras dos
+# dispensers, fotos VAZIA/FINAL no HOME) continua MEDINDO — as fotos saem, a
+# estação registra o total, `pendentes_mesa`/`deficit_mesa`/dessincronia andam
+# como sempre — e só o VEREDITO a deixa de fora: o que ela disser vira o alarme
+# `visao_ignorada`. É por continuar medindo que dá para religar no meio da OS
+# sem "a mais" falso na foto seguinte.
+#
+# O estado mora em `chave_visao_tc` e é lido em CADA decisão (`visao_conta()`),
+# nunca copiado no começo da OS. Ele não libera trava já ativa: liberar continua
+# sendo o botão de sempre.
+
+# Quantas leituras foram deixadas de fora na OS em execução (o console mostra).
+_visao_ignoradas_os: int = 0
+
+
+def visao_conta() -> bool:
+    return chave_visao_tc.visao_conta()
+
+
+def get_visao_tc() -> dict:
+    return {**chave_visao_tc.chave.estado(), "ignoradas_na_os_atual": _visao_ignoradas_os}
+
+
+def _publicar_visao_tc() -> None:
+    """Estado do switch em `_estado` (o `/ws` do console). Estado real primeiro,
+    tela depois — a ordem de `_ativar_trava`."""
+    if _lock:
+        with _lock:
+            _estado["visao_triple_check"] = get_visao_tc()
+    if _broadcast_fn:
+        _broadcast_fn()
+
+
+def _zerar_visao_ignoradas() -> None:
+    global _visao_ignoradas_os
+    _visao_ignoradas_os = 0
+    _publicar_visao_tc()
+
+
+MSG_VISAO_IGNORADA = "visão ignorada no Triple Check (switch desligado)"
+
+
+async def _registrar_visao_ignorada(os_id: str, slot_id: Optional[int], texto: str) -> None:
+    """UM alarme `visao_ignorada` por leitura deixada de fora, a contagem da OS
+    e o marcador do slot. Nunca levanta: é o caminho em que a OS SEGUE."""
+    global _visao_ignoradas_os
+    _visao_ignoradas_os += 1
+    alvo = f"OS {os_id}" + (f" D{slot_id}" if slot_id is not None else "")
+    descricao = f"{MSG_VISAO_IGNORADA}: {alvo} — {texto}"
+    logger.warning("[ORCH] %s", descricao)
+    _historico("visao_ignorada", descricao)
+    try:
+        await asyncio.to_thread(salvar_alarme, "visao_ignorada", "visao_ignorada", descricao)
+    except Exception as e:
+        logger.warning("[DB] salvar_alarme visao_ignorada: %s", e)
+    try:
+        await asyncio.to_thread(registrar_visao_ignorada, os_id, slot_id)
+    except Exception as e:
+        logger.warning("[DB] registrar_visao_ignorada: %s", e)
+    _publicar_visao_tc()
+
+
+class VereditoSku(NamedTuple):
+    """O que a leitura da câmera de um dispenser decide (passo 3b e re-scan).
+
+    `travar` = SKU comprovadamente errado com a visão no Triple Check (ou a
+    câmera muda no re-scan de um slot que já divergiu). `ignorada` = o texto
+    do alarme `visao_ignorada` quando o switch está desligado e a leitura
+    teria travado ou alarmado.
+    """
+    travar: bool
+    ignorada: Optional[str] = None
+
+
+def avaliar_sku_dispenser(resultado: Optional[dict], visao_conta: bool = True,
+                          rescan: bool = False) -> VereditoSku:
+    """PURA. A regra do SKU, com o switch.
+
+    Com a visão no Triple Check é a de sempre: divergência trava; falha de
+    leitura e timeout não (fonte que não mediu), EXCETO no re-scan, onde o
+    silêncio mantém a trava (`_VISAO_INDISPONIVEL`). Desligado, nada daqui
+    trava — a divergência, a falha e o timeout viram `ignorada`. A exceção é
+    `sem_etiqueta_cadastrada`: é cobertura, não leitura, e não alarma em
+    posição nenhuma do switch.
+    """
+    tipo = (resultado or {}).get("tipo")
+    if tipo == "leitura_dispenser_divergencia" or (rescan and tipo == _VISAO_INDISPONIVEL):
+        if visao_conta:
+            return VereditoSku(True)
+        if tipo == _VISAO_INDISPONIVEL:
+            return VereditoSku(False, "câmera do dispenser sem resposta no re-scan de "
+                                      "um SKU divergente")
+        return VereditoSku(False, f"câmera do dispenser: SKU lido="
+                                  f"{resultado.get('sku_lido', '?')} esperado="
+                                  f"{resultado.get('sku_esperado', '?')}")
+    if visao_conta:
+        return VereditoSku(False)
+    if resultado is None:
+        return VereditoSku(False, "câmera do dispenser sem resposta (timeout)")
+    if tipo == "leitura_dispenser_falha":
+        if resultado.get("motivo") == "sem_etiqueta_cadastrada":
+            return VereditoSku(False)
+        return VereditoSku(False, f"câmera do dispenser: falha de leitura "
+                                  f"({resultado.get('motivo') or 'desconhecido'})")
+    return VereditoSku(False)
 
 
 async def _ativar_trava(os_id: str, slot_id: Optional[int], motivo: str,
@@ -676,6 +788,13 @@ class ResultadoTripleCheck(NamedTuple):
     reconciliado: int = 0
     # Mensagens só de log, sem alarme (hoje: a reconciliação acima).
     informativos: tuple = ()
+    # Com o switch "Visão no Triple Check" DESLIGADO: o que a câmera da mesa
+    # disse e que, com ele ligado, teria virado divergência, alerta de oclusão
+    # ou falha de leitura. Não trava; cada item vira um alarme `visao_ignorada`.
+    visao_ignorada: tuple = ()
+    # A leitura da câmera da mesa como chegou — o veredito não a descarta só
+    # porque ela não conta (o relatório mostra o que a câmera viu).
+    leitura_mesa: Optional[dict] = None
 
 
 def _inteiro(valor, padrao: int = 0) -> int:
@@ -697,6 +816,7 @@ def avaliar_triple_check(
     slots_camera: tuple = (),
     motivo_mesa_indisponivel: Optional[str] = None,
     tolerancia_camera_mais: int = 0,
+    visao_conta: bool = True,
 ) -> ResultadoTripleCheck:
     """
     Confronta as 3 fontes independentes de contagem e decide se a OS trava.
@@ -746,6 +866,15 @@ def avaliar_triple_check(
     reconciliação (`reconciliado`, log), e só o EXCEDENTE é divergência. O
     default 0 é o comportamento de antes.
 
+    **`visao_conta=False` é o switch do console desligado.** A câmera é avaliada
+    EXATAMENTE como sempre — inclusive `oclusao` e `reconciliado`, que mantêm o
+    `deficit_mesa` do ciclo correto para quando o switch voltar —, mas o que ela
+    produziria (divergência, alerta de oclusão, falha de leitura ou timeout)
+    vai para `visao_ignorada` em vez de pesar no veredito. Dispenser e balança
+    decidem sozinhos, com o mesmo limiar. Sem nenhuma das três medindo, o
+    veredito é o de hoje: nada contradisse, a OS segue. Default True = o
+    comportamento de antes do switch.
+
     Função PURA: não envia comando, não toca no estado. `min_divergencias`
     sobrepõe o limiar de configuração (usado pelos testes).
     """
@@ -777,6 +906,9 @@ def avaliar_triple_check(
     # ALGUMA das outras duas acusou, inclusive a balança, que vem depois.
     div_disp = div_cam = div_peso = None
     indisponivel_peso = None
+    # O que a câmera disse e que, com o switch desligado, só vira informação.
+    falha_cam: Optional[str] = None
+    visao_ignorada: list[str] = []
 
     if quantidade_dispensada is None:
         indisponiveis.append("dispenser: sem confirmação de dispensa (prazo vencido)")
@@ -796,6 +928,10 @@ def avaliar_triple_check(
     if resultado_mesa is None:
         indisponiveis.append(
             f"câmera_mesa: {motivo_mesa_indisponivel or 'sem resposta (timeout)'}")
+        # Só o timeout é falha de leitura. Os motivos que o ciclo dá (posição
+        # sem visão, ressincronizando, comando recusado) já têm o rastro deles.
+        if motivo_mesa_indisponivel is None:
+            falha_cam = "câmera_mesa: sem resposta (timeout)"
     elif resultado_mesa.get("tipo") == "leitura_mesa_divergencia":
         esperado = (quantidade_esperada if esperado_camera is None
                     else _inteiro(esperado_camera, quantidade_esperada))
@@ -827,6 +963,19 @@ def avaliar_triple_check(
                                  "(payload incoerente)")
     elif resultado_mesa.get("tipo") == "leitura_mesa_falha":
         indisponiveis.append("câmera_mesa: falha de leitura")
+        falha_cam = (f"câmera_mesa: falha de leitura "
+                     f"({resultado_mesa.get('motivo') or 'desconhecido'})")
+
+    if not visao_conta:
+        # A conta da câmera continua feita (oclusão e reconciliação seguem
+        # valendo para o `deficit_mesa`); só o efeito no veredito sai.
+        if div_cam:
+            visao_ignorada.append(div_cam)
+            div_cam = None
+        visao_ignorada.extend(alertas)
+        alertas = []
+        if falha_cam:
+            visao_ignorada.append(falha_cam)
 
     if indisponivel_peso:
         indisponiveis.append(indisponivel_peso)
@@ -848,6 +997,8 @@ def avaliar_triple_check(
         oclusao=oclusao,
         reconciliado=reconciliado,
         informativos=tuple(informativos),
+        visao_ignorada=tuple(visao_ignorada),
+        leitura_mesa=resultado_mesa,
     )
 
 
@@ -1707,6 +1858,17 @@ async def _conferir_caixa_vazia(os_id: str, cancelar: asyncio.Event) -> bool:
                     logger.info("[ORCH] OS %s: caixa de coleta esvaziada — a OS começa.", os_id)
                 return True
 
+            if not visao_conta():
+                # Switch desligado: a foto foi tirada e fica registrada, mas não
+                # segura a OS.
+                await _resolver_alarme(alarme_id)
+                await _registrar_visao_ignorada(
+                    os_id, None,
+                    "caixa de coleta no HOME antes da OS: "
+                    + (f"câmera sem resposta ({motivo})" if contagem is None
+                       else f"{contagem} caixinha(s) na caixa") + " — a OS começa")
+                return True
+
             if contagem is None:
                 tipo = "camera_mesa_indisponivel_inicio"
                 descricao = (f"OS {os_id} não começa: a câmera da mesa não conferiu a "
@@ -1745,7 +1907,7 @@ class ResultadoFinal(NamedTuple):
 
 
 def avaliar_caixa_final(contada: Optional[int], esperada: int,
-                        peso_ok: Optional[bool]) -> ResultadoFinal:
+                        peso_ok: Optional[bool], visao_conta: bool = True) -> ResultadoFinal:
     """A conferência da caixa cheia. PURA — a tabela inteira cabe num teste.
 
     - igual → ok;
@@ -1758,7 +1920,19 @@ def avaliar_caixa_final(contada: Optional[int], esperada: int,
 
     `peso_ok` é a conjunção das pesagens por slot (ver `_processar_os`): não há
     leitura absoluta da balança no HOME.
+
+    `visao_conta=False` (switch do console desligado): o veredito é o mesmo,
+    mas nunca trava — o que não for "ok" sai com `alarme="visao_ignorada"` e a
+    mesa vai ao centro. A balança já decidiu slot a slot no ciclo.
     """
+    resultado = _avaliar_caixa_final(contada, esperada, peso_ok)
+    if visao_conta or resultado.estado == "ok":
+        return resultado
+    return resultado._replace(travar=False, alarme="visao_ignorada")
+
+
+def _avaliar_caixa_final(contada: Optional[int], esperada: int,
+                         peso_ok: Optional[bool]) -> ResultadoFinal:
     if contada is None:
         return ResultadoFinal(
             "indisponivel", True,
@@ -1850,7 +2024,7 @@ async def _conferir_caixa_final(os_id: str, esperado: int, peso_ok: Optional[boo
                                                  esperado, geracao)
         if _houve_pausa(geracao):
             continue
-        veredito = avaliar_caixa_final(contada, esperado, peso_ok)
+        veredito = avaliar_caixa_final(contada, esperado, peso_ok, visao_conta())
         _historico(f"conferencia_final_{veredito.estado}",
                    f"OS {os_id}: caixa no HOME contada="
                    f"{'—' if contada is None else contada} esperada={esperado} → "
@@ -1859,6 +2033,10 @@ async def _conferir_caixa_final(os_id: str, esperado: int, peso_ok: Optional[boo
             logger.warning("[ORCH] OS %s: FINAL sem leitura (%s).", os_id, motivo)
         if veredito.estado == "ok":
             logger.info("[ORCH] OS %s: %s", os_id, veredito.texto)
+            return
+        if veredito.alarme == "visao_ignorada":
+            await _registrar_visao_ignorada(os_id, None,
+                                            f"conferência final no HOME: {veredito.texto}")
             return
         if not veredito.travar:
             await _alarme_mesa(veredito.alarme or "conferencia_final_abaixo",
@@ -2581,6 +2759,7 @@ async def _processar_os(os_payload: dict):
     # nada no log explicasse.
     cancelar = asyncio.Event()
     _cancelar_cronograma = cancelar
+    _zerar_visao_ignoradas()
 
     # ── Estado: fora da fila, conferindo a caixa vazia ───────────────────────
     # A OS atravessa aguardando_caixa_vazia → em_andamento → conferindo_caixa →
@@ -2860,11 +3039,17 @@ async def _processar_os(os_payload: dict):
 
     for i, res in enumerate(resultados_visao_disp):
         a = atribuicoes_scan[i]
-        if res is None:
+        # O switch é lido AQUI, slot a slot: é o momento do veredito do SKU.
+        veredito_sku = avaliar_sku_dispenser(res, visao_conta())
+        if veredito_sku.ignorada:
+            # Switch desligado: a leitura fica registrada (o handler já gravou)
+            # e o slot segue sem conferência — um alarme, nunca trava.
+            await _registrar_visao_ignorada(os_id, a["dispenser_id"], veredito_sku.ignorada)
+        elif res is None:
             logger.warning(
                 "[ORCH] Timeout visão dispenser D%d — sem validação de SKU.", a["dispenser_id"]
             )
-        elif res.get("tipo") == "leitura_dispenser_divergencia":
+        elif veredito_sku.travar:
             logger.error(
                 "[ORCH] ⛔ SKU ERRADO D%d: lido=%s esperado=%s — trava ativa.",
                 a["dispenser_id"], res.get("sku_lido"), res.get("sku_esperado"),
@@ -2990,7 +3175,16 @@ async def _processar_os(os_payload: dict):
         # Verifica se ainda há divergência após a correção
         slots_sku_errado = []
         for a, res in zip(atribuicoes_retry, resultados_retry, strict=True):
-            if res is None:
+            # O switch pode ter sido desligado com a trava aberta — é o roteiro
+            # de emergência: a trava atual se libera pelo botão de sempre, e o
+            # re-scan já não trava mais pela câmera.
+            veredito_sku = avaliar_sku_dispenser(
+                res if res is not None else {"tipo": _VISAO_INDISPONIVEL},
+                visao_conta(), rescan=True)
+            if veredito_sku.ignorada:
+                await _registrar_visao_ignorada(os_id, a["dispenser_id"],
+                                                veredito_sku.ignorada)
+            elif res is None:
                 # Fonte que não RESPONDEU não é fonte que CONFIRMOU, e aqui a
                 # diferença decide o que sai do dispenser. Este slot tem SKU
                 # comprovadamente errado — foi essa medição que armou a trava.
@@ -3451,8 +3645,14 @@ async def _processar_os(os_payload: dict):
             slots_camera=slots_camera,
             motivo_mesa_indisponivel=motivo_mesa,
             tolerancia_camera_mais=deficit_mesa,
+            # Lido NESTE slot, não no começo da OS: desligar no meio vale já aqui.
+            visao_conta=visao_conta(),
         )
+        # O déficit anda nas duas posições do switch — é o que permite religar
+        # no meio da OS sem a caixinha escondida reaparecer como "a mais".
         deficit_mesa += veredito.oclusao - veredito.reconciliado
+        for texto in veredito.visao_ignorada:
+            await _registrar_visao_ignorada(os_id, disp_id, texto)
         for texto in veredito.informativos:
             logger.info("[ORCH] Triple Check D%d OS %s: %s", disp_id, os_id, texto)
         n_div  = len(veredito.divergencias)
@@ -3560,8 +3760,18 @@ async def _concluir_os(os_id: str, atribuicoes: list) -> None:
                 _estado["dispensers"][key]["status"] = "idle"
 
     logger.info("\n%s\n[ORCH] OS CONCLUÍDA: %s\n%s", "=" * 60, os_id, "=" * 60)
+    if _visao_ignoradas_os:
+        _historico("os_concluida_visao_fora", marca_visao_fora(os_id, _visao_ignoradas_os))
+    _zerar_visao_ignoradas()
     if _broadcast_fn:
         _broadcast_fn()
+
+
+def marca_visao_fora(os_id: str, n: int) -> str:
+    """A frase do histórico e do detalhe da OS — uma só, para as duas telas."""
+    plural = "s" if n != 1 else ""
+    return (f"OS {os_id} concluída com a visão fora do Triple Check "
+            f"({n} leitura{plural} ignorada{plural})")
 
 
 async def _encerrar_cancelada(os_id: str, motivo: str) -> None:
@@ -3593,6 +3803,7 @@ async def _retomar_etapa_final(os_payload: dict) -> None:
     esperado = int(os_payload.get("esperado") or 0)
     cancelar = asyncio.Event()
     _cancelar_cronograma = cancelar
+    _zerar_visao_ignoradas()
     logger.warning("[ORCH] OS %s retomada depois de um reinício do central: homing, "
                    "conferência da caixa (esperado %d) e centro.", os_id, esperado)
     with _lock:

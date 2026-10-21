@@ -262,6 +262,7 @@ _DDL_TABELAS = [
         payload_json TEXT         NOT NULL,
         criado_em    DATETIME(3)  NOT NULL,
         concluida_em DATETIME(3)  NULL,
+        visao_ignoradas INT       NOT NULL DEFAULT 0,
         INDEX idx_os_status (status),
         INDEX idx_os_criado (criado_em)
     ) ENGINE=InnoDB""",
@@ -276,6 +277,7 @@ _DDL_TABELAS = [
         quantidade_alvo INT          NOT NULL,
         quantidade_real INT          NOT NULL DEFAULT 0,
         status          VARCHAR(30)  NOT NULL DEFAULT 'pendente',
+        visao_ignorada  TINYINT(1)   NOT NULL DEFAULT 0,
         INDEX idx_ositem_os  (os_id),
         INDEX idx_ositem_dis (os_id, dispenser_id)
     ) ENGINE=InnoDB""",
@@ -417,10 +419,15 @@ _DDL_TABELAS = [
 _COLUNAS_EVOLUTIVAS: dict[str, dict[str, str]] = {
     "ordens": {
         "categoria": "VARCHAR(100) NOT NULL DEFAULT '' AFTER descricao",
+        # Leituras da visão que o switch "Visão no Triple Check" desligado
+        # deixou de fora do veredito nesta OS (fotos de slot, SKU, VAZIA, FINAL).
+        "visao_ignoradas": "INT NOT NULL DEFAULT 0 AFTER concluida_em",
     },
     "os_itens": {
         "sku":       "VARCHAR(150) NULL AFTER medicamento",
         "categoria": "VARCHAR(100) NULL AFTER sku",
+        # 1 = neste slot a visão divergiu/falhou com o switch desligado.
+        "visao_ignorada": "TINYINT(1) NOT NULL DEFAULT 0 AFTER status",
     },
     "usuarios": {
         "role": "VARCHAR(30) NOT NULL DEFAULT 'manutencao' AFTER nome_completo",
@@ -787,6 +794,23 @@ def atualizar_item_os(os_id: str, dispenser_id: int, quantidade_real: int, statu
                 "WHERE os_id=%s AND dispenser_id=%s",
                 (quantidade_real, status, os_id, dispenser_id),
             )
+
+
+def registrar_visao_ignorada(os_id: str, dispenser_id: int | None = None, n: int = 1):
+    """Conta `n` leituras da visão deixadas fora do Triple Check nesta OS e, com
+    `dispenser_id`, marca o slot. Foto do HOME não tem slot: só a OS conta."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ordens SET visao_ignoradas = visao_ignoradas + %s WHERE os_id=%s",
+                (n, os_id),
+            )
+            if dispenser_id is not None:
+                cur.execute(
+                    "UPDATE os_itens SET visao_ignorada=1 "
+                    "WHERE os_id=%s AND dispenser_id=%s",
+                    (os_id, dispenser_id),
+                )
 
 
 # Os status de uma OS que o orquestrador TIROU da fila e ainda não fechou. A

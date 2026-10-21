@@ -461,6 +461,8 @@ FATOR_VELOCIDADE=1.0        # 0.5 = dobro da velocidade, 2.0 = metade
 # PRÓPRIA, independente do login do app de manutenção. Sem default embutido.
 CONSOLE_SENHA=
 CONSOLE_SESSAO_HORAS=8
+# Estado de boot do switch "Visão no Triple Check" (1 = a visão trava).
+VISAO_TRIPLE_CHECK_PADRAO=1
 FIM
 ```
 
@@ -992,6 +994,7 @@ específico.
 | Pausar / retomar o automático | assume o controle sem competir com o ERP |
 | Estado ao vivo | OS ativa, fila, trava (com motivo e slot) e os 8 dispensers |
 | Liberar a trava | **com confirmação** |
+| **Visão no Triple Check** | switch no topo, um clique — desligado, as câmeras não travam a OS |
 | **Armar uma falha** | tipo + slot; dispara uma vez e se desarma sozinha |
 | **Resetar a planta** | **com confirmação** |
 | **Semear histórico** | **com confirmação** — dado de DEMONSTRAÇÃO |
@@ -1016,6 +1019,14 @@ O disparo manual **é** o `POST /api/v1/ordens`: o console monta o corpo com
 `docker stop`: o container segue de pé e volta a produzir no instante em que o
 console despausa. Não é persistida — restart do central retoma o automático.
 Pausar **não** bloqueia o disparo manual.
+
+**O switch "Visão no Triple Check" tira a visão do veredito numa emergência.**
+Desligado, a câmera da mesa, as câmeras dos dispensers e as fotos VAZIA/FINAL
+continuam medindo e registrando, mas o que disserem vira o alarme
+`visao_ignorada` em vez de travar; balança, dispenser e porta NR-12 continuam
+decidindo como sempre. Vale no próximo veredito, não libera trava já ativa
+(desligue → libere pelo botão de sempre) e não é persistido: todo boot nasce em
+`VISAO_TRIPLE_CHECK_PADRAO`.
 
 ### Modo apresentação
 
@@ -1436,6 +1447,7 @@ não existe.
 | `CONSOLE_SENHA` / `CONSOLE_SESSAO_HORAS` | vazia (desabilita) / `8` h | central |
 | `TRIPLE_CHECK_MIN_DIVERGENCIAS` | `1` (1–3) | central |
 | `VISAO_SKU_HABILITADA` | `1` — `0` não manda o comando de SKU; os slots seguem sem conferência de produto | central |
+| `VISAO_TRIPLE_CHECK_PADRAO` | `1` — estado de boot do switch "Visão no Triple Check" do console; `0` nasce com a visão informativa (não trava). Não é persistido: todo restart volta a este valor | central |
 | `VISAO_MESA_POSICOES` | `1,2,3,4,5,6,7,8` — slots em que a câmera da mesa vê a caixa inteira; fora deles não há foto e o slot é conferido junto com o próximo visível. `HOME` na lista registra que ela vê a caixa inteira no HOME (premissa da conferência da caixa) | central |
 | `VISAO_CAIXA_VAZIA` | `1` — confere a caixa de coleta no HOME: vazia antes da OS, cheia (contagem absoluta) depois; `0` pula as duas fotos | central |
 | `VISAO_CAIXA_VAZIA_REPETIR_S` | `10` s entre as re-fotos enquanto a caixa não esvazia (vírgula aceita) | central |

@@ -171,6 +171,10 @@ services:
       # 0 desliga a conferência de SKU pela câmera dos dispensers: os slots
       # seguem sem conferência de produto, sem mandar comando nem retentar.
       VISAO_SKU_HABILITADA: ${VISAO_SKU_HABILITADA:-1}
+      # Estado de BOOT do switch "Visão no Triple Check" do console. 1 = a visão
+      # conta (trava); 0 = nasce informativa. O switch não é persistido: todo
+      # restart volta a este valor.
+      VISAO_TRIPLE_CHECK_PADRAO: ${VISAO_TRIPLE_CHECK_PADRAO:-1}
       # A célula tem porta NR-12? 1 = o central nasce PARADO até ouvir o
       # primeiro `estado` da porta (porta muda é porta aberta). 0 na planta
       # simulada: ela não tem porta.

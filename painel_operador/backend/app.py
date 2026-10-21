@@ -1930,7 +1930,13 @@ def central_sync_worker():
 # lida do central no mesmo ciclo. O display de 7" tem UMA linha de mensagem da
 # máquina: ele a recebe dentro de `porta_faixa` quando não há pausa da porta
 # (`_faixa_para_display`) — a porta parada pesa mais que a caixa.
-TRAVA_CHAVES = ("ativa", "os_id", "slot_id", "motivo", "porta_faixa", "caixa_faixa")
+#
+# `visao_faixa` é o aviso do switch "Visão no Triple Check" do console do
+# central ("VISÃO FORA DO TRIPLE CHECK"), que vem no próprio `/api/v1/trava` —
+# vazio com o switch ligado. É a última da fila na linha única do display: ela
+# dura a emergência inteira, e a porta e a caixa pedem ação agora.
+TRAVA_CHAVES = ("ativa", "os_id", "slot_id", "motivo", "porta_faixa", "caixa_faixa",
+                "visao_faixa")
 _trava_espelho = {"atual": None, "anterior": None, "fonte_ok": False, "lida_em": 0.0}
 _trava_lock = threading.Lock()
 
@@ -1946,7 +1952,7 @@ TRAVA_CACHE_S = 2.0
 # trava" é o estado de boot da célula; o display não tem o que fazer com
 # "desconhecido", e o push da primeira leitura de verdade corrige em segundos.
 TRAVA_DESCONHECIDA = {"ativa": False, "os_id": "", "slot_id": None, "motivo": "",
-                      "porta_faixa": "", "caixa_faixa": ""}
+                      "porta_faixa": "", "caixa_faixa": "", "visao_faixa": ""}
 
 
 def _trava_normalizada(bruto) -> dict | None:
@@ -1961,6 +1967,7 @@ def _trava_normalizada(bruto) -> dict | None:
         "motivo":  str(bruto.get("motivo") or ""),
         "porta_faixa": str(bruto.get("porta_faixa") or ""),
         "caixa_faixa": str(bruto.get("caixa_faixa") or ""),
+        "visao_faixa": str(bruto.get("visao_faixa") or ""),
     }
 
 
@@ -1968,10 +1975,11 @@ def _faixa_para_display(estado: dict) -> dict:
     """A faixa da porta em ASCII para o display de 7": a fonte dele não tem o
     travessão nem os acentos, e um glifo que falta vira quadrado na tela."""
     import unicodedata
-    faixa = estado.get("porta_faixa") or estado.get("caixa_faixa") or ""
+    faixa = (estado.get("porta_faixa") or estado.get("caixa_faixa")
+             or estado.get("visao_faixa") or "")
     ascii_ = unicodedata.normalize("NFKD", faixa.replace("—", "-").replace("…", "...")
                                    ).encode("ascii", "ignore").decode()
-    saida = {k: v for k, v in estado.items() if k != "caixa_faixa"}
+    saida = {k: v for k, v in estado.items() if k not in ("caixa_faixa", "visao_faixa")}
     return {**saida, "porta_faixa": ascii_}
 
 

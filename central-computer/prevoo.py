@@ -232,6 +232,22 @@ def item_gerador(pausado: bool) -> dict:
                  "ativo (sem porta: worker de laço, não dá para sondar por HTTP)")
 
 
+def item_visao_triple_check(ativo: bool) -> dict:
+    """O switch "Visão no Triple Check" do console.
+
+    Desligado é ALERTA, não falha: foi alguém que desligou, numa emergência, e
+    a célula funciona — só sem a visão travando. Mas quem lê o pré-voo antes
+    da banca precisa saber que uma das três fontes não decide nada.
+    """
+    if ativo:
+        return _item("visao_triple_check", "Modo", "Visão no Triple Check", OK,
+                     "a visão conta no Triple Check")
+    return _item("visao_triple_check", "Modo", "Visão no Triple Check", ALERTA,
+                 "visão fora do Triple Check — câmeras não travam a OS; balança e "
+                 "dispenser continuam travando",
+                 "religue o switch no topo do console")
+
+
 # ── Banco ─────────────────────────────────────────────────────────────────────
 
 def itens_banco(diagnostico: dict | None) -> list[dict]:

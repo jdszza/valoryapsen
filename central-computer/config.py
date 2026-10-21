@@ -224,6 +224,26 @@ def _visao_caixa_vazia() -> bool:
     return True
 
 
+def _visao_triple_check_padrao() -> bool:
+    """Com que estado o switch "Visão no Triple Check" nasce a cada boot. Default: 1.
+
+    É o estado de BOOT, não um interruptor persistente: desligar pelo console
+    vale até o próximo restart, e reiniciar devolve a visão ao Triple Check
+    (ver `chave_visao_tc.py`). Valor inválido cai em 1 com ERROR, pelo mesmo
+    motivo de `VISAO_CAIXA_VAZIA`: tirar uma fonte do Triple Check por um erro
+    de digitação é o lado errado de errar.
+    """
+    bruto = os.getenv("VISAO_TRIPLE_CHECK_PADRAO", "1")
+    valor = bruto.strip().lower()
+    if valor in _SIM:
+        return True
+    if valor in _NAO:
+        return False
+    _cfg_logger.error("VISAO_TRIPLE_CHECK_PADRAO=%r inválido (1 ou 0) — usando 1 "
+                      "(a visão conta no Triple Check).", bruto)
+    return True
+
+
 def _numero_com_virgula(nome: str, default: float, minimo: float, maximo: float) -> float:
     """Número do `.env` que aceita `2,5` (como se digita em pt-BR) e cai no
     default com ERROR quando é inválido ou sai da faixa.
@@ -630,6 +650,9 @@ class Settings:
     # Conferência de SKU pela câmera dos dispensers (passo 3b). 0 = os slots
     # seguem sem conferência de produto, sem nem mandar o comando.
     VISAO_SKU_HABILITADA: bool = field(default_factory=_visao_sku_habilitada)
+    # Estado de BOOT do switch "Visão no Triple Check" do console. 0 = nasce com
+    # a visão informativa (não trava). Ver `chave_visao_tc.py`.
+    VISAO_TRIPLE_CHECK_PADRAO: bool = field(default_factory=_visao_triple_check_padrao)
 
     # ── Câmera da mesa: onde ela vê a caixa inteira ───────────────────────────
     # Fora destas posições o central não pede foto, e o slot é conferido junto
