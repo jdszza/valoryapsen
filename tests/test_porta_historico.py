@@ -155,6 +155,63 @@ def test_maquina_que_nao_confirma_a_parada_e_um_alarme(central, monkeypatch):
     assert any(u.endswith("/porta/negar") for u, _ in central.comandos)
 
 
+# ── 2b. A porta em campo autoriza sozinha (§10) ───────────────────────────────
+#
+# O nr12_oficial acende o "pode abrir" ao mesmo tempo em que manda o pedido, e
+# não recebe nada do PC. O central PARA — e não manda liberar nem negar.
+
+def _comandos_porta(central) -> list[str]:
+    base = central.modulo.orch.settings.PORTA_ADAPTER_URL
+    return [u for u, _ in central.comandos if u.startswith(base)]
+
+
+def test_pedido_autorizado_pela_porta_para_e_nao_manda_nada_a_porta(central):
+    with central.modulo._lock:
+        central.modulo._estado["os_ativa"] = {"os_id": "OS-H3"}
+    _rodar(central, _estado(),
+           _ev("pedido_acesso", uid="04A1B2C3", autorizada_pela_porta=True))
+    orch = central.modulo.orch
+    assert orch.get_pausa_porta()["motivo"] == "pedido_acesso"
+    urls = [u for u, _ in central.comandos]
+    assert any(u.endswith("/comandos/parar") and u.startswith(orch.settings.CNC_ADAPTER_URL)
+               for u in urls)
+    assert any(u.endswith("/comandos/parar")
+               and u.startswith(orch.settings.DISPENSER_ADAPTER_URL) for u in urls)
+    assert _comandos_porta(central) == [], "POST ao porta-adapter numa porta autônoma"
+    assert _alarmes(central) == []
+
+
+def test_parada_nao_confirmada_com_a_porta_ja_autorizada_e_alarme_sem_negar(central,
+                                                                            monkeypatch):
+    orch = central.modulo.orch
+
+    async def _post(url, payload, timeout=10.0):
+        central.comandos.append((url, payload))
+        return not url.endswith("/comandos/parar")
+    monkeypatch.setattr(orch, "_post", _post)
+    with central.modulo._lock:
+        central.modulo._estado["os_ativa"] = {"os_id": "OS-H4"}
+    _rodar(central, _estado(),
+           _ev("pedido_acesso", uid="04A1B2C3", autorizada_pela_porta=True))
+    assert _alarmes(central) == [("porta", "maquina_nao_confirmou_parada")]
+    texto = central.banco.chamadas_de("salvar_alarme")[0]["args"][2]
+    assert "JÁ tinha autorizado" in texto and "04A1B2C3" in texto
+    assert _comandos_porta(central) == [], "porta_negar numa porta que não recebe nada"
+
+
+def test_pedido_sem_a_flag_continua_mandando_liberar(central):
+    """O comportamento do firmware JSON (§9) segue de pé."""
+    _rodar(central, _estado(), _ev("pedido_acesso", uid="04A1B2C3"))
+    assert [u.rsplit("/", 1)[1] for u in _comandos_porta(central)] == ["liberar"]
+
+
+def test_porta_aberta_sem_porta_identificada_e_alarme_na_fonte_porta(central):
+    _rodar(central, _estado(), _ev("porta_aberta", porta=None, autorizada=False))
+    assert _alarmes(central) == [("porta", "porta_aberta_sem_autorizacao")]
+    texto = central.banco.chamadas_de("salvar_alarme")[0]["args"][2]
+    assert "não identificada" in texto and "None" not in texto
+
+
 # ── 3. A faixa, lida do central ───────────────────────────────────────────────
 
 def test_get_porta_publica_a_faixa_e_o_estado_ao_vivo(central):

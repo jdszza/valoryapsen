@@ -124,8 +124,8 @@ Painel     :5000  ─ GET (espelho de mão única) → Central
 
 O **`porta-adapter`** (:8104, a ponte central ↔ porta NR-12) **não** está nesta
 tabela de propósito: ele não tem serviço no compose. Não existe porta simulada,
-e na célula montada ele roda no host, dono da COM da porta
-(`porta-adapter\iniciar_host.bat`). Sem porta na célula
+e na célula montada ele roda no host, dono da COM do ESP RECEPTOR da porta,
+que ele só LÊ (`porta-adapter\iniciar_host.bat`; `docs/PROTOCOLO_SERIAL.md` §10). Sem porta na célula
 (`PORTA_NR12_HABILITADA=0`, o default) ninguém fala com ele.
 
 **Ordem de subida.** Todos os serviços de aplicação têm healthcheck (menos o
@@ -162,8 +162,9 @@ A **perna de cima não muda**: mesmos endpoints `/comandos/*`, mesmos modelos,
 mesmo payload de evento indo ao central sem interpretação. Por isso trocar o
 simulador por firmware não toca em `central-computer/`. Contrato completo em
 [`docs/PROTOCOLO_SERIAL.md`](docs/PROTOCOLO_SERIAL.md); o transporte é o
-`serial_link.py` (cópia idêntica nos quatro adapters com placa — o
-`porta-adapter` é o quarto —, com teste que cobra a igualdade).
+`serial_link.py` (cópia idêntica nos três adapters de transporte selecionável,
+com teste que cobra a igualdade). O `porta-adapter` não tem cópia: em campo a
+porta NR-12 fala texto e ele só LÊ (`leitor_linhas.py`, §10 do protocolo).
 
 Há uma **segunda porta** no dispenser-adapter: as 8 telas TFT
 (`dispenser_tft`, `DISPENSER_TFT_*`), espelho do que cada slot está fazendo.
@@ -568,7 +569,7 @@ container.
 | 2 | dispenser-adapter | host | 8100 | COM dos mecanismos + COM das telas TFT |
 | 3 | cnc-adapter | host | 8101 | COM da mesa |
 | 4 | weight-adapter | host | 8103 | COM da balança |
-| 5 | porta-adapter | host | 8104 | COM da porta NR-12 (USB própria) |
+| 5 | porta-adapter | host | 8104 | COM do ESP RECEPTOR da porta NR-12 (só leitura) |
 | 6 | painel de bancada | host | 5000 | COM do display de 7" |
 | 7 | estação de visão da mesa | host | 8212 | webcam da mesa |
 | 8 | estações de visão dos dispensers (esq, dir) | host | 8301, 8302 | webcams das duas fileiras |
@@ -604,14 +605,16 @@ gravação e o primeiro boot:
 | mecanismos dos dispensers + 8 telas TFT (duas placas) | [`dispenser/README.md`](dispenser/README.md) |
 | mesa CNC | [`cnc/README.md`](cnc/README.md), seção "Passo a passo — do zero até a mesa andando" |
 | balança HX711 | [`weight/README.md`](weight/README.md) |
-| porta NR-12 (RC522 + fins de curso) | [`porta/README.md`](porta/README.md) |
+| porta NR-12 (ESP da porta + ESP receptor) | [`porta/README.md`](porta/README.md) |
 | display de 7" | [`docs/BANCADA.md`](docs/BANCADA.md) |
 
 **A4. Descubra e FIXE a COM de cada placa.** Ligue as placas uma de cada vez,
 abra o monitor serial a 115200 e leia o ping: `{"cmd":"ping","sub":"cnc"}` é a
 mesa, `"sub":"weight"` a balança, `"sub":"dispenser"` os mecanismos,
-`"sub":"dispenser_tft"` as telas, `"sub":"porta"` a porta NR-12; o display manda
-`{"cmd":"ping"}` sem `sub`.
+`"sub":"dispenser_tft"` as telas; o display manda `{"cmd":"ping"}` sem `sub`.
+A porta NR-12 não tem ping: a COM dela é a do ESP **receptor**, que mostra o
+banner `=== RECEPTOR Serial2` ao resetar e as linhas `EVT:...` da porta ao passar
+uma tag.
 Fixe o número no Gerenciador de Dispositivos (*Portas (COM e LPT)* →
 *Propriedades* → *Configurações de Porta* → *Avançado…* → *Número da Porta
 COM*) e anote na tabela de [`docs/DEPLOY_WINDOWS.md`](docs/DEPLOY_WINDOWS.md),
@@ -679,7 +682,8 @@ DISPENSER_ADAPTER_URL=http://host.docker.internal:8100
 CNC_ADAPTER_URL=http://host.docker.internal:8101
 WEIGHT_ADAPTER_URL=http://host.docker.internal:8103
 # A porta NR-12: o adapter dela também roda no host, e a célula passa a nascer
-# PARADA até ouvir o primeiro `estado` da porta (porta muda é porta aberta).
+# PARADA até o estado da porta ser provado (porta muda é porta aberta) — o
+# ritual de subida: tag → 10 s → tag (porta/README.md).
 PORTA_ADAPTER_URL=http://host.docker.internal:8104
 PORTA_NR12_HABILITADA=1
 
@@ -761,9 +765,11 @@ C:\apsen\porta-adapter\iniciar_host.bat
 
 Cada um mostra a COM e o transporte ao subir. Confira que acharam a placa:
 `http://localhost:8100/health` (e `8101`, `8103`, `8104`) — `serial` com
-`"conectado": true`. No da porta, o bloco `porta` tem de mostrar
-`"link_ok": true` com o heartbeat a menos de 1 s: até lá, o central mantém a
-célula parada.
+`"conectado": true`. No da porta, `checks.estado-porta` começa em
+`"desconhecido — passe a tag"` — a porta não tem heartbeat e não responde a
+pergunta nenhuma. Faça o ritual de subida (passe a tag, espere os 10 s, passe a
+tag de novo): `"link_ok": true` e a célula faz homing e libera. Até lá, o
+central mantém a célula parada.
 
 **B3. O painel de bancada:**
 
@@ -1494,16 +1500,16 @@ não existe.
 | `VISAO_DISP_ASSENTAMENTO_S` / `VISAO_DISP_PRAZO_S` | `2` s de folga depois do catálogo novo valer / `20` s de teto para emitir a leitura | vision-adapter |
 | `VISAO_ETIQUETAS_ARQ` | `/app/etiquetas.json` — nome do central → QR/ArUco impressos | vision-adapter |
 | `MAX_FILA_OS` | `5` OS esperando | central |
-| `PORTA_NR12_HABILITADA` | `0` — `1` diz que a célula TEM porta NR-12: o central nasce parado até ouvir o primeiro `estado` dela | central |
-| `PORTA_PARADA_MAX_S` | `3` (faixa 0,5–4) — quanto se espera a CNC e os dispensers confirmarem a parada antes de autorizar a abertura | central |
-| `PORTA_JANELA_LIBERACAO_MS` | `10000` — janela da autorização no `porta_liberar` (LED "pode abrir" aceso) | central |
+| `PORTA_NR12_HABILITADA` | `0` — `1` diz que a célula TEM porta NR-12: o central nasce parado até o estado dela ser provado (ritual: tag → 10 s → tag) | central |
+| `PORTA_PARADA_MAX_S` | `3` (faixa 0,5–4) — quanto se espera a CNC e os dispensers confirmarem a parada (em campo a porta já autorizou sozinha: sem confirmação, é alarme) | central |
+| `PORTA_JANELA_LIBERACAO_MS` | `10000` — janela do `porta_liberar` do firmware JSON (`porta_nr12`); em campo a janela é a gravada na porta (10 s) | central |
 | `PORTA_SILENCIO_MAX_S` | `15` — nada da porta por esse tempo = link perdido (a célula para) | central |
 | `PORTA_TIMEOUT_HOMING_S` | `90` — teto do homing da retomada | central |
 | `PORTA_ADAPTER_URL` | `http://porta-adapter:8104` — na célula real, `http://host.docker.internal:8104` (o adapter roda no host) | central |
-| `PORTA_SERIAL_URL` | **obrigatória** — a COM da porta; vazia, o serviço recusa subir | porta-adapter |
-| `PORTA_SERIAL_BAUD` / `PORTA_ACK_TIMEOUT_S` | `115200` / `2` s | porta-adapter |
-| `PORTA_HEARTBEAT_MAX_S` | `2.5` — heartbeat da porta mais velho que isso = link perdido | porta-adapter |
-| `PORTA_ESTADO_REENVIO_S` | `5` — o `estado` sem mudança sobe ao central no máximo nesse intervalo, como sinal de vida | porta-adapter |
+| `PORTA_SERIAL_URL` | **obrigatória** — a COM do ESP RECEPTOR da porta (só leitura); vazia, o serviço recusa subir | porta-adapter |
+| `PORTA_SERIAL_BAUD` | `115200` | porta-adapter |
+| `PORTA_ESTADO_REENVIO_S` | `5` — com o link ok, o `estado` sintetizado é reenviado ao central nesse intervalo (a porta não tem heartbeat) | porta-adapter |
+| `PORTA_ESPERA_SENSORES_S` | `0.3` — quanto o `porta_aberta` espera a linha dos fins de curso que diz QUAL porta abriu | porta-adapter |
 | `TIMEOUT_CARREGAMENTO` / `_POSICIONAMENTO` / `_DISPENSA` | `180` / `120` / `120` s | central |
 | `TIMEOUT_VISAO_DISPENSER` / `_VISAO_MESA` / `_PESO` | `30` / `30` / `15` s | central |
 | `BROADCAST_MIN_INTERVALO_MS` | `500` ms entre broadcasts periódicos | central |

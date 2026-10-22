@@ -20,7 +20,7 @@ mini PC HP (Windows) ─┬─ COM_A  dispenser      (os 8 mecanismos)     ┐
                       ├─ COM_C  cnc            (a mesa)                 cnc-adapter        (host)
                       ├─ COM_D  weight         (a balança HX711)        weight-adapter     (host)
                       ├─ COM_E  display de 7"  (a bancada)              painel_operador    (host)
-                      └─ COM_F  porta          (a porta NR-12)          porta-adapter      (host) :8104
+                      └─ COM_F  receptor da porta NR-12 (só leitura)    porta-adapter      (host) :8104
 
 câmeras (USB) ─┬─ webcam da mesa          estação da mesa          (host) :8212
                ├─ webcam fileira esq.    estação dispensers esq   (host) :8301
@@ -32,7 +32,9 @@ alimentação: fonte externa. O USB do mini PC carrega SÓ dados.
 Seis portas, cada uma com o seu dono — o dispenser-adapter é dono de duas, e
 cada um dos outros, de uma. Nenhum processo varre. A porta NR-12 tem USB
 PRÓPRIA (COM_F) e não passa pela placa das telas: travar ou regravar as telas
-não cega a vigia da porta, e vice-versa.
+não cega a vigia da porta, e vice-versa. Em campo, desde 22/10/2026, **COM_F é a
+USB do ESP RECEPTOR**, que repassa as linhas de texto da ESP da porta; o
+porta-adapter só lê (`PROTOCOLO_SERIAL.md` §10).
 
 ## O que roda onde
 
@@ -51,7 +53,7 @@ não pendência"*).
 | `dispenser-adapter` (duas COM: mecanismos + telas TFT) | **host** | dono de COM_A e COM_B |
 | `cnc-adapter` | **host** | dono de COM_C |
 | `weight-adapter` | **host** | dono de COM_D |
-| `porta-adapter` | **host** | dono de COM_F. Não tem serviço no compose: não há porta simulada |
+| `porta-adapter` | **host** | dono de COM_F (o receptor da porta), só leitura. Não tem serviço no compose: não há porta simulada |
 | `painel_operador` (backend + display) | **host** | dono de COM_E, como já era |
 
 No compose isso é o **profile** `simulado`: os três adapters seriais e os quatro
@@ -97,12 +99,15 @@ Sem isto, a próxima troca de porta USB renumera tudo.
 | mesa CNC | `cnc` | COM_C = `COM__` | `CNC_SERIAL_URL` (cnc-adapter) |
 | balança HX711 | `weight` | COM_D = `COM__` | `WEIGHT_SERIAL_URL` (weight-adapter) |
 | display de 7" | (ping sem `sub`) | COM_E = `COM__` | `APSEN_DISPLAY_PORTA` (painel_operador) |
-| porta NR-12 (RC522 + fins de curso) | `porta` | COM_F = `COM__` | `PORTA_SERIAL_URL` (porta-adapter) — **obrigatória**: vazia, o serviço não sobe |
+| ESP RECEPTOR da porta NR-12 | (sem ping: banner `=== RECEPTOR Serial2`) | COM_F = `COM__` | `PORTA_SERIAL_URL` (porta-adapter) — **obrigatória**: vazia, o serviço não sobe |
 
 Qual placa está em qual COM: abra **uma** porta de cada vez com o monitor
 serial do PlatformIO a 115200 e leia o ping — `{"cmd":"ping","sub":"cnc"}` é
-a mesa; o display manda `{"cmd":"ping"}` sem `sub`. **Feche o monitor antes de
-subir os processos** (ver Armadilhas).
+a mesa; o display manda `{"cmd":"ping"}` sem `sub`. **O receptor da porta não
+tem ping**: com o porta-adapter PARADO, o Monitor Serial na COM dele mostra o
+banner `=== RECEPTOR Serial2` ao resetar o receptor, e as linhas `EVT:...` da
+porta ao passar uma tag (`[aviso] Nenhum byte recebido` = confira TX17→RX16 e o
+GND comum). **Feche o monitor antes de subir os processos** (ver Armadilhas).
 
 ### Fixar a COM no Windows
 
@@ -166,8 +171,10 @@ recebe o ambiente do `.bat` (ou da tarefa agendada) que o inicia.
 `<SUB>` é `DISPENSER`, `CNC` ou `WEIGHT`; o dispenser-adapter leva também
 `DISPENSER_TFT_TRANSPORTE=serial` e `DISPENSER_TFT_SERIAL_URL=COM_B`. O
 porta-adapter só tem transporte serial — não existe `PORTA_TRANSPORTE` — e leva
-`PORTA_SERIAL_URL=COM_F` (sem default no `.bat`: vazia, ele avisa e sai),
-`PORTA_SERIAL_BAUD=115200` e `PORTA_ACK_TIMEOUT_S=2`.
+`PORTA_SERIAL_URL=COM_F` — a COM do RECEPTOR (sem default no `.bat`: vazia, ele
+avisa e sai) — e `PORTA_SERIAL_BAUD=115200`. Não há ACK nem heartbeat do lado
+da porta: `PORTA_ACK_TIMEOUT_S` e `PORTA_HEARTBEAT_MAX_S` saíram com o firmware
+de campo.
 
 E o **central alcança os adapters do host** por `host.docker.internal`, o nome
 que o Docker Desktop dá à máquina hospedeira. No `.env` do mini PC:
@@ -183,8 +190,11 @@ PORTA_NR12_HABILITADA=1
 
 O `central-computer` lê essas variáveis do ambiente (`config.py`); o compose as
 declara com os nomes DNS de sempre como default, e o `.env` as sobrescreve.
-`PORTA_NR12_HABILITADA=1` faz o central nascer com a célula PARADA até ouvir o
-primeiro `estado` da porta — porta que nunca falou é porta aberta.
+`PORTA_NR12_HABILITADA=1` faz o central nascer com a célula PARADA até o estado
+da porta ser provado — porta que nunca falou é porta aberta. Como a porta não
+tem heartbeat nem responde a pergunta, a prova é o **ritual de subida**: passe a
+tag (a porta libera), espere os 10 s (ou abra e feche), passe a tag de novo
+(rearme) — a célula faz homing e retoma.
 
 ### Como subir cada adapter no host
 
@@ -344,7 +354,9 @@ primeira OS. Na ordem:
    `weight-adapter` e `porta-adapter\iniciar_host.bat` (com a COM_F em
    `PORTA_SERIAL_URL`). Enquanto o porta-adapter não sobe, o central mantém a
    célula parada: link perdido é porta aberta — subi-lo depois do Docker é a
-   ordem natural, e nenhuma OS começa antes do `porta_link_ok`;
+   ordem natural, e nenhuma OS começa antes do `porta_link_ok`. Com o
+   adapter no ar, o estado da porta ainda é DESCONHECIDO: faça o ritual de
+   subida (tag → 10 s → tag) para a célula fazer homing e liberar;
 3. o painel de bancada (`painel_operador\iniciar_backend.bat`);
 4. as três estações de visão (`vision\iniciar_mesa.bat`,
    `vision\iniciar_dispensers.bat esq` e `vision\iniciar_dispensers.bat dir`).
@@ -411,11 +423,16 @@ sintoma é só "desconectado" no `/health` do adapter (ou `OFFLINE` no display).
 Feche todos antes de subir os processos; para regravar um firmware, derrube o
 processo dono daquela COM primeiro.
 
-**Cadastrar tag da porta exige parar o porta-adapter.** Os comandos de bancada
-(`R`/`S`/`L`) vão pelo Monitor Serial na MESMA USB que o adapter usa. Feche a
-janela do porta-adapter, cadastre, feche o Monitor e suba o adapter de novo —
-enquanto ele estiver parado, a célula fica parada (link perdido é porta aberta),
-e é o comportamento certo.
+**Cadastrar tag da porta é na USB DA PORTA, com notebook.** Em campo a COM_F é
+a do ESP RECEPTOR, e o cadastro (`R`/`S`/`C`/`L`) é feito pelo Monitor Serial
+na USB da ESP da PORTA, na bancada — o mini PC e o porta-adapter não
+participam (`porta/README.md`). (Com o firmware anterior, `porta_nr12`, os
+comandos iam pela mesma USB que o adapter usava, e cadastrar exigia pará-lo.)
+
+**A porta parada travada é um ponto cego.** A ESP da porta não tem linha de
+vida: travada, ou com o fio TX2→RX2 rompido, ela fica tão muda quanto uma porta
+fechada que ninguém tocou, e nada avisa. Antes de começar, um teste de tag
+confirma que o caminho está vivo.
 
 **`ACCESS_DENIED` numa porta que "está livre".** Quase sempre é processo
 duplicado: fechar a janela nem sempre mata o Python. `tasklist | findstr python`

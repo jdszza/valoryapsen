@@ -14,7 +14,7 @@ Uma porta por firmware, uma linha JSON por mensagem:
 | `dispenser-adapter` | as 8 telas TFT              | uma (a SEGUNDA porta do mesmo adapter) | `dispenser_tft` | [`dispenser/telas_tft/`](../dispenser/README.md) |
 | `cnc-adapter`       | a mesa CNC                  | uma   | `cnc`              | — |
 | `weight-adapter`    | a balança HX711             | uma   | `weight`           | [`weight/balanca2_3/`](../weight/README.md) |
-| `porta-adapter`     | a porta NR-12 (RC522 + fins de curso; porta presa por ímã) | uma — USB PRÓPRIA no mini PC, independente das telas | `porta` | [`porta/porta_nr12/`](../porta/README.md) |
+| `porta-adapter`     | a porta NR-12 (RC522 + fins de curso; porta presa por ímã) | uma — USB do ESP RECEPTOR, só leitura (seção 10) | — (texto, não JSON) | [`porta/nr12_oficial/` + `porta/receptor_esp32/`](../porta/README.md) |
 
 Três dos quatro firmwares estão escritos. A balança foi a primeira
 (`weight/balanca2_3/`, manual em `weight/README.md`) e as duas placas do
@@ -34,6 +34,9 @@ vê todo comando que desce e todo evento que sobe do slot é o dispenser-adapter
 — ver a seção 6. A porta NR-12 é o caso oposto, e de propósito: placa própria,
 USB própria e adapter próprio (`porta-adapter`, HTTP 8104), para que travar ou
 regravar a placa das telas não cegue a vigia da porta — ver a seção 9.
+**Em campo, desde 22/10/2026, a porta não fala este contrato**: ela fala linhas
+de texto, decide a tag sozinha e o PC só LÊ — ver a seção 10, que é o contrato
+da porta de hoje. A seção 9 descreve o firmware JSON anterior.
 
 ---
 
@@ -713,7 +716,9 @@ A porta NR-12 é a exceção da tabela: o `porta-adapter` **só** tem transporte
 serial — não há simulador de porta, e fingir um ACK faria o central autorizar
 uma porta imaginária. Não existe `PORTA_TRANSPORTE`; `PORTA_SERIAL_URL` é
 **obrigatória** (vazia, o serviço recusa subir), e `PORTA_SERIAL_BAUD`/
-`PORTA_ACK_TIMEOUT_S` seguem os defaults acima. Ver a seção 9.
+`PORTA_ACK_TIMEOUT_S` seguiam os defaults acima no firmware JSON (seção 9). Em
+campo (seção 10) a COM é a do ESP receptor, nada desce por ela, e não há ACK:
+`PORTA_ACK_TIMEOUT_S` e `PORTA_HEARTBEAT_MAX_S` deixaram de existir.
 
 ## 8. Sem placa: as placas falsas
 
@@ -735,6 +740,14 @@ tudo verde para sempre, inclusive com o protocolo quebrado.
 ---
 
 ## 9. `porta` — a porta NR-12
+
+> **Não é o que está gravado em campo.** Esta seção descreve o firmware JSON
+> `porta/porta_nr12/` — USB própria, ping/pong, ACK, e o central autorizando a
+> abertura. Desde 22/10/2026 a porta em campo é o `porta/nr12_oficial/` com o
+> ESP receptor `porta/receptor_esp32/`, e o contrato dela é a **seção 10**. A
+> seção 9 fica como está: a placa falsa `tests/fakes/placa_porta.py` e
+> `tests/test_porta_firmware.py` ainda confrontam o firmware JSON, que continua
+> no repositório.
 
 **Duas portas físicas da célula, uma ESP, e uma USB só dela no mini PC.** A ESP
 da porta (RC522 + dois fins de curso + LED "pode abrir") é uma placa DEDICADA,
@@ -905,3 +918,168 @@ adapter. Duas exceções ao "sem interpretar", e as duas são de TRANSPORTE:
 
 Ao reabrir a USB da porta, o adapter manda `porta_estado` — sem ele, a placa só
 falaria no próximo heartbeat, e o `porta_link_ok` esperaria por nada.
+
+## 10. Porta NR-12 em campo: nr12_oficial + receptor (só leitura)
+
+**Este é O contrato da porta desde 22/10/2026.** O firmware da porta mudou fora
+do repositório, e as cópias fiéis do que está gravado nas placas estão em
+`porta/nr12_oficial/nr12_oficial.ino` (a ESP da porta) e
+`porta/receptor_esp32/receptor_esp32.ino` (a ESP que repassa à USB). As duas
+**não são editadas por este repositório**: `tests/test_porta_texto.py` fixa o
+sha256 de cada uma e confere o adapter contra elas.
+
+```
+ESP da PORTA (nr12_oficial)  ──TX2(17)→RX2(16)──►  ESP RECEPTOR (receptor_esp32)  ──USB (COMx)──►  porta-adapter :8104  ──REST──►  central
+RC522 + ES1 teto + ES2 frente                      repassa as linhas, idênticas
+decide a tag SOZINHA                               (o fio de volta TX17 só serve
+                                                    ao teste manual `T` do receptor)
+```
+
+**O PC só LÊ. Nenhum byte desce** — nem à porta, nem ao receptor: não há
+`porta_liberar`, `porta_negar`, `porta_estado`, ping, pong, ACK nem `cmd_id`. O
+`porta-adapter` abre a COM do receptor (DTR/RTS desligados antes do `open`, a
+mesma regra do `serial_link`: abrir do jeito padrão reinicia a ESP), lê linha a
+linha e TRADUZ cada linha nos eventos do vocabulário de sempre (seção 9,
+"Eventos"), que sobem a `POST /api/v1/eventos/porta` como antes. O central quase
+não mudou: ganhou a flag `autorizada_pela_porta` (abaixo).
+
+### Formato das linhas
+
+Toda linha de máquina da porta é
+
+```
+EVT:<CODIGO>[;UID=<HEX>] | <texto humano>
+```
+
+Só o que vem **antes** de ` | ` é máquina; o texto é para quem lê o Monitor
+Serial e pode mudar sem quebrar nada. O `UID` é hexadecimal maiúsculo sem
+separador (`04A1B2C3`), o mesmo da seção 9. O adapter tolera espaços, CR e lixo
+imprimível ANTES de `EVT:` (o filtro de ruído do receptor descarta só byte não
+imprimível) e normaliza o UID para maiúsculas.
+
+Depois de **todo** `ALERTA_*` (e depois do boot) a porta imprime, na mesma volta
+do `loop()`, a linha dos fins de curso:
+
+```
+   ES1(D4)=FECHADO  ES2(D18)=ABERTO
+```
+
+**ES1 = `teto`, ES2 = `frente`.** `FECHADO`/`ABERTO` viram `fechada`/`aberta`.
+É ela que diz QUAL porta abriu: o `EVT:ALERTA_*` não diz.
+
+### Tradução: linha → estado da porta → eventos ao central
+
+| linha da porta | estado da porta depois | sobe ao central (nesta ordem) |
+|---|---|---|
+| `EVT:BOOT_OK` | FECHADA, sem rearme, teto e frente fechadas | `boot` (teto, frente) → `estado` |
+| `EVT:ALERTA_SEM_AUTORIZACAO` | ABERTA_SEM_AUTORIZACAO (qual porta: a linha ES) | `porta_aberta` (autorizada false, porta) — um por porta aberta → `estado` |
+| `EVT:PAUSA` | LIBERADA, sem rearme, teto e frente fechadas (a porta só libera com as duas fechadas) | `pedido_acesso` (uid, autorizada_pela_porta true) → `liberada` (janela_ms 10000) → `estado` |
+| `EVT:ALERTA_PORTA_ABERTA` | ABERTA_AUTORIZADA (qual porta: a linha ES) | `porta_aberta` (autorizada true, porta) — um por porta aberta → `estado` |
+| `EVT:LIBERACAO_EXPIRADA` | FECHADA, rearme pendente, teto e frente fechadas | `liberacao_expirada` (motivo janela_expirou) → `estado` |
+| `EVT:PORTA_FECHADA` | FECHADA, rearme pendente, teto e frente fechadas | `porta_fechada` → `estado` |
+| `EVT:REARME_OK` | FECHADA, sem rearme, teto e frente fechadas | `estado` → `rearme` (uid) |
+| `EVT:TAG_NEGADA` | não muda | `tag_negada` (uid) |
+| `EVT:REG_INICIO`, `EVT:REG_SALVA`, `EVT:REG_JA_EXISTE`, `EVT:REG_ERRO`, `EVT:REG_CANCELADO`, `EVT:REG_FIM` | não muda | nada — é bancada: log e `/health` |
+| linha ES (`ES1(D4)=… ES2(D18)=…`) | teto = ES1, frente = ES2 | completa o `porta_aberta` pendente; `estado` se mudou |
+
+Quatro detalhes que a tabela não mostra:
+
+* **A segunda porta que abre com a primeira já aberta não gera linha.** Nos
+  estados ABERTA_* o `nr12_oficial` só olha se as duas fecharam; a segunda
+  abertura é muda, e o central só sabe dela pelo `PORTA_FECHADA`. A célula já
+  está parada por causa da primeira, então nada de segurança se perde — só a
+  linha do histórico.
+
+* **`REARME_OK` sobe o `estado` ANTES do `rearme`.** `_bloqueio_da_retomada`
+  confere que a porta está em FECHADA e sem rearme pendente; com o `rearme`
+  primeiro, o central o recusaria por um estado velho.
+* **O `porta_aberta` espera a linha ES** por até `PORTA_ESPERA_SENSORES_S`
+  (0,3 s) — ela sai na mesma volta do `loop()`, a poucos ms. Com as duas portas
+  abertas, sobem DOIS `porta_aberta`. Sem a linha no prazo, sobe UM com
+  `porta: null`, e o central abre o alarme na fonte `porta` ("porta não
+  identificada") em vez de `porta_None`.
+* **`liberada` leva `janela_ms: 10000`**, que é o `JANELA_LIBERACAO_MS` gravado
+  na porta. O adapter não a mede; ele a declara, para o histórico ter o número.
+
+### O que o receptor imprime sozinho — e o adapter ignora
+
+O receptor repassa cada linha IDÊNTICA, e por conta própria imprime só:
+
+* o banner do boot: `=== RECEPTOR Serial2 | segundo ESP32 ===`,
+  `Serial2: RX=GPIO16 (pull-up ON)  TX=GPIO17  baud=115200`,
+  `Aguardando mensagens do ESP32 da porta...`, `Comandos: X (hex on/off) | …`;
+* as respostas dos comandos de bancada dele, todas começando com `>> `;
+* `[linha longa sem fim] …` — linha de mais de 400 bytes sem `\n`, despejada
+  crua; e
+* `[aviso] Nenhum byte recebido no Serial2 ate agora. …` a cada 5 s, **enquanto
+  nada tiver chegado desde o boot do receptor**. Esse o adapter não ignora: ele
+  vira o diagnóstico `receptor_sem_dados` no `/health` — o fio porta→receptor
+  (TX17→RX16, GND comum) sem dado nenhum.
+
+Nada disso sobe ao central. Qualquer outra linha também não: log DEBUG e um
+contador de linhas desconhecidas no `/health`.
+
+### Link, estado sintetizado e estado desconhecido
+
+**A porta não tem heartbeat.** Ela fica MUDA enquanto nada acontece, e a vigia
+antiga ("nenhum `estado` em 2,5 s = link perdido") pararia a célula a cada
+2,5 s. Por isso:
+
+* **link ok = a USB do receptor aberta E o estado da porta conhecido.** O
+  `porta_link_ok` sobe na transição, ANTES dos eventos da linha que a provou;
+  a USB que cai sobe `porta_link_perdido` UMA vez e o adapter esquece o estado;
+* **o `estado` é SINTETIZADO pelo adapter**, a partir do modelo dele (`estado`,
+  `aguardando_rearme`, `teto`, `frente`, e `"fonte": "adapter"`). Sobe depois de
+  cada transição e é reenviado a cada `PORTA_ESTADO_REENVIO_S` (5 s) enquanto o
+  link está ok — é isso que satisfaz a vigia de silêncio do central
+  (`PORTA_SILENCIO_MAX_S`), que existe para notar o ADAPTER morto;
+* **o estado começa DESCONHECIDO.** Não há como perguntar à porta. Ao subir o
+  adapter — ou ao voltar a USB do receptor — nada sobe até chegar uma linha
+  que PROVE o estado: `BOOT_OK`, `PAUSA`, `LIBERACAO_EXPIRADA`, `PORTA_FECHADA`,
+  `REARME_OK` ou um `ALERTA_*`. `TAG_NEGADA` e `REG_*` não provam nada, e com o
+  estado desconhecido também não sobem.
+
+Com `PORTA_NR12_HABILITADA=1` o central nasce em pausa por link perdido ("porta
+que nunca falou é porta aberta"), então o **ritual de subida** é:
+
+1. **passar a tag** — `EVT:PAUSA` prova as duas portas fechadas, e o link fica ok;
+2. **esperar os 10 s** (`LIBERACAO_EXPIRADA`) **ou abrir e fechar** (`PORTA_FECHADA`)
+   — a porta entra em rearme pendente;
+3. **passar a tag de novo** — `EVT:REARME_OK`; a célula faz homing e retoma.
+
+Reiniciar a ESP da porta (`EVT:BOOT_OK`, com as duas fechadas) também prova o
+estado, e retoma sozinho pela regra de sempre do link perdido sem porta aberta
+no meio.
+
+### O ponto cego
+
+**ESP da porta travada, ou o fio TX2→RX2 rompido, COM a porta parada, NÃO é
+detectável.** Silêncio é o normal desta porta, e o próximo evento real (uma tag,
+uma abertura) também não chega — a célula seguiria rodando com uma porta que
+ninguém escuta. A USB do receptor de pé não prova nada sobre a porta: o receptor
+continua vivo e calado. Não há como fechar isso sem regravar a porta; a correção
+futura (fora deste escopo) é ela emitir uma linha de vida periódica — por
+exemplo `EVT:VIVO` a cada segundo — e o adapter voltar a vigiar a idade dela.
+Enquanto isso, **um teste de tag antes de começar** confirma que o caminho
+inteiro está vivo.
+
+### A autorização é da PORTA
+
+A tag cadastrada acende o LED "pode abrir" e manda `EVT:PAUSA` **ao mesmo
+tempo**: o central não tem mais como segurar a autorização até a máquina
+confirmar a parada, porque não manda nada à porta. Ele recebe
+`pedido_acesso` com **`autorizada_pela_porta: true`**, entra em pausa e PARA
+(CNC e dispensers, em `gather`) — e não manda `porta_liberar` nem
+`porta_negar`. Parada não confirmada em `PORTA_PARADA_MAX_S` vira o alarme
+`maquina_nao_confirmou_parada`, dizendo que a porta já tinha autorizado a
+abertura. Pausa, retomada, rearme, histórico, alarmes e faixa seguem iguais.
+
+O único `/comandos/porta/*` que o central ainda chama é `porta/estado`, no
+rearme recusado: o adapter o atende **reenviando o `estado` do modelo**, sem
+tocar na serial (503 com o estado desconhecido). `porta/liberar` e `porta/negar`
+respondem **409** — se o central voltar a chamá-los, o erro aparece em vez de um
+ACK falso.
+
+**Cadastro de tag** (`R`/`S`/`C`/`L`) é na USB **da porta**, com notebook e
+Monitor Serial, na bancada: as tags moram na NVS dela. O mini PC e o
+`porta-adapter` não participam.

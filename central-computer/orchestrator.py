@@ -2465,12 +2465,19 @@ async def _alarme_porta(fonte: str, tipo: str, descricao: str) -> None:
         logger.warning("[DB] salvar_alarme %s: %s", tipo, e)
 
 
-async def _atender_pedido_acesso(uid: str, geracao: int) -> None:
+async def _atender_pedido_acesso(uid: str, geracao: int,
+                                 autorizada_pela_porta: bool = False) -> None:
     """Para tudo, e SÓ com a parada confirmada autoriza a abertura.
 
     A porta não tem fechadura (é presa por ímã): quem puxa, abre. O que o
     `porta_liberar` faz é acender o "pode abrir" — abertura antes dele é
     abertura SEM autorização, e para a célula do mesmo jeito.
+
+    `autorizada_pela_porta`: a porta em campo (nr12_oficial, §10 do protocolo)
+    decide a tag SOZINHA e acende o "pode abrir" ao mesmo tempo em que manda o
+    pedido — e não recebe nada do PC. Aí o central só PARA: não há o que
+    liberar nem negar, e a parada não confirmada vira alarme dizendo que a
+    abertura já estava autorizada.
 
     A pausa já nasceu em `evento_porta`, na hora em que o pedido chegou; aqui
     fica só o que demora. `geracao` é a da pausa que este pedido abriu: se ela
@@ -2482,6 +2489,14 @@ async def _atender_pedido_acesso(uid: str, geracao: int) -> None:
     if _maquina_ativa():
         confirmada = await _parar_maquina()
     if _porta_geracao != geracao or _pausa_porta is None:
+        return
+    if autorizada_pela_porta:
+        if not confirmada:
+            await _alarme_porta(
+                "porta", "maquina_nao_confirmou_parada",
+                f"A porta JÁ tinha autorizado a abertura (tag {uid}), e a CNC ou os "
+                f"dispensers não confirmaram a parada em "
+                f"{settings.PORTA_PARADA_MAX_S:.1f}s.")
         return
     if confirmada:
         ok = await _post(settings.PORTA_ADAPTER_URL + "/comandos/porta/liberar",
@@ -2664,7 +2679,9 @@ async def evento_porta(payload: dict) -> dict:
         # A pausa nasce AQUI, e não na tarefa: o ciclo que está mandando um
         # `dispensar` neste instante precisa vê-la quando o comando voltar.
         _entrar_em_pausa("pedido_acesso")
-        _agendar_porta(_atender_pedido_acesso(payload.get("uid") or "?", _porta_geracao))
+        _agendar_porta(_atender_pedido_acesso(
+            payload.get("uid") or "?", _porta_geracao,
+            autorizada_pela_porta=bool(payload.get("autorizada_pela_porta"))))
 
     elif tipo == "liberada":
         _porta["estado"] = "LIBERADA"
@@ -2679,8 +2696,14 @@ async def evento_porta(payload: dict) -> dict:
                          aguardando_rearme=True)
         _agendar_porta(_parar_se_ativa("porta_aberta", _porta_geracao))
         if not autorizada:
-            alarmes.append((f"porta_{porta}", "porta_aberta_sem_autorizacao",
-                            f"Porta {porta} aberta SEM autorização (OS "
+            # Sem `porta`: a linha dos fins de curso não chegou a tempo (§10).
+            # A fonte é a genérica — `porta_None` não mandaria ninguém a lugar
+            # nenhum.
+            identificada = porta in PORTAS
+            alarmes.append((f"porta_{porta}" if identificada else "porta",
+                            "porta_aberta_sem_autorizacao",
+                            f"{'Porta ' + porta if identificada else 'Porta não identificada'}"
+                            f" aberta SEM autorização (OS "
                             f"{_os_em_andamento() or 'nenhuma'}) — a célula parou."))
 
     elif tipo == "porta_fechada":

@@ -1168,9 +1168,11 @@ def test_serial_link_nao_conhece_asyncio():
 # 10. As cópias de serial_link.py são a MESMA
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Toda pasta com `serial_link.py`: os adapters de transporte selecionável e o
-# `porta-adapter`, que só tem serial. Eram três; a porta NR-12 trouxe a quarta.
-PASTAS_COM_SERIAL_LINK = sorted({PASTA[n] for n in ADAPTERS_SERIAIS} | {"porta-adapter"})
+# Toda pasta com `serial_link.py`: os adapters de transporte selecionável. A
+# porta NR-12 trouxe uma quarta cópia e a levou embora em 22/10/2026: em campo
+# a porta fala texto e o `porta-adapter` só LÊ (`leitor_linhas.py`, §10) — não
+# há ping, ACK nem `cmd_id` daquele lado. Voltaram a ser três.
+PASTAS_COM_SERIAL_LINK = sorted({PASTA[n] for n in ADAPTERS_SERIAIS})
 
 
 def test_as_copias_de_serial_link_sao_identicas():
@@ -1187,7 +1189,7 @@ def test_as_copias_de_serial_link_sao_identicas():
         pasta: (RAIZ_REPO / pasta / "serial_link.py").read_bytes()
         for pasta in PASTAS_COM_SERIAL_LINK
     }
-    assert len(conteudos) == 4, sorted(conteudos)
+    assert len(conteudos) == 3, sorted(conteudos)
     # Nenhuma cópia escondida em outra pasta, fora desta comparação.
     achadas = sorted(c.parent.name for c in RAIZ_REPO.glob("*/serial_link.py"))
     assert achadas == PASTAS_COM_SERIAL_LINK, achadas

@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-"""O firmware da porta NR-12 — o que só existe nele.
+"""O firmware JSON da porta NR-12 (`porta/porta_nr12/`) — o que só existe nele.
+
+**Não é o que está gravado em campo.** Desde 22/10/2026 a porta em campo é o
+`porta/nr12_oficial/` com o ESP receptor, que falam texto e não recebem nada do
+PC (§10); quem os confere é `tests/test_porta_texto.py`. Este arquivo continua
+cobrando o firmware JSON, que segue no repositório — o texto abaixo descreve
+ESSE firmware, no presente dele.
 
 O que vale para toda placa que inclui `apsen_serial.h` (as quatro cópias
 idênticas, o subsistema declarado, o laço que não lê a serial por conta

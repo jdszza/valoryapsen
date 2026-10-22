@@ -651,13 +651,15 @@ WebSocket, e a mesma linha: transição nunca é filtrada, porque atraso ali é
 atraso de decisão do operador — e porque duas dispensas idênticas são dois fatos,
 não um repetido.
 
-### Quatro cópias de `serial_link.py`, e um teste que as compara
+### Três cópias de `serial_link.py`, e um teste que as compara
 
-O arquivo é idêntico nos quatro adapters com placa — os três daqui e o
-`porta-adapter`, que veio com a USB própria da porta NR-12 —, e
-`tests/test_serial_link.py` reprova se divergirem (e se aparecer uma cópia em
-pasta que a comparação não conhece) — a mesma forma de `tests/test_adapters.py`
-com o `_post_central`.
+O arquivo é idêntico nos três adapters daqui, e `tests/test_serial_link.py`
+reprova se divergirem (e se aparecer uma cópia em pasta que a comparação não
+conhece) — a mesma forma de `tests/test_adapters.py` com o `_post_central`.
+Foram quatro enquanto a porta NR-12 falava o firmware JSON (`porta_nr12`): o
+`porta-adapter` tinha a sua. Em campo a porta fala texto e o adapter só LÊ
+(`leitor_linhas.py`, sem ping, ACK nem `cmd_id` — ver "Em campo a porta decide
+e o PC só escuta"), e a quarta cópia saiu.
 
 Cópia e não `shared/` porque cada adapter tem o seu próprio contexto de build no
 compose (`build: ./cnc-adapter`): compartilhar obrigaria os três a virarem
@@ -665,9 +667,8 @@ compose (`build: ./cnc-adapter`): compartilhar obrigaria os três a virarem
 três imagens e passaria a exigir `.dockerignore`. É a avaliação que a seção "Os
 templates moram no CENTRAL" já registra — com a diferença de que lá a alternativa
 era um GET, e aqui não existe GET que resolva: este código roda antes de haver
-rede. **Se um dia existirem cinco cópias, a conta muda**; com quatro — e a
-quarta sem imagem nenhuma, porque o `porta-adapter` só roda no host —, o teste
-de igualdade continua custando menos que a infraestrutura.
+rede. **Se um dia existirem cinco cópias, a conta muda**; com três, o teste de
+igualdade continua custando menos que a infraestrutura.
 
 O corolário de sempre, e ele mordeu aqui: arquivo novo no adapter exige que o
 Dockerfile o copie. O `weight-adapter` fazia `COPY main.py .` e teria subido sem
@@ -3196,6 +3197,92 @@ ESP da porta ──USB (COMx)──> porta-adapter :8104 ──REST──> centr
 ESP das telas ──USB──> dispenser-adapter :8100 (só telas)
 ```
 
+**Em campo, desde 22/10/2026, o desenho é outro** — ver a subseção logo abaixo.
+O resto desta seção foi escrito para o firmware JSON `porta/porta_nr12/` (que
+continua no repositório); onde ele afirma o contrário do que vale em campo, o
+trecho está marcado como "valia com o porta_nr12", e o porquê ficou.
+
+### Em campo a porta decide e o PC só escuta (22/10/2026)
+
+O firmware da porta mudou FORA do repositório, e agora são **duas ESPs**:
+
+```
+ESP da PORTA (nr12_oficial) ──TX2(17)→RX2(16)──> ESP RECEPTOR ──USB (COMx)──> porta-adapter :8104 ──REST──> central
+RC522 + ES1 teto + ES2 frente                    repassa as linhas, idênticas
+decide a tag SOZINHA
+```
+
+As cópias fiéis do que está gravado nas placas estão em
+`porta/nr12_oficial/nr12_oficial.ino` e `porta/receptor_esp32/receptor_esp32.ino`,
+e **não se editam** — a mesma regra das estações de visão: `tests/test_porta_texto.py`
+fixa o sha256 das duas (com `\r\n` normalizado) e confere o adapter contra
+elas, por texto e com piso, validado por mutação. O contrato é o §10 de
+`docs/PROTOCOLO_SERIAL.md`; o §9 ficou descrevendo o firmware JSON.
+
+**O PC só LÊ.** A porta fala linhas de texto (`EVT:<CODIGO>[;UID=<HEX>] | <texto>`
+e, depois de cada alerta, a linha dos fins de curso `ES1(D4)=… ES2(D18)=…`), e
+não lê o Serial2: nada do PC chega a ela. O `porta-adapter` abre a COM do
+RECEPTOR com o `leitor_linhas.py` — que não tem método de escrita, e um teste por
+AST reprova `write`/`flush`/`send` na pasta inteira — e o `porta_texto.py`,
+PURO, traduz cada linha nos eventos do vocabulário de sempre. O central não
+mudou de lógica: pausa, retomada, rearme, histórico, alarmes, faixa e painel são
+os mesmos, porque os eventos que chegam a `/api/v1/eventos/porta` são os mesmos.
+
+| decisão | quem | por quê |
+|---|---|---|
+| a tag vale | a porta (NVS) | o cadastro é físico, na USB DA PORTA, com notebook |
+| **a abertura é autorizada** | **a porta, sozinha** | a tag acende o LED "pode abrir" e manda `EVT:PAUSA` ao mesmo tempo |
+| a máquina para | o central, ao RECEBER o pedido | porta aberta, pedido de acesso ou link perdido |
+| a máquina retoma | o central, no `rearme` | fechar a porta não religa nada |
+
+**Por que o central não segura mais o "pode abrir".** Com o `porta_nr12` ele
+só mandava `porta_liberar` com a parada CONFIRMADA. A porta de campo não recebe
+nada — não há por onde segurar. O `pedido_acesso` chega com
+`autorizada_pela_porta: true`, e o central faz a única coisa que sobrou: para
+(`_atender_pedido_acesso` com a flag não manda `porta_liberar` nem
+`porta_negar`). Parada não confirmada vira o mesmo `maquina_nao_confirmou_parada`,
+agora dizendo que a porta JÁ tinha autorizado. Pedido sem a flag continua no
+caminho antigo, e há teste dos dois.
+
+**O `estado` é SINTETIZADO, porque a porta não tem heartbeat.** Ela fica muda
+enquanto nada acontece; a vigia antiga ("nenhum `estado` em 2,5 s = link
+perdido") pararia a célula a cada 2,5 s. Link ok passou a ser **a USB do
+receptor aberta E o estado da porta conhecido**, e o adapter reenvia o `estado`
+do MODELO dele (`"fonte": "adapter"`) a cada `PORTA_ESTADO_REENVIO_S` com o
+link ok — é o que satisfaz a vigia de silêncio do central, que existe para notar
+o ADAPTER morto. A USB que cai e volta mais rápido que a vigia também é link
+perdido: o leitor conta as conexões, e o que se sabia da porta é da conexão
+anterior.
+
+**O estado começa DESCONHECIDO.** Não há a quem perguntar. Nada sobe até uma
+linha que o PROVE (BOOT_OK, PAUSA, LIBERACAO_EXPIRADA, PORTA_FECHADA, REARME_OK
+ou um ALERTA_*) — nem a `tag_negada`. "Porta que nunca falou é porta aberta"
+continua valendo, e o custo é o **ritual de subida**: tag (PAUSA prova as duas
+fechadas) → 10 s ou abrir/fechar → tag (REARME_OK) → homing → célula livre. O
+REARME_OK sobe o `estado` FECHADA ANTES do `rearme`, porque é ele que o
+`_bloqueio_da_retomada` confere.
+
+**Qual porta abriu** vem da linha ES que a porta imprime logo depois do
+`ALERTA_*`. O adapter segura o `porta_aberta` até ela (ou até
+`PORTA_ESPERA_SENSORES_S`, 0,3 s) e sobe um por porta aberta; sem a linha, sobe
+com `porta: null`, e o alarme vai para a fonte `porta` ("porta não
+identificada"), nunca `porta_None`. A segunda porta que abre com a primeira já
+aberta não gera linha nenhuma no firmware de campo — só o `PORTA_FECHADA`, com
+as duas.
+
+**O ponto cego, aceito no protótipo:** a ESP da porta travada, ou o fio TX2→RX2
+rompido, COM a porta parada, não é detectável — silêncio é o normal, e o
+receptor continua vivo e calado. O próximo evento real também não chega. Sem
+editar o `.ino` não há como fechar isso; a correção futura é a porta emitir uma
+linha de vida periódica (ex. `EVT:VIVO`) e o adapter voltar a vigiar a idade
+dela. Até lá, um teste de tag antes de começar.
+
+O que saiu do `porta-adapter` junto: `serial_link.py`, ping/pong, ACK,
+`cmd_id`, sessão, `PORTA_ACK_TIMEOUT_S`, `PORTA_HEARTBEAT_MAX_S` e o
+`porta_estado` na reconexão. `POST /comandos/porta/estado` (o rearme recusado)
+reenvia o `estado` do modelo sem tocar na serial; `liberar` e `negar` respondem
+**409** — se o central voltar a chamá-los, o erro aparece em vez de um ACK falso.
+
 ### A porta tem USB e adapter próprios, e não passa pelas telas
 
 Ela já passou: a ESP da porta falava por UART com a placa das 8 telas TFT, que
@@ -3236,7 +3323,10 @@ comandos `/comandos/porta/*` só trocaram de endereço (`PORTA_ADAPTER_URL`), e 
 pré-voo sonda o porta-adapter só com `PORTA_NR12_HABILITADA` — numa célula sem
 porta o serviço não existe e não pode virar item vermelho.
 
-### Quem decide o quê
+### Quem decide o quê (valia com o porta_nr12)
+
+Em campo a autorização é da PORTA — ver a tabela de "Em campo a porta decide e
+o PC só escuta". Esta é a do firmware JSON:
 
 | decisão | quem | por quê |
 |---|---|---|
@@ -3245,7 +3335,8 @@ porta o serviço não existe e não pode virar item vermelho.
 | a máquina para | o central, na hora | porta aberta, pedido de acesso ou link perdido |
 | a máquina retoma | o central, no `rearme` | fechar a porta não religa nada |
 
-**A tag não autoriza sozinha.** A tag gera `pedido_acesso`; o central entra em
+**Com o porta_nr12, a tag não autorizava sozinha** (valia com o porta_nr12; em
+campo, ela autoriza — e o central só para). A tag gera `pedido_acesso`; o central entra em
 pausa PRIMEIRO, manda `parar` à CNC e aos dispensers em `gather`, e só com os
 dois ACKs (e, se havia dispensa saindo, a contagem dela) manda `porta_liberar`,
 que acende o LED "pode abrir" da placa. Sem confirmação em
@@ -3348,11 +3439,16 @@ Três caminhos chegam à retomada, e cada um tem o porquê:
   célula volta ao que fazia. Já `janela_expirou` (liberada, ninguém abriu) exige
   tag: a máquina parou, e só retoma por decisão.
 
-### Link perdido é porta aberta — vigiado em três lugares
+### Link perdido é porta aberta — vigiado em dois lugares
+
+Em campo a porta não tem heartbeat, e o vigia do adapter é só a USB do
+RECEPTOR (mais o estado desconhecido, que segura o link fora até uma linha que o
+prove — ver "Em campo a porta decide e o PC só escuta"). O parágrafo a seguir
+valia com o porta_nr12, e o porquê continua o mesmo.
 
 Ninguém que perde o link consegue avisar que o perdeu, então cada salto tem o
 seu vigia: o `porta-adapter` (USB da porta caída, ou heartbeat mais velho que
-`PORTA_HEARTBEAT_MAX_S`, 2,5 s) e o central (`vigiar_porta`, nada da porta em
+`PORTA_HEARTBEAT_MAX_S`, 2,5 s — variável que saiu com o firmware de campo) e o central (`vigiar_porta`, nada da porta em
 `PORTA_SILENCIO_MAX_S` — o adapter reenvia o `estado` a cada 5 s mesmo sem
 mudança justamente para isso). O adapter soma as duas fontes dele num estado
 só e sobe só a transição — `porta_link_ok` só com o primeiro `estado` depois da
@@ -3400,7 +3496,8 @@ impede ninguém de abrir — e por isso a parada vale para TODA abertura, não s
 para a autorizada.
 
 **Houve um solenoide no desenho, e ele saiu.** O `porta_liberar` energizava uma
-fechadura; hoje ele só autoriza (o LED). Os nomes do protocolo ficaram —
+fechadura; no porta_nr12 ele só autorizava (o LED) — e em campo ele nem desce
+mais: a porta acende o LED sozinha. Os nomes do protocolo ficaram —
 `porta_liberar`, `LIBERADA`, `liberada`, `liberacao_expirada` —, porque o que
 eles descrevem continua o mesmo: a janela em que abrir é combinado. O que sumiu
 é o campo `solenoide` do `estado` e o pino de fechadura do sketch, e

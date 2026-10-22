@@ -1,20 +1,23 @@
 # -*- coding: utf-8 -*-
-"""O contrato da porta NR-12 (§9) — documento × placa falsa × transporte.
+"""O contrato da porta NR-12 — §9 (firmware JSON) e §10 (o que está em campo).
 
-A porta é o quinto firmware da célula, com USB PRÓPRIA no mini PC e um adapter
-só dela (o `porta-adapter`). Ela não entra em `ADAPTERS_SERIAIS` — aquela lista
-é a dos adapters com transporte SELECIONÁVEL (http × serial), e a porta só tem
-serial: não há simulador de porta. Por isso tem este arquivo próprio, com as
-mesmas três cópias de sempre confrontadas:
+**§9** descreve o firmware JSON `porta/porta_nr12/`, que continua no
+repositório mas NÃO está gravado em campo desde 22/10/2026. As seções 1 a 3
+confrontam o documento com a placa falsa dele:
 
   * `docs/PROTOCOLO_SERIAL.md` §9 — o documento;
   * `tests/fakes/placa_porta.py`  — a placa falsa, modelo da máquina de estados
-                                    do firmware;
-  * `porta-adapter/main.py`       — quem manda o comando (seção 4).
+                                    do firmware JSON;
+  * o transporte exercitado de verdade, por `socket://`, com o `serial_link`
+    do outro lado do fio: ping/pong, o comando `porta_*` descendo com o ACK da
+    porta, e a porta que para de falar.
 
-E o transporte é exercitado de verdade, por `socket://`, com o `serial_link`
-do outro lado do fio: ping/pong, o comando `porta_*` descendo com o ACK da
-porta, e a porta que para de falar.
+A antiga seção 4 ("documento × adapter — quem MANDA o comando") saiu: o
+`porta-adapter` não manda mais comando nenhum (§10).
+
+**§10** é o contrato de campo: a porta fala texto, o adapter só lê e traduz.
+A seção 4 daqui confronta a tabela do §10 com `porta-adapter/porta_texto.py` —
+os códigos `EVT:` tratados e os eventos que sobem.
 """
 from __future__ import annotations
 
@@ -202,9 +205,10 @@ def test_janela_vencida_entra_em_rearme_e_central_mudo_nao():
 
 pytest.importorskip("serial", reason="pyserial (tests/requirements-dev.txt)")
 
-# A cópia de `serial_link.py` que a porta usa. As cinco são idênticas
-# (`tests/test_serial_link.py`), então o que muda é só de qual pasta ela vem.
-PASTA_SERIAL_LINK = "porta-adapter"
+# A cópia de `serial_link.py` que o firmware JSON usaria. O `porta-adapter`
+# não tem mais a dele (em campo ele só lê texto, §10); as três que sobraram são
+# idênticas (`tests/test_serial_link.py`), então qualquer uma serve.
+PASTA_SERIAL_LINK = "cnc-adapter"
 
 
 @pytest.fixture
@@ -325,39 +329,70 @@ def test_porta_que_para_de_falar_some_do_fio_inteira(montagem):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. Documento × adapter — quem MANDA o comando
+# 4. §10 × tradutor — o que está em campo
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _adapter():
-    return ast.parse((RAIZ_REPO / "porta-adapter" / "main.py").read_text(encoding="utf-8"))
+TRADUTOR = RAIZ_REPO / "porta-adapter" / "porta_texto.py"
 
 
-def adapter_comandos_porta() -> set[str]:
-    for no in ast.walk(_adapter()):
+def _secao_10() -> str:
+    texto = DOC.read_text(encoding="utf-8")
+    return texto.split("## 10. Porta NR-12 em campo", 1)[1].split("\n## ", 1)[0]
+
+
+def _tabela_10() -> list[list[str]]:
+    bloco = _secao_10().split("### Tradução", 1)[1].split("### ", 1)[0]
+    linhas = []
+    for crua in bloco.splitlines():
+        crua = crua.strip()
+        if crua.startswith("|") and not crua.startswith("|---"):
+            linhas.append([c.strip() for c in crua.strip("|").split("|")])
+    return linhas[1:]                       # sem o cabeçalho
+
+
+def doc10_codigos() -> set[str]:
+    return {c for linha in _tabela_10() for c in re.findall(r"`EVT:(\w+)`", linha[0])}
+
+
+def doc10_eventos() -> set[str]:
+    return {e for linha in _tabela_10() for e in re.findall(r"`(\w+)`", linha[2])}
+
+
+def _constante(arvore, nome: str) -> set[str]:
+    for no in ast.walk(arvore):
         if (isinstance(no, ast.Assign) and isinstance(no.targets[0], ast.Name)
-                and no.targets[0].id == "_COMANDOS_PORTA"):
-            return {c.value for c in no.value.keys}
+                and no.targets[0].id == nome):
+            return {e.value for e in no.value.elts}
     return set()
 
 
-def adapter_campos_porta() -> dict[str, set[str]]:
-    enviados = {}
-    for no in ast.walk(_adapter()):
-        if (isinstance(no, ast.Call) and isinstance(no.func, ast.Name)
-                and no.func.id == "_enviar_porta" and len(no.args) == 2
-                and isinstance(no.args[0], ast.Constant)
-                and isinstance(no.args[1], ast.Dict)):
-            enviados[no.args[0].value] = {c.value for c in no.args[1].keys}
-    return enviados
+def tradutor_codigos() -> set[str]:
+    arvore = ast.parse(TRADUTOR.read_text(encoding="utf-8"))
+    return _constante(arvore, "CODIGOS_QUE_SOBEM") | _constante(arvore, "CODIGOS_DE_BANCADA")
 
 
-def test_o_adapter_manda_exatamente_os_comandos_documentados():
-    assert adapter_comandos_porta() == set(doc_comandos())
-    assert set(adapter_campos_porta()) == set(doc_comandos()), (
-        "todo comando documentado tem de ter uma rota que o envie")
+def tradutor_eventos() -> set[str]:
+    """O primeiro argumento de toda chamada `self._ev("tipo", ...)`."""
+    arvore = ast.parse(TRADUTOR.read_text(encoding="utf-8"))
+    return {no.args[0].value for no in ast.walk(arvore)
+            if isinstance(no, ast.Call) and isinstance(no.func, ast.Attribute)
+            and no.func.attr == "_ev" and no.args and isinstance(no.args[0], ast.Constant)}
 
 
-def test_os_campos_que_o_adapter_envia_sao_os_documentados():
-    documentado = doc_comandos()
-    for cmd, campos in adapter_campos_porta().items():
-        assert campos == set(documentado[cmd]), cmd
+def test_os_extratores_enxergam_a_secao_10():
+    """Guarda da guarda, com piso: 14 códigos e 9 eventos hoje."""
+    assert len(doc10_codigos()) >= 14 and len(tradutor_codigos()) >= 14
+    assert len(doc10_eventos()) >= 9 and len(tradutor_eventos()) >= 9
+
+
+def test_a_secao_10_lista_exatamente_os_codigos_que_o_tradutor_trata():
+    assert doc10_codigos() == tradutor_codigos()
+
+
+def test_a_secao_10_lista_exatamente_os_eventos_que_o_tradutor_sobe():
+    assert doc10_eventos() == tradutor_eventos()
+
+
+def test_os_eventos_do_tradutor_sao_do_vocabulario_da_secao_9():
+    """O central não mudou de vocabulário: todo evento que sobe já existia."""
+    assert tradutor_eventos() <= set(doc_eventos())

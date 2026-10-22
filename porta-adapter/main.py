@@ -1,36 +1,43 @@
 """
-APSEN - Porta Adapter v1.0
-Bridge bidirecional entre o Computador Central e a porta NR-12.
+APSEN - Porta Adapter v2.0
+Tradutor SÓ DE LEITURA entre a porta NR-12 em campo e o Computador Central.
 
-Fluxo entrada (← Central):
-  POST /comandos/porta/liberar  → `porta_liberar` na placa da porta
-  POST /comandos/porta/negar    → `porta_negar`
-  POST /comandos/porta/estado   → `porta_estado`
+Em campo, desde 22/10/2026, a porta são DUAS ESPs (`docs/PROTOCOLO_SERIAL.md`
+§10):
 
-Fluxo saída (← porta):
-  eventos da placa              → POST /api/v1/eventos/porta no central
+    ESP da PORTA (nr12_oficial) ──Serial2──> ESP RECEPTOR ──USB (COMx)──> este adapter ──REST──> central
+    RC522 + ES1 teto + ES2 frente           repassa as linhas, idênticas
+    decide a tag SOZINHA
 
-A placa da porta (RC522 + fins de curso ES1 teto / ES2 frente + LED "pode
-abrir") tem USB PRÓPRIA no mini PC, e este processo é o dono dela
-(`docs/PROTOCOLO_SERIAL.md` §9). Ela já falou por UART com a placa das 8 telas
-TFT, que repassava tudo ao dispenser-adapter; o desenho saiu, e a lógica que
-morava lá veio para cá sem mudar de comportamento. A razão é de segurança:
-travar ou regravar a placa das telas cegava a vigia da porta — e link perdido
-é porta aberta, a célula inteira parada por causa de uma tela. Com um processo
-e uma COM só dela, a porta tem o seu `/health` e cai sozinha.
+A porta fala linhas de TEXTO (`EVT:<CODIGO>[;UID=<HEX>] | <texto>` e a linha
+dos fins de curso), não JSON, e a tag autoriza a abertura SOZINHA: o LED "pode
+abrir" acende ao mesmo tempo em que o `EVT:PAUSA` sai. Este adapter abre a COM
+do RECEPTOR, lê, e TRADUZ cada linha nos eventos do vocabulário de sempre
+(`porta_texto.py`), que sobem a `POST /api/v1/eventos/porta` como antes. O
+central não precisou mudar de lógica — só ganhou a flag `autorizada_pela_porta`.
 
-Só há UM transporte, o serial. Os outros adapters têm `<SUB>_TRANSPORTE=http`
-como default porque têm simulador; a porta não tem — fingir um ACK aqui faria o
-central autorizar uma porta imaginária. Por isso este serviço não está no
-compose: ele roda no host, como os outros adapters com placa (o Docker
-Desktop do Windows não repassa COM para container), por `iniciar_host.bat`.
+**Nada desce.** Nem à porta, nem ao receptor: não há `porta_liberar`,
+`porta_negar`, `porta_estado`, ping, pong, ACK nem `cmd_id`, e o leitor
+(`leitor_linhas.py`) não tem método de escrita. A porta em campo é autônoma, e
+um byte que descesse por engano poderia pô-la em modo registro.
 
-O adapter traduz TRANSPORTE, não decide nada da porta: o conteúdo atravessa
-cru, na ordem em que chegou. O que ele soma é o LINK — a USB da porta e a
-idade do último heartbeat viram UM estado, e só a transição sobe.
+**Não há heartbeat**, e isso muda o que é "link": a porta fica muda enquanto
+nada acontece. Link ok = a USB do receptor aberta E o estado da porta
+CONHECIDO — e o estado começa desconhecido, porque não há a quem perguntar.
+Nada sobe até uma linha que o prove. Com o link ok, o `estado` é SINTETIZADO
+a partir do modelo e reenviado a cada `PORTA_ESTADO_REENVIO_S`: é o que mantém
+a vigia de silêncio do central satisfeita.
+
+**O ponto cego**, aceito no protótipo: a ESP da porta travada, ou o fio
+TX2→RX2 rompido, COM a porta parada, não é detectável — silêncio é o normal, e
+a USB do receptor de pé não prova nada sobre a porta. A correção exige regravar
+a porta (uma linha de vida periódica, ex. `EVT:VIVO`).
+
+Roda no host (o Docker Desktop do Windows não repassa COM para container), por
+`iniciar_host.bat`, e não há simulador: fingir a porta faria o central confiar
+numa porta imaginária.
 """
 import asyncio
-import json
 import logging
 import os
 import time
@@ -39,9 +46,9 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
 
-import serial_link
+import leitor_linhas
+import porta_texto
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [PORTA-ADAPTER] %(levelname)s %(message)s")
@@ -50,41 +57,32 @@ logger = logging.getLogger(__name__)
 CENTRAL_URL          = os.getenv("CENTRAL_URL",   "http://central-computer:8000")
 TIMEOUT_EVENT        = float(os.getenv("TIMEOUT_EVENT", "5"))
 
-SUBSISTEMA           = "porta"
 SERIAL_URL           = os.getenv("PORTA_SERIAL_URL", "").strip()
 SERIAL_BAUD          = int(os.getenv("PORTA_SERIAL_BAUD", "115200"))
-ACK_TIMEOUT_S        = float(os.getenv("PORTA_ACK_TIMEOUT_S", "2"))
 
-# Heartbeat da porta mais velho que isto = link perdido, mesmo com a USB de pé:
-# a placa travou e parou de falar. São cinco heartbeats de 500 ms — folga para
-# um atraso de escalonamento do host sem virar parada da célula por ruído.
-PORTA_HEARTBEAT_MAX_S = float(os.getenv("PORTA_HEARTBEAT_MAX_S", "2.5"))
-# O heartbeat chega a cada 500 ms e não sobe a cada 500 ms: sobe na MUDANÇA e,
-# sem mudança, no máximo a cada tanto — como sinal de vida. É ele que deixa o
-# central distinguir "porta parada, tudo fechado" de "adapter morto".
+# O `estado` sintetizado é reenviado a cada tanto com o link ok, mesmo sem
+# mudança — a porta não tem heartbeat, e é este reenvio que deixa o central
+# distinguir "porta parada, tudo fechado" de "adapter morto".
 PORTA_ESTADO_REENVIO_S = float(os.getenv("PORTA_ESTADO_REENVIO_S", "5"))
+# Quanto o `porta_aberta` espera a linha dos fins de curso, que diz QUAL porta
+# abriu. Ela sai na mesma volta do `loop()` da porta, a poucos ms.
+PORTA_ESPERA_SENSORES_S = float(os.getenv("PORTA_ESPERA_SENSORES_S", "0.3"))
 
 ROTA_EVENTOS         = "/api/v1/eventos/porta"
 
 _client: httpx.AsyncClient | None = None
-_link: "serial_link.LinkSerial | None" = None
+_leitor: "leitor_linhas.LeitorLinhas | None" = None
 _loop: asyncio.AbstractEventLoop | None = None
+_modelo = porta_texto.ModeloPorta()
 
 
 def _exigir_url(url: str, variavel: str) -> None:
     """Sem porta fixada, este serviço RECUSA subir.
 
-    Com a URL vazia o `serial_link` varre TODAS as portas, e cada sondagem abre
-    a porta por até `PROBE_ASSENTAR_S + PROBE_ESPERA_S` (~9,5 s). Na célula
-    montada são cinco placas e cinco processos: enquanto um deles segura a COM
-    da CNC para conferir, o cnc-adapter toma `ACCESS_DENIED` na própria — boot
-    não-determinístico em que uma placa às vezes não é achada, e o log de cada
-    processo mostra só a metade dele.
-
-    Recusar é a resposta certa AQUI, e não um aviso: este processo existe para
-    falar com UMA porta, e sem ela não faz nada de útil. E, ao contrário dos
-    outros adapters, não há transporte http para cair: a varredura nem é uma
-    opção, porque a porta é a única placa deste serviço e ela tem COM fixa.
+    Na célula montada são cinco placas e cinco processos, e uma varredura
+    abriria as COMs dos outros — boot não-determinístico em que uma placa às
+    vezes não é achada. Este processo existe para ler UMA porta, a do receptor,
+    e sem ela não faz nada de útil.
     """
     if not url:
         raise RuntimeError(
@@ -97,29 +95,26 @@ def _exigir_url(url: str, variavel: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _client, _link, _loop
+    global _client, _leitor, _loop
     _exigir_url(SERIAL_URL, "PORTA_SERIAL_URL")
     _client = httpx.AsyncClient()
     _loop = asyncio.get_running_loop()
-    logger.info("[STARTUP] porta serial %s @ %d | central %s",
+    logger.info("[STARTUP] receptor da porta em %s @ %d (só leitura) | central %s",
                 SERIAL_URL, SERIAL_BAUD, CENTRAL_URL)
-    _link = serial_link.LinkSerial(
-        subsistema=SUBSISTEMA, url=SERIAL_URL, baud=SERIAL_BAUD,
-        ack_timeout_s=ACK_TIMEOUT_S, ao_receber_evento=_evento_da_placa,
-    )
-    _link.iniciar()
-    # Sem esperar a placa: ela pode não estar plugada, e o adapter tem que
-    # subir assim mesmo para o /ping responder. Quem conta a verdade sobre a
-    # porta é o /health — e, para o central, a vigia abaixo.
+    _leitor = leitor_linhas.LeitorLinhas(SERIAL_URL, _linha_da_usb, baud=SERIAL_BAUD)
+    _leitor.iniciar()
+    logger.info("[STARTUP] estado da porta DESCONHECIDO até a primeira linha que o "
+                "prove — passe a tag.")
+    # Sem esperar a placa: o /ping tem de responder com o receptor fora.
     vigia = asyncio.create_task(_laco_vigia_porta())
     yield
     vigia.cancel()
-    _link.parar()
+    _leitor.parar()
     await _client.aclose()
     logger.info("[SHUTDOWN] httpx.AsyncClient encerrado")
 
 
-app = FastAPI(title="APSEN Porta Adapter v1.0", lifespan=lifespan)
+app = FastAPI(title="APSEN Porta Adapter v2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -163,31 +158,31 @@ async def _post_central(payload: dict) -> bool:
     return False
 
 
-# ── A porta NR-12: o link é UM estado, e só a transição sobe ─────────────────
+# ── A porta: o link é UM estado, e só a transição sobe ───────────────────────
 
 def _porta_vazia() -> dict:
     return {
-        # None = ainda não se sabe (boot). Só `True` depois do primeiro `estado`.
+        # None = ainda não se sabe (boot). True só com a USB aberta E o estado
+        # da porta conhecido.
         "link_ok": None,
-        "ultimo_estado": None,
-        "ultimo_estado_em": None,       # monotonic
-        "ultimo_estado_ts": None,       # o `ts` da placa, para o /health
-        "encaminhado_em": None,         # monotonic do último `estado` que subiu
-        "assinatura_encaminhada": None,
         "usb_conectada": None,
-        "desde": time.monotonic(),
+        # A conexão da USB a que o que se sabe da porta pertence. Outra
+        # conexão = a USB caiu e voltou, talvez mais rápido que a vigia.
+        "conexao": None,
+        "ultima_linha_porta_em": None,      # monotonic
+        "estado_enviado_em": None,          # monotonic do último `estado` que subiu
         "eventos": 0,
         "perdas": 0,
+        "linhas_receptor": 0,
+        "linhas_desconhecidas": 0,
     }
 
 
 _porta: dict = _porta_vazia()
-# Serializa o TRATAMENTO inteiro de cada evento, e não só cada POST: o
-# `porta_link_ok` tem de chegar ANTES do `estado` que o provou, e nenhum evento
-# seguinte pode se intercalar entre os dois. Dois `run_coroutine_threadsafe`
-# seguidos se cruzariam no `await` do POST; `asyncio.Lock` é FIFO, então a
-# ordem em que as linhas chegaram da placa é a ordem em que sobem. Criado no
-# loop, na primeira vez.
+# Serializa o TRATAMENTO inteiro de cada linha, e não só cada POST: o
+# `porta_link_ok` tem de chegar ANTES dos eventos da linha que o provou, e o
+# `estado` do REARME_OK antes do `rearme`. `asyncio.Lock` é FIFO, então a ordem
+# em que as linhas chegaram do receptor é a ordem em que sobem.
 _porta_lock: "asyncio.Lock | None" = None
 
 
@@ -202,127 +197,115 @@ def _ts_agora() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
 
 
-def _assinatura(payload: dict) -> str:
-    return json.dumps({k: v for k, v in payload.items() if k != "ts"},
-                      sort_keys=True, ensure_ascii=False, default=str)
-
-
 async def _postar_porta(payload: dict) -> bool:
     """Sobe um evento. Só é chamado com `_ordem()` já tomado."""
+    _porta["eventos"] += 1
+    if payload.get("tipo") == "estado":
+        _porta["estado_enviado_em"] = time.monotonic()
+    else:
+        logger.info("[PORTA] → %s %s", payload.get("tipo"),
+                    {k: v for k, v in payload.items() if k not in ("origem", "tipo", "ts")})
     ok = await _post_central(payload)
     if not ok:
         logger.warning("[PORTA] evento '%s' não chegou ao Central.", payload.get("tipo"))
     return ok
 
 
-async def _porta_link_perdido(motivo: str) -> None:
-    """Link perdido = porta aberta, para o central. Sobe UMA vez por queda."""
-    async with _ordem():
-        await _link_perdido_sob_ordem(motivo)
-
-
 async def _link_perdido_sob_ordem(motivo: str) -> None:
+    """Link perdido = porta aberta, para o central. Sobe UMA vez por queda, e
+    o que se sabia da porta deixa de valer."""
+    _modelo.esquecer()
+    _porta["estado_enviado_em"] = None
     if _porta["link_ok"] is False:
         return
     _porta["link_ok"] = False
     _porta["perdas"] += 1
-    _porta["assinatura_encaminhada"] = None   # o próximo `estado` sobe sempre
-    logger.warning("[PORTA] link da porta PERDIDO — %s.", motivo)
+    logger.warning("[PORTA] link da porta PERDIDO — %s. Estado volta a "
+                   "DESCONHECIDO até uma linha que o prove (passe a tag).", motivo)
     await _postar_porta({"origem": "porta", "tipo": "porta_link_perdido",
                          "ts": _ts_agora()})
 
 
-async def _tratar_evento_porta(payload: dict) -> None:
-    """Um evento da placa da porta, já no event loop.
+async def _conferir_conexao(numero: int) -> None:
+    if _porta["conexao"] is not None and numero != _porta["conexao"]:
+        await _link_perdido_sob_ordem("a USB do receptor caiu e voltou")
+    _porta["conexao"] = numero
 
-    O conteúdo sobe CRU. As duas únicas decisões são de transporte: o link e o
-    heartbeat repetido.
-    """
+
+async def _tratar_linha(texto: str, agora: float, conexao: int = 0) -> None:
+    """Uma linha da USB do receptor, já no event loop."""
     async with _ordem():
-        await _tratar_sob_ordem(payload)
+        await _tratar_sob_ordem(texto, agora, conexao)
 
 
-async def _tratar_sob_ordem(payload: dict) -> None:
-    _porta["eventos"] += 1
-    tipo = payload.get("tipo")
-
-    if tipo in ("porta_link_perdido", "porta_link_ok"):
-        # Os dois são DESTE adapter. Vindos da placa, são de um firmware antigo
-        # (ou da placa das telas, que repassava a porta): o link é decidido
-        # aqui, e subir a opinião dela duplicaria a transição no central.
-        logger.warning("[PORTA] '%s' vindo da placa ignorado — a vigia do link "
-                       "é deste adapter.", tipo)
+async def _tratar_sob_ordem(texto: str, agora: float, conexao: int) -> None:
+    await _conferir_conexao(conexao)
+    linha = porta_texto.interpretar_linha(texto)
+    if linha is None:
+        if porta_texto.linha_do_receptor(texto):
+            _porta["linhas_receptor"] += 1
+        else:
+            _porta["linhas_desconhecidas"] += 1
+        logger.debug("[RECEPTOR] %s", texto)
         return
+    if linha.tipo == "receptor_sem_dados":
+        logger.warning("[RECEPTOR] %s", texto.strip())
+    else:
+        _porta["ultima_linha_porta_em"] = agora
+        logger.info("[PORTA] %s", texto.strip())
 
-    if tipo == "estado":
-        agora = time.monotonic()
-        _porta["ultimo_estado"] = payload
-        _porta["ultimo_estado_em"] = agora
-        _porta["ultimo_estado_ts"] = payload.get("ts")
-        if _porta["link_ok"] is not True:
-            _porta["link_ok"] = True
-            logger.info("[PORTA] link da porta OK.")
-            await _postar_porta({"origem": "porta", "tipo": "porta_link_ok",
-                                 "ts": _ts_agora()})
-        assinatura = _assinatura(payload)
-        repetido = assinatura == _porta["assinatura_encaminhada"]
-        recente = (_porta["encaminhado_em"] is not None
-                   and agora - _porta["encaminhado_em"] < PORTA_ESTADO_REENVIO_S)
-        if repetido and recente:
-            return
-        _porta["assinatura_encaminhada"] = assinatura
-        _porta["encaminhado_em"] = agora
-
-    logger.info("[PORTA] %s %s", tipo,
-                {k: v for k, v in payload.items() if k not in ("origem", "tipo", "ts")})
-    await _postar_porta(payload)
+    eventos = _modelo.aplicar(linha, agora, ts=_ts_agora())
+    if _modelo.conhecido and _porta["link_ok"] is not True:
+        _porta["link_ok"] = True
+        logger.info("[PORTA] estado da porta CONHECIDO — link ok.")
+        await _postar_porta({"origem": "porta", "tipo": "porta_link_ok",
+                             "ts": _ts_agora()})
+    for evento in eventos:
+        await _postar_porta(evento)
 
 
-def _evento_da_placa(payload: dict) -> None:
-    """Chamado NA THREAD LEITORA do `serial_link` — nunca no event loop.
+def _linha_da_usb(texto: str) -> None:
+    """Chamado NA THREAD LEITORA — nunca no event loop.
 
     O salto para o loop é `run_coroutine_threadsafe`, na ordem em que as linhas
     chegaram: é o que deixa o `_post_central` (httpx async, com o retry que a
-    suíte cobra) ser o mesmo dos outros adapters, em vez de ganhar uma segunda
-    implementação síncrona.
+    suíte cobra) ser o mesmo dos outros adapters. O instante e a conexão são
+    capturados AQUI, na chegada, e não quando o loop chegar à linha.
     """
-    if not isinstance(payload, dict) or not isinstance(payload.get("tipo"), str):
-        logger.warning("[SERIAL] evento fora do contrato, descartado: %r", payload)
-        return
     loop = _loop
     if loop is None:
-        logger.warning("[SERIAL] evento chegou antes do event loop — descartado.")
+        logger.warning("[RECEPTOR] linha chegou antes do event loop — descartada.")
         return
-    asyncio.run_coroutine_threadsafe(_tratar_evento_porta(payload), loop)
+    conexao = getattr(_leitor, "conexoes", 0)
+    asyncio.run_coroutine_threadsafe(_tratar_linha(texto, time.monotonic(), conexao), loop)
 
 
 async def _vigiar_porta_uma_vez() -> None:
-    """Uma rodada da vigia: USB da porta e idade do heartbeat.
+    """Uma rodada da vigia: USB do receptor, `porta_aberta` sem a linha dos
+    fins de curso no prazo, e o reenvio do `estado` sintetizado.
 
-    Separada do laço para que a suíte a chame sem esperar relógio. Ninguém do
-    outro lado do cabo avisa que caiu — quem perdeu o link não tem como dizer
-    que o perdeu —, então quem vigia é este lado.
+    Separada do laço para que a suíte a chame sem esperar relógio. Não há
+    vigia de heartbeat: a porta não tem heartbeat.
     """
-    conectada = bool(_link is not None and _link.conectado)
-    antes = _porta["usb_conectada"]
+    conectada = bool(_leitor is not None and _leitor.conectado)
     _porta["usb_conectada"] = conectada
-
-    if not conectada:
-        await _porta_link_perdido("a USB da porta caiu")
-        return
-    if antes is False:
-        # A USB voltou: pede um `estado` na hora em vez de esperar o próximo
-        # heartbeat. O `porta_link_ok` só sobe com o `estado` que chegar.
-        logger.info("[PORTA] USB da porta de volta — pedindo `porta_estado`.")
-        try:
-            await asyncio.to_thread(_link.enviar_comando, "porta_estado", {})
-        except serial_link.ErroLink as exc:
-            logger.warning("[PORTA] porta_estado na reconexão falhou: %s", exc)
-
-    referencia = _porta["ultimo_estado_em"] or _porta["desde"]
-    if _porta["link_ok"] is not False and time.monotonic() - referencia > PORTA_HEARTBEAT_MAX_S:
-        await _porta_link_perdido(
-            f"nenhum `estado` da porta há mais de {PORTA_HEARTBEAT_MAX_S:.1f}s")
+    async with _ordem():
+        if not conectada:
+            _porta["conexao"] = None
+            await _link_perdido_sob_ordem("a USB do receptor caiu")
+            return
+        await _conferir_conexao(getattr(_leitor, "conexoes", 0))
+        agora = time.monotonic()
+        for evento in _modelo.vencer_pendente(agora, PORTA_ESPERA_SENSORES_S,
+                                              ts=_ts_agora()):
+            await _postar_porta(evento)
+        if _porta["link_ok"] is not True:
+            return
+        enviado = _porta["estado_enviado_em"]
+        if enviado is None or agora - enviado >= PORTA_ESTADO_REENVIO_S:
+            estado = _modelo.estado_evento(_ts_agora())
+            if estado is not None:
+                await _postar_porta(estado)
 
 
 async def _laco_vigia_porta() -> None:
@@ -334,84 +317,56 @@ async def _laco_vigia_porta() -> None:
         await asyncio.sleep(0.25)
 
 
-# ── Comandos (Central → Adapter → porta) ──────────────────────────────────────
+# ── Comandos (Central → Adapter) — nenhum desce às ESPs ───────────────────────
 
-# Os três comandos da porta. O NOME é o `cmd` da linha serial, e o mesmo do §9
-# — nada é traduzido no caminho.
-_COMANDOS_PORTA = {
-    "porta_liberar": "/comandos/porta/liberar",
-    "porta_negar":   "/comandos/porta/negar",
-    "porta_estado":  "/comandos/porta/estado",
-}
-
-
-async def _enviar_porta(comando: str, payload: dict) -> dict:
-    """Comando à porta. Recusa da placa é 502, placa inalcançável é 503 — os
-    mesmos de todo adapter: o orquestrador não distingue um do outro."""
-    if _link is None:
-        raise HTTPException(503, "Porta NR-12: transporte serial não iniciado")
-    try:
-        # `enviar_comando` BLOQUEIA até o ACK, e `Serial.write`/`read` são
-        # síncronos: chamá-los no event loop congelaria o adapter inteiro,
-        # inclusive o /ping. `tests/test_porta_adapter.py` cobra por AST.
-        return await asyncio.to_thread(_link.enviar_comando, comando, payload)
-    except serial_link.AckNegativo as exc:
-        raise HTTPException(502, f"Porta recusou '{comando}': {exc}")
-    except serial_link.ErroLink as exc:
-        raise HTTPException(503, f"Porta indisponível: {exc}")
-
-
-class PortaLiberarReq(BaseModel):
-    janela_ms: int
-
-    @field_validator("janela_ms")
-    @classmethod
-    def _faixa(cls, v: int) -> int:
-        # A placa limita 1..60 s; recusar aqui é 422 com o nome do campo, em
-        # vez de a placa corrigir em silêncio um número que alguém digitou.
-        if not 1000 <= v <= 60000:
-            raise ValueError("janela_ms deve ser 1000-60000")
-        return v
-
-
-class PortaNegarReq(BaseModel):
-    motivo: str
-
-
-@app.post("/comandos/porta/liberar")
-async def cmd_porta_liberar(req: PortaLiberarReq):
-    logger.info("[CMD] PORTA LIBERAR janela=%d ms", req.janela_ms)
-    resultado = await _enviar_porta("porta_liberar", {"janela_ms": req.janela_ms})
-    return {"ok": True, "porta": resultado}
-
-
-@app.post("/comandos/porta/negar")
-async def cmd_porta_negar(req: PortaNegarReq):
-    logger.info("[CMD] PORTA NEGAR motivo=%s", req.motivo)
-    # 60 é o que cabe no `MAX_MOTIVO_LEN` (64) do firmware, com folga.
-    resultado = await _enviar_porta("porta_negar", {"motivo": req.motivo[:60]})
-    return {"ok": True, "porta": resultado}
+_ESTADO_DESCONHECIDO = "estado da porta ainda desconhecido — passe a tag"
+_PORTA_AUTONOMA = ("porta autônoma: a autorização é da própria porta e nada é "
+                   "enviado às ESPs")
 
 
 @app.post("/comandos/porta/estado")
 async def cmd_porta_estado():
-    resultado = await _enviar_porta("porta_estado", {})
-    return {"ok": True, "porta": resultado}
+    """O central pede um `estado` (rearme recusado): ele sai do MODELO, sem
+    tocar na serial — não há a quem perguntar."""
+    async with _ordem():
+        estado = _modelo.estado_evento(_ts_agora()) if _porta["link_ok"] is True else None
+        if estado is None:
+            raise HTTPException(503, _ESTADO_DESCONHECIDO)
+        await _postar_porta(estado)
+    return {"ok": True, "enviado_a_placa": False}
+
+
+@app.post("/comandos/porta/liberar")
+async def cmd_porta_liberar():
+    """409, e não um ACK falso: se o central voltar a pedir para liberar, o
+    erro aparece em vez de ele achar que acendeu um LED."""
+    raise HTTPException(409, _PORTA_AUTONOMA)
+
+
+@app.post("/comandos/porta/negar")
+async def cmd_porta_negar():
+    raise HTTPException(409, _PORTA_AUTONOMA)
 
 
 # ── Diagnóstico ───────────────────────────────────────────────────────────────
 
 def _estado_porta_health() -> dict:
-    ultimo = _porta["ultimo_estado_em"]
+    ultima = _porta["ultima_linha_porta_em"]
     return {
         "link_ok": _porta["link_ok"],
         "usb_conectada": _porta["usb_conectada"],
-        "ultimo_heartbeat_ts": _porta["ultimo_estado_ts"],
-        "idade_heartbeat_s": None if ultimo is None else round(time.monotonic() - ultimo, 2),
-        "heartbeat_max_s": PORTA_HEARTBEAT_MAX_S,
-        "ultimo_estado": _porta["ultimo_estado"],
+        "estado_conhecido": _modelo.conhecido,
+        "modelo": _modelo.resumo(),
+        "idade_ultima_linha_porta_s": None if ultima is None
+        else round(time.monotonic() - ultima, 2),
+        "ultimo_codigo_bancada": _modelo.ultimo_codigo_bancada,
+        "receptor_sem_dados": _modelo.receptor_sem_dados,
+        "linhas_desconhecidas": _porta["linhas_desconhecidas"],
+        "codigos_desconhecidos": _modelo.codigos_desconhecidos,
+        "linhas_receptor": _porta["linhas_receptor"],
         "eventos": _porta["eventos"],
         "perdas_de_link": _porta["perdas"],
+        "reenvio_estado_s": PORTA_ESTADO_REENVIO_S,
     }
 
 
@@ -422,12 +377,8 @@ def ping():
 
 @app.get("/health")
 async def health():
-    """Diagnóstico: o central e a porta — nunca no /ping.
-
-    O /ping diz que este processo está de pé, e é o que o pré-voo sonda;
-    atrelá-lo ao hardware faria um cabo solto parecer um processo morto, e
-    "inicie o .bat" seria a ação errada para um cabo solto.
-    """
+    """Diagnóstico: o central, a USB do receptor e o estado da porta — nunca
+    no /ping, que diz só que este processo está de pé."""
     checks: dict[str, str] = {}
     try:
         r = await _client.get(CENTRAL_URL + "/ping", timeout=3.0)
@@ -435,11 +386,11 @@ async def health():
     except Exception as exc:
         checks["central-computer"] = f"erro: {exc}"
 
-    estado = _link.estado() if _link is not None else {"conectado": False}
-    checks["placa-porta"] = "ok" if estado.get("conectado") else "desconectada"
-    porta = _estado_porta_health()
-    checks["link-porta"] = "ok" if porta["link_ok"] is True else "perdido"
-
-    ok = all(v == "ok" for v in checks.values())
+    serial = _leitor.estado() if _leitor is not None else {"conectado": False}
+    checks["receptor-usb"] = "ok" if serial.get("conectado") else "desconectada"
+    checks["estado-porta"] = ("conhecido" if _modelo.conhecido
+                              else "desconhecido — passe a tag")
+    ok = (checks["central-computer"] == "ok" and checks["receptor-usb"] == "ok"
+          and _modelo.conhecido)
     return {"status": "ok" if ok else "degradado", "checks": checks,
-            "serial": estado, "porta": porta}
+            "serial": serial, "porta": _estado_porta_health()}
