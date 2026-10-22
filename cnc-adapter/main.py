@@ -181,9 +181,15 @@ class ComandoMoverReq(BaseModel):
         # A faixa A–J é a da NVS da placa (dez slots, uma por ordem padrão).
         # Recusar aqui é 422 na hora; deixar passar custaria a ida à placa para
         # voltar com `receita_desconhecida` — o mesmo "não", mais caro.
+        # Vazia é a OS personalizada do console: ela não tem roteiro gravado,
+        # e a placa acha a parada pelo `dispenser_alvo` (loga `-`). Vazia vai
+        # vazia na linha serial — nunca uma letra emprestada de outra ordem.
         v = (v or "").strip().upper()
+        if v == "":
+            return v
         if len(v) != 1 or not "A" <= v <= "J":
-            raise ValueError("receita deve ser uma letra de A a J")
+            raise ValueError("receita deve ser uma letra de A a J, ou vazia "
+                             "(OS personalizada)")
         return v
 
     @field_validator("dispenser_alvo")
@@ -396,7 +402,7 @@ async def health():
 @app.post("/comandos/mover")
 async def cmd_mover(req: ComandoMoverReq):
     logger.info("[CMD] MOVER → D%d receita %s ciclo %d/%d OS %s",
-                req.dispenser_alvo, req.receita,
+                req.dispenser_alvo, req.receita or "-",
                 req.ciclo_atual, req.total_ciclos, req.os_id)
     resultado = await _enviar(
         "mover",

@@ -1084,6 +1084,44 @@ isso devolve `{nome: medicamento}` em vez de agrupar por categoria — e por iss
 `MIN_MEDS_POR_OS`, `MAX_MEDS_POR_OS`, `QTD_MIN` e `QTD_MAX` saíram do compose:
 não há mais nada a sortear com eles.
 
+## OS personalizada: o slot é do operador, a rota é do central
+
+O console monta uma OS à mão — medicamento, dispenser e quantidade por linha
+(`template_id: "PERS"`) — e ela entra pela mesma porta, na mesma fila e com o
+mesmo teto das dez ordens padrão. Três decisões, e cada uma tem um modo de
+falhar que ela evita:
+
+**`atribuir_slots_fixos` existe porque `atribuir_slots` escolhe.** A função de
+sempre reaproveita resíduo, procura slot livre e sacrifica o de menor resíduo:
+para a OS personalizada isso desmentiria a escolha do operador, e "D3" na tela
+viraria D5 na bancada sem aviso. A nova é pura como a outra e tem a mesma forma
+de retorno: usa o `dispenser_id` do item, reaproveita sem limpeza o slot com o
+MESMO medicamento e marca `precisa_limpeza` no slot com outro — a etapa 1b é a
+mesma. O que o central continua decidindo é a ORDEM das paradas
+(`planejar_rota`): a serpentina vale para qualquer conjunto de slots, e a ordem
+de digitação custaria travessias de corredor à toa.
+
+**`receita` vazia, e não uma letra emprestada.** A mesa acha a parada pelo
+`dispenser_alvo` (`dispenser_pos()`); a letra só vai para o log. Mandar "A" numa
+OS que não é a OS-URO-01 faria o log da placa afirmar que rodou um roteiro que
+não rodou. Vazia é "OS sem receita": o firmware já aceitava, e o cnc-adapter e
+o `cnc_simulator` passaram a aceitar SÓ isso além de A–J. Qualquer outro
+`template_id` sem letra continua abortando com `receita_nao_mapeada`.
+
+**A validação mora em `receber_ordem`, não só no console.** É a porta única
+(ver "O disparo manual É o `POST /api/v1/ordens`"): uma checagem só na tela
+deixaria um POST à mão mandar dois itens para o mesmo dispenser. As regras
+(1..8 linhas, quantidade 1..10, nada repetido, tudo no catálogo) estão em
+`os_personalizada.py`, puro, e os limites da tela são escritos nela pelo
+`console.pagina_console()` a partir do módulo — um teto copiado no JS deixaria
+o operador montar uma linha que o central recusa. Pelo mesmo motivo, item com
+`dispenser_id` numa OS que NÃO é personalizada é 422: o ERP não escolhe slot, e
+um campo aceito e ignorado é uma escolha que ninguém honra.
+
+O `template_id` não é coluna de `ordens`, mas viaja no `payload_json`: a OS
+personalizada que um reinício pega em `aguardando_caixa_vazia` volta à fila
+ainda personalizada, com os dispensers escolhidos.
+
 ## O console de operação mora no central, e não duplica caminho nenhum
 
 O central passou a servir uma interface própria em `/console`: a mesa de onde

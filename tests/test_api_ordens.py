@@ -478,3 +478,64 @@ def test_salvar_ordem_devolve_false_quando_a_os_ja_existe(database, monkeypatch)
     assert inserida is False
     assert conexao.cur.inserts_em("os_itens") == []
     assert (conexao.commits, conexao.rollbacks) == (0, 1)
+
+
+# ── OS personalizada: o slot é do operador, e a porta única confere ───────────
+
+def _catalogo_pers(api, monkeypatch, nomes=("ALOIS 10MG", "RETEMIC 5MG", "INSIT 50MG")):
+    monkeypatch.setattr(api.central.modulo, "listar_medicamentos", lambda: [
+        {"nome": n, "sku": f"SKU-{i}", "categoria": "cat"} for i, n in enumerate(nomes)])
+
+
+def _payload_pers(*linhas, os_id="PERS-20261021T143000-A1B2C3") -> dict:
+    return {"os_id": os_id, "template_id": "PERS", "descricao": "Ordem personalizada",
+            "categoria": "personalizada",
+            "medicamentos": [{"medicamento": m, "sku": "x", "categoria": "x",
+                              "quantidade": q, "dispenser_id": d}
+                             for m, d, q in linhas]}
+
+
+def test_personalizada_valida_e_aceita_e_leva_o_dispenser(api, monkeypatch):
+    _catalogo_pers(api, monkeypatch)
+    resposta = api.cliente.post("/api/v1/ordens", json=_payload_pers(
+        ("ALOIS 10MG", 7, 4), ("RETEMIC 5MG", 2, 1)))
+    assert resposta.status_code == 200, resposta.json()
+    assert api.ordens.gravadas == ["PERS-20261021T143000-A1B2C3"]
+
+
+def test_personalizada_invalida_e_422_com_a_lista_e_nada_persiste(api, monkeypatch):
+    _catalogo_pers(api, monkeypatch)
+    resposta = api.cliente.post("/api/v1/ordens", json=_payload_pers(
+        ("ALOIS 10MG", 5, 4), ("RETEMIC 5MG", 5, 11), ("NAO EXISTE", 1, 1)))
+    assert resposta.status_code == 422
+    corpo = resposta.json()
+    assert corpo["erro"] == "os_personalizada_invalida"
+    assert "linha 2: D5 já usado na linha 1." in corpo["problemas"]
+    assert "linha 2: quantidade 11 fora da faixa 1..10." in corpo["problemas"]
+    assert any(p.startswith("linha 3: 'NAO EXISTE'") for p in corpo["problemas"])
+    assert api.ordens.gravadas == [] and api.fila.enfileiradas == []
+
+
+def test_personalizada_com_catalogo_fora_e_503(api, monkeypatch):
+    monkeypatch.setattr(api.central.modulo, "listar_medicamentos", lambda: [])
+    resposta = api.cliente.post("/api/v1/ordens", json=_payload_pers(("ALOIS 10MG", 1, 1)))
+    assert resposta.status_code == 503
+    assert resposta.json()["erro"] == "catalogo_indisponivel"
+    assert api.ordens.gravadas == []
+
+
+def test_personalizada_com_fila_cheia_e_429(api, monkeypatch):
+    _catalogo_pers(api, monkeypatch)
+    _encher_fila(api)
+    resposta = api.cliente.post("/api/v1/ordens", json=_payload_pers(("ALOIS 10MG", 1, 1)))
+    assert resposta.status_code == 429
+    assert api.ordens.gravadas == []
+
+
+def test_dispenser_id_numa_os_padrao_e_recusado(api):
+    payload = _payload()
+    payload["medicamentos"][0]["dispenser_id"] = 3
+    resposta = api.cliente.post("/api/v1/ordens", json=payload)
+    assert resposta.status_code == 422
+    assert resposta.json()["erro"] == "dispenser_id_nao_permitido"
+    assert api.ordens.gravadas == [] and api.fila.enfileiradas == []

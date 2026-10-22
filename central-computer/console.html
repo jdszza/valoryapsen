@@ -267,6 +267,37 @@ button{font-family:inherit}
   letter-spacing:.7px; text-transform:uppercase;
   color:#F6DFA8; background:rgba(196,154,58,.14); border:1px solid var(--ap-gold);
 }
+
+/* ── Ordem personalizada ───────────────────────────────────────────────────── */
+/* Uso único: uma linha por medicamento, o dispenser escolhido à mão. O seletor
+   de dispenser é desenhado nas duas fileiras, como a bancada — "D7" tem que
+   ser um lugar, não um número numa lista. */
+.pers{padding:12px 14px; display:flex; flex-direction:column; gap:9px}
+.pers .linha-pers{
+  display:grid; grid-template-columns:minmax(0,1fr) auto 76px auto; gap:8px;
+  align-items:center; padding:8px 9px; margin-bottom:6px; border-radius:8px;
+  background:var(--ap-surface-2); border:1px solid var(--ap-line-soft);
+}
+.pers .linha-pers.erro{border-color:var(--ap-err)}
+.pers select,.pers input[type=number]{
+  min-width:0; padding:7px 8px; border-radius:8px; font:inherit; font-size:12.5px;
+  color:var(--ap-text); background:var(--ap-surface); border:1px solid var(--ap-line);
+}
+.pers .disps{display:grid; gap:3px}
+.pers .disps button{
+  padding:3px 0; width:28px; font-size:10.5px; font-family:var(--ap-mono);
+  border-radius:5px; border:1px solid var(--ap-line); background:var(--ap-surface);
+  color:var(--ap-muted); cursor:pointer;
+}
+.pers .disps button.sel{background:var(--ap-gold); color:#111; border-color:var(--ap-gold)}
+/* Dispenser já usado noutra linha some, mas guarda o lugar: a grade continua
+   com a forma da bancada. */
+.pers .disps button.usado{visibility:hidden}
+.pers .remover{padding:5px 9px}
+.pers .aviso-pers{grid-column:1 / -1; font-size:11px; line-height:1.4; color:#F2D27A}
+.pers .erro-pers{grid-column:1 / -1; font-size:11px; line-height:1.4; color:#E08C82}
+.pers .acoes{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+.pers .acoes .nota{font-size:11px; color:var(--ap-faint)}
 </style>
 </head>
 <body>
@@ -340,6 +371,19 @@ button{font-family:inherit}
     </h2>
     <div id="problemas" class="problemas" hidden></div>
     <div class="ordens" id="grade"></div>
+
+    <h2>Ordem personalizada
+      <span class="nota">uso único · medicamento, dispenser e quantidade por linha</span>
+    </h2>
+    <div class="pers" id="cartaoPers">
+      <div id="persLinhas"></div>
+      <div class="acoes">
+        <button class="btn" id="btnPersLinha">+ linha</button>
+        <span class="nota" id="persNota"></span>
+        <button class="btn btn-ouro" id="btnPersDisparar" style="margin-left:auto">
+          Disparar</button>
+      </div>
+    </div>
   </section>
 
   <div class="coluna">
@@ -538,6 +582,10 @@ function desenharOrdens(corpo) {
   var grade = $("grade");
   grade.innerHTML = "";
 
+  if (corpo.num_slots && corpo.num_slots !== persNumSlots) {
+    persNumSlots = corpo.num_slots;
+    desenharPers();
+  }
   $("notaOrdens").textContent =
     templates.length + " ordens · " + corpo.num_slots + " slots na célula" +
     (corpo.catalogo_carregado ? "" : " · CATÁLOGO INDISPONÍVEL");
@@ -955,6 +1003,13 @@ function aplicarEstado(st) {
         (cnc.total_ciclos ? " · ciclo " + cnc.ciclo_atual + "/" + cnc.total_ciclos : ""));
 
   desenharBancada(st.dispensers, cnc);
+
+  /* O aviso de resíduo da ordem personalizada lê o mesmo snapshot. Redesenha só
+     quando o aviso mudou: redesenhar a cada frame fecharia o select que o
+     operador está abrindo. */
+  var avisosAntes = persLinhas.map(avisoResiduo).join("|");
+  persDispensers = st.dispensers;
+  if (persLinhas.map(avisoResiduo).join("|") !== avisosAntes) desenharPers();
 }
 
 /* Duas fileiras frente a frente, com o corredor da CNC entre elas — o arranjo
@@ -1003,7 +1058,172 @@ function cartaoSlot(id, d, alvo) {
          "</div>";
 }
 
+/* ── Ordem personalizada ──────────────────────────────────────────────────────
+   Os limites vêm do central na hora de servir a página
+   (`os_personalizada.MAX_ITENS_PERS`, `QTD_MIN_PERS`, `QTD_MAX_PERS`), e quem
+   CONFERE a OS é o `POST /api/v1/ordens`: a tela só evita montar o que ele vai
+   recusar. O disparo vai por /console/api/disparar-personalizada. */
+var PERS = { maxItens: __PERS_MAX_ITENS__, qtdMin: __PERS_QTD_MIN__,
+             qtdMax: __PERS_QTD_MAX__ };
+var persNumSlots = 8;
+var persCatalogo = [];
+var persLinhas = [];
+var persDispensers = {};
+var persErros = {};
+
+function persTeto() { return Math.min(PERS.maxItens, persNumSlots); }
+
+async function carregarCatalogoPers() {
+  try {
+    var resp = await fetch("/medicamentos", { credentials: "same-origin" });
+    var corpo = await resp.json();
+    persCatalogo = (corpo || []).map(function (m) { return m.nome; })
+                                .filter(Boolean).sort();
+  } catch (erro) {
+    persCatalogo = [];
+    registrar("Carregar catálogo de medicamentos", "err", String(erro), null, "—");
+  }
+  if (!persLinhas.length) novaLinhaPers(); else desenharPers();
+}
+
+function novaLinhaPers() {
+  if (persLinhas.length >= persTeto()) return;
+  persLinhas.push({ medicamento: "", dispenser_id: null, quantidade: PERS.qtdMin });
+  desenharPers();
+}
+
+/* O resíduo que a etapa 1b vai descartar: o dispenser escolhido tem OUTRO
+   medicamento — o mesmo critério do `atribuir_slots_fixos`. */
+function avisoResiduo(linha) {
+  if (!linha.dispenser_id) return "";
+  var d = persDispensers[String(linha.dispenser_id)];
+  if (!d) return "";
+  var qtd = d.quantidade_residual || d.quantidade || 0;
+  if (!d.medicamento || !qtd || d.medicamento === linha.medicamento) return "";
+  return "D" + linha.dispenser_id + " tem " + d.medicamento + " × " + qtd +
+         " — será descartado antes da carga";
+}
+
+function desenharPers() {
+  var caixa = $("persLinhas");
+  caixa.innerHTML = "";
+  var metade = Math.ceil(persNumSlots / 2);
+
+  persLinhas.forEach(function (linha, idx) {
+    var outras = persLinhas.filter(function (_, j) { return j !== idx; });
+    var usadosDisp = outras.map(function (l) { return l.dispenser_id; });
+    var usadosMed = outras.map(function (l) { return l.medicamento; });
+
+    var div = document.createElement("div");
+    div.className = "linha-pers" + (persErros[idx + 1] ? " erro" : "");
+
+    var sel = document.createElement("select");
+    var vazio = document.createElement("option");
+    vazio.value = ""; vazio.textContent = "— medicamento —";
+    sel.appendChild(vazio);
+    persCatalogo.forEach(function (nome) {
+      if (usadosMed.indexOf(nome) >= 0) return;   /* usado noutra linha some */
+      var o = document.createElement("option");
+      o.value = nome; o.textContent = nome;
+      if (nome === linha.medicamento) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.addEventListener("change", function () {
+      linha.medicamento = sel.value; desenharPers();
+    });
+    div.appendChild(sel);
+
+    /* Duas fileiras, D1..D(N/2) em cima e o resto embaixo: a bancada. */
+    var disps = document.createElement("div");
+    disps.className = "disps";
+    disps.style.gridTemplateColumns = "repeat(" + metade + ",28px)";
+    for (var i = 1; i <= persNumSlots; i++) {
+      (function (id) {
+        var b = document.createElement("button");
+        b.type = "button";
+        b.textContent = "D" + id;
+        if (linha.dispenser_id === id) b.className = "sel";
+        if (usadosDisp.indexOf(id) >= 0) { b.className = "usado"; b.disabled = true; }
+        b.addEventListener("click", function () {
+          linha.dispenser_id = id; desenharPers();
+        });
+        disps.appendChild(b);
+      })(i);
+    }
+    div.appendChild(disps);
+
+    var qtd = document.createElement("input");
+    qtd.type = "number"; qtd.min = PERS.qtdMin; qtd.max = PERS.qtdMax; qtd.step = 1;
+    qtd.value = linha.quantidade;
+    qtd.addEventListener("change", function () {
+      linha.quantidade = parseInt(qtd.value, 10);
+    });
+    div.appendChild(qtd);
+
+    var rem = document.createElement("button");
+    rem.className = "btn remover"; rem.textContent = "×"; rem.title = "Remover linha";
+    rem.addEventListener("click", function () {
+      persLinhas.splice(idx, 1); persErros = {};
+      if (!persLinhas.length) novaLinhaPers(); else desenharPers();
+    });
+    div.appendChild(rem);
+
+    var aviso = avisoResiduo(linha);
+    if (aviso) {
+      var a = document.createElement("div");
+      a.className = "aviso-pers"; a.textContent = aviso;
+      div.appendChild(a);
+    }
+    (persErros[idx + 1] || []).forEach(function (msg) {
+      var e = document.createElement("div");
+      e.className = "erro-pers"; e.textContent = msg;
+      div.appendChild(e);
+    });
+
+    caixa.appendChild(div);
+  });
+
+  $("btnPersLinha").hidden = persLinhas.length >= persTeto();
+  texto($("persNota"), persLinhas.length + " de " + persTeto() + " linhas · " +
+        "quantidade " + PERS.qtdMin + "–" + PERS.qtdMax);
+}
+
+/* "linha 3: D5 já usado na linha 1" → o erro aparece na linha 3. */
+function distribuirErros(problemas) {
+  persErros = {};
+  (problemas || []).forEach(function (p) {
+    var m = /^linha (\d+): (.*)$/.exec(p);
+    if (m) (persErros[m[1]] = persErros[m[1]] || []).push(m[2]);
+  });
+}
+
+$("btnPersLinha").addEventListener("click", novaLinhaPers);
+
+/* Um clique: disparar é rotina, não é destrutivo (a regra do console). */
+$("btnPersDisparar").addEventListener("click", async function () {
+  var btn = $("btnPersDisparar");
+  btn.disabled = true;
+  var itens = persLinhas.map(function (l) {
+    return { medicamento: l.medicamento, dispenser_id: l.dispenser_id,
+             quantidade: l.quantidade };
+  });
+  var r = await chamar("Disparar ordem personalizada",
+                       "/console/api/disparar-personalizada", { itens: itens });
+  btn.disabled = false;
+  if (r && r.ok && r.corpo && r.corpo.os_id) {
+    registrar("OS criada", "info", r.corpo.os_id + " · posição na fila: " +
+              (r.corpo.posicao_fila != null ? r.corpo.posicao_fila : "?"));
+    /* Uso único: o formulário limpa. */
+    persLinhas = []; persErros = {};
+    novaLinhaPers();
+    return;
+  }
+  distribuirErros(r && r.corpo ? r.corpo.problemas : null);
+  desenharPers();
+});
+
 carregarTemplates();
+carregarCatalogoPers();
 carregarInjecao();
 carregarVisaoTC();
 conectar();

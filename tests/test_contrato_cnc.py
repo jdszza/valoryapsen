@@ -103,9 +103,9 @@ def test_o_mover_nao_manda_coordenada(carregar_orquestrador):
 
 # ── As recusas que o modelo do adapter faz, e por que são dele ────────────────
 
-@pytest.mark.parametrize("receita", ["", "K", "AA", "c ", "1"],
-                         ids=["vazia", "fora_da_faixa", "duas_letras",
-                              "minuscula_com_espaco", "digito"])
+@pytest.mark.parametrize("receita", ["K", "AA", "c ", "1", "-"],
+                         ids=["fora_da_faixa", "duas_letras",
+                              "minuscula_com_espaco", "digito", "traco"])
 def test_receita_fora_de_a_j_e_recusada_na_borda(carregar_adapter, receita):
     """A–J é a faixa da NVS da placa: dez slots, um por ordem padrão.
 
@@ -126,6 +126,18 @@ def test_receita_fora_de_a_j_e_recusada_na_borda(carregar_adapter, receita):
 
     with pytest.raises(ValidationError):
         adapter.ComandoMoverReq(dispenser_alvo=1, os_id="OS-1", receita=receita)
+
+
+@pytest.mark.parametrize("receita", ["", "  "])
+def test_receita_vazia_e_a_os_personalizada(carregar_adapter, receita):
+    """Vazia é "OS sem receita" (a ordem montada no console). A placa acha a
+    parada pelo `dispenser_alvo` e loga `-`; o adapter deixa passar vazia, e só
+    vazia — "-" ou qualquer outro texto segue 422."""
+    adapter = carregar_adapter("cnc")
+
+    req = adapter.ComandoMoverReq(dispenser_alvo=1, os_id="PERS-1", receita=receita)
+
+    assert req.receita == ""
 
 
 @pytest.mark.parametrize("alvo", [0, NUM_SLOTS + 1])
@@ -204,3 +216,30 @@ def test_o_posicionado_do_mover_no_simulador_leva_destino_dispenser(carregar_sim
     monkeypatch.setattr(sim.modulo.time, "sleep", lambda _s: None)
     sim.modulo._mover_para(3, *sim.modulo.BANCADA[3], "OS-7", 1, 2)
     assert sim.eventos_do_tipo("posicionado")[-1]["destino"] == "dispenser"
+
+
+# ── O simulador: vazia passa, letra não gravada continua recusada ─────────────
+
+def _mover_no_simulador(sim, receita):
+    return sim.modulo.executar_mover(sim.modulo.MoverReq(
+        dispenser_alvo=2, os_id="PERS-1", receita=receita,
+        ciclo_atual=1, total_ciclos=1))
+
+
+def test_simulador_aceita_receita_vazia_da_os_personalizada(carregar_simulador):
+    """Vazia pula `CNC_RECEITAS_GRAVADAS`: o simulador se move por
+    `BANCADA[dispenser_alvo]`, como a placa, que nunca usou a letra para achar
+    a parada."""
+    sim = carregar_simulador("cnc", env={"CNC_RECEITAS_GRAVADAS": "A"})
+    resposta = _mover_no_simulador(sim, "")
+    assert resposta["ok"] is True
+    assert resposta["destino"] == dict(zip("xy", sim.modulo.BANCADA[2]))
+
+
+def test_simulador_continua_recusando_letra_nao_gravada(carregar_simulador):
+    from fastapi import HTTPException
+
+    sim = carregar_simulador("cnc", env={"CNC_RECEITAS_GRAVADAS": "A"})
+    with pytest.raises(HTTPException) as exc:
+        _mover_no_simulador(sim, "B")
+    assert "receita_desconhecida" in str(exc.value.detail)

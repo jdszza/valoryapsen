@@ -288,8 +288,10 @@ no central em tempo de execução (serpentina) e muda quando um slot sai da OS:
 errado, e o sintoma chegaria como divergência de SKU num slot só —
 indistinguível de uma falha mecânica.
 
-`receita` é a letra A–J do slot da NVS: ela diz QUAL ordem está em execução, vai
-para o log da placa, e **não** é usada para achar a posição.
+`receita` é a letra A–J do slot da NVS **ou vazia** (OS personalizada, montada
+no console): ela diz QUAL ordem está em execução, vai para o log da placa (vazia
+sai como `-`), e **não** é usada para achar a posição. Vazia é "OS sem receita",
+nunca uma letra emprestada de outra ordem — o log mentiria qual roteiro rodou.
 
 ### Eventos (placa → adapter)
 

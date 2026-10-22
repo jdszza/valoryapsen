@@ -1349,11 +1349,44 @@ sistema.
 | `409` | `{"erro": "os_duplicada", "os_id": ...}` | `os_id` já registrado (`INSERT IGNORE` não inseriu) | **não** — reenviar daria 409 para sempre, e reprocessar seria dose dobrada no leito |
 | `429` | `{"erro": "fila_cheia", "os_id": ...}` | `MAX_FILA_OS` OS já esperando. **Nada é persistido** — a recusa vem ANTES do INSERT | **não** — a próxima OS já nasce com `os_id` novo |
 | `503` | `{"erro": "persistencia_indisponivel", "os_id": ...}` | banco fora do ar; a OS **não** entra na fila | **não** — encheria o log enquanto o banco está fora |
+| `422` | `{"erro": "os_personalizada_invalida", "problemas": [...]}` ou `{"erro": "dispenser_id_nao_permitido"}` | OS personalizada que não passa em `os_personalizada.validar`, ou `dispenser_id` num item de OS que não é personalizada. Nada é persistido | **não** — o mesmo corpo seria recusado de novo |
 
 Os corpos seguem a forma `{"erro": ..., "os_id": ...}` e por isso são
 `JSONResponse`: `HTTPException` embrulharia tudo em `detail`. A declaração
 executável está no `responses=` do endpoint, em `central-computer/main.py`, e sai
 no Swagger; `tests/test_api_ordens.py` prende os quatro casos.
+
+#### OS personalizada (`template_id: "PERS"`)
+
+Montada à mão no console: o operador escolhe **medicamento, dispenser e
+quantidade** por linha. Entra pela mesma porta, na mesma fila e com o mesmo
+teto; não vira modelo salvo.
+
+```json
+{
+  "os_id": "PERS-20261021T143000-A1B2C3",
+  "template_id": "PERS",
+  "descricao": "Ordem personalizada",
+  "categoria": "personalizada",
+  "medicamentos": [
+    {"medicamento": "ALOIS 10MG", "sku": "<do catálogo>", "categoria": "<do catálogo>",
+     "quantidade": 4, "dispenser_id": 3}
+  ]
+}
+```
+
+- `template_id == "PERS"` é o que a marca; nenhuma ordem padrão usa esse id.
+- 1 a 8 linhas (nunca mais que `NUM_SLOTS`), quantidade 1..10, nenhum dispenser
+  e nenhum medicamento repetido, todo medicamento no catálogo. A conferência é
+  de `receber_ordem` (`os_personalizada.validar`), antes da fila e do INSERT;
+  catálogo fora é `503 catalogo_indisponivel`.
+- `os_id` sai de `os_templates.novo_os_id("PERS")`; `sku`/`categoria` saem do
+  catálogo no central.
+- O slot é o do item (`orchestrator.atribuir_slots_fixos`); a ORDEM das paradas
+  é da serpentina (`planejar_rota`). O `mover` vai com `receita: ""` — a placa
+  acha a parada pelo `dispenser_alvo` e loga `-`.
+- Em qualquer outra OS, item com `dispenser_id` é `422 dispenser_id_nao_permitido`:
+  quem escolhe o slot é o central.
 
 > Entre **não dispensar** e **dispensar sem rastro**, um sistema de medicação
 > escolhe não dispensar. Com o banco fora, a OS dispensada não teria linha em
@@ -1366,6 +1399,7 @@ O console tem rotas próprias, **fora do Swagger** e atrás do cookie de sessão
 GET  /console | /console/login | /console/prevoo
 POST /console/login | /console/logout
 POST /console/api/disparar               chama o MESMO receber_ordem do POST /api/v1/ordens
+POST /console/api/disparar-personalizada idem, com a OS montada linha a linha (PERS)
 POST /console/api/gerador                pausa/retoma o ERP
 POST /console/api/liberar-trava
 GET  /console/api/injecao                tipos + gatilho armado
@@ -1392,6 +1426,7 @@ valoryapsen/
 │   ├── orchestrator.py     # fila, atribuição de slots, rota, Triple Check, trava
 │   ├── database.py         # MySQL — DDL, pool, seeds (fonte única do schema)
 │   ├── os_templates.py     # as 10 ordens padrão
+│   ├── os_personalizada.py # a OS montada no console: validação e corpo (puro)
 │   ├── console.py          # senha, sessão HMAC, flag de pausa
 │   ├── injecao.py          # gatilho de falha (um por vez, check-and-pop)
 │   ├── necessidades.py     # a lista priorizada (pura)

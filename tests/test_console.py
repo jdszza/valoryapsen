@@ -685,3 +685,95 @@ def test_prevoo_inclui_a_visao_com_uma_sonda_so(logado, monkeypatch):
     da_visao = [i for i in corpo["itens"] if i["grupo"] == "Visão"]
     assert [i["id"] for i in da_visao] == ["visao"]
     assert da_visao[0]["estado"] == "falha"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OS personalizada: também por `receber_ordem`
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _linhas(modulo, *pares):
+    nomes = sorted(modulo.os_templates.nomes_usados())
+    return {"itens": [{"medicamento": nomes[i], "dispenser_id": d, "quantidade": 2}
+                      for i, d in pares]}
+
+
+def test_personalizada_passa_por_receber_ordem(logado, monkeypatch):
+    original = logado.modulo.receber_ordem
+    chamadas = []
+
+    async def espiao(req):
+        chamadas.append(req)
+        return await original(req)
+
+    monkeypatch.setattr(logado.modulo, "receber_ordem", espiao)
+
+    resposta = logado.cliente.post("/console/api/disparar-personalizada",
+                                   json=_linhas(logado.modulo, (0, 7), (1, 2)))
+
+    assert resposta.status_code == 200, resposta.json()
+    assert len(chamadas) == 1
+    assert chamadas[0].template_id == "PERS"
+    assert chamadas[0].os_id.startswith("PERS-")
+    enfileirada = logado.fila.enfileiradas[0]
+    assert [i["dispenser_id"] for i in enfileirada["medicamentos"]] == [7, 2]
+    assert all(i["sku"].startswith("SKU-") for i in enfileirada["medicamentos"])
+
+
+def test_personalizada_invalida_volta_por_linha_sem_persistir(logado):
+    resposta = logado.cliente.post("/console/api/disparar-personalizada",
+                                   json=_linhas(logado.modulo, (0, 3), (1, 3)))
+    assert resposta.status_code == 422
+    assert resposta.json()["problemas"] == ["linha 2: D3 já usado na linha 1."]
+    assert logado.ordens.gravadas == [] and logado.fila.enfileiradas == []
+
+
+def test_personalizada_com_fila_cheia_chega_como_429(logado):
+    fila_real = logado.modulo.orch._os_queue
+    while not fila_real.full():
+        fila_real.put_nowait({"os_id": f"OS-ENFILEIRADA-{fila_real.qsize()}"})
+    resposta = logado.cliente.post("/console/api/disparar-personalizada",
+                                   json=_linhas(logado.modulo, (0, 1)))
+    assert resposta.status_code == 429
+    assert logado.ordens.gravadas == []
+
+
+def test_personalizada_com_catalogo_fora_e_503(logado, monkeypatch):
+    monkeypatch.setattr(logado.modulo, "listar_medicamentos", lambda: [])
+    resposta = logado.cliente.post("/console/api/disparar-personalizada",
+                                   json={"itens": [{"medicamento": "X", "dispenser_id": 1,
+                                                    "quantidade": 1}]})
+    assert resposta.status_code == 503
+    assert logado.fila.enfileiradas == []
+
+
+def test_personalizada_nao_e_bloqueada_pela_pausa(logado):
+    logado.cliente.post("/console/api/gerador", json={"pausado": True})
+    resposta = logado.cliente.post("/console/api/disparar-personalizada",
+                                   json=_linhas(logado.modulo, (0, 1)))
+    assert resposta.status_code == 200
+
+
+def test_personalizada_sem_sessao_e_401(console):
+    resposta = console.cliente.post("/console/api/disparar-personalizada",
+                                    json={"itens": []})
+    assert resposta.status_code == 401
+
+
+def test_a_pagina_tem_o_cartao_da_ordem_personalizada(logado):
+    """O cartão está lá, o JS chama a rota nova, e os limites da tela são os
+    do módulo — lidos do HTML SERVIDO, não de uma cópia escrita aqui."""
+    import re
+
+    pers = logado.modulo.os_personalizada
+    pagina = logado.cliente.get("/console").text
+
+    assert "Ordem personalizada" in pagina
+    assert 'id="cartaoPers"' in pagina
+    assert "/console/api/disparar-personalizada" in pagina
+    assert "__PERS_" not in pagina, "placeholder de limite não substituído"
+
+    m = re.search(r"var PERS = \{ maxItens: (\d+), qtdMin: (\d+),\s*qtdMax: (\d+) \}",
+                  pagina)
+    assert m, "bloco de limites da ordem personalizada sumiu da página"
+    assert tuple(map(int, m.groups())) == (
+        pers.MAX_ITENS_PERS, pers.QTD_MIN_PERS, pers.QTD_MAX_PERS)

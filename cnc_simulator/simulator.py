@@ -550,7 +550,10 @@ def executar_mover(req: MoverReq):
     # O comentário foi escrito antes de o firmware existir, e ninguém conferiu
     # depois — é exatamente o modo de falhar que ele descreve.
     receita = (req.receita or "").strip().upper()
-    if receita not in RECEITAS_GRAVADAS:
+    # Vazia é a OS personalizada: sem roteiro gravado, e o simulador se move
+    # por `BANCADA[dispenser_alvo]` de qualquer jeito — como a placa, que acha
+    # a parada pelo dispenser e loga `-`.
+    if receita and receita not in RECEITAS_GRAVADAS:
         # `receita_desconhecida` é o ÚNICO código que só existe deste lado, e
         # está documentado no §4 como tal. O firmware aceita qualquer receita
         # (ela é log, não endereço — quem acha a posição é `dispenser_pos`);
@@ -591,7 +594,7 @@ def executar_mover(req: MoverReq):
 
     return {
         "ok": True,
-        "msg": f"Movendo para D{req.dispenser_alvo} (receita {receita})",
+        "msg": f"Movendo para D{req.dispenser_alvo} (receita {receita or '-'})",
         "destino": {"x": alvo_x, "y": alvo_y},
     }
 

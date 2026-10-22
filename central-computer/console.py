@@ -63,6 +63,7 @@ import threading
 import time
 from pathlib import Path
 
+import os_personalizada
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -268,7 +269,16 @@ def resetar_pausa() -> None:
 # que é exatamente o que se faz na véspera de uma apresentação.
 
 def pagina_console() -> str:
-    return _PAGINA_CONSOLE.read_text(encoding="utf-8")
+    """A página do console, com os limites da OS personalizada já escritos.
+
+    Os três números saem de `os_personalizada` na hora de servir, e não de uma
+    cópia no JS: um teto escrito à mão na tela deixaria o operador montar uma
+    linha que o central recusa — ou esconder uma que ele aceita.
+    """
+    return (_PAGINA_CONSOLE.read_text(encoding="utf-8")
+            .replace("__PERS_MAX_ITENS__", str(os_personalizada.MAX_ITENS_PERS))
+            .replace("__PERS_QTD_MIN__", str(os_personalizada.QTD_MIN_PERS))
+            .replace("__PERS_QTD_MAX__", str(os_personalizada.QTD_MAX_PERS)))
 
 
 def pagina_prevoo() -> str:

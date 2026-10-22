@@ -3563,3 +3563,126 @@ def test_roteiro_completo_pedido_liberar_abrir_fechar_rearme_homing_resto(
                          "maquina_nao_confirmou_parada")]
     assert orq.modulo.get_pausa_porta() is None
     assert orq.estado["porta"]["faixa"] == ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OS PERSONALIZADA — o slot é do operador, a rota é do central
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _item_fixo(med: str, slot: int, qtd: int = 3) -> dict:
+    return {**_item(med, qtd), "dispenser_id": slot}
+
+
+def _payload_pers(os_id: str, *itens) -> dict:
+    return {"os_id": os_id, "descricao": "Ordem personalizada",
+            "template_id": "PERS", "medicamentos": list(itens)}
+
+
+def test_fixos_usam_o_dispenser_escolhido_sem_escolher_nada(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    atrib = orq.modulo.atribuir_slots_fixos(
+        [_item_fixo("A", 7), _item_fixo("B", 2)], _dispensers())
+    assert [(a["dispenser_id"], a["medicamento"], a["precisa_limpeza"])
+            for a in atrib] == [(7, "A", False), (2, "B", False)]
+
+
+def test_fixos_marcam_slot_sujo_e_reaproveitam_o_igual(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    estado = _dispensers(**{"3": ("RETEMIC 5MG", 4), "5": ("A", 6), "6": ("Outro", 0)})
+    atrib = orq.modulo.atribuir_slots_fixos(
+        [_item_fixo("B", 3), _item_fixo("A", 5), _item_fixo("C", 6)], estado)
+    assert {a["dispenser_id"]: a["precisa_limpeza"] for a in atrib} == {
+        3: True, 5: False, 6: False}
+
+
+@pytest.mark.parametrize("slots", [(1, 1), (0,), (NUM_SLOTS + 1,), (None,), (True,)])
+def test_fixos_recusam_dispenser_repetido_ou_fora_da_faixa(carregar_orquestrador, slots):
+    orq = carregar_orquestrador()
+    itens = [_item_fixo(f"M{i}", s) for i, s in enumerate(slots)]
+    assert orq.modulo.atribuir_slots_fixos(itens, _dispensers()) is None
+
+
+def test_fixos_nao_tocam_no_estado_recebido(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    estado = _dispensers(**{"3": ("X", 4)})
+    copia = {k: dict(v) for k, v in estado.items()}
+    orq.modulo.atribuir_slots_fixos([_item_fixo("B", 3)], estado)
+    assert estado == copia
+
+
+def test_os_personalizada_mover_sem_receita_e_rota_por_posicao(carregar_orquestrador):
+    """D7, D2, D5 digitados nessa ordem; a mesa vai na ordem da serpentina."""
+    orq = carregar_orquestrador()
+    digitados = [7, 2, 5]
+    asyncio.run(orq.modulo._processar_os(_payload_pers(
+        "PERS-1", *[_item_fixo(f"M{s}", s) for s in digitados])))
+
+    movers = orq.adapter.comandos("/comandos/mover")
+    rota = orq.modulo.planejar_rota(digitados, orq.modulo.HOME)
+    assert rota != digitados
+    assert [m["dispenser_alvo"] for m in movers] == rota
+    assert all(m["receita"] == "" for m in movers)
+    carregados = sorted(c["dispenser_id"] for c in orq.adapter.comandos("/comandos/carregar"))
+    assert carregados == sorted(digitados)
+    assert _status_gravados(orq) == _sucesso("PERS-1")
+
+
+def test_os_personalizada_limpa_o_slot_sujo_antes_da_carga(carregar_orquestrador):
+    orq = carregar_orquestrador()
+    orq.slot(3).update({"medicamento": "RETEMIC 5MG", "quantidade": 4})
+    asyncio.run(orq.modulo._processar_os(_payload_pers("PERS-2", _item_fixo("B", 3))))
+    assert [c["dispenser_id"] for c in orq.adapter.comandos("/comandos/limpar")][:1] == [3]
+    assert ("PERS-2", "concluida") in _status_gravados(orq)
+
+
+def test_abort_da_personalizada_nao_toca_slot_de_outra_os(carregar_orquestrador,
+                                                           monkeypatch):
+    orq = carregar_orquestrador()
+    monkeypatch.setattr(orq.modulo.settings, "TIMEOUT_CARREGAMENTO", 0.01)
+    orq.adapter.recusar_rotas.add("/comandos/carregar")
+    _slot_de_outra_os(orq, 8)
+
+    asyncio.run(orq.modulo._processar_os(_payload_pers(
+        "PERS-3", _item_fixo("A", 1), _item_fixo("B", 3))))
+
+    assert _status_gravados(orq) == _abortada_no_ciclo("PERS-3")
+    assert sorted(c["dispenser_id"] for c in orq.adapter.comandos("/comandos/limpar")) == [1, 3]
+    assert orq.slot(8)["os_id"] == "OS-VIZINHA"
+    assert orq.slot(8)["medicamento"] == "Vizinho"
+
+
+def test_template_desconhecido_continua_abortando(carregar_orquestrador):
+    """Só `PERS` vai sem receita; qualquer outro id sem letra segue barrado."""
+    orq = carregar_orquestrador()
+    payload = _payload_os("OS-X")
+    payload["template_id"] = "PERS-NAO"
+    asyncio.run(orq.modulo._processar_os(payload))
+    assert orq.adapter.comandos("/comandos/mover") == []
+    assert ("OS-X", "erro") in _status_gravados(orq)
+
+
+def test_ensaio_d7_d2_d5_do_console_ate_o_centro(carregar_orquestrador):
+    """O roteiro da verificação final, em processo: o corpo que o console monta
+    (`os_personalizada.montar_corpo`) atravessa o orquestrador de verdade — D2
+    com outro medicamento é limpo antes da carga, a rota sai pela serpentina e
+    a OS fecha com a mesa no centro."""
+    orq = carregar_orquestrador()
+    pers = orq.modulo.os_personalizada
+    catalogo = {n: {"sku": f"SKU-{n}", "categoria": "c"} for n in ("A", "B", "C")}
+    corpo = pers.montar_corpo(
+        [{"medicamento": "A", "dispenser_id": 7, "quantidade": 3},
+         {"medicamento": "B", "dispenser_id": 2, "quantidade": 10},
+         {"medicamento": "C", "dispenser_id": 5, "quantidade": 1}], catalogo)
+    assert pers.validar(corpo["medicamentos"], catalogo, NUM_SLOTS) == []
+    orq.slot(2).update({"medicamento": "RETEMIC 5MG", "quantidade": 4})
+
+    asyncio.run(orq.modulo._processar_os(corpo))
+
+    os_id = corpo["os_id"]
+    assert [c["dispenser_id"] for c in orq.adapter.comandos("/comandos/limpar")][:1] == [2]
+    movers = orq.adapter.comandos("/comandos/mover")
+    assert [m["dispenser_alvo"] for m in movers] == \
+        orq.modulo.planejar_rota([7, 2, 5], orq.modulo.HOME)
+    assert {m["receita"] for m in movers} == {""}
+    assert orq.adapter.comandos("/comandos/centro")
+    assert _status_gravados(orq) == _sucesso(os_id)

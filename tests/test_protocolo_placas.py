@@ -29,6 +29,7 @@ de casar deixa tudo verde para sempre.
 from __future__ import annotations
 
 import ast
+import asyncio
 import re
 from pathlib import Path
 
@@ -900,3 +901,27 @@ def test_o_centro_sem_origem_nao_inventa_posicao():
     assert evento["tipo"] == "erro"
     assert evento["codigo_erro"] == "sem_homing"
     assert placa.no_centro == 0
+
+
+def test_mover_com_receita_vazia_vale_nas_tres_copias(doc, carregar_adapter):
+    """A OS personalizada manda `receita: ""`. O documento diz que pode, o
+    adapter deixa passar e repassa vazia na linha, e a placa falsa (como a
+    real) vai ao dispenser pelo `dispenser_alvo` — vazia não é "sem endereço"."""
+    assert "**ou vazia**" in doc.split(SECAO["cnc"], 1)[1].split("\n## ", 1)[0]
+
+    adapter = carregar_adapter("cnc")
+    req = adapter.ComandoMoverReq(dispenser_alvo=3, os_id="PERS-1", receita="")
+    enviados: list[tuple] = []
+
+    async def _fake(comando, payload):
+        enviados.append((comando, payload))
+        return {"ok": True}
+
+    adapter._enviar = _fake
+    asyncio.run(adapter.cmd_mover(req))
+    assert enviados and enviados[0][1]["receita"] == ""
+
+    placa = PlacaCNC(atraso_evento=0.0)
+    eventos = placa.eventos_para("mover", {**enviados[0][1]})
+    assert [e["tipo"] for e in eventos] == ["posicionado"]
+    assert eventos[0]["dispenser_alvo"] == 3

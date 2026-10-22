@@ -69,6 +69,7 @@ import chave_visao_tc
 import console
 import injecao
 import necessidades
+import os_personalizada
 import prevoo
 import seed_demo
 import orchestrator as orch
@@ -1628,11 +1629,70 @@ class EventoPesoReq(BaseModel):
 # ENDPOINTS — RECEBIMENTO (adapters e erp-simulator)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _os_personalizada_invalida(os_id: str, problemas: list) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"erro": "os_personalizada_invalida", "os_id": os_id,
+                 "problemas": problemas, "mensagem": "; ".join(problemas)},
+    )
+
+
+def _catalogo_indisponivel_pers(os_id: str = "") -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"erro": "catalogo_indisponivel", "os_id": os_id,
+                 "mensagem": ("Catálogo de medicamentos indisponível — a OS "
+                              "sairia sem SKU para a câmera comparar.")},
+    )
+
+
+async def _catalogo_ou_none() -> dict | None:
+    """`{nome: medicamento}`, ou None com o banco fora — nunca `{}` por engano."""
+    try:
+        catalogo = _catalogo_por_nome(await asyncio.to_thread(listar_medicamentos))
+    except Exception as exc:
+        logger.warning("[API] Catálogo indisponível (%s).", exc)
+        return None
+    return catalogo or None
+
+
+async def _recusa_de_slot_escolhido(req: "NovaOSReq") -> JSONResponse | None:
+    """A regra do `dispenser_id` nos itens, para as duas espécies de OS.
+
+    - `template_id == "PERS"`: `os_personalizada.validar` contra o catálogo;
+      catálogo fora é 503 (a mesma recusa do disparo padrão do console).
+    - qualquer outra: item com `dispenser_id` é 422 — o ERP não escolhe slot.
+    """
+    if req.template_id == os_personalizada.TEMPLATE_ID:
+        catalogo = await _catalogo_ou_none()
+        if catalogo is None:
+            return _catalogo_indisponivel_pers(req.os_id)
+        problemas = os_personalizada.validar(req.medicamentos, catalogo,
+                                             settings.NUM_SLOTS)
+        if problemas:
+            logger.warning("[API] OS personalizada %s recusada: %s",
+                           req.os_id, "; ".join(problemas))
+            return _os_personalizada_invalida(req.os_id, problemas)
+        return None
+
+    if any(isinstance(item, dict) and item.get("dispenser_id") is not None
+           for item in req.medicamentos):
+        return JSONResponse(
+            status_code=422,
+            content={"erro": "dispenser_id_nao_permitido", "os_id": req.os_id,
+                     "mensagem": ("Só a OS personalizada (template_id "
+                                  f"'{os_personalizada.TEMPLATE_ID}') escolhe o "
+                                  "dispenser; nas demais quem escolhe é o central.")},
+        )
+    return None
+
+
 @app.post("/api/v1/ordens", tags=["Ordens de Serviço"],
     responses={
         409: {"description": "OS já registrada (`os_duplicada`). O reenvio NÃO é reprocessado."},
+        422: {"description": "OS personalizada inválida (`os_personalizada_invalida`, com `problemas` por linha) ou `dispenser_id` numa OS que não é personalizada (`dispenser_id_nao_permitido`). Nada é persistido."},
         429: {"description": "Fila cheia (`fila_cheia`). Nada é persistido — a recusa vem ANTES do INSERT."},
-        503: {"description": "Banco indisponível (`persistencia_indisponivel`). A OS não entra na fila."},
+        503: {"description": "Banco indisponível (`persistencia_indisponivel`), ou catálogo indisponível para conferir uma OS personalizada (`catalogo_indisponivel`). A OS não entra na fila."},
     })
 async def receber_ordem(req: NovaOSReq):
     """Recebe nova OS do erp-simulator.
@@ -1673,6 +1733,14 @@ async def receber_ordem(req: NovaOSReq):
 
     if not os_id or not medicamentos:
         raise HTTPException(400, "os_id e medicamentos são obrigatórios")
+
+    # OS personalizada: o slot é do operador, e é AQUI — na porta única, não só
+    # no console — que se confere a escolha. Antes da fila e do INSERT: OS
+    # recusada não gera linha. Nas demais o central escolhe o slot, e um
+    # `dispenser_id` vindo de fora seria uma escolha que ninguém vai honrar.
+    recusa = await _recusa_de_slot_escolhido(req)
+    if recusa is not None:
+        return recusa
 
     if not orch.ha_vaga_na_fila():
         fila = orch.fila_status()
@@ -2625,6 +2693,14 @@ class ConsoleDisparoReq(BaseModel):
     template_id: str
 
 
+class ConsolePersonalizadaReq(BaseModel):
+    # Lista sem tipo de propósito: quem julga cada linha é
+    # `os_personalizada.validar`, com a mensagem por linha que a tela mostra.
+    # Um modelo Pydantic por item responderia 422 no formato do FastAPI, que o
+    # console não sabe ler.
+    itens: list
+
+
 class ConsoleGeradorReq(BaseModel):
     pausado: bool
 
@@ -2860,6 +2936,39 @@ async def console_disparar(request: Request, req: ConsoleDisparoReq):
     if isinstance(resultado, JSONResponse):
         return resultado
     return {**resultado, "template_id": template["template_id"],
+            "descricao": corpo["descricao"]}
+
+
+@app.post("/console/api/disparar-personalizada", include_in_schema=False)
+async def console_disparar_personalizada(request: Request, req: ConsolePersonalizadaReq):
+    """Dispara a OS PERSONALIZADA montada no console — também por `receber_ordem`.
+
+    O console só monta o corpo (`os_personalizada.montar_corpo`, com `sku` e
+    `categoria` do catálogo); quem confere a OS é `receber_ordem`, a porta
+    única, e as recusas dela (422/409/429/503) chegam à tela intactas. A
+    validação aqui antes de montar existe só para que um item malformado vire
+    o mesmo 422 por linha em vez de um `KeyError` — a regra é a mesma função.
+    Pausa do gerador não bloqueia, como no disparo padrão.
+    """
+    _console_exigir_sessao(request)
+
+    catalogo = await _catalogo_ou_none()
+    if catalogo is None:
+        return _catalogo_indisponivel_pers()
+
+    problemas = os_personalizada.validar(req.itens, catalogo, settings.NUM_SLOTS)
+    if problemas:
+        return _os_personalizada_invalida("", problemas)
+
+    corpo = os_personalizada.montar_corpo(req.itens, catalogo)
+    logger.info("[CONSOLE] Disparo de OS personalizada → %s (%s)", corpo["os_id"],
+                ", ".join(f"D{i['dispenser_id']}←{i['medicamento']}×{i['quantidade']}"
+                          for i in corpo["medicamentos"]))
+
+    resultado = await receber_ordem(NovaOSReq(**corpo))
+    if isinstance(resultado, JSONResponse):
+        return resultado
+    return {**resultado, "template_id": corpo["template_id"],
             "descricao": corpo["descricao"]}
 
 

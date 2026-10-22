@@ -34,6 +34,7 @@ import httpx
 
 import chave_visao_tc
 import injecao
+import os_personalizada
 import os_templates
 from config import settings
 from database import (
@@ -751,6 +752,54 @@ def atribuir_slots(medicamentos: list, estado_dispensers: dict) -> Optional[list
             "sku":             sku,
             "categoria":       cat,
             "quantidade":      qtd,
+            "precisa_limpeza": precisa_limpeza,
+        })
+
+    return atribuicoes
+
+
+def atribuir_slots_fixos(medicamentos: list, estado_dispensers: dict) -> Optional[list]:
+    """A atribuição da OS PERSONALIZADA: o slot é o que o operador escolheu.
+
+    Mesma forma de retorno de `atribuir_slots`, e pura como ela — só decide e
+    marca; quem limpa o slot marcado é a etapa 1b do `_processar_os`. A
+    diferença é que aqui nada se escolhe:
+
+      - slot com o MESMO medicamento → reaproveita o resíduo, sem limpeza
+        (o passo 1 de `atribuir_slots`);
+      - slot com OUTRO medicamento e quantidade > 0 → `precisa_limpeza=True`;
+      - `dispenser_id` ausente, fora da faixa ou repetido → `None`. É defesa:
+        `receber_ordem` já recusou isso na borda (`os_personalizada.validar`).
+    """
+    atribuicoes: list[dict] = []
+    usados: set[int] = set()
+
+    for item in medicamentos:
+        slot_id = item.get("dispenser_id")
+        if (not isinstance(slot_id, int) or isinstance(slot_id, bool)
+                or not 1 <= slot_id <= NUM_SLOTS or slot_id in usados):
+            logger.error("[IA] OS personalizada com dispenser inválido ou repetido: %r",
+                         slot_id)
+            return None
+        usados.add(slot_id)
+
+        med = item["medicamento"]
+        disp = estado_dispensers.get(str(slot_id), {})
+        med_atual = disp.get("medicamento")
+        qtd_atual = disp.get("quantidade", 0) or 0
+        precisa_limpeza = qtd_atual > 0 and med_atual != med
+        if precisa_limpeza:
+            logger.warning("[IA] %s → D%d escolhido no console (limpeza necessária: "
+                           "descarta %s × %d)", med, slot_id, med_atual, qtd_atual)
+        else:
+            logger.info("[IA] %s → D%d escolhido no console", med, slot_id)
+
+        atribuicoes.append({
+            "dispenser_id":    slot_id,
+            "medicamento":     med,
+            "sku":             item.get("sku", ""),
+            "categoria":       item.get("categoria", ""),
+            "quantidade":      item["quantidade"],
             "precisa_limpeza": precisa_limpeza,
         })
 
@@ -2791,7 +2840,15 @@ async def _processar_os(os_payload: dict):
     # `receita_desconhecida` que a placa devolve no PRIMEIRO ciclo significaria
     # ter carregado os dispensers, limpado resíduo e gasto o ciclo inteiro para
     # nada. A checagem vem antes de reservar slot.
-    receita = os_templates.receita_de(os_payload.get("template_id") or "")
+    #
+    # A OS personalizada (montada no console) é a exceção declarada: ela não
+    # tem roteiro gravado e não finge ter. `receita` vazia diz à mesa "OS sem
+    # receita" — a placa acha a parada pelo `dispenser_alvo` de qualquer jeito
+    # e loga `-`. Uma letra emprestada de outra ordem faria o log mentir sobre
+    # qual roteiro rodou.
+    personalizada = os_payload.get("template_id") == os_personalizada.TEMPLATE_ID
+    receita = ("" if personalizada
+               else os_templates.receita_de(os_payload.get("template_id") or ""))
     if receita is None:
         logger.error(
             "[ORCH] OS %s sem receita mapeada (template_id=%r) — a mesa não tem "
@@ -2800,7 +2857,11 @@ async def _processar_os(os_payload: dict):
         )
         await _abortar_os(os_id, "receita_nao_mapeada")
         return
-    logger.info("[ORCH] OS %s usa a receita %s da mesa.", os_id, receita)
+    if personalizada:
+        logger.info("[ORCH] OS %s é personalizada: slots escolhidos no console, "
+                    "mover sem receita.", os_id)
+    else:
+        logger.info("[ORCH] OS %s usa a receita %s da mesa.", os_id, receita)
 
     # ── 0b. HOME e caixa VAZIA, antes de reservar qualquer coisa ─────────────
     # A OS anterior terminou com a mesa no CENTRO: o homing é obrigatório, e é
@@ -2835,7 +2896,10 @@ async def _processar_os(os_payload: dict):
         disp_snapshot = {k: dict(v) for k, v in _estado["dispensers"].items()}
 
     # ── 1. Atribuição de slots (IA) ──────────────────────────────────────────
-    atribuicoes = atribuir_slots(medicamentos, disp_snapshot)
+    # A personalizada traz o slot de cada item: o central não escolhe nada,
+    # só marca o que precisa de limpeza (a 1b abaixo cuida igual).
+    atribuicoes = (atribuir_slots_fixos(medicamentos, disp_snapshot) if personalizada
+                   else atribuir_slots(medicamentos, disp_snapshot))
     if atribuicoes is None:
         logger.error("[ORCH] OS %s REJEITADA — sem slots disponíveis.", os_id)
         # Rejeição também é uma saída de `_processar_os`, e agora a OS já está

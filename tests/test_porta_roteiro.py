@@ -19,6 +19,7 @@ caminho, então um evento que o adapter perdesse, reordenasse ou mandasse para
 o lugar errado aparece aqui como OS que não conclui.
 """
 import asyncio
+import time
 
 import pytest
 from fastapi import HTTPException
@@ -109,10 +110,17 @@ def celula(carregar_orquestrador, carregar_adapter, monkeypatch):
 
 
 async def _quando(condicao, limite_s: float = 10.0):
-    for _ in range(int(limite_s / 0.01)):
+    # O prazo é de RELÓGIO, não uma contagem de voltas: no Windows a resolução
+    # do relógio do asyncio é ~15,6 ms, então `sleep(0.01)` volta na hora e mil
+    # voltas eram ~30 ms em vez de 10 s — o roteiro falhava ao acaso, antes de
+    # o evento atravessar a USB falsa.
+    prazo = time.monotonic() + limite_s
+    while time.monotonic() < prazo:
         if condicao():
             return True
         await asyncio.sleep(0.01)
+    if condicao():
+        return True
     raise AssertionError("a condição não aconteceu")
 
 
